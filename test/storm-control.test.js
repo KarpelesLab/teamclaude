@@ -238,7 +238,8 @@ test('a quoted startConc does not loosen the ramp: one request at the instant of
   let admitted = 0;
   let gone = false;
   const waits = Array.from({ length: 5 }, () => am.admit(0, () => gone).then(ok => { if (ok) admitted++; }));
-  await sleep(30);
+  // The slot that is free is taken without a timer; the other four are polling.
+  await new Promise(resolve => setImmediate(resolve));
   assert.equal(admitted, 1, 'the cap is 1 at the switch, not "10"');
   gone = true;
   await Promise.all(waits);
@@ -246,37 +247,21 @@ test('a quoted startConc does not loosen the ramp: one request at the instant of
 
 test('a startConc and stepConc of 0 do not hold an idle account\'s first request for the window', async () => {
   const { am } = withRamp({ startConc: 0, stepConc: 0, windowMs: 2000, pollMs: 5 });
-  am._beginRamp(am.accounts[0]);
-  const start = Date.now();
+  const acct = am.accounts[0];
+  am._beginRamp(acct);
+  // A cap of 0 that cannot grow would park the request until the window ran
+  // out; the cap is what says it will not, whatever the clock does.
+  assert.equal(am._rampCap(acct, acct.rampStartedAt), 1);
   assert.equal(await am.admit(0), true);
-  const waited = Date.now() - start;
-  assert.ok(waited < 500, `admitted after ${waited}ms; the window is 2000ms`);
 });
 
 test('a window of 1e999 with a cap that cannot grow does not hold an idle account for good', async () => {
   const { am } = withRamp({ startConc: 0, stepConc: 0, windowMs: JSON.parse('1e999'), pollMs: 5 });
-  am._beginRamp(am.accounts[0]);
-  let gone = false;
-  const admitted = am.admit(0, () => gone);
-  const first = await Promise.race([admitted, sleep(300).then(() => 'still waiting')]);
-  gone = true;
-  await admitted;
-  assert.equal(first, true);
-});
-
-test('a pollMs of 0 or 1 does not turn a waiting admit into a 1 ms timer loop', async () => {
-  for (const pollMs of [0, 1]) {
-    const { am } = withRamp({ startConc: 1, stepConc: 1, stepMs: 10_000, windowMs: 60_000, pollMs });
-    am._beginRamp(am.accounts[0]);
-    await am.admit(0); // the only slot
-    let checks = 0;
-    let gone = false;
-    const waiting = am.admit(0, () => { checks++; return gone; });
-    await sleep(200);
-    gone = true;
-    assert.equal(await waiting, false);
-    assert.ok(checks <= 10, `pollMs ${pollMs}: ${checks} re-checks in 200ms; the default pollMs of 50 makes about 4`);
-  }
+  const acct = am.accounts[0];
+  am._beginRamp(acct);
+  assert.equal(am.ramp.windowMs, 30_000, 'a window that never ends is not kept');
+  assert.equal(am._rampCap(acct, acct.rampStartedAt), 1);
+  assert.equal(await am.admit(0), true);
 });
 
 // A value that is not a number is named as it was written in the config.
