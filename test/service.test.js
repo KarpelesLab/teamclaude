@@ -6,17 +6,43 @@ import { join } from 'node:path';
 import {
   serviceKind, launchAgentPath, systemdUnitPath, logPath, resolveExec, servicePath,
   renderLaunchAgent, renderSystemdUnit, systemdQuote, installService, uninstallService, serviceStatus, LABEL,
+  LAUNCHD_UNLOAD_WAIT_MS,
 } from '../src/service.js';
 
 // Records every command a call would run, and answers each with a canned result.
+// A list answers successive matching calls in turn, then repeats its last entry.
 function recorder(results = {}) {
   const calls = [];
   const run = (cmd, args) => {
     calls.push([cmd, ...args].join(' '));
     const key = Object.keys(results).find(k => [cmd, ...args].join(' ').includes(k));
-    return results[key] || { code: 0, stdout: '', stderr: '' };
+    const answer = results[key];
+    if (Array.isArray(answer)) return answer.length > 1 ? answer.shift() : answer[0];
+    return answer || { code: 0, stdout: '', stderr: '' };
   };
   return { run, calls };
+}
+
+// What `launchctl print gui/<uid>/<label>` answers once launchd has no such
+// label (exit 113), and while it still has one.
+const NOT_LOADED = { code: 113, stdout: '', stderr: `Bad request.\nCould not find service "${LABEL}" in domain for user gui: 501` };
+const LOADED = { code: 0, stdout: `gui/501/${LABEL} = {\n\tstate = running\n\tpid = 4242\n}\n`, stderr: '' };
+// launchctl bootstrap racing an agent launchd has not finished removing.
+const EIO = { code: 5, stdout: '', stderr: 'Bootstrap failed: 5: Input/output error\nTry re-running the command as root for richer errors.' };
+
+// A clock that moves only when the code under test sleeps, so a wait is
+// asserted by what was slept and never by wall time. A sleep that resolves at
+// once never yields to the timers, so an uncapped wait would spin past
+// --test-timeout and hang the run: it throws instead.
+function fakeClock() {
+  let t = 0;
+  const slept = [];
+  const sleep = async (ms) => {
+    slept.push(ms);
+    t += ms;
+    if (t > 10 * LAUNCHD_UNLOAD_WAIT_MS) throw new Error(`slept ${t} ms: the wait has no cap`);
+  };
+  return { slept, now: () => t, sleep };
 }
 
 test('service kind follows the platform', () => {
@@ -174,9 +200,10 @@ test('a control character in any unit path is refused, not written', () => {
 test('installing on launchd writes the plist and loads it', async () => {
   const home = await mkdtemp(join(tmpdir(), 'tc-svc-'));
   try {
-    const { run, calls } = recorder();
+    const { run, calls } = recorder({ print: NOT_LOADED });
+    const clock = fakeClock();
     const res = await installService({
-      kind: 'launchd', home, platform: 'darwin', run, log: () => {},
+      kind: 'launchd', home, platform: 'darwin', run, log: () => {}, now: clock.now, sleep: clock.sleep,
       exec: { node: '/opt/homebrew/bin/node', entry: '/opt/homebrew/bin/teamclaude' },
     });
     assert.equal(res.ok, true);
@@ -184,7 +211,100 @@ test('installing on launchd writes the plist and loads it', async () => {
     assert.match(written, /teamclaude/);
     // bootout before bootstrap: bootstrap fails outright if the label is loaded.
     assert.match(calls[0], /^launchctl bootout gui\/\d+\/com\.karpeleslab\.teamclaude$/);
-    assert.match(calls[1], /^launchctl bootstrap gui\/\d+ /);
+    assert.match(calls[1], /^launchctl print gui\/\d+\/com\.karpeleslab\.teamclaude$/);
+    assert.match(calls[2], /^launchctl bootstrap gui\/\d+ /);
+    assert.equal(calls.length, 3);
+    // Nothing was loaded, so nothing waited.
+    assert.deepEqual(clock.slept, []);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+// `bootout` can return while the old process is still exiting. A bootstrap
+// sent then fails with EIO, and the reinstall leaves no agent loaded at all.
+test('a reinstall waits for launchd to let go of the old agent before loading the new one', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'tc-svc-'));
+  try {
+    const { run, calls } = recorder({ print: [LOADED, LOADED, NOT_LOADED] });
+    const clock = fakeClock();
+    const res = await installService({
+      kind: 'launchd', home, platform: 'darwin', run, log: () => {}, now: clock.now, sleep: clock.sleep,
+      exec: { node: '/n', entry: '/e' },
+    });
+    assert.equal(res.ok, true);
+    assert.deepEqual(calls.map(c => c.split(' ').slice(0, 2).join(' ')), [
+      'launchctl bootout', 'launchctl print', 'launchctl print', 'launchctl print', 'launchctl bootstrap',
+    ]);
+    // One pause after each answer that still found the label.
+    assert.equal(clock.slept.length, 2);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('a bootstrap that answers EIO is retried after a pause', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'tc-svc-'));
+  try {
+    const { run, calls } = recorder({ print: NOT_LOADED, bootstrap: [EIO, { code: 0, stdout: '', stderr: '' }] });
+    const clock = fakeClock();
+    const res = await installService({
+      kind: 'launchd', home, platform: 'darwin', run, log: () => {}, now: clock.now, sleep: clock.sleep,
+      exec: { node: '/n', entry: '/e' },
+    });
+    assert.equal(res.ok, true);
+    assert.equal(calls.filter(c => c.startsWith('launchctl bootstrap')).length, 2);
+    assert.equal(clock.slept.length, 1);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+// The wait has a cap, and an agent launchd never lets go of ends in a failure
+// that says what to do, not a hang and not a silent success.
+test('the wait for the old agent is bounded, and EIO on every attempt fails loudly', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'tc-svc-'));
+  try {
+    const rec = recorder({ print: LOADED, bootstrap: EIO });
+    const clock = fakeClock();
+    let waitedMs = null;
+    const run = (cmd, args) => {
+      if (args[0] === 'bootstrap' && waitedMs === null) waitedMs = clock.now();
+      return rec.run(cmd, args);
+    };
+    const res = await installService({
+      kind: 'launchd', home, platform: 'darwin', run, log: () => {}, now: clock.now, sleep: clock.sleep,
+      exec: { node: '/n', entry: '/e' },
+    });
+    assert.equal(res.ok, false);
+    // It waited out the cap, then stopped polling within a second of it.
+    assert.ok(waitedMs >= LAUNCHD_UNLOAD_WAIT_MS, `bootstrapped after ${waitedMs} ms`);
+    assert.ok(waitedMs < LAUNCHD_UNLOAD_WAIT_MS + 1000, `bootstrapped after ${waitedMs} ms`);
+    assert.equal(rec.calls.filter(c => c.startsWith('launchctl bootstrap')).length, 3);
+    // launchctl's own first line, without its "re-run as root" hint, and the way out.
+    assert.match(res.error, /^Bootstrap failed: 5: Input\/output error \(tried 3 times\)/);
+    assert.doesNotMatch(res.error, /as root/);
+    assert.match(res.error, /teamclaude service install/);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('a bootstrap failure other than EIO is reported at once, without a retry', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'tc-svc-'));
+  try {
+    const { run, calls } = recorder({
+      print: NOT_LOADED, bootstrap: { code: 2, stdout: '', stderr: 'Bootstrap failed: 2: No such file or directory' },
+    });
+    const clock = fakeClock();
+    const res = await installService({
+      kind: 'launchd', home, platform: 'darwin', run, log: () => {}, now: clock.now, sleep: clock.sleep,
+      exec: { node: '/n', entry: '/e' },
+    });
+    assert.equal(res.ok, false);
+    assert.equal(res.error, 'Bootstrap failed: 2: No such file or directory');
+    assert.equal(calls.filter(c => c.startsWith('launchctl bootstrap')).length, 1);
+    assert.deepEqual(clock.slept, []);
   } finally {
     await rm(home, { recursive: true, force: true });
   }
@@ -193,9 +313,10 @@ test('installing on launchd writes the plist and loads it', async () => {
 test('a failed load is reported as a failure, not a silent success', async () => {
   const home = await mkdtemp(join(tmpdir(), 'tc-svc-'));
   try {
-    const { run } = recorder({ bootstrap: { code: 5, stdout: '', stderr: 'Load failed: 5: Input/output error' } });
+    const { run } = recorder({ print: NOT_LOADED, bootstrap: { code: 5, stdout: '', stderr: 'Load failed: 5: Input/output error' } });
+    const clock = fakeClock();
     const res = await installService({
-      kind: 'launchd', home, platform: 'darwin', run, log: () => {},
+      kind: 'launchd', home, platform: 'darwin', run, log: () => {}, now: clock.now, sleep: clock.sleep,
       exec: { node: '/n', entry: '/e' },
     });
     assert.equal(res.ok, false);
@@ -272,7 +393,7 @@ test('the systemd unit follows XDG_CONFIG_HOME when one is set', async () => {
 test('uninstall unloads before deleting the unit file', async () => {
   const home = await mkdtemp(join(tmpdir(), 'tc-svc-'));
   try {
-    const { run, calls } = recorder();
+    const { run, calls } = recorder({ print: NOT_LOADED });
     await installService({
       kind: 'launchd', home, platform: 'darwin', run, log: () => {},
       exec: { node: '/n', entry: '/e' },

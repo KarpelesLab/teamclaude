@@ -3,8 +3,9 @@ import { sameIdentity } from './identity.js';
 import { safeLine } from './safe-text.js';
 import { removedAccountIds, addedAccountIds, configIndexFor } from './account-pairing.js';
 import { ensureAccountIds } from './account-id.js';
-import { accountSwitchThreshold, accountAllowsExtraUsage, accountRouting } from './account-manager.js';
+import { accountSwitchThreshold, accountAllowsExtraUsage, accountRouting, accountEndsAt } from './account-manager.js';
 import { localListener } from './upstream-proxy.js';
+import { accountCredit } from './api-credit.js';
 
 /**
  * Sync accounts from disk config: add new accounts and refresh credentials
@@ -108,7 +109,9 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
       accountManager.sessionPins?.rename(mgr.name, diskAcct.name);
       mgr.name = diskAcct.name;
     }
-    if (diskAcct.priority != null && mgr.priority !== diskAcct.priority) mgr.priority = diskAcct.priority;
+    // Read as makeAccount reads it, so deleting the key returns the account to
+    // the default tier instead of leaving it at the priority it last held (#640).
+    mgr.priority = diskAcct.priority || 0;
     // A list position edited on disk applies on reload for the same reason a
     // priority edit does, and `null` rather than `??` so deleting the field
     // puts the account back among the unplaced instead of leaving it stuck at
@@ -118,6 +121,13 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     // operator decision about a running fleet, and waiting for a restart to
     // honour a budget defeats the budget.
     mgr.maxUsage = diskAcct.maxUsage ?? null;
+    // A cordon applies on reload too: placement reads it at the next request,
+    // and a conversation already on the account is kept there (account-manager.js).
+    accountManager.setCordoned(mgr.index, !!diskAcct.cordoned);
+    // An end time set, moved or cleared on disk (`teamclaude ends`) is read by
+    // the very next selection. Through the constructor's own parse, so a value
+    // refused at startup is refused here, and a removed key clears it.
+    mgr.endsAt = accountEndsAt(diskAcct);
     mgr.maxSpend = diskAcct.maxSpend ?? null;
     // Same for a per-account switch threshold (#409): thresholdFor() reads it
     // straight off the account, so a disk edit takes effect on the very next
@@ -140,6 +150,11 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     // one that points back at this server's own listener (memConfig's port is
     // the one the server is bound to; a port edit on disk needs a restart).
     accountManager.setRouting(mgr.index, accountRouting(diskAcct, localListener(memConfig)));
+    // Same for the prepaid-credit setting (api-credit.js), through the
+    // constructor's own validation: an amount or a renewal day corrected on
+    // disk shows on the next status read, and a replaced admin key is read at
+    // once rather than after the old key's backoff.
+    accountManager.setCreditConfig(mgr.index, accountCredit(diskAcct));
     // Read at the moment a refusal asks whether to spend a reset credit, so a
     // disk edit must land here to bind — and an operator who has just exempted
     // an account is doing so precisely because they do not want the next
@@ -181,11 +196,15 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
       if (diskAcct.maxSpend != null) cfgAcct.maxSpend = diskAcct.maxSpend; else delete cfgAcct.maxSpend;
       if (diskAcct.switchThreshold != null) cfgAcct.switchThreshold = diskAcct.switchThreshold; else delete cfgAcct.switchThreshold;
       if (diskAcct.routing) cfgAcct.routing = diskAcct.routing; else delete cfgAcct.routing;
+      if (diskAcct.credit != null) cfgAcct.credit = diskAcct.credit; else delete cfgAcct.credit;
       if (diskAcct.priority != null) cfgAcct.priority = diskAcct.priority; else delete cfgAcct.priority;
       // The TUI's reorder writes this key onto the entry, so after one
       // arrangement every entry carries a value for a hand edit to lose to.
       if (Number.isFinite(diskAcct.displayOrder)) cfgAcct.displayOrder = diskAcct.displayOrder; else delete cfgAcct.displayOrder;
       if (diskAcct.disabled) cfgAcct.disabled = true; else delete cfgAcct.disabled;
+      if (diskAcct.cordoned) cfgAcct.cordoned = true; else delete cfgAcct.cordoned;
+      // As written, not as parsed: the entry keeps the operator's own text.
+      if (diskAcct.endsAt != null) cfgAcct.endsAt = diskAcct.endsAt; else delete cfgAcct.endsAt;
       if (diskAcct.allowExtraUsage === true) cfgAcct.allowExtraUsage = true; else delete cfgAcct.allowExtraUsage;
       // Both polarities are mirrored, unlike the flags above: `false` is the
       // side of this key that does something, so a stale mirror of either value
@@ -198,17 +217,20 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     if (mgr.disabled !== wantDisabled) accountManager.setDisabled(mgr.index, wantDisabled);
 
     // Existing account — resolve fresh credentials from disk
-    /** @type {{ accessToken?: string, refreshToken?: string, expiresAt?: number, apiKey?: string }|null} */
+    /** @type {{ accessToken?: string, refreshToken?: string, expiresAt?: number, refreshTokenExpiresAt?: number, apiKey?: string }|null} */
     let freshCred = null;
     if (diskAcct.type === 'oauth' && diskAcct.importFrom) {
       try {
         const creds = await importCredentials(diskAcct.importFrom);
-        freshCred = { accessToken: creds.accessToken, refreshToken: creds.refreshToken, expiresAt: creds.expiresAt };
+        // The refresh token's own expiry rides with the token it describes, here
+        // and below: a newer sign-in on disk brings its date (or none), and a
+        // staler copy never gets as far as updateAccountTokens.
+        freshCred = { accessToken: creds.accessToken, refreshToken: creds.refreshToken, expiresAt: creds.expiresAt, refreshTokenExpiresAt: creds.refreshTokenExpiresAt };
       } catch (/** @type {any} */ err) {
         console.error(`[TeamClaude] Re-import failed for "${safeLine(diskAcct.name, 64)}": ${err.message}`);
       }
     } else if (diskAcct.type === 'oauth' && diskAcct.accessToken) {
-      freshCred = { accessToken: diskAcct.accessToken, refreshToken: diskAcct.refreshToken, expiresAt: diskAcct.expiresAt };
+      freshCred = { accessToken: diskAcct.accessToken, refreshToken: diskAcct.refreshToken, expiresAt: diskAcct.expiresAt, refreshTokenExpiresAt: diskAcct.refreshTokenExpiresAt };
     } else if (diskAcct.type === 'apikey' && diskAcct.apiKey) {
       freshCred = { apiKey: diskAcct.apiKey };
     }

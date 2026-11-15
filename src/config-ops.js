@@ -2,6 +2,7 @@ import { DEFAULT_SWITCH_THRESHOLD, distributionMode } from './account-manager.js
 import { matchAccounts } from './identity.js';
 import { THRESHOLD_BUCKET_KEYS, WEEKLY_BUCKET_KEYS } from './model.js';
 import { createRollingWarmupSchedule, resolveWarmupSchedule } from './warmup-schedule.js';
+import { parseEndsAt } from './ends-at.js';
 
 /**
  * The rules behind the runtime-tunable settings, as changes to a config object.
@@ -381,6 +382,57 @@ export function setAccountPriority(config, query, spec = {}) {
   if (typeof priority !== 'number' || !Number.isSafeInteger(priority)) throw new ConfigOpError('priority must be an integer, or place must be "first" or "last"');
   account.priority = priority;
   return { name: account.name, priority };
+}
+
+/**
+ * Cordon an account, or put it back: a cordoned account takes no new
+ * conversation, while one already on it keeps being served there.
+ *
+ * Uncordoning deletes the key, as enabling does: an absent key is the default.
+ *
+ * @param {any} config
+ * @param {string} query
+ * @param {boolean} cordoned
+ * @param {{ orgFilter?: string }} [spec]
+ */
+export function setAccountCordoned(config, query, cordoned, spec = {}) {
+  if (typeof cordoned !== 'boolean') throw new ConfigOpError('cordoned must be true or false');
+  const account = resolveConfiguredAccount(config, query, spec.orgFilter);
+  if (cordoned) account.cordoned = true;
+  else delete account.cordoned;
+  return { name: account.name, cordoned: !!account.cordoned };
+}
+
+/**
+ * Set or clear an account's end time (accounts[].endsAt): the moment the
+ * operator knows it stops being usable, which selection then treats as the
+ * deadline for its unspent weekly quota when it comes before the weekly reset.
+ *
+ * `value` is epoch milliseconds or an ISO 8601 date or date-time; a bare date
+ * is the start of that day in local time. `null` clears it by deleting the key,
+ * an absent key being the default.
+ *
+ * Epoch milliseconds are stored as the number. A date is stored as the UTC
+ * instant it named when the command ran, so an entry written as a local day
+ * does not move when the server later runs in another time zone.
+ *
+ * @param {any} config
+ * @param {string} query
+ * @param {string|number|null} value
+ * @param {{ orgFilter?: string }} [spec]
+ * @returns {{ name: string, endsAt: number|null }}  the end time as epoch ms
+ */
+export function setAccountEndsAt(config, query, value, spec = {}) {
+  const account = resolveConfiguredAccount(config, query, spec.orgFilter);
+  if (value === null) {
+    delete account.endsAt;
+    return { name: account.name, endsAt: null };
+  }
+  const endsAt = parseEndsAt(value);
+  if (endsAt == null) throw new ConfigOpError('the end time must be an ISO 8601 date or date-time (2026-12-01, 2026-12-01T09:00:00Z) or epoch milliseconds');
+  const asEpoch = typeof value === 'number' || /^\d+$/.test(String(value).trim());
+  account.endsAt = asEpoch ? endsAt : new Date(endsAt).toISOString();
+  return { name: account.name, endsAt };
 }
 
 /**

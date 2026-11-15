@@ -14,7 +14,9 @@
     "sessionDetail": false,
     "mcp": "off",
     "drainTimeoutSeconds": 0,
-    "cliproxyApi": "off"
+    "cliproxyApi": "off",
+    "controlPlane": "client",
+    "usageHistory": false
   },
   "upstream": "https://api.anthropic.com",
   "switchThreshold": 0.98,
@@ -22,6 +24,7 @@
   "synthesizeQuotaHeaders": false,
   "poolQuotaHeaders": false,
   "distributeSessions": false,
+  "switchOnSessionReset": true,
   "adaptiveDistribution": {
     "scoring": "burndown"
   },
@@ -71,7 +74,22 @@
       "type": "apikey",
       "priority": 10,
       "disabled": false,
+      "cordoned": false,
       "apiKey": "sk-ant-api03-your-api-key"
+    },
+    {
+      "name": "api-credit",
+      "type": "apikey",
+      "priority": 100,
+      "disabled": true,
+      "apiKey": "sk-ant-api03-your-credit-org-api-key",
+      "credit": {
+        "amount": 200,
+        "currency": "USD",
+        "cycleStart": "2026-11-02",
+        "adminKey": "sk-ant-admin01-your-admin-key",
+        "refreshMinutes": 15
+      }
     }
   ],
   "routes": [

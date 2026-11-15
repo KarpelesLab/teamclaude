@@ -4,13 +4,6 @@ import { Readable } from 'node:stream';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
 
-// POST /teamclaude/switch is the headless equivalent of picking an account with
-// 's' in the TUI: both only move the manager's currentIndex. The TUI is not
-// reachable when the proxy runs as a background service, which is what this
-// endpoint exists for. currentIndex is a weak preference — selection drops it
-// when the account is unavailable and also when an available account has a
-// lower priority value — so "recorded" and "in effect" are tested separately.
-
 function listen(server) {
   return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
 }
@@ -147,11 +140,7 @@ test('switching to a usable account reports it as eligible', async () => {
   });
 });
 
-// Unavailability is not the only way a switch gets undone. A perfectly healthy
-// account is dropped just as fast when another available account outranks it on
-// priority, so "eligible" has to answer the real question — would a request go
-// here — rather than only "is this account usable at all".
-test('a switch that priority will immediately override is reported as ineligible', async () => {
+test('a manual switch takes priority over automatic ranking and reports eligibility', async () => {
   const am = new AccountManager([
     { name: 'high@example.com', type: 'apikey', apiKey: 'k1', priority: 0 },
     { name: 'low@example.com', type: 'apikey', apiKey: 'k2', priority: 1 },
@@ -162,12 +151,11 @@ test('a switch that priority will immediately override is reported as ineligible
     const res = await post(port, JSON.stringify({ account: 'low@example.com' }));
     assert.equal(res.status, 200);
     assert.equal(res.body.ok, true, 'the switch is still recorded');
-    assert.equal(res.body.eligible, false, 'a preempted target is not where traffic will go');
-    assert.match(res.body.reason, /priority/i);
-    assert.match(res.body.reason, /high@example\.com/, 'name the account that wins');
-    assert.equal(am.currentIndex, 1, 'currentIndex still moves');
-    // Proof the report is not pedantic: selection hands it straight back.
-    assert.equal(am.getActiveAccount().name, 'high@example.com');
+    assert.equal(res.body.eligible, true);
+    assert.equal(res.body.reason, undefined);
+    assert.equal(am.currentIndex, 1);
+    assert.equal(am.getActiveAccount().name, 'low@example.com');
+    assert.equal(am.previewRouteIndex('claude-opus-5-5'), 1);
   } finally {
     proxy.close();
   }

@@ -1,3 +1,5 @@
+import { creditView } from './api-credit.js';
+
 /** Resolve a subscription's quota capacity relative to a Claude Pro account. */
 export function quotaTier(account) {
   const rateLimitTier = account.rateLimitTier || null;
@@ -148,8 +150,12 @@ function fiveHourExempt(/** @type {any[]} */ summaries, /** @type {Record<string
   return { ...aggregate, exemptAccounts, exemptWeight: clean(exemptWeight) };
 }
 
-/** Build the quota payload shared by the control endpoint and status clients. */
-export function buildQuotaSummary(accounts) {
+/**
+ * Build the quota payload shared by the control endpoint and status clients.
+ * @param {any[]} accounts
+ * @param {number} [now]
+ */
+export function buildQuotaSummary(accounts, now = Date.now()) {
   const summaries = accounts
     .map(account => ({
       name: account.name,
@@ -163,6 +169,10 @@ export function buildQuotaSummary(accounts) {
       // `buckets.fiveHour` is null for both.
       sessionWindow: typeof account.quota?.sessionWindowStated === 'boolean' ? account.quota.sessionWindowStated : null,
       buckets: accountBuckets(account.quota || {}),
+      // Prepaid API credit (api-credit.js), and like `monthly` above the key
+      // appears only on an account that has some: money, not a utilization
+      // window, so it is no bucket and joins no aggregate.
+      ...(account.creditConfig ? { credit: creditView(account, now) } : {}),
     }));
   /** @type {Record<string, Record<string, any>|null>} */
   const aggregate = Object.fromEntries(BUCKETS.map(key => [key, aggregateBucket(summaries, key)]));

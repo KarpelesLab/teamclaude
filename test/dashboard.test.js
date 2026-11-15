@@ -1029,7 +1029,7 @@ test('selecting a window relabels every table it governs', async () => {
 const CLIENT_CALLER = {
   kind: 'client',
   client: 'ci',
-  refused: ['/teamclaude/threshold', '/teamclaude/priority', '/teamclaude/disable'],
+  refused: ['/teamclaude/threshold', '/teamclaude/priority', '/teamclaude/disable', '/teamclaude/account-cordon'],
 };
 
 test('callerCan hides exactly the refused controls', () => {

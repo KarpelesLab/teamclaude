@@ -123,6 +123,19 @@ test('an unknown username is an error rather than an ignored pin', () => {
   assert.doesNotMatch(error, /typo/);
 });
 
+// A pin may name several accounts, in order (see pin-list.test.js). Each name
+// has to match, as a single one does, and the pin travels on as written.
+test('the Basic username may name several accounts, each of which has to match', () => {
+  const am = { accounts: [{ name: 'work' }, { name: 'personal' }, { name: 'me (Acme, Inc.)' }] };
+  assert.deepEqual(resolveConnectPin({ headers: { 'proxy-authorization': basic('work,personal:') } }, am, null), { pin: 'work,personal', error: null });
+  // A name with a comma in it is still the one account it names.
+  assert.deepEqual(resolveConnectPin({ headers: { 'proxy-authorization': basic('me (Acme, Inc.):') } }, am, null), { pin: 'me (Acme, Inc.)', error: null });
+  const { pin, error } = resolveConnectPin({ headers: { 'proxy-authorization': basic('work,typo:') } }, am, null);
+  assert.equal(pin, null);
+  assert.match(error, /Unknown account pin "wo…" \(9 chars\)/);
+  assert.doesNotMatch(error, /typo/);
+});
+
 test('no header, or a Bearer key, yields no pin', () => {
   const am = { accounts: [{ name: 'work' }] };
   assert.deepEqual(resolveConnectPin({ headers: {} }, am, 'secret'), { pin: null, error: null });
@@ -216,6 +229,57 @@ test('an unknown pin is refused at CONNECT', T, async () => {
     );
   } finally {
     closeHard(proxy); closeHard(upstream);
+  }
+});
+
+const creditAccount = (name) => ({ name, type: 'apikey', apiKey: `KEY-${name}`, disabled: true });
+
+test('a CONNECT pinned to a list moves a billing-refused request to the next account', T, async () => {
+  const { caCertPem, leafCertPem, leafKeyPem } = generateCertChain('localhost');
+  const seen = [];
+  const upstream = makeUpstream((req) => {
+    const key = req.headers['x-api-key'];
+    seen.push(key);
+    return key === 'KEY-a'
+      ? { status: 400, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ type: 'error', error: { type: 'billing_error', message: 'Billing is unavailable.' } }) }
+      : { status: 200, headers: { 'x-saw-key': key || 'none' } };
+  });
+  const upPort = await listen(upstream);
+
+  const am = new AccountManager([oauthAccount('plan', 'TOKEN-P'), creditAccount('a'), creditAccount('b')], 0.98);
+  const proxy = makeProxy(am, upPort, { caCertPem, leafCertPem, leafKeyPem });
+  const proxyPort = await listen(proxy);
+
+  let tlsSock = null;
+  try {
+    tlsSock = await connectThroughProxy(proxyPort, `127.0.0.1:${upPort}`, caCertPem, ['h2'], basic('a,b:'));
+    const resp = await postOverTunnel(tlsSock);
+    assert.equal(resp[':status'], 200);
+    assert.equal(resp['x-saw-key'], 'KEY-b');
+    assert.deepEqual(seen, ['KEY-a', 'KEY-b']);
+  } finally {
+    tlsSock?.destroy(); closeHard(proxy); closeHard(upstream);
+  }
+});
+
+test('a list pin with a name that matches no account is refused at CONNECT', T, async () => {
+  const { caCertPem, leafCertPem, leafKeyPem } = generateCertChain('localhost');
+  const upstream = makeUpstream(() => ({ status: 200 }));
+  const upPort = await listen(upstream);
+
+  const am = new AccountManager([creditAccount('a'), creditAccount('b')], 0.98);
+  const proxy = makeProxy(am, upPort, { caCertPem, leafCertPem, leafKeyPem });
+  const proxyPort = await listen(proxy);
+
+  // A tunnel that wrongly opens is closed too, so a failure here cannot hang the run.
+  let tlsSock = null;
+  try {
+    await assert.rejects(
+      connectThroughProxy(proxyPort, `127.0.0.1:${upPort}`, caCertPem, ['h2'], basic('a,nosuch:')).then((s) => { tlsSock = s; }),
+      /407/,
+    );
+  } finally {
+    tlsSock?.destroy(); closeHard(proxy); closeHard(upstream);
   }
 });
 

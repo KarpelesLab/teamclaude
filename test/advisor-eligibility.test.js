@@ -241,6 +241,23 @@ test('no eligible account still degrades to the request model, in both modes', (
   }
 });
 
+test('the degrade line does not claim a route when the request model finds no account either', () => {
+  for (const advisorEligibility of ['strict', 'prefer']) {
+    const am = new AccountManager([oauth('a'), oauth('b')], 0.98, { advisorEligibility });
+    for (const account of am.accounts) {
+      spendFable(account);
+      account.status = 'throttled';
+      account.rateLimitedUntil = Date.now() + 3600_000;
+    }
+    let picked;
+    const lines = capture(() => { picked = am.getActiveAccount(new Set([0, 1]), OPUS, FABLE); });
+    assert.equal(picked, null, advisorEligibility);
+    assert.deepEqual(lines.filter(l => /No account eligible for advisor model/.test(l)), [
+      `[TeamClaude] No account eligible for advisor model "${FABLE}" — and no account is available for the request model either, so no account was selected`,
+    ], advisorEligibility);
+  }
+});
+
 test('setAdvisorEligibility switches a running manager both ways', () => {
   const am = fleet();
   capture(() => {

@@ -41,6 +41,15 @@ export function getQuotaSeriesPath() {
 }
 
 /**
+ * Path to the usage history (a sibling of the config, see usage/db.js), named
+ * after it so two configs in one directory keep separate histories.
+ */
+export function getUsageDbPath() {
+  const cfg = getConfigPath();
+  return cfg.endsWith('.json') ? cfg.replace(/\.json$/, '.usage.db') : cfg + '.usage.db';
+}
+
+/**
  * Path to the crash log (a sibling of the config), where a fatal error is
  * recorded before the process exits.
  */

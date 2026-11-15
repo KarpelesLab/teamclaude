@@ -9,7 +9,9 @@ import { envVar } from './brand.js';
 import { creditCount } from './codex-usage.js';
 import { LOGIN_TIMEOUT_MS, codeRace, openBrowser, pasteFromTerminal } from './login-flow.js';
 import { safeLine } from './safe-text.js';
+import { resetRetryAt } from './reset-readings.js';
 import { anthropicLink } from './account-refusal.js';
+import { refreshTokenExpiryFromResponse, withFamilyExpiry } from './refresh-token-expiry.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
 const execFileAsync = promisify(execFile);
@@ -146,41 +148,146 @@ export const USAGE_USER_AGENT = 'claude-cli/2.1.288 (external, cli)';
 const DEFAULT_TOKEN_ENDPOINT = 'https://platform.claude.com/v1/oauth/token';
 const DEFAULT_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 
+// The longest wait a Retry-After is taken at. It is upstream's number, and the
+// account holds its refreshes for it (AccountManager.ensureTokenFresh), in
+// memory, past a re-login and a re-enable: unbounded, one `Retry-After:
+// 99999999999` stopped an account's renewals for about 3,169 years, or until a
+// restart, and one past about 8.6 trillion seconds made the hold an invalid
+// Date whose log line threw out of ensureTokenFresh. A far-future HTTP date
+// cannot throw, but held as long. An hour is the cap server.js puts on the
+// longest 429 hold it arms, the one for a quota rejection.
+const RETRY_AFTER_MAX_MS = 60 * 60_000;
+
 /**
  * A Retry-After header in milliseconds: delta-seconds or an HTTP date (RFC 9110
- * §10.2.3). Undefined when absent or unparseable.
+ * §10.2.3), at most RETRY_AFTER_MAX_MS. Undefined when absent or unparseable.
  * @param {string|null|undefined} value
  * @param {number} [now]
  */
 export function parseRetryAfterMs(value, now = Date.now()) {
   if (typeof value !== 'string' || !value.trim()) return undefined;
-  if (/^\d+$/.test(value.trim())) return Number(value.trim()) * 1000;
+  if (/^\d+$/.test(value.trim())) return Math.min(Number(value.trim()) * 1000, RETRY_AFTER_MAX_MS);
   const at = Date.parse(value);
-  return Number.isFinite(at) ? Math.max(0, at - now) : undefined;
+  return Number.isFinite(at) ? Math.min(Math.max(0, at - now), RETRY_AFTER_MAX_MS) : undefined;
 }
 
 const DEFAULT_APPEAL_URL = 'https://claude.ai/restricted';
 
 /**
+ * The OAuth error a token endpoint's answer carries, in either shape: the flat
+ * one RFC 6749 §5.2 defines (`{"error": "invalid_grant", "error_description":
+ * ...}`), or nested as an Anthropic API error (`{"type": "error", "error":
+ * {"type": "invalid_grant", ...}}`), where Claude Code's own refresh reads the
+ * code from `error.type`. Which one upstream sends is not verified; both are
+ * read. The description and the link are the OAuth `error_description` and
+ * `error_uri`, each taken from inside the nested object or else from beside
+ * it; `message` is the nested object's own text. Null when the body is
+ * neither.
+ * @param {string} text
+ * @returns {{ code: string, description: unknown, uri: unknown, message: unknown }|null}
+ */
+function oauthErrorOf(text) {
+  let body;
+  try { body = JSON.parse(text); } catch { return null; }
+  const e = body?.error;
+  if (typeof e === 'string') return { code: e, description: body.error_description, uri: body.error_uri, message: undefined };
+  if (e && typeof e === 'object' && typeof e.type === 'string') {
+    return { code: e.type, description: e.error_description ?? body.error_description, uri: e.error_uri ?? body.error_uri, message: e.message };
+  }
+  return null;
+}
+
+/**
  * The appeal link of a refusal for an account on hold, checked as Claude Code does:
  * it is shown to the operator, so anything but a plain https Anthropic link becomes the default.
+ * The hold itself is read in either shape (oauthErrorOf), where Claude Code
+ * reads it in the flat one only.
  * @param {string} text
  */
 function holdAppealUrl(text) {
-  let body;
-  try { body = JSON.parse(text); } catch { return undefined; }
-  if (!['invalid_grant', 'access_denied'].includes(body?.error) || body.error_description !== 'account_on_hold') return undefined;
-  return anthropicLink(body.error_uri) ?? DEFAULT_APPEAL_URL;
+  const oauth = oauthErrorOf(text);
+  if (!oauth || !['invalid_grant', 'access_denied'].includes(oauth.code) || oauth.description !== 'account_on_hold') return undefined;
+  return anthropicLink(oauth.uri) ?? DEFAULT_APPEAL_URL;
+}
+
+/**
+ * The token endpoint's own reason for a refusal, as `invalid_grant: Refresh
+ * token expired`, or undefined when the body is not an OAuth error (in either
+ * shape, see oauthErrorOf). Status carries it beside a `refresh_rejected`
+ * error (#629), so only the code and the description (or, nested, the
+ * message) go there, each bounded: never the rest of the body.
+ * @param {string} text
+ * @returns {string|undefined}
+ */
+export function oauthErrorSummary(text) {
+  const oauth = oauthErrorOf(text);
+  const code = oauth?.code;
+  if (typeof code !== 'string' || !/^[A-Za-z0-9_.-]{1,40}$/.test(code)) return undefined;
+  const said = typeof oauth?.description === 'string' ? oauth.description : oauth?.message;
+  const desc = typeof said === 'string' ? safeLine(said, 100) : '';
+  return desc ? `${code}: ${desc}` : code;
+}
+
+/**
+ * Whether the token endpoint refused the grant itself: `invalid_grant`, the
+ * OAuth error for a refresh token that is invalid, expired or revoked (RFC 6749
+ * §5.2), and what upstream answers a dead one, in either shape (oauthErrorOf).
+ * The other OAuth errors are about the client or the request
+ * (`invalid_client`, `unauthorized_client`, `invalid_request`, ...), which are
+ * the same for every account here, and a code this does not know proves
+ * nothing either.
+ * @param {string} text
+ */
+function refusesGrant(text) {
+  return oauthErrorOf(text)?.code === 'invalid_grant';
+}
+
+/**
+ * Whether a failed refresh says the refresh token itself is dead: it is not
+ * sent again, and the account needs a re-login (or, on hold, an appeal).
+ *
+ * A 400, 401 or 403 alone does not say so. Whatever stands between this
+ * process and the token endpoint (a firewall, a proxy, a CDN) can answer one
+ * with a page of its own, and a token taken for dead stays unused until a new
+ * one arrives, while credential sync empties the row holding it
+ * (credential-sync.js), so every install then waits for a sign-in. So
+ * refreshAccessToken, which parses the body, sets `grantRefused` on its error,
+ * true only for `invalid_grant` or a hold, and only an explicit false spares
+ * the token. An error without it, the Codex refresh's, which does not parse
+ * its body, is judged by its status alone, as before.
+ * @param {any} err
+ */
+export function isRefreshRejection(err) {
+  if (err?.status !== 400 && err?.status !== 401 && err?.status !== 403) return false;
+  return err.grantRefused !== false;
 }
 
 /**
  * Refresh an expired OAuth access token using the refresh token.
- * Retries on 5xx and network errors with exponential backoff.
+ * Retries a 5xx and a network failure, with exponential backoff. The catch
+ * below reads the error's own name, message and code, never its `cause`:
+ * - direct: any `fetch failed`, and a timeout;
+ * - through the fleet's upstream proxy: a refused or reset connection, and a
+ *   timeout once the tunnel is open; a CONNECT the proxy refuses or never
+ *   answers, and a TLS handshake over it that times out (sx.js), are not;
+ * - through an account's routing proxy: a reset or a timeout once the tunnel
+ *   is open. A tunnel it fails to open arrives wrapped as ROUTING_FAILED
+ *   (account-routing.js) and is not retried; the proxy's own refresh path
+ *   then holds that account out of rotation (markRoutingFailed).
  * `routing` is the account's own egress proxy (account-routing.js); null goes
  * by the fleet path (upstream proxy when configured, direct otherwise).
- * `budgetMs` bounds the whole call, retries included: no attempt goes out once
- * it is spent, and none outlives it — the time a lock held for this renewal
- * has left (credential-sync.js).
+ * `budgetMs`, the time a lock held for this renewal has left
+ * (credential-sync.js), bounds the whole call, retries included: no attempt
+ * goes out once it is spent, and none outlives it once its connection is open.
+ * Opening a tunnel through a proxy has timeouts of its own, for the CONNECT and
+ * for the TLS handshake over it (20s each through a routing proxy, 30s each
+ * through the upstream proxy), and an attempt still opening one can run past
+ * both the budget and REFRESH_TIMEOUT_MS. A backoff pause can still end the
+ * call up to 1s past the budget, which credential-sync's STORE_RESERVE_MS
+ * absorbs. Without a budget, each attempt has the REFRESH_TIMEOUT_MS bound of
+ * its own, so three timed-out attempts and their backoff take about 91.5s at
+ * the default; through a proxy, a tunnel still opening can hold each attempt
+ * longer.
  * @param {string} refreshToken
  * @param {string} [endpoint]
  * @param {import('./account-routing.js').RoutingProxy|null} [routing]
@@ -230,7 +337,8 @@ export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_
         const err = /** @type {CodedError} */ (new Error(`Token refresh failed (${res.status}): ${text}`));
         // Surface the HTTP status so callers can distinguish a genuine auth
         // rejection (the refresh token is dead — re-login needed) from a
-        // transient server error. 5xx is retried above; reaching here with a 5xx
+        // transient server error, with `grantRefused` below (see
+        // isRefreshRejection). 5xx is retried above; reaching here with a 5xx
         // means retries were exhausted, which is still transient, not auth.
         err.status = res.status;
         // A 429 says how long to stay away; the account holds its refreshes
@@ -242,6 +350,10 @@ export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_
         // A hold is not a dead token: a re-login does not lift it.
         const appealUrl = holdAppealUrl(text);
         if (appealUrl) /** @type {any} */ (err).appealUrl = appealUrl;
+        const oauthError = oauthErrorSummary(text);
+        if (oauthError) /** @type {any} */ (err).oauthError = oauthError;
+        // Whether this answer is the endpoint refusing the refresh token itself.
+        /** @type {any} */ (err).grantRefused = !!appealUrl || refusesGrant(text);
         throw err;
       }
 
@@ -272,6 +384,12 @@ export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_
  * and the expiry is `expires_at` (seconds or milliseconds) or `expires_in`
  * seconds when either is a finite number — or one hour from now when neither
  * is, which just makes the next refresh happen early.
+ *
+ * `refreshTokenExpiresAt` (epoch ms) is on the result only when the response
+ * states when the refresh token itself lapses; see refreshTokenExpiryFromResponse
+ * for the two spellings read and why. It is what THIS response said: a caller
+ * refreshing a token it already has a date for keeps the earlier of the two
+ * (withFamilyExpiry), and a new sign-in takes it as it is.
  */
 export function tokenPairFromResponse(data, { previousRefreshToken = undefined, now = Date.now() } = {}) {
   const accessToken = data?.access_token;
@@ -283,7 +401,8 @@ export function tokenPairFromResponse(data, { previousRefreshToken = undefined, 
   const expiresIn = Number(data.expires_in);
   const expiresAt = normalizeExpiresAt(data.expires_at)
     ?? (Number.isFinite(expiresIn) && expiresIn > 0 ? now + expiresIn * 1000 : now + 3600 * 1000);
-  return { accessToken, refreshToken, expiresAt };
+  const refreshTokenExpiresAt = refreshTokenExpiryFromResponse(data, now);
+  return { accessToken, refreshToken, expiresAt, ...(refreshTokenExpiresAt != null && { refreshTokenExpiresAt }) };
 }
 
 /**
@@ -305,9 +424,15 @@ export function normalizeExpiresAt(expiresAt) {
  * Check if an OAuth token is expiring within the given threshold.
  *
  * No expiry at all means unknown, and the token is used until upstream says
- * otherwise. An expiry that is present but not a number is treated as already
- * reached: it cannot be trusted to lie in the future, and refreshing replaces
- * it with one that can be compared.
+ * otherwise. That is any falsy value: absent, null, an empty string, and 0,
+ * which is how the callback.net store writes an expiry it was never given
+ * (credential-sync.js, whose rows need a number) and which makeAccount reads
+ * back as null; a token from a sign-in that carried no expiry reads the same
+ * on every install. Any other value that does not read as a positive finite
+ * number (`'0'`, `'soon'`, `-1`, `Infinity`) is present but unusable, and is
+ * treated as already reached: it cannot be trusted to lie in the future, and
+ * refreshing replaces it with one that can be compared. A numeric string is
+ * read as the time it spells.
  */
 export function isTokenExpiringSoon(expiresAt, thresholdMs = 5 * 60 * 1000) {
   if (!expiresAt) return false;
@@ -396,11 +521,14 @@ export async function fetchProfile(accessToken, routing = null) {
  * is what identity.js isTokenRejection keys on:
  *   - 401 when the credential is dead: the profile endpoint rejected the access
  *     token and there was no refresh token to renew it with, or the token
- *     endpoint rejected the refresh (400/401/403 — the same reading
- *     account-manager gives a refresh that needs a re-login);
+ *     endpoint refused the refresh token itself (isRefreshRejection, the same
+ *     reading account-manager gives a refresh that needs a re-login);
  *   - the token endpoint's status, or null, when the refresh failed for a
- *     reason that says nothing about the token (network, 5xx after retries):
- *     the credential is unreachable, not refused, and stays importable by name.
+ *     reason that says nothing about the token (network, 5xx after retries, a
+ *     400/401/403 that was not the endpoint's refusal, such as a page from a
+ *     firewall in front of it): the credential is unreachable, not refused,
+ *     and stays importable by name. A 401 among those is carried as null,
+ *     since isTokenRejection would read it as the upstream's verdict.
  * A 403 is neither refreshed nor a rejection: the upstream answers 403 to a
  * valid token from an unexpected region (see egress-guard.js) and under an org
  * policy, and a new token would meet the same answer.
@@ -409,12 +537,12 @@ export async function fetchProfile(accessToken, routing = null) {
  * @param {import('./account-routing.js').RoutingProxy|null} [routing] - the
  * account's own egress proxy; every call here (the profile, and the refresh it
  * may need first) is that account's traffic. Null goes by the fleet path.
- * @param {{ renew?: (creds: Record<string, any>) => Promise<{ accessToken: string, refreshToken: string, expiresAt: number }> }} [opts]
+ * @param {{ renew?: (creds: Record<string, any>) => Promise<{ accessToken: string, refreshToken: string, expiresAt: number, refreshTokenExpiresAt?: number|null }> }} [opts]
  * renew: the refresh itself, which the caller can put behind the callback.net
  * lock (credential-sync.js refreshOutsideProxy); the default is a plain one.
  * @returns {Promise<{ creds: Record<string, any>, profile: Record<string, any> }>}
  */
-export async function profileForCredentials(creds, routing = null, { renew = (c) => refreshAccessToken(c.refreshToken, undefined, routing) } = {}) {
+export async function profileForCredentials(creds, routing = null, { renew = (c) => refreshAccessToken(c.refreshToken, undefined, routing).then((/** @type {any} */ t) => withFamilyExpiry(c, t)) } = {}) {
   /** @type {Record<string, any>|null} */
   let profile = isTokenExpired(creds.expiresAt) ? null : await fetchProfile(creds.accessToken, routing);
   if (profile && profile.status !== 401) return { creds, profile };
@@ -438,18 +566,24 @@ export async function profileForCredentials(creds, routing = null, { renew = (c)
     profile ??= await fetchProfile(creds.accessToken, routing);
     if (profile.status !== 401) return { creds, profile };
     const e = /** @type {CodedError} */ (err);
-    const rejected = e.status === 400 || e.status === 401 || e.status === 403;
+    const rejected = isRefreshRejection(e);
     return {
       creds,
       profile: rejected
         ? { ...profile, error: `${profile.error}; token refresh rejected: ${e.message}` }
         // Not a verdict: the refresh token may well be good, so this is the
-        // unreachable shape, carrying the token endpoint's status if it gave one.
-        : { error: `${profile.error}; token refresh failed: ${e.message}`, status: e.status ?? null },
+        // unreachable shape, carrying the token endpoint's status if it gave
+        // one, but a 401 as none: that one isTokenRejection takes for a verdict.
+        : { error: `${profile.error}; token refresh failed: ${e.message}`, status: e.status === 401 ? null : e.status ?? null },
     };
   }
 
+  // `renewed` carries the refresh token's own expiry when one is known (the
+  // default renewal and the callback.net one both keep the earlier date of a
+  // rotation). Without one, the date `creds` came with is not copied onto it:
+  // the renewal may be a token another install stored, which is another family.
   const fresh = { ...creds, ...renewed };
+  if (renewed.refreshTokenExpiresAt == null) delete fresh.refreshTokenExpiresAt;
   return { creds: fresh, profile: await fetchProfile(fresh.accessToken, routing) };
 }
 
@@ -555,13 +689,23 @@ export function normalizeSpend(data) {
  */
 export function formatMoney(spend) {
   if (!spend) return 'unknown';
+  // The exponent is upstream's (normalizeSpend keeps any finite number), and
+  // toLocaleString throws a RangeError for fraction digits outside 0-100: one
+  // usage payload with an exponent of -1 threw out of the status line, the TUI
+  // row and the probe's "started spending" log. An amount in no currency's
+  // minor unit is not rendered as one. The bound is resolveMaxSpendMinor's
+  // (model.js), which refuses the same exponents for the money cap; checked
+  // here rather than in normalizeSpend so that it still sees them and sets no
+  // cap rather than a wrong one.
+  const exponent = spend.exponent ?? 2;
+  if (!Number.isInteger(exponent) || exponent < 0 || exponent > 6) return 'unknown';
   const sym = { USD: '$', EUR: '\u20ac', GBP: '\u00a3', JPY: '\u00a5' }[spend.currency] || '';
   const unit = (minor) => {
     if (minor == null) return null;
-    const v = minor / (10 ** (spend.exponent ?? 2));
+    const v = minor / (10 ** exponent);
     const text = v.toLocaleString('en-US', {
-      minimumFractionDigits: spend.exponent ?? 2,
-      maximumFractionDigits: spend.exponent ?? 2,
+      minimumFractionDigits: exponent,
+      maximumFractionDigits: exponent,
     });
     // Suffix the code when there is no symbol for it, so an unfamiliar currency
     // is still identifiable rather than rendering as a bare number.
@@ -611,10 +755,10 @@ export function normalizeUsageBucket(bucket) {
  * limit), or { error, status } on failure.
  * @param {string} accessToken
  * @param {import('./account-routing.js').RoutingProxy|null} [routing] - the account's own egress proxy
- * @param {{ fetchImpl?: Function, now?: number }} [opts] `now` is the clock the
+ * @param {{ fetchImpl?: Function, now?: number, onPayload?: (data: any) => void }} [opts] `now` is the clock the
  *   banked-reset expiry is judged against; tests pin it.
  */
-export async function fetchUsage(accessToken, routing = null, { fetchImpl = proxyFetch, now = Date.now() } = {}) {
+export async function fetchUsage(accessToken, routing = null, { fetchImpl = proxyFetch, now = Date.now(), onPayload } = {}) {
   try {
     const res = await fetchImpl(USAGE_URL, {
       headers: {
@@ -634,10 +778,14 @@ export async function fetchUsage(accessToken, routing = null, { fetchImpl = prox
       } catch {
         detail = await res.text().catch(() => '');
       }
-      return { error: `HTTP ${res.status}${detail ? ': ' + detail : ''}`, status: res.status };
+      return { error: `HTTP ${res.status}${detail ? ': ' + detail : ''}`, status: res.status, retryAt: resetRetryAt(res) };
     }
 
-    return normalizeUsagePayload(await res.json(), now);
+    const data = await res.json();
+    // The probe captures spend handles out of band, before normalization. They
+    // must never enter the usage object that flows to saved quota.
+    onPayload?.(data);
+    return normalizeUsagePayload(data, now);
   } catch (err) {
     return { error: err.message || String(err), status: null };
   }
@@ -704,6 +852,12 @@ export function normalizeUsagePayload(data, now = Date.now()) {
  *    reads `usable_now: false`.
  *  - `expiresAt` is the soonest `ends_at` among the grants counted, so the
  *    displays can say when the reset lapses and drop it once it has.
+ *  - `fable` is the part of `available` that is a Fable reset (isFableReset):
+ *    a grant that clears the Fable weekly but not the shared one. Those
+ *    arrived with the Fable 5.2 launch (2026-11-09, "New model launch: one
+ *    Fable reset ..."); the October grants cleared `seven_day` too. The
+ *    displays name the two apart, since a Fable reset gives back only what
+ *    Fable used of the shared weekly.
  *
  * An ineligible block is null, not zero. Its reason so far has always been
  * about the caller (`surface`, `cli_version`), not the account, so "none" would
@@ -716,13 +870,14 @@ export function normalizeUsagePayload(data, now = Date.now()) {
  *
  * @param {any} block  the payload's `cedar_ember` object
  * @param {number} [now]  ms epoch a grant's expiry is measured against
- * @returns {{available: number, applicable: number, expiresAt: number|null}|null}
+ * @returns {{available: number, applicable: number, expiresAt: number|null, fable: number}|null}
  */
 export function bankedResets(block, now = Date.now()) {
   if (!block || typeof block !== 'object' || block.eligible !== true) return null;
   if (!Array.isArray(block.grants)) return null;
   let available = 0;
   let applicable = 0;
+  let fable = 0;
   /** @type {number|null} */
   let expiresAt = null;
   for (const grant of block.grants) {
@@ -733,10 +888,30 @@ export function bankedResets(block, now = Date.now()) {
     if (Number.isFinite(ends) && ends <= now) continue;
     available += left;
     if (grant.usable_now === true && grant.paused !== true) applicable += left;
+    if (isFableReset(grant.clears)) fable += left;
     if (Number.isFinite(ends) && (expiresAt == null || ends < expiresAt)) expiresAt = ends;
   }
   // Re-capped after summing, for the same width budget creditCount guards.
-  return { available: creditCount(available) ?? 0, applicable: creditCount(applicable) ?? 0, expiresAt };
+  return {
+    available: creditCount(available) ?? 0,
+    applicable: creditCount(applicable) ?? 0,
+    expiresAt,
+    fable: creditCount(fable) ?? 0,
+  };
+}
+
+/**
+ * Whether a grant's `clears` list makes it a Fable reset: it clears the Fable
+ * weekly (`seven_day_overage_included`) and not the shared one (`seven_day`).
+ * Whether it also clears `five_hour` does not decide it: on a Max account it
+ * does not, on a Team Premium seat the same grant does (both read live
+ * 2026-11-10), and neither gives back the shared weekly.
+ *
+ * @param {unknown} clears  a grant's `clears` list
+ */
+export function isFableReset(clears) {
+  if (!Array.isArray(clears)) return false;
+  return clears.includes('seven_day_overage_included') && !clears.includes('seven_day');
 }
 
 // OAuth config (extracted from Claude Code). Client id + token endpoint are

@@ -72,7 +72,7 @@ test('full mode lists every tool in a fixed order, annotated', async () => {
   assert.deepEqual(listed.map(t => t.name), [
     'get_status', 'get_quota', 'get_settings',
     'switch_account', 'reload_config', 'probe_quota',
-    'set_account_enabled', 'set_account_priority', 'set_account_routing', 'remove_account',
+    'set_account_enabled', 'set_account_cordoned', 'release_account_pins', 'set_account_priority', 'set_account_routing', 'remove_account',
     'set_threshold', 'set_distribution', 'set_probe_interval', 'set_warmup',
     'set_route', 'remove_route', 'set_blocked_models', 'set_client_mode',
   ]);
@@ -103,9 +103,10 @@ test('switch_account moves the preference and says whether rotation will follow'
   const { tools, am } = await fixture();
   const result = await ok(tools, 'switch_account', { account: 'bob@example.com', org: 'Globex' });
   assert.equal(result.account, 'bob@example.com (Globex)');
-  assert.equal(result.eligible, false);
-  assert.match(result.reason, /outranked by higher-priority account "alice@example.com"/);
+  assert.equal(result.eligible, true);
+  assert.equal(result.reason, undefined);
   assert.equal(am.currentIndex, 2);
+  assert.equal(am.getActiveAccount().name, 'bob@example.com (Globex)');
 });
 
 test('an account token that fits several accounts is refused with the candidates', async () => {

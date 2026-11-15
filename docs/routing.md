@@ -18,7 +18,34 @@ How TeamClaude decides which account serves a request, and what it does when tha
 
 TeamClaude prefers to keep you on one account. It stays on the current one and only rotates when that account nears `switchThreshold` (default `0.98`).
 
-When it does have to pick, ranking is: lowest `priority` number first, then, among accounts of equal priority, the one whose governing weekly bucket resets soonest. Spending the account closest to its refresh preserves the ones whose window resets further out. A model with its own weekly bucket (Fable, Sonnet) is ranked by that bucket rather than the shared one. Set an explicit order with `teamclaude priority <name> <n>`, or `--first` / `--last`. `teamclaude login --api` adds a key at priority 100 — a metered key is a last resort behind the subscriptions unless you say otherwise ([API key](accounts.md#api-key)).
+An account you have [cordoned](usage.md#cordoning-one-account) is never picked for new work, whatever its priority; a conversation already on it stays there.
+
+When it does have to pick, ranking is: lowest `priority` number first, then, among accounts of equal priority, the one whose governing weekly bucket resets soonest. Spending the account closest to its refresh preserves the ones whose window resets further out. A model with its own weekly bucket (Fable, Sonnet) is ranked by that bucket rather than the shared one. To make the soonest reset a standing preference rather than a tiebreak, set `"preferSoonestWeeklyReset": true`. Then, on every request, traffic moves to the available account in the top priority tier whose governing weekly window resets soonest — at least a minute sooner than the current one — and rotation ranks that reset ahead of expiry pressure. This is earliest-deadline-first: weekly quota that would expire unspent is spent first, then the next-soonest, and an account sidelined by its 5-hour window is reclaimed as soon as that window frees up. An account whose weekly reset is unknown never preempts. Hot-applies on config reload.
+
+Separately, and on by default, an account whose 5-hour window resets takes the traffic straight away when its weekly window lapses sooner than the current account's, even though the current account is healthy (the log says `session quota reset and weekly expires sooner — switching to it`). Each such move costs the conversations on the old account their prompt cache, and with [keep-warm](quota.md#keep-warm) running every idle account's window resets every five hours. Set `"switchOnSessionReset": false` to keep traffic on a working account. The reset account still rejoins rotation and wins it on its sooner weekly when rotation next has to pick. Set an explicit order with `teamclaude priority <name> <n>`, or `--first` / `--last`. `teamclaude login --api` adds a key at priority 100 — a metered key is a last resort behind the subscriptions unless you say otherwise ([API key](accounts.md#api-key)).
+
+### An account with an end date
+
+Some accounts stop being usable at a time no usage response reports: a subscription you cancelled that runs to the end of its paid month, a trial. Whatever weekly quota such an account holds at that moment is lost, the same way quota is lost at a weekly reset. Tell the proxy when:
+
+```bash
+teamclaude ends me@example.com 2026-12-01            # start of that day, local time
+teamclaude ends me@example.com 2026-12-01T09:00:00Z  # an exact instant
+teamclaude ends me@example.com --clear
+```
+
+This writes `"endsAt"` on the account's entry (an ISO 8601 string or epoch milliseconds; `ends` also takes epoch milliseconds) and reloads a running server. From then on the account's **deadline** is the earlier of its governing weekly reset and its end time, and everything that ranks accounts by how soon their quota expires reads the deadline in place of the weekly reset:
+
+- the equal-priority tiebreak above (soonest first),
+- `preferSoonestWeeklyReset`, which moves traffic to the account with the soonest deadline,
+- the session-reset switch, which moves to an account whose 5-hour window came back when its deadline is sooner than the current account's,
+- [expiry pressure](#expiry-pressure-routing) and the adaptive `"scoring": "pressure"` placement, where the time left to spend the headroom is the time to the deadline, so the account's pressure rises as its end approaches.
+
+An account with no weekly reading yet has its end time as its deadline, and a fresh window on it is priced over the time left rather than a full week.
+
+It only ranks. `priority` still comes first, so an ending account in a lower tier is not pulled ahead of a preferred one: give it the same or a lower priority number if you want it drained. Thresholds, caps, cordons, pins and routes are untouched, and no account becomes available or unavailable because of an end time. Once the time has passed it has no effect at all: the account is not disabled, and what the ended subscription does is reported by upstream and handled as it is for any account ([billing refusals](#billing-refusals), a plan that left the OAuth profile). `teamclaude status` shows the date on the account (`Ends     2026-12-01 (in 6 days)`), the TUI row carries an `ends 6d` tag, and each account in `status --json` and `GET /teamclaude/status` carries `endsAt` as epoch milliseconds (`null` when unset).
+
+Without `preferSoonestWeeklyReset` or `expiryRouting` the deadline is consulted only when selection has to pick, as the weekly reset is: an account being spent is left until it reaches `switchThreshold`.
 
 ## The two kinds of 429
 
@@ -43,7 +70,10 @@ An HTTP `400` with Anthropic's `invalid_request_error` message beginning
 `400` or `402` with a structured `billing_error`, excludes that account from
 automatic rotation for five minutes. The request fails over immediately,
 including to [subscription usage credits] when the existing fallback policy
-allows them. Other validation errors pass through unchanged.
+allows them. Other validation errors pass through unchanged. A request
+pinned to one account is not moved; one pinned to a
+[list of API-key accounts](#a-list-of-api-key-accounts) moves to the next one
+listed.
 
 Status reports the billing refusal separately from quota exhaustion and
 recommends checking billing or purchasing credits. If every eligible account
@@ -63,13 +93,23 @@ If every configured account returns that exact denial, TeamClaude's terminal `50
 
 An explicit [`TC_ACCT` pin](#pin-a-session-to-one-account) continues to target exactly the requested account and never fails over, even while that account is excluded from automatic rotation.
 
+## Codex models a plan does not serve
+
+Each ChatGPT plan serves its own set of Codex models. A free plan, or a paid plan that lapsed to free, refuses the larger ones with a JSON `400`: "The '<model>' model is not supported when using Codex with a ChatGPT account." TeamClaude reads this from `error.message` or `detail`, and acts only when the message is that whole sentence and names the request's own model, exactly as sent. On a Codex account, this `400` keeps the account out of rotation **for that model only**, and the request fails over at once. The account continues to serve the models its plan has. The cooldown is 5 min, then 15 min, then 1 h for each later denial. A `400` to a request that was sent before the last denial does not count again. None of this is persisted.
+
+TeamClaude does not decide from the plan name which models an account serves. OpenAI changes that list, and the list also depends on the client version. The `400` is the only reliable signal.
+
+A completed response for the model, to a request sent after the last denial, clears that model's entry. A change in the account's reported plan type (for example `free` to `prolite`) clears all of the account's entries, so a renewed plan serves at once. Until then, `teamclaude status` shows a `Models` line, and the status JSON has `modelDenials` (`model`, `until`, `detail`, `since`, `count`).
+
+If no account that can take the request serves the model, the client gets upstream's `400`, not a `429` or a hold, because a quota reset does not change a plan. A [`TC_ACCT` pin](#pin-a-session-to-one-account) to such an account gets the same `400`. If one account refuses the model and another is only out of quota, the request waits for quota as usual.
+
 ## Account refusals
 
-Some refusals are about the account rather than the request: `error.details.error_code` is `verification_required` (the owner has to verify their identity), `account_on_hold`, `organization_on_hold`, `organization_disabled`, `restricted_regime_endpoint` or `ip_not_in_allowed_range`. Older answers say the same with a `400` and no code: "This organization has been disabled." or "Identity verification is required…". On an OAuth account, any of these in a JSON `400` or a `403` puts the account in `error` with upstream's message (see [Why an account is in `error`](accounts.md#why-an-account-is-in-error)), and the request fails over. Every other `400` goes to the client unchanged. If every account was refused, the terminal `502` quotes upstream's message for each; later requests name the account as refused by upstream and point to `teamclaude status`.
+Some refusals are about the account rather than the request: `error.details.error_code` is `verification_required` (the owner has to verify their identity), `account_on_hold`, `organization_on_hold`, `organization_disabled`, `restricted_regime_endpoint` or `ip_not_in_allowed_range`. Older answers say the same with a `400` and no code: "This organization has been disabled." or "Identity verification is required…". On an OAuth account, any of these in a JSON `400` or a `403` puts the account in `error` with upstream's message (see [Why an account is in `error`](accounts.md#why-an-account-is-in-error)), and the request fails over. Every other `400` goes to the client unchanged, except a [Codex model that the plan does not serve](#codex-models-a-plan-does-not-serve). If every account was refused, the terminal `502` quotes upstream's message for each; later requests name the account as refused by upstream and point to `teamclaude status`.
 
 ## Token scope denials
 
-A `403` with `error.details.error_code: oauth_scope_insufficient` is about the token, not the account. A `claude setup-token` token carries `user:inference` only, so Claude Code's bootstrap, settings and connector-registry calls draw this on every such account. TeamClaude does not fail those over: a `GET` that draws one goes out once more on the client's own bearer, like the [identity plane](proxy-modes.md), over the same upstream proxy, sx route and admission queue as any forwarded request, and rotation stays where it was. Any other method, which includes every completion, a [pinned](#pin-a-session-to-one-account) request, and a client with no bearer of its own get the normal handling.
+A `403` with `error.details.error_code: oauth_scope_insufficient` is about the token, not the account. A `claude setup-token` token carries `user:inference` only and cannot reach endpoints that require `user:profile`. Known [client control-plane calls](proxy-modes.md#mitm-proxy-mode-default) bypass rotation from the start, unless `proxy.controlPlane` is `"pool"`. For other endpoints, and for those calls in that mode, an unpinned `GET` that draws a scope denial goes out once more on the client's own bearer, over the same upstream proxy, sx route and admission queue as any forwarded request, and rotation stays where it was. Any other method, which includes every completion, a [pinned](#pin-a-session-to-one-account) request, and a client with no bearer of its own get the normal handling.
 
 ## One failover hop on a rate limit
 
@@ -112,7 +152,7 @@ TeamClaude does not strip or rewrite thinking blocks, so nothing is lost for goo
 
 When you run many agents at once and the active account runs out, every in-flight request fails over to the next account **at the same instant** — a thundering herd that can spend a big chunk of the fresh account's quota (large contexts) and instantly throttle it, cascading down the fleet ([#84](https://github.com/KarpelesLab/teamclaude/issues/84)).
 
-To prevent this, requests onto a **just-switched-to account** are paced: concurrency starts at 1 and the cap ramps up over a few seconds, then lifts. The first request or two reveal whether the new account is also near-exhausted **before** the whole herd commits to it, so a cascade is broken up hop by hop. The gate is **fail-open** — a request never blocks longer than the ramp window, and a client that disconnects while waiting just drops out — and the slot is held only until response headers arrive, so streaming replies don't tie up concurrency.
+To prevent this, requests onto a **just-switched-to account** are paced: concurrency starts at 1 and the cap ramps up step by step, then lifts once the ramp window (`windowMs`, 30 seconds by default) has passed. The first request or two reveal whether the new account is also near-exhausted **before** the whole herd commits to it, so a cascade is broken up hop by hop. The gate is **fail-open**: a request waits at most the ramp window, except on an account in a rate-limit pause, where it first waits out the pause and the window starts when the pause ends. A client that disconnects while waiting just drops out, and the slot is held only until response headers arrive, so streaming replies don't tie up concurrency. A 429 that pauses the account (see [the two kinds of 429](#the-two-kinds-of-429)) does so for at most `TEAMCLAUDE_RATE_LIMIT_ABSORB_MAX_SECONDS` (60 by default), and a further one extends the pause and restarts the ramp.
 
 On by default. Tune or disable via `stormRamp` in the config:
 
@@ -125,11 +165,15 @@ On by default. Tune or disable via `stormRamp` in the config:
 - **`windowMs`** — after this long, pacing stops entirely (default 30s).
 - **`enabled: false`** — turn storm control off (send the full burst immediately, pre-#84 behavior).
 
-The same gate handles rate-limit 429s: TeamClaude pauses the account for the `retry-after` window so new queries wait instead of piling on, then releases the held queries through a fresh ramp (staggered, not all at once).
+Each number has to be a finite number above 0, written without quotes, and `pollMs` (how often a waiting query re-checks the cap, default 50) a whole number of milliseconds from 5 to 536870911. A value that is not — `"1"`, `0`, a negative number, a field name the ramp does not know — is ignored with one line in the log, and that field keeps its default. `enabled` takes `true` or `false`; any other value is read for its truth, so `0`, `null` and `""` turn storm control off, and is named in the log. The block is read at startup; a reload does not apply a change to it.
+
+The same gate handles rate-limit 429s: TeamClaude pauses the account for the `retry-after` window, at most `TEAMCLAUDE_RATE_LIMIT_ABSORB_MAX_SECONDS` (60 by default), so new queries wait instead of piling on, then releases the held queries through a fresh ramp (staggered, not all at once).
 
 ## Model-aware routing
 
 The per-model weekly cap (e.g. Fable) is tracked separately, so an account whose Fable quota is spent is skipped **only** for Fable requests and still serves Opus/Sonnet. **Eligibility for a family model takes the higher of that family's bucket and the shared weekly one**, because family spend meters twice, once in the family bucket and once in the shared one. An account already past its shared weekly cap is therefore unavailable for family traffic too, rather than continuing to serve it and pushing the shared bucket further past the cap. The reverse still holds: a spent *family* bucket bars only that family. One consequence worth knowing: on the weekly buckets the family gate is the stricter of the two, so an account whose weekly quota lets it serve Fable can also serve Opus. That is a statement about quota only, since a `routes` pin or a blocklist can still make an account ineligible for one model and not the other. Requests are routed by their `model`, read exactly from the request body in both base-URL and MITM modes. `teamclaude status` shows this per account (a `Models` line) and any families it detects appear as **auto** routes.
+
+How large the second charge is has been measured once, on one pool of Claude subscriptions over eight days ([#662](https://github.com/KarpelesLab/teamclaude/issues/662)). Per cache token, a response served from the Fable bucket moved the shared weekly 2.9 to 12.7 times as far as one served from the shared bucket (median 5.0 across the accounts), and it moved the Fable window further still. Traffic on the shared bucket did not move the Fable window. So a Fable window that shows room can still drain the shared weekly several times faster than Opus does. That is one pool, with cache tokens only (input and output are not counted per bucket), so read it as an order of magnitude and not as a rate. The `pressure` score for a Fable request is still taken from the Fable bucket alone; the shared weekly bounds it as a ceiling, as above.
 
 Advisor requests (Claude Code's `/advisor`) carry a **second** model nested in the tools array. Routing sees it too, so the request lands on an account eligible for both the main model and the advisor, falling back to main-model-only routing when no account can serve both.
 
@@ -147,6 +191,8 @@ The counts are the accounts that can serve the request right now, and how many o
 - `"prefer"` routes a narrowed request **by its main model only**, as though it declared no advisor: every account that can serve the main model is a candidate, under the ordinary rotation, session distribution included. The advisor call is then made by whichever account serves the request, which may be one your routes do not list for the advisor's model, or one whose bucket for it is spent — upstream fails that advisor call and Claude Code may stop using the advisor for the session. A route pin on the advisor's model is set aside with it. Where every candidate can serve the advisor, nothing changes, and the advisor model still takes part in selection.
 
 In both modes, no account able to serve the advisor at all means main-model-only routing, as before.
+
+An account's [`maxUsage`](quota.md#per-account-usage-caps) cap on the advisor's family holds in both modes: while another account can serve the request, selection and a failover hop stay off an account whose cap bars that family, since the advisor call would cross it. When no other account can serve the request it is routed by its main model as usual, so a cap on the advisor's family never refuses a request by itself. A `TC_ACCT` or session pin stays where it is pinned.
 
 Unwanted models can be rejected outright with [`blockedModels`](configuration.md#fields) instead of being forwarded — a model no account can serve otherwise gets rate-limited upstream and hangs the pipeline.
 
@@ -268,6 +314,16 @@ score = P ÷ (1 + load)
 
 Every candidate needs a score, so the states the band leaves open are priced: a reset that has already passed, or no reading, counts as a fresh window (the cap, or 1, over one week); a reading with no reset time uses the band's own lower bound; and an account with nothing left under its caps scores 0. When every candidate scores 0 the even walk places the conversation, as it does when every account is reserved. Nothing else changes: availability, priority, the band, pins and the decision whether a pinned conversation moves (the `preempt` rollover above) are untouched. When that decision has moved a conversation, `"pressure"` picks the destination among the other accounts. With `expiryRouting` off the band lets every account through and only the score changes. The setting applies to `"adaptive"` only and is read at startup.
 
+With `"pressureFiveHour": true` in `adaptiveDistribution` (off by default, read at startup, and only under `"scoring": "pressure"`), the score also counts the 5-hour window, so an account close to that wall takes fewer new conversations:
+
+```
+score = P × h5 ÷ (1 + load),   h5 = (T5 − 5h use) ÷ T5
+```
+
+`T5` is the lower of the account's own 5-hour cap and switch threshold. `h5` runs from 1 for an untouched window to 0 at `T5`, and a window with no reading, no reset time or a reset already passed counts as 1. It places new conversations only: it can slow how quickly one busy pinned conversation reaches the wall, not stop it, and the decision whether a pinned conversation moves does not read it. `teamclaude status` shows the factor as `5h room`.
+
+With `"fiveHourSoftMargin": 0.15` in `adaptiveDistribution` (`0`, off, by default; read at startup, and only under `"scoring": "pressure"`), a new conversation stops going to an account once its live 5-hour use reaches its own 5-hour cap, or a full window with no cap, less the margin: at `0.15`, a `0.7` cap stops at `0.55` and an uncapped account at `0.85`. Otherwise placement ignores that window until the account leaves rotation, and every conversation pinned there then moves at once and loses its cache. It is only a preference: it applies while another account of the same priority can take the conversation, so it never refuses a request or reaches for a lower priority such as a metered key. Conversations already pinned to the account stay, and it shows in `status` as not competing.
+
 ### Load distribution
 
 ```json
@@ -300,7 +356,7 @@ An account whose governing bucket is not fully reported is handled in two separa
 
 Selection then draws from the **top pressure band**: accounts within `tolerance` (a ratio, ≥ 1) of the best pressure in the top priority tier. Inside the band the usual rules apply unchanged — `distributeSessions` still spreads new conversations by load, priority still wins, and the storm ramp still paces failover. `tolerance` is the dial between load spreading and expiry pressure: large values approach pure load-balancing, `1.0` is strict highest-pressure-first (and effectively disables spreading).
 
-With `preempt` on, a **pinned conversation** (and the sticky current account) is re-routed when its account's governing weekly window **rolls over** — the account just became both the freshest and the furthest-dated choice, so staying would burn the window that gained a full week while sooner-expiring quota goes unspent. That rollover is the only thing **this feature** does to a pin. Pressure on its own never moves one, and neither does the pinned account's quota draining — that is the policy working, and re-routing on it would thrash the prompt cache for nothing. Everything that moved a pin before still does, unchanged. A pin **stops being honoured** when the account cannot serve the request (every reason `teamclaude status` names on its **Blocked** line, from spent quota through a rate-limit hold to an upstream refusal), when a higher-priority account is available, or when that account was already tried and failed earlier in the same request. A pin is **bypassed outright** by a manual route pin and by a `/tc-acct/` (`TC_ACCT`) override, both of which resolve before session affinity is consulted at all. And a pin can simply **cease to exist**: removing an account deletes the pins that named it, and a conversation idle past the known window is forgotten along with all of them. (That enumeration is the three writers of a conversation's pin map — `touch`, `remapAccounts`, and record expiry — plus the two paths that resolve ahead of affinity; it is the search, not a recollection.) Cost of the rollover itself: at most one cache-miss turn per PIN per rollover of the window that pin is measured on, roughly once per account per week.
+With `preempt` on, a **pinned conversation** (and the sticky current account) is re-routed when its account's governing weekly window **rolls over** — the account just became both the freshest and the furthest-dated choice, so staying would burn the window that gained a full week while sooner-expiring quota goes unspent. That rollover is the only thing **this feature** does to a pin. Pressure on its own never moves one, and neither does the pinned account's quota draining — that is the policy working, and re-routing on it would thrash the prompt cache for nothing. Everything that moved a pin before still does, unchanged. A pin **stops being honoured** when the account cannot serve the request (every reason `teamclaude status` names on its **Blocked** line, from spent quota through a rate-limit hold to an upstream refusal), when a higher-priority account is available, or when that account was already tried and failed earlier in the same request. A pin is **bypassed outright** by a manual route pin and by a `/tc-acct/` (`TC_ACCT`) override, both of which resolve before session affinity is consulted at all. And a pin can simply **cease to exist**: removing an account deletes the pins that named it, [`teamclaude release`](usage.md#releasing-the-conversations-on-an-account) deletes the pins on one account on your say-so, and a conversation idle past the known window is forgotten along with all of them. (That enumeration is the four writers of a conversation's pin map — `touch`, `remapAccounts`, `releaseAccount`, and record expiry — plus the two paths that resolve ahead of affinity; it is the search, not a recollection.) Cost of the rollover itself: at most one cache-miss turn per PIN per rollover of the window that pin is measured on, roughly once per account per week.
 
 **A rollover is measured against what the last request read where it came to rest.** The whole state is one reading per pin and one for the sticky current account, taken when a request arrives to find it already placed. A selection that only *sends* a request may never arrive, so it writes only where no roll can be lost: a choice that never named an account, or one whose recorded windows have not rolled. The roll a preemption pushes traffic off is **held** until an attempt selecting under this move's stamp is **served** at the destination — upstream's response headers gave a status below 400 — and the reading is still the one that move left there: once it has moved away and come back its stamp is a later one, and the roll stays held. A body that fails afterwards does not un-serve the attempt. A second preemption before the first is settled holds both: each escaped account keeps its own reading until traffic returns to it or a stay is served under the stamp of the move that escaped that roll. The account a hand-back leaves keeps its own roll the same way, under no move's stamp: the move that leaves it is a move back, so a stay served where it returns to is no evidence about the account it left. A reading no walk established names no fleet of its own, so the roll it loses is held for the fleet of the roll being handed back, since a hold naming nobody can be settled by nobody. A roll is handed back once. A reading restored from a hold is held again only for a window that has rolled since the hand-back, so two accounts that have each rolled cannot trade their rolls for ever. A stay served on the account a roll is held against releases it whatever move stamped it, and only for the fleet the hold names, because the reading has come back to the account that owes it. The sticky current account's reading is one slot every provider shares, so the hold names the fleet that last established the reading it preserves, and only where the destination is that fleet's own subscription, which no other fleet is ever served at, does a success of its own release the roll; anywhere else the destination holds one reading for whoever it serves, and a success by whichever fleet is served there releases it. A request whose provider does not own the cursor borrows it, and gives it back but not the reading. With no roll standing on the account it names, a borrowed walk leaves it naming the borrower's, so the owner's next request re-reads that account and the test compares the reading against itself. A roll on the account the cursor names is missed whenever the reading names somewhere else by the owner's next request, whether the borrow that moved it fell before that roll or after. Only a borrower resting on a cursor of its own moves a reading whose account has already rolled, so a fleet without one yet leaves a standing roll for the owner to preempt on. That rest also puts the displaced roll into the hold, so only the later order leaves anything to recover. A fail-back is handed the roll where the borrow followed it, and nothing where it came first.
 
@@ -320,7 +376,7 @@ The event stays recorded on the account. The first request that can be sent both
 
 ## Pin a session to one account
 
-`TC_ACCT` forces every request onto **one** account, bypassing rotation (and never failing over to another). It works in **both** modes — MITM (the default) and `--no-mitm`:
+`TC_ACCT` forces every request onto **one** account, bypassing rotation (and never failing over to another, except along a [list of API-key accounts](#a-list-of-api-key-accounts) when billing refuses one). It works in **both** modes — MITM (the default) and `--no-mitm`:
 
 ```bash
 # By email — what you'll normally use
@@ -345,6 +401,22 @@ Prefer the `accountUuid` (printed by `teamclaude accounts`) for anything scripte
 The rotation index is **not** accepted — it is array position, so deleting an account would silently repoint every later pin at a *different* account.
 
 > If you hold the *same* account in two orgs, a bare uuid or email matches the first one. `TC_ACCT=<accountUuid>/<orgUuid>` picks a specific one — rarely needed.
+
+### A list of API-key accounts
+
+`TC_ACCT` may name several API-key accounts, separated by commas, in the order they are to be spent:
+
+```bash
+TC_ACCT=credit-one,credit-two,credit-three teamclaude run
+```
+
+The session is pinned to the first. When upstream billing refuses the account a request is on (no API credit left, see [Billing refusals](#billing-refusals)), that request goes to the next account in the list, and later requests pass over a listed account for as long as its billing cooldown lasts. The refusal arrives before the model runs and before anything reaches the client, so the request runs once, on the account that takes it. A listed account serves while it is disabled, as a pinned one does, so accounts kept out of rotation can be spent this way and no other.
+
+That is the only move. A rate limit, a `5xx`, a credential refusal or any other answer is handled as for a pin to one account; a response that has started reaching the client is never moved; and the list never moves a request to or from a subscription, whatever it names. A listed account at its usage cap, or of another provider, is passed over. When no listed account is left, the request ends as a pin to the last one tried does.
+
+Every name has to match an account, or the pin is refused as an unknown one is. A value that matches as a whole is still that one account, so a display name with a comma in its org keeps working. Under MITM the list travels as the proxy URL's username (`http://credit-one,credit-two:<key>@127.0.0.1:3456`), under `--no-mitm` in the `/tc-acct/` prefix. The [session pin](#move-one-running-session) names one account.
+
+Each account is usually its own organization, and organizations share no prompt cache, so the first request of each conversation after a move writes its cached prefix again on the next account.
 
 ### Move one running session
 
@@ -386,8 +458,9 @@ URL-encode spaces and parens in a name here. The fully-qualified `accountUuid/or
 Rotation is transparent to your Claude Code session, but it's worth knowing how it interacts with Anthropic's [prompt cache](https://docs.claude.com/en/docs/build-with-claude/prompt-caching).
 
 - **Your context is never lost.** Claude Code resends the full transcript every turn, and TeamClaude rewrites the request's `account_uuid` to match the injected token, so whichever account serves a turn sees the complete history — a mid-session switch is invisible to the client.
-- **The cache doesn't carry across accounts.** The prompt cache is scoped to the account/organization that created it and expires after a few minutes, so the first turn after a switch is a cache **miss** — that turn is processed without the cache discount, after which the new account warms its own cache. No proxy can share a cache across organizations.
+- **The cache doesn't carry across organizations.** The prompt cache is scoped to the organization that created it and expires after a few minutes. Each personal subscription is usually its own organization, so on such a pool the first turn after a switch is a cache **miss** — that turn is processed without the cache discount, after which the new account warms its own cache. No proxy can share a cache across organizations.
+- **Within one organization a switch often does not miss.** One operator measured this over 16 hours on a pool whose accounts all share an organization ([#643](https://github.com/KarpelesLab/teamclaude/issues/643)), counting a response as a hit when at least 90% of its prompt came from the cache. The first response after a move hit 73% of the time (85 of 117), against 93% for staying on the same account, and 9 of 10 hit on an account that had not served the conversation in the last hour. That is one pool and a small sample, and the gap is unexplained, so plan for a switch to cost some cache hits rather than none. Where this page says a move costs a cold cache, read that as the cross-organization case.
 
 In practice this rarely bites, because TeamClaude prefers to keep you on one account (see [Choosing an account](#choosing-an-account)) — a single account tends to serve a whole session and switches are infrequent.
 
-> [Keep-warm](quota.md#keep-warm) is unrelated to this — it starts an idle account's **5h session timer**, not its prompt cache. A freshly-rotated account still takes a one-turn cache miss regardless.
+> [Keep-warm](quota.md#keep-warm) is unrelated to this — it starts an idle account's **5h session timer**, not its prompt cache. An account in another organization still takes a one-turn cache miss after a rotation, regardless.
