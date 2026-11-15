@@ -781,6 +781,34 @@ test('a pass that finds this install signed out ends a pending removal', async (
   assert.equal(tombstoneOf(store.byKey(key).Data), null);
 });
 
+test('a signed-out pass and a timed retry that both find the sign-out give the removal up once', async () => {
+  const store = makeStore();
+  const key = syncKeyFor(claude('b'));
+  const home = setup([claude('a'), claude('b')], { store });
+  await home.sync.sync();
+  let down = true;
+  home.sync.api = async (...args) => { if (down) throw new Error('fetch failed'); return store.api(...args); };
+  let pass = null;
+  home.sync.sleep = async (ms) => {
+    store.tick(ms);
+    if (ms !== 60_000) return;
+    // Signed out during the first pause. A pass starts, the retry comes round,
+    // and each has read the sign-out before either acts on it: the pass first.
+    const answers = [];
+    home.sync.isSignedIn = () => new Promise((resolve) => {
+      answers.push(resolve);
+      if (answers.length === 2) for (const answer of answers) answer(false);
+    });
+    pass = home.sync.sync();
+  };
+  home.am.removeAccount(1);
+  assert.deepEqual(await home.settled(), [false]);
+  assert.equal((await pass).signedIn, false);
+  assert.equal(home.sync.pendingRemovals.size, 0);
+  assert.equal(tombstoneOf(store.byKey(key).Data), null);
+  assert.equal(home.logs.filter((l) => NOT_RECORDED('b', 'this install is signed out of callback\\.net').test(l)).length, 1, home.logs.join('\n'));
+});
+
 const LAPSED = 'callback\\.net did not take it within an hour';
 
 test('a removal pending for more than an hour is dropped, and does not tombstone a sign-in made on another install since', async () => {

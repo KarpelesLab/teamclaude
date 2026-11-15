@@ -888,8 +888,10 @@ export class CredentialSync {
    */
   _dropIfLapsed(key, account) {
     if (this.pendingRemovals.get(key) !== account) return false;
-    const since = this._removedAt.get(account);
-    if (since == null || this.now() - since <= REMOVAL_PENDING_MAX_MS) return false;
+    // Set with the mark in onAccountRemoved, so every pending removal has one
+    // (one missing would read as lapsed: NaN is never within the bound).
+    const since = /** @type {number} */ (this._removedAt.get(account));
+    if (this.now() - since <= REMOVAL_PENDING_MAX_MS) return false;
     this._abandonRemoval(key, account, 'callback.net did not take it within an hour');
     return true;
   }
