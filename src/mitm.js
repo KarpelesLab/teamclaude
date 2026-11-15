@@ -21,7 +21,7 @@ import http2 from 'node:http2';
 import { getConfigPath } from './config.js';
 import { generateCertChain } from './x509.js';
 import { createProxyRequestListener, resolveClientAuth, loopbackExempt, relayUpgrade, resolvePinList, describeConnectError, KEEP_ALIVE_TIMEOUT_MS, shouldStripOverageHeaders } from './server.js';
-import { interceptHostsFor, isNeverIntercepted, providerForPath, DEFAULT_PROVIDER } from './provider.js';
+import { interceptHostsFor, isNeverIntercepted, providerForPath, providerForHost, providerOf, DEFAULT_PROVIDER } from './provider.js';
 import { forwardRefusal, guardedLookup, FORBIDDEN_FORWARD } from './forward-target.js';
 import { safeLine } from './safe-text.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
@@ -75,8 +75,8 @@ export function chainShortfall(caCertPem, leafCertPem, hosts, now = Date.now()) 
     const ca = new X509Certificate(caCertPem);
     const leaf = new X509Certificate(leafCertPem);
     if (!leaf.verify(ca.publicKey)) return { signed: false, shortfall: 'is not signed by the stored CA' };
-    const names = (leaf.subjectAltName || '').split(',').map((s) => s.trim());
-    const missing = hosts.filter((h) => !names.includes(`DNS:${h}`));
+    const names = leafDnsNames(leaf);
+    const missing = hosts.filter((h) => !names.includes(h));
     if (missing.length) return { signed: true, shortfall: `does not name ${missing.join(', ')}` };
     for (const cert of [ca, leaf]) {
       const validTo = new Date(cert.validTo).getTime();
@@ -89,6 +89,17 @@ export function chainShortfall(caCertPem, leafCertPem, hosts, now = Date.now()) 
   } catch {
     return { signed: false, shortfall: 'cannot be read' };
   }
+}
+
+/**
+ * The DNS names in a leaf's subjectAltName.
+ * @param {string|X509Certificate} leaf  PEM, or a parsed certificate
+ * @returns {string[]}
+ */
+function leafDnsNames(leaf) {
+  const cert = typeof leaf === 'string' ? new X509Certificate(leaf) : leaf;
+  return (cert.subjectAltName || '').split(',').map((s) => s.trim())
+    .filter((s) => s.startsWith('DNS:')).map((s) => s.slice(4));
 }
 
 /**
@@ -236,8 +247,14 @@ export function upgradeUpstreamFor(hostHeader, config, upstream) {
  * the top of this file.
  * @param {Object} opts
  * @param {Object} opts.config
- * @param {Object} opts.accountManager
- * @param {() => Promise<{ key: string, cert: string }>} opts.ensureLeaf  current leaf PEMs
+ * @param {import('./account-manager.js').AccountManager} opts.accountManager
+ * @param {() => Promise<{ key: string, cert: string }>} opts.ensureLeaf  current leaf PEMs. Once a
+ *   call resolves, every later call resolves to the same leaf: each terminating server keeps the
+ *   one it got, and the check below reads it again (createProxyServer's memo guarantees this)
+ * @param {string[]|null} [opts.leafHosts]  hosts the leaf is known to name; a host hostMode
+ *   would intercept that is not among them is terminated only if the leaf `ensureLeaf`
+ *   returns (the one every terminating server presents) names it, and otherwise tunnelled,
+ *   or refused when pinned (null: no check)
  * @param {string|null} [opts.logDir]
  * @param {Object} [opts.hooks]
  * @param {(line: string) => void} [opts.log]
@@ -250,9 +267,13 @@ export function upgradeUpstreamFor(hostHeader, config, upstream) {
  *   into createProxyRequestListener so a request forwarded through a terminated tunnel
  *   writes a usage row the same way the base HTTP listener does — no separate write path.
  */
-export function createConnectHandler({ config, accountManager, ensureLeaf, logDir = null, hooks = {}, log = () => {}, sx = null, egress = null, clientUsage = null, dimensionUsage = null, drain = null, usageStore = undefined }) {
+export function createConnectHandler({ config, accountManager, ensureLeaf, leafHosts = null, logDir = null, hooks = {}, log = () => {}, sx = null, egress = null, clientUsage = null, dimensionUsage = null, drain = null, usageStore = undefined }) {
   const upstream = config.upstream || 'https://api.anthropic.com';
   const holdMs = (config.holdSeconds || 0) * 1000;
+  // Host and reason pairs already reported as tunnelled for want of a leaf
+  // that names the host: once per host for a leaf that does not, and once per
+  // distinct load error for one that could not be loaded.
+  const unnamedReported = new Set();
 
   // One terminating h2/h1 server per pin, minted lazily on the first intercepted
   // CONNECT that needs it (key '' = unpinned, the common case).
@@ -400,7 +421,10 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
     const { host, port } = authority;
     const mode = hostMode(host, config);
 
-    if (mode === 'tunnel') {
+    // A blind tunnel: every host hostMode does not claim, and a claimed one the
+    // presented leaf does not name (see the rewrite path below). `onEstablished`
+    // runs once the destination policy has passed and the dial is up.
+    const tunnel = (/** @type {(() => void)|null} */ onEstablished = null) => {
       // Destination policy (see forward-target.js): a tunnel may not reach
       // this machine's loopback, the unspecified address, or link-local — that
       // is how a remote client with only a low-trust key would reach our own
@@ -446,6 +470,7 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
           return;
         }
         established = true;
+        onEstablished?.();
         reply200Raw(clientSocket);
         if (head && head.length) up.write(head);
         up.pipe(clientSocket); clientSocket.pipe(up);
@@ -464,6 +489,10 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
       up.on('close', () => teardown('502 Bad Gateway'));
       clientSocket.on('close', () => teardown()); // client gone: nothing to write
       up.setTimeout(30_000, () => teardown('504 Gateway Timeout')); // bound a stalled connect/idle tunnel
+    };
+
+    if (mode === 'tunnel') {
+      tunnel();
       return;
     }
 
@@ -496,11 +525,55 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
       return;
     }
 
-    getServer(pin || '', auth.client).then((srv) => {
+    const intercept = () => getServer(pin || '', auth.client).then((srv) => {
       reply200Raw(clientSocket);
       if (head && head.length) clientSocket.unshift(head);
       srv.emit('connection', clientSocket);
     }).catch((err) => { log(`[TeamClaude] MITM ${host}: ${err.message}`); reply502Raw(clientSocket); clientSocket.destroy(); });
+
+    // hostMode reads the accounts live, so a reload that adds the first Codex
+    // account makes chatgpt.com an intercepted host at once. The leaf is read
+    // at the first intercepted CONNECT, for the hosts the accounts needed when
+    // the proxy started (a stored chain that names more is reused), and every
+    // terminating server presents that one leaf. A leaf naming another host
+    // would come with a new CA (its key is never kept, see ensureCerts), which
+    // every client launched before it refuses. So a host off that list is
+    // terminated only if the leaf names it, since the client's handshake would
+    // fail on the name. If it does not, or the leaf cannot be loaded at all,
+    // an unpinned CONNECT is tunnelled until a restart renews the chain, or,
+    // when the leaf could not be loaded, until it can be; the client runs on
+    // its own login, with nothing pooled or booked. A CONNECT pinned to an
+    // account of the host's provider is refused, with 503 since this proxy
+    // cannot serve it until then: that pin asks for accounts of the pool, and
+    // a tunnel would drop it unsaid. A pin naming none governs nothing on this
+    // host (TC_ACCT rides HTTPS_PROXY into whatever a session starts), so it
+    // is tunnelled as it was before the account was added. Decided before a
+    // terminating server is built, so a refusal builds none.
+    if (leafHosts && !leafHosts.includes(host)) {
+      ensureLeaf()
+        .then(({ cert }) => ({ named: leafDnsNames(cert).includes(host), until: ', until the proxy restarts', why: 'the certificate this proxy presents does not name it' }))
+        .catch((err) => ({ named: false, until: '', why: `this proxy's certificate could not be loaded (${safeLine(err?.message || err, 160)})` }))
+        .then(({ named, until, why }) => {
+          if (named) return intercept();
+          const provider = providerForHost(host);
+          if (pin && (resolvePinList(accountManager, pin) || []).some((i) => providerOf(accountManager.accounts[i]) === provider)) {
+            log(`[TeamClaude] CONNECT ${host} refused for pin ${redactToken(pin)}: an account added since the proxy started needs that host, and ${why}; a tunnel would serve the pin outside the pool`);
+            refuseRaw(clientSocket, '503 Service Unavailable');
+            return;
+          }
+          // Said once the tunnel is up, so a dial the destination policy refuses
+          // is not reported as a tunnel.
+          tunnel(() => {
+            const key = `${host}\u0000${why}`;
+            if (unnamedReported.has(key)) return;
+            unnamedReported.add(key);
+            log(`[TeamClaude] MITM: tunnelling ${host} untouched, on the client's own login${until}: an account added since the proxy started needs that host, and ${why}`);
+          });
+        })
+        .catch((err) => { log(`[TeamClaude] MITM ${host}: ${err?.message || err}`); reply502Raw(clientSocket); clientSocket.destroy(); });
+      return;
+    }
+    intercept();
   };
 }
 
