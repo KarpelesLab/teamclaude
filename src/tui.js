@@ -20,6 +20,7 @@ import { resolveMaxUsage, resolveMaxSpendMinor, switchThresholdDiffs, modelLabel
 import { parseProxyUrl, proxyToUrl, describeProxy, describeSelfProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy, localListener, isSelfProxy } from './upstream-proxy.js';
 import { describeRouting, parseRoutingUrl, routingToUrl, checkRouting } from './account-routing.js';
 import { sanitizeText, safeLine } from './safe-text.js';
+import { refreshTokenExpiryWarning, knownRefreshTokenExpiry, setRefreshTokenExpiry } from './refresh-token-expiry.js';
 // The setting rules live in one module; the CLI, the MCP tools and this screen
 // all read them from there, so they cannot drift apart (#426).
 import { MAX_PROBE_SECONDS, ROUTE_COLORS } from './config-ops.js';
@@ -2490,6 +2491,8 @@ export class TUI {
         refreshToken: creds.refreshToken,
         expiresAt: creds.expiresAt,
       };
+      // When the refresh token lapses, where the credential file says.
+      setRefreshTokenExpiry(entry, creds.refreshTokenExpiresAt);
 
       // Same rule as the login path: a name match counts only where it is not
       // standing in for a different account+org. Both organizations of one person
@@ -2500,6 +2503,8 @@ export class TUI {
       if (idx >= 0) {
         const prev = this.config.accounts[idx];
         this.config.accounts[idx] = updateAccountEntry(prev, entry);
+        // A new refresh token: the date the row held was about the old one.
+        setRefreshTokenExpiry(this.config.accounts[idx], creds.refreshTokenExpiresAt);
         // The account to update is the one built from this entry. Identity cannot
         // answer that: the entry may have matched on a bare name while carrying no
         // UUID, and then no account matches the freshly profiled identity at all.
@@ -2513,6 +2518,7 @@ export class TUI {
           amAcct.credential = creds.accessToken;
           amAcct.refreshToken = creds.refreshToken;
           amAcct.expiresAt = creds.expiresAt;
+          amAcct.refreshTokenExpiresAt = knownRefreshTokenExpiry(creds.refreshTokenExpiresAt);
           if (entry.accountUuid) amAcct.accountUuid = entry.accountUuid;
           if (entry.orgUuid) amAcct.orgUuid = entry.orgUuid;
           if (entry.orgName) amAcct.orgName = entry.orgName;
@@ -3280,7 +3286,13 @@ export class TUI {
   _rowLines(/** @type {number} */ idx, /** @type {any} */ L, /** @type {Set<number>} */ current) {
     const a = this.am.accounts[idx];
     const row = this._renderRow(idx, L, current);
-    if (this._unavailable(a) !== 'error') return [row];
+    if (this._unavailable(a) !== 'error') {
+      // A known refresh-token expiry gets a line only once it is close (or
+      // past): on every row it would double the list for a date weeks away,
+      // which `teamclaude status` shows.
+      const soon = refreshTokenExpiryWarning(a);
+      return soon ? [row, ...wrapWords(soon, L.width - 4).map(l => `    ${yellow(l)}`)] : [row];
+    }
     const plain = (/** @type {string} */ s) => s;
     const why = unavailableLine({ ...a, unavailable: 'error', onExtraUsage: this._onExtraUsage(a) }, { dim: plain, yellow: plain, red: plain });
     return [row, ...wrapWords(why ?? '', L.width - 4).map(l => `    ${yellow(l)}`)];

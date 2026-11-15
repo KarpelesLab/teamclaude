@@ -16,6 +16,7 @@ import { forecastFleet } from './fleet-forecast.js';
 import { QuotaSeries } from './quota-series.js';
 import { safeLine } from './safe-text.js';
 import { isRefused } from './account-refusal.js';
+import { knownRefreshTokenExpiry, setRefreshTokenExpiry, withFamilyExpiry, expiryAfterReplacement, loginCommandFor } from './refresh-token-expiry.js';
 import { parseRoutingUrl, describeRouting, routingToUrl, isRoutingFailure } from './account-routing.js';
 import { isSelfProxy } from './upstream-proxy.js';
 import { envVar } from './brand.js';
@@ -607,6 +608,10 @@ function makeAccount(acct, index, listener = null) {
     credential: acct.accessToken || acct.apiKey,
     refreshToken: acct.refreshToken || null,
     expiresAt: acct.expiresAt || null,
+    // When the refresh token itself lapses (epoch ms), where the provider or
+    // the imported credential file said; null when nobody did. See
+    // refresh-token-expiry.js.
+    refreshTokenExpiresAt: knownRefreshTokenExpiry(acct.refreshTokenExpiresAt),
     status: 'active',
     // Why the account last went to 'error' (see _needsLogin); read only while
     // status is 'error', so a recovery path need not clear it.
@@ -6254,6 +6259,7 @@ export class AccountManager {
       // imported one dead on invalid_grant (locking the account out until a
       // re-login), or overwriting it with a result minted from the old family.
       const sent = account.refreshToken;
+      const heldExpiry = account.refreshTokenExpiresAt;
       try {
         // Each provider mints tokens at its own endpoint with its own client
         // id, so the grant is dispatched by provider. Both return the same
@@ -6275,7 +6281,9 @@ export class AccountManager {
             ? this._codexRefreshFn(sent, undefined, account.routing || null, opts)
             : this._refreshFn(sent, undefined, account.routing || null, opts));
           minted = true;
-          return tokens;
+          // A rotation of the token held: its date is the earlier of the one
+          // held and the one this response stated, never a later one.
+          return withFamilyExpiry({ refreshTokenExpiresAt: heldExpiry }, tokens);
         };
         const newTokens = await this._refreshCoordinator(account, refresh, { force });
         if (newTokens == null) return;
@@ -6293,9 +6301,13 @@ export class AccountManager {
           console.log(`[TeamClaude] Discarding refresh result for account "${safeLine(account.name, 64)}" — its tokens were replaced while the refresh was in flight`);
           return;
         }
+        // Before the token changes: a token the coordinator took from the
+        // store is not a rotation of ours, and brings its own date or none.
+        const refreshTokenExpiresAt = expiryAfterReplacement(account, newTokens);
         account.credential = newTokens.accessToken;
         account.refreshToken = newTokens.refreshToken;
         account.expiresAt = newTokens.expiresAt;
+        account.refreshTokenExpiresAt = refreshTokenExpiresAt;
         account._lastRefreshAt = Date.now();
         account._deadRefreshToken = null; // this token works; clear any stale guard
         account._refreshHeldUntil = null;
@@ -6303,7 +6315,9 @@ export class AccountManager {
         // Set before the listener runs: it is what lets the sync store them.
         account._minted = minted;
         console.log(`[TeamClaude] Token refreshed for account "${safeLine(account.name, 64)}"`);
-        this._onTokenRefresh?.(account.index, newTokens);
+        // The listeners persist what they are handed, so they are handed the
+        // date the account now holds (no key: none, and none is saved).
+        this._onTokenRefresh?.(account.index, setRefreshTokenExpiry({ ...newTokens }, refreshTokenExpiresAt));
       } catch (/** @type {any} */ err) {
         console.error(`[TeamClaude] Token refresh failed for "${safeLine(account.name, 64)}": ${err.message}`);
         // Why, until a refresh succeeds: what the client is told when this
@@ -6467,7 +6481,7 @@ export class AccountManager {
       code,
       detail,
       since: Date.now(),
-      remedy: providerOf(account) === 'codex' ? 'teamclaude login --codex' : 'teamclaude login',
+      remedy: loginCommandFor(account),
       link,
     };
     return account.errorReason;
@@ -6496,12 +6510,15 @@ export class AccountManager {
    * Of the token fields it writes only those it is given: one left out keeps
    * the account's own, except the expiry, which goes with the access token.
    * @param {number} accountIndex
-   * @param {{ accessToken?: string, refreshToken?: string, expiresAt?: number }} tokens
+   * A different refresh token replaces the date its predecessor's expiry was
+   * known by — with the one given, or with none (expiryAfterReplacement).
+   * @param {{ accessToken?: string, refreshToken?: string, expiresAt?: number, refreshTokenExpiresAt?: number|null }} tokens
    */
-  updateAccountTokens(accountIndex, { accessToken, refreshToken, expiresAt }) {
+  updateAccountTokens(accountIndex, { accessToken, refreshToken, expiresAt, refreshTokenExpiresAt }) {
     const account = this.accounts[accountIndex];
     if (!account || account.type !== 'oauth') return;
 
+    account.refreshTokenExpiresAt = expiryAfterReplacement(account, { refreshToken, refreshTokenExpiresAt });
     if (accessToken) account.credential = accessToken;
     if (refreshToken) account.refreshToken = refreshToken;
     // An expiry describes the access token it comes with: given an access
@@ -6528,11 +6545,11 @@ export class AccountManager {
     console.log(`[TeamClaude] Updated tokens for account "${safeLine(account.name, 64)}"`);
     // What the account now holds, not what came in: the listener writes these
     // onto the account's config row, and a field left out would blank it there.
-    this._onTokenRefresh?.(accountIndex, {
+    this._onTokenRefresh?.(accountIndex, setRefreshTokenExpiry({
       accessToken: account.credential,
       refreshToken: account.refreshToken,
       expiresAt: account.expiresAt,
-    });
+    }, account.refreshTokenExpiresAt));
   }
 
   /**
@@ -6809,6 +6826,9 @@ export class AccountManager {
         // beside a refresh_rejected error it tells a token that died after
         // days idle from one rotated away by another client (#629).
         lastRefreshAt: a._lastRefreshAt ?? null,
+        // When the refresh token lapses (epoch ms). Present only when the
+        // provider or the imported credential file stated it (#674).
+        ...(a.refreshTokenExpiresAt != null ? { refreshTokenExpiresAt: a.refreshTokenExpiresAt } : {}),
         subscriptionLost: a.subscriptionLost ? { ...a.subscriptionLost } : null,
         // Why the account is out of rotation right now (null = it can serve).
         // Distinguishes a local threshold decision from an upstream rejection —
