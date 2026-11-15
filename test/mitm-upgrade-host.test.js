@@ -63,23 +63,25 @@ function connectThroughProxy(proxyPort, target, caCertPem) {
   });
 }
 
-async function upgradeOver(tlsSock, hostHeader) {
+async function upgradeOver(tlsSock, hostHeader, extra = '') {
   tlsSock.write(
     'GET /v1/session_ingress/ws/abc HTTP/1.1\r\n' +
     `Host: ${hostHeader}\r\n` +
     'Upgrade: websocket\r\nConnection: Upgrade\r\n' +
-    'authorization: Bearer client-own-token\r\n\r\n',
+    'authorization: Bearer client-own-token\r\n' + extra + '\r\n',
   );
   const [reply] = await once(tlsSock, 'data');
   return reply.toString('utf8');
 }
 
-async function setup() {
+async function setup(extraConfig = {}) {
   const { caCertPem, leafCertPem, leafKeyPem } = generateCertChain('localhost');
   const upstream = http.createServer((req, res) => { res.writeHead(404); res.end(); });
   const sawUpgrade = [];
+  const handshakes = [];
   upstream.on('upgrade', (req, socket) => {
     sawUpgrade.push(req.headers.host);
+    handshakes.push(req.headers);
     socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n');
     socket.on('data', (c) => socket.write(c));
   });
@@ -88,14 +90,14 @@ async function setup() {
   const proxy = http.createServer();
   const logs = [];
   proxy.on('connect', createConnectHandler({
-    config: { upstream: `http://127.0.0.1:${upPort}`, mitm: { http1Only: true } },
+    config: { upstream: `http://127.0.0.1:${upPort}`, mitm: { http1Only: true }, ...extraConfig },
     accountManager: am,
     ensureLeaf: async () => ({ key: leafKeyPem, cert: leafCertPem }),
     log: (l) => logs.push(l),
   }));
   allowLoopbackForward(proxy);
   const proxyPort = await listen(proxy);
-  return { caCertPem, upstream, upPort, proxy, proxyPort, sawUpgrade, logs };
+  return { caCertPem, upstream, upPort, proxy, proxyPort, sawUpgrade, handshakes, logs };
 }
 
 test('an Upgrade whose Host is the tunnelled upstream host is relayed there', T, async () => {
@@ -122,6 +124,23 @@ test('an Upgrade naming a host this proxy does not intercept is refused, not rel
     await once(tlsSock, 'close');
     assert.deepEqual(sawUpgrade, [], 'nothing reached the upstream');
     assert.ok(logs.some(l => /refusing a WebSocket Upgrade for host "evil\.example"/.test(l)), logs.join('\n'));
+  } finally {
+    tlsSock.destroy(); closeHard(proxy); closeHard(upstream);
+  }
+});
+
+// The operator's usage-dimension labels stay behind on the MITM's channel as
+// they do on the base listener's: the handshake is relayed without them.
+test('an Upgrade through the tunnel is relayed without usage-dimension headers', T, async () => {
+  const { caCertPem, upstream, upPort, proxy, proxyPort, handshakes } = await setup({ proxy: { usageDimensions: [{ name: 'project', header: 'x-tc-project' }] } });
+  const tlsSock = await connectThroughProxy(proxyPort, `127.0.0.1:${upPort}`, caCertPem);
+  try {
+    const reply = await upgradeOver(tlsSock, `127.0.0.1:${upPort}`, 'x-tc-project: private/repo\r\nx-tc-other: kept\r\n');
+    assert.match(reply, /101 Switching Protocols/);
+    assert.equal(handshakes.length, 1);
+    assert.equal(handshakes[0].authorization, 'Bearer client-own-token');
+    assert.equal(handshakes[0]['x-tc-project'], undefined, 'the dimension header must not be relayed');
+    assert.equal(handshakes[0]['x-tc-other'], 'kept');
   } finally {
     tlsSock.destroy(); closeHard(proxy); closeHard(upstream);
   }
