@@ -8,13 +8,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { updateAccountEntry } from '../src/identity.js';
+import { childEnvWithoutProxy } from '../test-helpers/env.js';
 
-// `teamclaude login --long-lived` asks for `user:inference user:profile` with a
-// one-year `expires_in` — the token endpoint refuses a custom lifetime for any
-// wider scope set — and keeps no refresh token, so nothing can later swap the
-// year-long access token for a short one. The paste flow runs in a child
-// process, because it reads its code from stdin; a stub token endpoint records
-// what the exchange sent.
+// `teamclaude login --long-lived` makes the request `claude setup-token` makes:
+// the scope `user:inference` alone, with a one-year `expires_in` on the code
+// exchange. It keeps no refresh token, so nothing can later swap the year-long
+// access token for a short one. The paste flow runs in a child process, because
+// it reads its code from stdin; a stub token endpoint records what the exchange
+// sent.
 
 const oauthUrl = new URL('../src/oauth.js', import.meta.url).href;
 const cliPath = fileURLToPath(new URL('../src/index.js', import.meta.url));
@@ -62,9 +63,13 @@ async function inertBin(dir) {
 
 // Runs `program` with stdin held open until the authorize URL is printed, then
 // types `code`. Resolves with the URL, the exit code and everything printed.
+// The child ends on its own in every case here: the paste flow when its input
+// ends, a refused command when it exits. The proxy variables are taken out of
+// its environment, so its token exchange reaches the stub and not a proxy the
+// developer has exported.
 function runPasteFlow(args, { code = 'code-1', env = {} } = {}) {
   const child = spawn(process.execPath, args, {
-    env: { ...process.env, TEAMCLAUDE_DISABLE_AUTOUPDATE: '1', ...env },
+    env: childEnvWithoutProxy({ TEAMCLAUDE_DISABLE_AUTOUPDATE: '1', ...env }),
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   let stdout = '';
@@ -80,11 +85,7 @@ function runPasteFlow(args, { code = 'code-1', env = {} } = {}) {
     }
   });
   child.stderr.on('data', c => { stderr += c; });
-  // A flow that never reads the code (the browser login waits on its callback
-  // forever) must fail the test, not hang it.
-  const killer = setTimeout(() => child.kill('SIGKILL'), 20_000);
   return new Promise(resolve => child.on('close', status => {
-    clearTimeout(killer);
     const match = stdout.match(/https:\/\/claude\.ai\/oauth\/authorize\S*/);
     resolve({ status, stdout, stderr, authorizeUrl: match ? new URL(match[0]) : null });
   }));
@@ -101,13 +102,14 @@ function loginProgram(options) {
 
 const result = (stdout) => JSON.parse(stdout.match(/^RESULT (.*)$/m)[1]);
 
-test('a long-lived login asks for inference and profile only, for a year, and keeps no refresh token', async (t) => {
+test('a long-lived login asks for inference only, for a year, and keeps no refresh token', async (t) => {
   const { endpoint, seen } = await stubTokenEndpoint(t);
   const before = Date.now();
   const run = await runPasteFlow(loginProgram({ longLived: true, tokenEndpoint: endpoint }));
   assert.equal(run.status, 0, run.stderr);
 
-  assert.equal(run.authorizeUrl.searchParams.get('scope'), 'user:inference user:profile');
+  // Exactly the scope `claude setup-token` asks for, and no other.
+  assert.equal(run.authorizeUrl.searchParams.get('scope'), 'user:inference');
   assert.equal(run.authorizeUrl.searchParams.get('redirect_uri'), MANUAL_REDIRECT);
 
   assert.equal(seen.length, 1);
@@ -119,6 +121,8 @@ test('a long-lived login asks for inference and profile only, for a year, and ke
   assert.equal(creds.accessToken, 'at-granted');
   assert.equal(creds.longLived, true);
   assert.equal('refreshToken' in creds, false);
+  // Nor a date for one: an ordinary sign-in is given 30 days (#710).
+  assert.equal('refreshTokenExpiresAt' in creds, false);
   assert.ok(creds.expiresAt >= before + YEAR * 1000, `expiresAt ${creds.expiresAt} is under a year away`);
 });
 
@@ -142,7 +146,7 @@ test('the ordinary paste login keeps full scopes, the default lifetime and its r
 // hours, long after the operator has walked away.
 test('a long-lived login fails when the server grants more than a day short of a year', async (t) => {
   for (const [grant, said] of [
-    [{ expires_in: 28_800 }, /granted a token for 2880\ds/],
+    [{ expires_in: 28_800 }, /granted a token for \d+s/],
     [{ expires_in: YEAR - 2 * 86_400 }, /granted a token for \d+s/],
     [{}, /granted no usable expiry/],
     [{ expires_at: 'not-a-time' }, /granted no usable expiry/],
@@ -209,11 +213,28 @@ test('`teamclaude login --long-lived` runs the long-lived paste flow', async (t)
   const configPath = join(dir, 'config.json');
   await writeFile(configPath, JSON.stringify({ proxy: { port: 1, apiKey: 'tc-test' }, accounts: [] }));
   // An empty answer stops the login before any network call.
-  const run = await runPasteFlow([cliPath, 'login', '--long-lived'], {
+  const run = await runPasteFlow([cliPath, 'login', '--long-lived', '--name', 'year'], {
     code: '', env: { TEAMCLAUDE_CONFIG: configPath, PATH: await inertBin(dir) },
   });
   assert.equal(existsSync(join(dir, 'opened')), false, 'the long-lived login opened a browser');
   assert.ok(run.authorizeUrl, `no authorize URL printed:\n${run.stdout}\n${run.stderr}`);
-  assert.equal(run.authorizeUrl.searchParams.get('scope'), 'user:inference user:profile');
+  assert.equal(run.authorizeUrl.searchParams.get('scope'), 'user:inference');
   assert.match(run.stderr, /No authorization code provided/);
+});
+
+// The token cannot read the profile every other login is named from, so the
+// name has to be given, and the login stops before a sign-in link is shown:
+// an authorization code is single-use, and would be spent for nothing.
+test('`teamclaude login --long-lived` without --name stops before the sign-in link', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-long-lived-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const configPath = join(dir, 'config.json');
+  await writeFile(configPath, JSON.stringify({ proxy: { port: 1, apiKey: 'tc-test' }, accounts: [] }));
+  const run = await runPasteFlow([cliPath, 'login', '--long-lived'], {
+    code: '', env: { TEAMCLAUDE_CONFIG: configPath, PATH: await inertBin(dir) },
+  });
+  assert.equal(run.status, 1);
+  assert.equal(run.authorizeUrl, null, `a sign-in link was printed:\n${run.stdout}`);
+  assert.match(run.stderr, /--long-lived needs --name/);
+  assert.equal(existsSync(join(dir, 'opened')), false);
 });

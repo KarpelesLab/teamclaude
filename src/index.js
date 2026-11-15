@@ -1478,6 +1478,14 @@ async function loginCommand() {
       console.error('--long-lived is a Claude subscription login and cannot be combined with --api, --codex or --oauth');
       process.exit(1);
     }
+    // Before anything is opened or asked: the token this login returns carries
+    // `user:inference` alone, so the profile that names every other login
+    // cannot be read with it, and the name is all the account is known by.
+    if (!argValue('--name')) {
+      console.error('--long-lived needs --name: its token serves inference only, so the account cannot be named from its profile.');
+      console.error('Usage: teamclaude login --long-lived --name <name>   (the name of an existing account renews that one)');
+      process.exit(1);
+    }
     await loginOAuthCommand({ pasteOnly: true, longLived: true });
     return;
   }
@@ -2171,7 +2179,8 @@ async function accountsCommand() {
   // Fetch profiles in parallel for all OAuth accounts
   const profiles = await Promise.all(
     config.accounts.map(a =>
-      a.type === 'oauth' && a.accessToken ? fetchProfile(a.accessToken, accountRouting(a, localListener(config))) : null
+      // Not a long-lived account: its token cannot read the profile (403).
+      a.type === 'oauth' && a.accessToken && !isLongLived(a) ? fetchProfile(a.accessToken, accountRouting(a, localListener(config))) : null
     )
   );
 
@@ -2253,7 +2262,9 @@ async function accountsCommand() {
     // OAuth account
     const hasProfile = p && !p.error;
     const tier = hasProfile ? (p.hasClaudeMax ? 'Max' : p.hasClaudePro ? 'Pro' : 'subscription') : null;
-    const status = hasProfile ? `Claude ${tier}` : `unknown (${p?.error || 'no token'})`;
+    const status = hasProfile ? `Claude ${tier}`
+      : isLongLived(a) ? 'long-lived token, inference only'
+      : `unknown (${p?.error || 'no token'})`;
     const src = a.source ? `, ${a.source}` : '';
     console.log(`  [${i + 1}] ${a.name} (${status}${src})`);
     if (hasProfile && p.email && p.email !== a.name) console.log(`       Email: ${p.email}`);
@@ -3177,7 +3188,9 @@ Commands:
   import              Import credentials from Claude Code
   login               OAuth login via browser (over SSH: copy/paste, as --token)
   login --token       OAuth login via copy/paste (no local callback; for headless/remote)
-  login --long-lived  Copy/paste login for a one-year, non-refreshing token
+  login --long-lived --name <name>
+                      Copy/paste login for a one-year token, as claude setup-token
+                      makes: inference only, never refreshed, no usage reads
   login --codex       Codex (ChatGPT) login via browser; on a terminal the address
                       the browser lands on can be pasted instead (--no-browser)
   login --api         Add an API key account (a last resort by default:
@@ -3398,10 +3411,16 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
   // refresh token is still good, so a stale token is renewed first and the
   // renewed pair is what gets saved below — `creds` is the set to write.
   const userNamed = !!name;
+  // A long-lived token (long-lived.js) is not asked: the profile endpoint
+  // needs a scope it does not carry and would answer 403. What stands in is
+  // the shape of a profile that could not be read, so the account goes by the
+  // name given, which loginCommand has already required.
+  const longLived = creds.longLived === true;
   // The refresh goes through the callback.net lock when this install is
   // signed in there: the token being imported may be one the store holds, and
   // so one other installs hold too.
-  const identified = await profileForCredentials(creds, routing, {
+  /** @type {{ creds: Record<string, any>, profile: Record<string, any> }} */
+  const identified = longLived ? { creds, profile: { error: 'a long-lived token cannot read its profile', status: null } } : await profileForCredentials(creds, routing, {
     renew: (c) => refreshOutsideProxy({ name: name || 'imported account', type: 'oauth', accessToken: c.accessToken, refreshToken: c.refreshToken, expiresAt: c.expiresAt, refreshTokenExpiresAt: c.refreshTokenExpiresAt }, (o) => refreshAccessToken(c.refreshToken, undefined, routing, o), { force: true })
       .then((t) => t ?? Promise.reject(new Error('token not renewed'))),
   });
@@ -3425,7 +3444,9 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
     process.exit(1);
   }
 
-  if (!profileOk) {
+  if (longLived) {
+    console.log('A long-lived token serves inference only: the account is saved under the name given, with no profile lookup.');
+  } else if (!profileOk) {
     console.error(`Warning: importing named account without profile detection — ${profile?.error ? sanitizeText(profile.error) : 'profile unavailable'}`);
   }
   if (!name && profile?.email) {
@@ -3468,8 +3489,14 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
       // re-login updateAccountEntry spreads incoming over prev, so the routing
       // the entry already had survives instead of being silently cleared.
       ...(routing && storeRouting ? { routing: routingToUrl(routing) } : {}),
-      ...(creds.longLived === true && { longLived: true }),
+      ...(longLived && { longLived: true }),
     };
+    // No profile was read for a long-lived login, so it states no plan. The
+    // keys are left off rather than written as null: onto an entry of the
+    // same name, what an earlier full login learned about the account stays.
+    if (longLived) {
+      for (const field of ['organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro']) delete (/** @type {Record<string, any>} */ (account))[field];
+    }
     // When the refresh token lapses, if these credentials came with it.
     setRefreshTokenExpiry(account, creds.refreshTokenExpiresAt);
 

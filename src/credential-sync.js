@@ -97,6 +97,7 @@ import { providerOf } from './provider.js';
 import { sameIdentity } from './identity.js';
 import { safeLine } from './safe-text.js';
 import { setRefreshTokenExpiry, withFamilyExpiry } from './refresh-token-expiry.js';
+import { isLongLived } from './long-lived.js';
 
 /** Rows this proxy owns start with this; anything else in the store is left alone. */
 export const KEY_PREFIX = 'teamrouter.';
@@ -163,8 +164,10 @@ function segment(/** @type {unknown} */ v) {
  */
 export function isSyncable(a) {
   // A long-lived token is this install's own: never stored for the others, and
-  // never replaced by a refreshing login stored by another install.
-  if (!a || a.type !== 'oauth' || a.upstream || a.longLived === true) return false;
+  // never replaced by a refreshing login stored by another install. The mark
+  // is read as everywhere else (isLongLived): on an entry that names an
+  // `importFrom` file it means nothing, and that account refreshes and syncs.
+  if (!a || a.type !== 'oauth' || a.upstream || isLongLived(a)) return false;
   return providerOf(a) === 'codex' ? !!a.accountId : !!a.accountUuid;
 }
 

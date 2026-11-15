@@ -920,10 +920,11 @@ export function isFableReset(clears) {
 const OAUTH_AUTHORIZE = 'https://claude.ai/oauth/authorize';
 const OAUTH_SCOPES = 'org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload';
 const MANUAL_LOGIN_REDIRECT_URI = 'https://console.anthropic.com/oauth/code/callback';
-// The token endpoint refuses a custom expires_in for every scope outside these
-// two: inference, and the profile and usage reads behind naming, tiers and the
-// quota probe.
-const LONG_LIVED_SCOPES = 'user:inference user:profile';
+// What `claude setup-token` asks for, and nothing else: the same flow on the
+// same client id and URLs, with the scope `user:inference` alone and
+// `expires_in` of one year (in seconds) on the code exchange. A token on that
+// scope serves inference only; see long-lived.js for what that leaves out.
+const LONG_LIVED_SCOPES = 'user:inference';
 const LONG_LIVED_EXPIRES_IN = 365 * 24 * 3600;
 
 /**
@@ -1106,9 +1107,10 @@ function isLoopbackAddress(text, port) {
  * @param {AbortSignal | null} [opts.signal]  cancels the wait and closes the listener
  * @param {number} [opts.timeoutMs]  0 waits for ever
  * @param {typeof exchangeCodeForTokens} [opts.exchange]  injectable so tests need no token endpoint
- * @param {boolean} [opts.longLived]  a one-year token on LONG_LIVED_SCOPES, returned marked
- *   `longLived` and without the refresh token, which expires within weeks and
- *   whose use would replace the year-long access token
+ * @param {boolean} [opts.longLived]  the `claude setup-token` request: a one-year
+ *   token on LONG_LIVED_SCOPES, returned marked `longLived` and without any
+ *   refresh token the response carries. Such a token is not refreshed, and a
+ *   refresh would replace the year-long access token with a short one
  * @param {string} [opts.tokenEndpoint]
  */
 export async function startOAuthLogin({ loopback = true, routing = null, signal = null, timeoutMs = LOGIN_TIMEOUT_MS, exchange = exchangeCodeForTokens, longLived = false, tokenEndpoint = DEFAULT_TOKEN_ENDPOINT } = {}) {

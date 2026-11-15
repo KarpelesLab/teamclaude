@@ -57,8 +57,18 @@ function oauthAccount(account) {
 function accountBlock(account) {
   if (!oauthAccount(account)) return 'not an OAuth Claude or Codex account';
   if (account.disabled) return 'account is disabled';
+  if (inferenceOnly(account)) return 'a long-lived token serves inference only and cannot read or redeem resets';
   if (providerOf(account) === DEFAULT_PROVIDER && !account.orgUuid) return 'missing Claude organization id';
   return null;
+}
+
+/**
+ * A long-lived account (long-lived.js): the reset read and the claim both need
+ * a scope its token does not carry, so neither is sent.
+ * @param {Record<string, any>} account
+ */
+function inferenceOnly(account) {
+  return account?.longLived === true;
 }
 
 /**
@@ -115,7 +125,7 @@ export function createResetActions({ accountManager, claudeRedeemer, codexRedeem
       atLimit: null, exhausted: [], cooldownUntil: null, weeklyResetsAt: null,
       fleetHoldUntil, grants: [], seenAt, stale: false, retryAt: null,
     };
-    if (!oauthAccount(account)) return { ...details, error: accountBlock(account) };
+    if (!oauthAccount(account) || inferenceOnly(account)) return { ...details, error: accountBlock(account) };
     try {
       const blocked = accountBlock(account);
       const held = holdWarning(redeemer, fleetHoldUntil, at);
@@ -195,7 +205,7 @@ export function createResetActions({ accountManager, claudeRedeemer, codexRedeem
    * @returns {Promise<ResetDetails>}
    */
   async function readFresh(account) {
-    if (!oauthAccount(account)) return detailsFor(account, null, null);
+    if (!oauthAccount(account) || inferenceOnly(account)) return detailsFor(account, null, null);
     const read = providerOf(account) === 'codex'
       ? await codexRedeemer.readDetails(account)
       : await claudeRedeemer.readStatus(account);

@@ -18,6 +18,7 @@ import { safeLine } from './safe-text.js';
 import { parseEndsAt } from './ends-at.js';
 import { isRefused } from './account-refusal.js';
 import { knownRefreshTokenExpiry, setRefreshTokenExpiry, withFamilyExpiry, expiryAfterReplacement, loginCommandFor } from './refresh-token-expiry.js';
+import { isLongLived } from './long-lived.js';
 import { parseRoutingUrl, describeRouting, routingToUrl, isRoutingFailure } from './account-routing.js';
 import { isSelfProxy } from './upstream-proxy.js';
 import { envVar } from './brand.js';
@@ -523,15 +524,8 @@ function planOf(/** @type {Record<string, any>} */ account) {
   return account.hasClaudeMax === true ? 'Max' : account.hasClaudePro === true ? 'Pro' : null;
 }
 
-/**
- * Whether an entry holds a `login --long-lived` token, which is never refreshed.
- * An `importFrom` entry takes its token from a refreshing Claude Code login, so
- * the marker means nothing there.
- * @param {Record<string, any>} acct
- */
-export function isLongLived(acct) {
-  return acct?.longLived === true && !acct.importFrom;
-}
+// Whether an entry holds a `login --long-lived` token; see long-lived.js.
+export { isLongLived };
 
 // Build a fresh in-memory account record from a config/disk account object.
 // Shared by the constructor and addAccount() so the field set can never drift
@@ -639,14 +633,18 @@ function makeAccount(acct, index, listener = null) {
     // state, so the line is printed once rather than per refusal.
     threadRefusalReported: false,
     models: acct.models || null,
+    // A `login --long-lived` token (long-lived.js): inference only, never
+    // refreshed. It holds no refresh token whatever its entry carries, so every
+    // gate that asks "can this account be refreshed" answers no.
     longLived: isLongLived(acct),
     credential: acct.accessToken || acct.apiKey,
     refreshToken: isLongLived(acct) ? null : acct.refreshToken || null,
     expiresAt: acct.expiresAt || null,
     // When the refresh token itself lapses (epoch ms), where the provider or
     // the imported credential file said; null when nobody did. See
-    // refresh-token-expiry.js.
-    refreshTokenExpiresAt: knownRefreshTokenExpiry(acct.refreshTokenExpiresAt),
+    // refresh-token-expiry.js. A long-lived account has no refresh token for
+    // a date to describe.
+    refreshTokenExpiresAt: isLongLived(acct) ? null : knownRefreshTokenExpiry(acct.refreshTokenExpiresAt),
     status: 'active',
     // Why the account last went to 'error' (see _needsLogin); read only while
     // status is 'error', so a recovery path need not clear it.
@@ -6960,6 +6958,11 @@ export class AccountManager {
         // When the refresh token lapses (epoch ms). Present only when the
         // provider or the imported credential file stated it (#674).
         ...(a.refreshTokenExpiresAt != null ? { refreshTokenExpiresAt: a.refreshTokenExpiresAt } : {}),
+        // A `login --long-lived` account, with when its token lapses (epoch
+        // ms, null when the entry states none). Present only on such an
+        // account: it is why the row has no plan, no probe and no usage read,
+        // and the date is what status counts down to the yearly re-login.
+        ...(a.longLived === true ? { longLived: true, expiresAt: a.expiresAt ?? null } : {}),
         subscriptionLost: a.subscriptionLost ? { ...a.subscriptionLost } : null,
         // Why the account is out of rotation right now (null = it can serve).
         // Distinguishes a local threshold decision from an upstream rejection —
