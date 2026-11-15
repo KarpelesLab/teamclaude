@@ -225,8 +225,6 @@ teamclaude route list        # Manage per-model routes (add/rm)
 teamclaude threshold 90      # Utilization at which rotation leaves an account
 teamclaude distribute on     # Spread new sessions across equal-priority accounts
 teamclaude probe 300         # Enable background quota refresh (off by default)
-teamclaude redeem <name>     # Spend one Codex reset credit now (--force skips the min-days floor)
-teamclaude redeem --plan     # What the auto-redeem policy would do now, spending nothing
 teamclaude warmup 600        # Enable keep-warm (off by default, spends quota)
 teamclaude warmup reset 15:30 --timezone Europe/Moscow
                              # Schedule warm-up for a daily target reset
@@ -252,7 +250,7 @@ Re-running `teamclaude service install` rewrites the unit and restarts the proxy
 
 ## Control routes under a second name
 
-Every `/teamclaude/…` route the server exposes — `status`, `quota`, `reload`, `switch`, `disable`, `account-cordon`, `account-release`, `priority`, `threshold`, `probe`, `redeem`, `redeem/plan`, `drain`, `undrain`, `dashboard` and `mcp` — also answers at the same path under `/teamrouter/…`, with the same gates and the same replies. It is the first step of the [rename to TeamRouter](../README.md#renaming-to-teamrouter); scripts and dashboards written against `/teamclaude/…` keep working unchanged.
+Every `/teamclaude/…` route the server exposes — `status`, `quota`, `reload`, `switch`, `disable`, `account-cordon`, `account-release`, `priority`, `threshold`, `probe`, `drain`, `undrain`, `dashboard` and `mcp` — also answers at the same path under `/teamrouter/…`, with the same gates and the same replies. It is the first step of the [rename to TeamRouter](../README.md#renaming-to-teamrouter); scripts and dashboards written against `/teamclaude/…` keep working unchanged.
 
 ## Cordoning one account
 

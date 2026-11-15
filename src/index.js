@@ -282,10 +282,6 @@ switch (command) {
     await probeCommand();
     process.exit(0);
     break;
-  case 'redeem':
-    await redeemCommand();
-    process.exit(0);
-    break;
   case 'warmup':
     await warmupCommand();
     process.exit(0);
@@ -958,11 +954,8 @@ async function serverCommand() {
   // Banked Claude usage-limit resets are armed by the same switch.
   hooks.redeemClaudeResetForPool = (/** @type {Record<string, any>[]} */ accounts, /** @type {{ model?: string|null }} */ opts) => claudeRedeemer.maybeRedeemForPool(accounts, opts);
   hooks.redeemCodexResetForPool = (/** @type {Record<string, any>[]} */ accounts) => redeemer.maybeRedeemForPool(accounts);
-  // The operator's own hand on the same redeemer (`teamclaude redeem`), the
-  // dry run of its policy (`--plan`), and the policy's view of each account
-  // for the status payload.
-  hooks.redeemCodexReset = (/** @type {Record<string, any>} */ account, /** @type {{force?: boolean}} */ opts) => redeemer.redeemOne(account, opts);
-  hooks.planCodexRedeem = () => redeemer.plan();
+  // The spending strategy's view of each Codex account, for the status payload.
+  // Read-only: nothing reached through it spends a credit.
   hooks.describeAutoRedeem = (/** @type {Record<string, any>} */ account) => redeemer.describe(account);
   hooks.getStatusExtra = () => ({
     // The reset-credit spending strategy as it stands, read live like the
@@ -2439,94 +2432,6 @@ async function probeCommand() {
   await notifyRunningServer(saved);
 }
 
-// ── redeem ──────────────────────────────────────────────────
-
-// Spend one Codex rate-limit reset credit by hand, or show what the automatic
-// policy would do. Both go through the RUNNING server: the redeemer that holds
-// the cooldowns, the idempotency keys and the redemption ledger lives there,
-// and a second redeemer in this process would know none of them.
-async function redeemCommand() {
-  const config = await loadOrCreateConfig();
-  const port = config.proxy.port;
-  const headers = { 'x-api-key': config.proxy.apiKey };
-  const plan = args.includes('--plan');
-  const force = args.includes('--force');
-  const name = args.slice(1).find(arg => !arg.startsWith('-')) ?? null;
-  const usage = 'Usage: teamclaude redeem <account> [--force]   or   teamclaude redeem --plan';
-
-  if (plan === !!name || (plan && force)) {
-    console.error(usage);
-    process.exit(1);
-  }
-
-  /** @param {string} path @param {RequestInit} [init] */
-  const call = async (path, init = {}) => {
-    let res;
-    try {
-      res = await fetch(`http://localhost:${port}${path}`, { ...init, headers: { ...headers, ...(init.headers || {}) } });
-    } catch (/** @type {any} */ err) {
-      console.error(`Cannot connect to proxy at localhost:${port}`);
-      console.error('Is the server running? Start with: teamclaude server');
-      if (err?.message) console.error(`Details: ${err.message}`);
-      process.exit(1);
-    }
-    const data = await res.json().catch(() => ({}));
-    return { res, data };
-  };
-
-  if (plan) {
-    const { res, data } = await call('/teamclaude/redeem/plan');
-    if (!res.ok) {
-      const detail = typeof data.error === 'string' ? data.error : null;
-      console.error(detail || `Unexpected reply from localhost:${port} (HTTP ${res.status}).`);
-      if (!detail) console.error('An older server without this endpoint answers this way; restart it to pick up the new version.');
-      process.exit(1);
-    }
-    if (args.includes('--json')) {
-      await writeStdout(`${JSON.stringify(data, null, 2)}\n`);
-      return;
-    }
-    const p = data.policy || {};
-    console.log(`Auto-redeem: ${data.autoRedeemResets === true ? 'on' : 'off'}`
-      + `  min days to reset: ${p.minDaysToReset > 0 ? p.minDaysToReset : 'off'}`
-      + `  max share per cohort: ${p.maxShare < 1 ? `${Math.round(p.maxShare * 100)}%` : 'off'}`
-      + `  max per day: ${p.maxPerDay > 0 ? p.maxPerDay : 'off'}`
-      + `  redeemed last 24h: ${p.redeemedLast24h ?? 0}`);
-    if (data.fleetHold) console.log(`Hold:        ${sanitizeText(data.fleetHold)}`);
-    const rows = Array.isArray(data.accounts) ? data.accounts : [];
-    if (!rows.length) console.log('No Codex accounts.');
-    for (const row of rows) {
-      const value = row.creditValueWeeks == null ? 'credit value unknown (no reset time)' : `credit worth ${row.creditValueWeeks.toFixed(2)} of a week (${row.daysToReset}d to reset)`;
-      const held = row.creditsHeld == null ? 'credits unknown' : `${row.creditsHeld} credit${row.creditsHeld === 1 ? '' : 's'} held`;
-      console.log(`  ${safeLine(row.name, 64)}: ${sanitizeText(row.verdict)} — ${value}, ${held}, weekly ${row.exhausted ? 'spent' : 'not spent'}`);
-    }
-    console.log(data.wouldRedeem ? `Would redeem first: ${safeLine(data.wouldRedeem, 64)}` : 'Would redeem: nothing right now.');
-    return;
-  }
-
-  const { res, data } = await call('/teamclaude/redeem', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ account: name, force }),
-  });
-  if (!res.ok) {
-    const detail = typeof data.error === 'string' ? data.error : null;
-    console.error(detail || `Redeem failed: unexpected reply from localhost:${port} (HTTP ${res.status}).`);
-    if (!detail) console.error('An older server without this endpoint answers this way; restart it to pick up the new version.');
-    if (data.accounts?.length) {
-      console.error('Known accounts:');
-      for (const n of data.accounts) console.error(`  ${safeLine(n, 64)}`);
-    }
-    process.exit(1);
-  }
-  if (data.redeemed) {
-    console.log(`Redeemed a reset credit on "${safeLine(data.account, 64)}" — ${data.windowsReset ?? 0} window(s) reset (${sanitizeText(data.code || 'reset')}).`);
-    return;
-  }
-  console.error(`Not redeemed on "${safeLine(data.account, 64)}": ${sanitizeText(data.reason || 'no reason given')}`);
-  process.exit(1);
-}
-
 // ── warmup ──────────────────────────────────────────────────
 
 async function warmupCommand() {
@@ -3338,11 +3243,6 @@ Commands:
                       the fewest requests in the last ten minutes
   probe [off|secs]    Opt-in background quota refresh for idle accounts
                       (off by default; reads usage endpoint, spends no quota)
-  redeem <name>       Spend one of a Codex account's free rate-limit reset
-                      credits now (needs server; only when its weekly window
-                      is spent; --force overrides autoRedeemMinDaysToReset)
-  redeem --plan       Print what the auto-redeem policy would do right now,
-                      spending nothing
   warmup [off|secs]   Opt-in: keep idle accounts' 5h timers running by sending
                       a minimal claude request to each (spends a little quota)
   warmup reset HH:MM --timezone Area/City
