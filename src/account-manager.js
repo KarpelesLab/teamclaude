@@ -1258,6 +1258,12 @@ export class AccountManager {
 
   // Entry IDs, never credentials, names or positions. Ambiguous IDs are not
   // identities even if only one of the duplicate entries is currently enabled.
+  //
+  // A disabled account is still an identity. Disabling one leaves the pins on
+  // it in place while the server runs (every placement path skips an account
+  // that is not available and writes nothing), so a pin saved or restored while
+  // its account is disabled is the same dormant pin, and is there again when
+  // the account is enabled.
   exportAffinityState() {
     const identities = this._affinityAccounts();
     return this.sessionTracker.exportAffinity(index => {
@@ -1284,7 +1290,7 @@ export class AccountManager {
       if (typeof account.id !== 'string' || !account.id) continue;
       if (seen.has(account.id)) { identities.delete(account.id); continue; }
       seen.add(account.id);
-      if (!account.disabled) identities.set(account.id, account);
+      identities.set(account.id, account);
     }
     return identities;
   }

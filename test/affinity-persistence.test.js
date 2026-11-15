@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { SessionTracker, SESSION_KNOWN_TTL_MS as TTL, MAX_SESSIONS } from '../src/session-tracker.js';
+import { SessionTracker, SESSION_KNOWN_TTL_MS as TTL, MAX_SESSIONS, MAX_AFFINITY_PINS } from '../src/session-tracker.js';
 import { AccountManager } from '../src/account-manager.js';
 import * as config from '../src/config.js';
 import { affinityAccounts } from '../test-helpers/affinity-fixtures.js';
@@ -98,7 +98,7 @@ test('sliding idle lifetime survives days of activity and repeated restarts with
       const idle = new SessionTracker({ now: () => now });
       const beforeUse = JSON.parse(JSON.stringify(live.exportAffinity(identify)));
       idle.restoreAffinity(beforeUse, resolve);
-      assert.equal(idle.sessions.get('clock')?.lastSeen, seen, 'idle rollback does not renew use');
+      assert.equal(idle.sessions.get('clock')?.lastSeen, now, 'a time ahead of the clock is read as now');
       assert.equal(idle.pinnedAccount('clock', 'unified7d'), 1);
       live.beginRequest('clock');
       live.touch('clock', 2, 'sibling');
@@ -121,6 +121,31 @@ test('sliding idle lifetime survives days of activity and repeated restarts with
       assert.equal(live.exportAffinity(identify).sessions.length, 0);
     }
   });
+});
+
+// A time ahead of the clock (the clock was stepped back between the save and
+// this start, or the file is damaged) would never reach its idle expiry and
+// would be the last record evicted at the cap.
+test('restored times ahead of the clock are clamped to now, so they expire and are evicted like any other', () => {
+  let now = 10 * TTL;
+  const tracker = new SessionTracker({ now: () => now });
+  tracker.restoreAffinity(snapshot(
+    row({ key: 'ahead', lastSeen: now + 30 * TTL, pins: [{ bucket: 'unified7d', account: identify(1), at: now + 40 * TTL }] }),
+    row({ key: 'behind', lastSeen: now - 5, pins: [{ bucket: 'unified7d', account: identify(2), at: now - 9 }] }),
+    row({ key: 'max', lastSeen: Number.MAX_VALUE, pins: [{ bucket: 'unified7d', account: identify(1), at: Number.MAX_VALUE }] }),
+  ), resolve);
+  for (const key of ['ahead', 'max']) {
+    assert.equal(tracker.sessions.get(key).lastSeen, now, key);
+    assert.equal(tracker.sessions.get(key).firstSeen, now, key);
+    assert.equal(tracker.sessions.get(key).pins.get('unified7d').at, now, key);
+  }
+  assert.equal(tracker.sessions.get('behind').lastSeen, now - 5, 'a time in the past is kept as saved');
+  assert.equal(tracker.sessions.get('behind').pins.get('unified7d').at, now - 9);
+  assert.equal(tracker.pinnedAccount('ahead', 'unified7d'), 1);
+  now += TTL + 1;
+  assert.equal(tracker.pinnedAccount('ahead', 'unified7d'), null, 'idle for the known window after the restore, it is forgotten');
+  assert.equal(tracker.pinnedAccount('max', 'unified7d'), null);
+  assert.equal(tracker.exportAffinity(identify).sessions.length, 0);
 });
 
 test('malformed versions, keys, timestamps and duplicate records cannot create affinity', () => {
@@ -169,14 +194,13 @@ test('restore bounds conversations and newest thread IDs, retaining thread-only 
   assert.equal(saved.sessions[0].key, `s${MAX_SESSIONS + 1}`);
 });
 
-test('missing, ambiguous, disabled and changed-provider identities drop pins but keep threads', () => {
+test('missing, ambiguous and changed-provider identities drop pins but keep threads', () => {
   const source = manager();
   source.sessionTracker.beginRequest(KEY, undefined, { sessionId: 'client', conversation: DIGEST });
   source.recordSession(KEY, 1, OPUS);
   source.sessionTracker.recordThreadMessage(KEY, 'msg_1');
   const saved = source.exportAffinityState();
   for (const rows of [accounts.filter(a => a.id !== 'b'), [...accounts, { ...accounts[1] }],
-    accounts.map(a => a.id === 'b' ? { ...a, disabled: true } : a),
     accounts.map(a => a.id === 'b' ? { ...a, provider: 'codex' } : a)]) {
     const fresh = manager(rows);
     fresh.restoreAffinityState(saved);
@@ -186,6 +210,34 @@ test('missing, ambiguous, disabled and changed-provider identities drop pins but
   const anonymous = manager([{ ...accounts[0], id: undefined }]);
   anonymous.recordSession('anon', 0, OPUS);
   assert.equal(anonymous.exportAffinityState().sessions.length, 0);
+});
+
+// Disabling an account leaves the pins on it in place while the server runs;
+// a restart in between must not be what loses them.
+test('a pin on a disabled account is saved and restored dormant, and serves again once the account is enabled', () => {
+  const source = manager();
+  source.recordSession('alpha', 1, OPUS);
+  source.setDisabled(1, true);
+  const saved = JSON.parse(JSON.stringify(source.exportAffinityState()));
+  assert.deepEqual(saved.sessions[0].pins.map(p => p.account), [{ id: 'b', provider: 'anthropic' }]);
+  const fresh = manager(accounts.map(a => a.id === 'b' ? { ...a, disabled: true } : a));
+  fresh.restoreAffinityState(saved);
+  assert.equal(fresh.accounts[fresh.sessionTracker.pinnedAccount('alpha', 'unified7d')].id, 'b');
+  assert.notEqual(fresh.getActiveAccount(null, OPUS, null, 'alpha').id, 'b', 'a disabled account is not routed to');
+  fresh.setDisabled(fresh.accounts.findIndex(a => a.id === 'b'), false);
+  assert.equal(fresh.getActiveAccount(null, OPUS, null, 'alpha').id, 'b');
+});
+
+test('one saved conversation restores a bounded number of pins and no oversized bucket key', () => {
+  const tracker = new SessionTracker({ now: () => 100 });
+  const pins = [{ bucket: 'b'.repeat(129), account: identify(1), at: 90 },
+    ...Array.from({ length: MAX_AFFINITY_PINS + 5 }, (_, i) => ({ bucket: `bucket-${i}`, account: identify(1), at: 90 }))];
+  tracker.restoreAffinity(JSON.parse(JSON.stringify(snapshot(row({ pins })))), resolve);
+  const restored = tracker.sessions.get(KEY).pins;
+  assert.equal(restored.size, MAX_AFFINITY_PINS);
+  assert.equal(restored.has('b'.repeat(129)), false);
+  assert.ok(restored.has('bucket-0'));
+  assert.equal(tracker.exportAffinity(identify).sessions[0].pins.length, MAX_AFFINITY_PINS);
 });
 
 test('restored affinity obeys current quota, exclusions, model routes and manual selection', () => {

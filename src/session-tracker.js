@@ -164,6 +164,12 @@ function setAndReturn(map, key, value) {
 const boundedString = (value, limit) => typeof value === 'string' && value.length > 0 && value.length <= limit;
 /** @param {unknown} value @returns {value is number} */
 const affinityTime = value => typeof value === 'number' && Number.isFinite(value) && value >= 0;
+// Bounds on what one saved conversation may bring back. A bucket key is the
+// name of a quota field, and a conversation holds one pin per weekly bucket it
+// has spent, so both limits sit far above anything the tracker writes. They are
+// for a damaged file, which must not restore more than a live record can hold.
+const MAX_BUCKET_LENGTH = 128;
+export const MAX_AFFINITY_PINS = 64;
 /** @param {any} row @returns {row is AffinitySession} */
 function affinityRow(row) {
   return row != null && boundedString(row.key, MAX_KEY_LENGTH)
@@ -214,7 +220,7 @@ export class SessionTracker {
       const pins = [];
       for (const [bucket, pin] of s.pins) {
         const account = identifyAccount(pin.idx);
-        if (affinityAccount(account) && typeof bucket === 'string' && bucket && affinityTime(pin.at)) {
+        if (pins.length < MAX_AFFINITY_PINS && affinityAccount(account) && boundedString(bucket, MAX_BUCKET_LENGTH) && affinityTime(pin.at)) {
           pins.push({ bucket, account: { id: account.id, provider: account.provider }, at: pin.at });
         }
       }
@@ -228,25 +234,38 @@ export class SessionTracker {
 
   // Keys are opaque, as on ingress. Owner metadata is independent: some keys
   // carry no client session or conversation, and must still retain their pins.
+  //
+  // No saved time is taken as later than `now`. A time ahead of the clock, from
+  // a clock stepped back between the save and this start or from a damaged
+  // file, would otherwise never reach its idle expiry and would be the last
+  // record evicted at the cap. Clamped, it is read as "seen just now", which is
+  // the longest a restored record can be owed.
   /** @param {any} snapshot @param {(account: AffinityAccount) => number|null} resolveAccount @param {number} [now] */
   restoreAffinity(snapshot, resolveAccount, now = this._now()) {
     if (snapshot?.version !== 1 || !Array.isArray(snapshot.sessions)) return;
-    const rows = snapshot.sessions.filter((/** @type {any} */ row) => affinityRow(row) && !this._isExpired({ lastSeen: row.lastSeen, inFlight: 0 }, now));
-    rows.sort((/** @type {AffinitySession} */ a, /** @type {AffinitySession} */ b) => b.lastSeen - a.lastSeen);
-    for (const row of rows) {
+    /** @type {Array<{row: AffinitySession, lastSeen: number}>} */
+    const rows = [];
+    for (const row of snapshot.sessions) {
+      if (!affinityRow(row)) continue;
+      const lastSeen = Math.min(row.lastSeen, now);
+      if (!this._isExpired({ lastSeen, inFlight: 0 }, now)) rows.push({ row, lastSeen });
+    }
+    rows.sort((a, b) => b.lastSeen - a.lastSeen);
+    for (const { row, lastSeen } of rows) {
       if (this.sessions.size >= MAX_SESSIONS) break;
       if (this.sessions.has(row.key)) continue;
       const pins = new Map();
       for (const pin of row.pins) {
-        if (!pin || typeof pin.bucket !== 'string' || !pin.bucket || pins.has(pin.bucket)
+        if (pins.size >= MAX_AFFINITY_PINS) break;
+        if (!pin || !boundedString(pin.bucket, MAX_BUCKET_LENGTH) || pins.has(pin.bucket)
             || !affinityAccount(pin.account) || !affinityTime(pin.at)) continue;
         const idx = resolveAccount(pin.account);
-        if (idx != null && Number.isInteger(idx) && idx >= 0) pins.set(pin.bucket, { idx, at: pin.at });
+        if (idx != null && Number.isInteger(idx) && idx >= 0) pins.set(pin.bucket, { idx, at: Math.min(pin.at, now) });
       }
       const threads = new Set(row.threads.filter(isMessageId));
       while (threads.size > MAX_THREAD_MESSAGES) threads.delete(threads.values().next().value);
       if (!pins.size && !threads.size) continue;
-      const s = this._ensure(row.key, row.lastSeen);
+      const s = this._ensure(row.key, lastSeen);
       s.sessionId = row.sessionId;
       s.conversation = row.conversation;
       s.pins = pins;

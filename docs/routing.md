@@ -279,12 +279,25 @@ open requests, counters or rollover observations enter this section. Operator
 
 The same one-hour **sliding idle lifetime** applies across restarts. Restoring
 never refreshes it: a conversation active for days can survive, while one idle
-for more than an hour is forgotten. Removed, disabled, ambiguous or changed-provider
-accounts lose their saved pins. Current model, provider, route, quota and hard-pin
-checks still govern every request. Thread ownership can survive a dropped pin,
-but does not make another account capable of continuing the upstream thread.
+for more than an hour is forgotten. A saved time later than the clock at startup
+(the clock was stepped back, or the file is damaged) is read as the startup
+time, so such a record still expires an hour later.
 
-While a request is in flight, a snapshot observes its current use without storing request counters or resuming the stream. Idle timestamps remain unchanged across saves and restarts; expiry follows the tracker’s existing wall clock behavior, including backward clock adjustments. Pin timestamps retain their original values even when another family was last used after the clock moved backward.
+A pin names its account by config entry ID and provider, so reordering or
+renaming accounts between starts changes nothing. A pin whose account was
+removed, or whose entry now belongs to another provider, is dropped. A pin on a
+disabled account is saved and restored like any other and stays unused until the
+account is enabled; it is replaced if its conversation is routed elsewhere in
+the meantime. If two running accounts ever carry the same entry ID, neither is
+saved or restored as a pin target. Config loading already gives the later of two
+rows sharing an ID a new one, so a row copied by hand above its original keeps
+the ID and inherits the original's saved pins; the cost is one cache miss per
+affected conversation. Current model, provider, route, quota and hard-pin checks
+still govern every request. Thread ownership can survive a dropped pin, but does
+not make another account capable of continuing the upstream thread.
+
+A conversation with a request in flight at save time is saved as seen at that
+moment. Request counters are not stored and the stream is not resumed.
 
 State is saved on the existing minute tick and on graceful shutdown, including
 once more after an enabled drain completes. Abrupt termination can lose routing
