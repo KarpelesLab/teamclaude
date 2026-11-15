@@ -137,6 +137,66 @@ test('MITM h2: authorization injected, x-api-key dropped, quota observed, body r
   }
 });
 
+// A client token refresh (/v1/oauth/token) takes relayRaw, not the forward
+// path, and inside an h2 tunnel its answer is written by the h2 server, whose
+// writeHead throws on most connection-specific headers. relayRaw used to drop
+// only transfer-encoding and connection, so an upstream sending keep-alive,
+// upgrade, proxy-connection or a te other than "trailers" (a Node upstream
+// sends Keep-Alive by default) made the refresh's answer, its 502 and the
+// listener's last-resort 502 all throw, and the rejection that escaped took
+// the daemon down. Every name in the set goes now, as on the other paths;
+// trailer, which h2 accepts, is checked for that reason alone. connection is
+// sent as "trailers", the one value writeHead throws on rather than dropping
+// itself, so the drop relayRaw already made stays tested.
+test('MITM h2: a token refresh is answered without the upstream\'s connection-specific headers', T, async () => {
+  const { caCertPem, leafCertPem, leafKeyPem } = generateCertChain('localhost');
+  const upstream = makeUpstream((req) => ({
+    status: 200,
+    headers: {
+      'content-type': 'application/json',
+      connection: 'trailers',
+      'keep-alive': 'timeout=5',
+      upgrade: 'h2c',
+      'proxy-connection': 'keep-alive',
+      te: 'gzip',
+      trailer: 'x-checksum',
+      'x-saw-path': req.url,
+    },
+    body: '{"access_token":"new"}',
+  }));
+  const upPort = await listen(upstream);
+  const am = new AccountManager([oauthAccount('acct@x', 'REAL-TOKEN')], 0.98);
+  const proxy = makeProxy(am, upPort, { caCertPem, leafCertPem, leafKeyPem });
+  const proxyPort = await listen(proxy);
+
+  const tlsSock = await connectThroughProxy(proxyPort, `127.0.0.1:${upPort}`, caCertPem, ['h2']);
+  try {
+    assert.equal(tlsSock.alpnProtocol, 'h2');
+    const client = http2.connect('https://localhost', { createConnection: () => tlsSock });
+    const req = client.request({ ':method': 'POST', ':path': '/v1/oauth/token', 'content-type': 'application/json' });
+    let resp, body = '';
+    req.on('response', (h) => { resp = h; });
+    req.setEncoding('utf8'); req.on('data', (d) => { body += d; }); req.end('{"grant_type":"refresh_token"}');
+    // Bounded: the failure this guards leaves the stream unanswered, and an
+    // unbounded wait would hold the cleanup below, and the file, open with it.
+    const answered = await new Promise((resolve) => {
+      const deadline = setTimeout(() => resolve(false), 5000);
+      req.once('close', () => { clearTimeout(deadline); resolve(true); });
+    });
+
+    assert.ok(answered, 'the token refresh got no answer');
+    assert.equal(resp?.[':status'], 200);
+    assert.equal(body, '{"access_token":"new"}');
+    assert.equal(resp['x-saw-path'], '/v1/oauth/token');
+    for (const name of ['keep-alive', 'upgrade', 'proxy-connection', 'te', 'trailer']) {
+      assert.equal(resp[name], undefined, `${name} must not be relayed`);
+    }
+    client.close();
+  } finally {
+    tlsSock.destroy(); closeHard(proxy); closeHard(upstream);
+  }
+});
+
 test('MITM h1: over http/1.1, authorization is injected and the body relayed', T, async () => {
   const { caCertPem, leafCertPem, leafKeyPem } = generateCertChain('localhost');
   const upstream = makeUpstream((req, body) => ({

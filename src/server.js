@@ -2868,9 +2868,10 @@ async function refuseOversizedBody(req, res) {
  * credentials are injected and the body goes through unchanged, with only
  * content-type, accept and user-agent forwarded (one of them configured as a
  * usage dimension in `strip` counts as not sent). On the way back the
- * connection-specific and stale framing headers (transfer-encoding,
- * connection, content-encoding, content-length) are dropped, and so is the
- * per-org billing family when `stripOverage` is set (see isOverageHeader).
+ * connection-specific headers (CONNECTION_SPECIFIC_HEADERS), the stale
+ * framing ones (content-encoding, content-length) and an upstream copy of
+ * CORRELATION_HEADER (the proxy's own) are dropped, and so is the per-org
+ * billing family when `stripOverage` is set (see isOverageHeader).
  */
 async function relayRaw(req, res, upstream, sx, maxBodyBytes = DEFAULT_MAX_BODY_BYTES, stripOverage = false, strip = /** @type {Set<string>|null} */ (null)) {
   const bodyChunks = [];
@@ -2905,8 +2906,14 @@ async function relayRaw(req, res, upstream, sx, maxBodyBytes = DEFAULT_MAX_BODY_
       // `.text()` already decompressed the body, so drop content-encoding and
       // the now-stale content-length (both refer to the compressed bytes) — else
       // a gzip'd upstream response reaches the client mis-framed / truncated.
-      if (key === 'transfer-encoding' || key === 'connection' ||
-          key === 'content-encoding' || key === 'content-length') continue;
+      // All of the connection-specific set, not just transfer-encoding and
+      // connection: this path serves /v1/oauth/token on the MITM's h2 server
+      // too, where writeHead throws on most of them (and an upstream that is
+      // itself a Node server sends `Keep-Alive` by default), and over h1
+      // writeHead throws on trailer for any answer it does not send chunked:
+      // one with no body (a 204, a 304, an answer to HEAD), one with a
+      // Content-Length, any answer to an HTTP/1.0 client.
+      if (CONNECTION_SPECIFIC_HEADERS.has(key) || key === 'content-encoding' || key === 'content-length') continue;
       if (key === CORRELATION_HEADER) continue;
       if (stripOverage && isOverageHeader(key)) continue;
       responseHeaders[key] = value;

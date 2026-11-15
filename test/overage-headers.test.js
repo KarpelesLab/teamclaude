@@ -257,6 +257,82 @@ test('relayRaw (POST /v1/oauth/token): overage headers are stripped, plan-quota 
   }
 });
 
+// Not overage, but the same filter on the same path. Node's h1 writeHead
+// throws on a Trailer header for any answer it does not send chunked: one with
+// no body (a 204, a 304, an answer to HEAD), one with a Content-Length, any
+// answer to an HTTP/1.0 client. relayRaw used to pass trailer through, so an
+// upstream answering a token refresh with one made the answer, its 502 and the
+// listener's last-resort 502 all throw, and the rejection took the daemon
+// down. It goes with the rest of CONNECTION_SPECIFIC_HEADERS now.
+//
+// A raw upstream, since a Node server will not write those answers itself: it
+// waits for each request's body, then writes `answer` as given.
+async function rawTokenUpstream(answer) {
+  const sockets = new Set();
+  const server = net.createServer((s) => {
+    sockets.add(s);
+    let buf = '';
+    s.on('data', (d) => {
+      buf += d;
+      const end = buf.indexOf('\r\n\r\n');
+      if (end < 0) return;
+      const len = Number(/content-length:\s*(\d+)/i.exec(buf.slice(0, end))?.[1] || 0);
+      if (buf.length < end + 4 + len) return;
+      buf = '';
+      s.write(answer);
+    });
+    s.on('error', () => {});
+  });
+  const port = await listen(server);
+  return { port, close() { for (const s of sockets) s.destroy(); server.close(); } };
+}
+
+const refreshOnly = { getActiveAccount() { throw new Error('must not touch accounts on a client token refresh'); } };
+
+test('relayRaw (POST /v1/oauth/token): a 204 carrying Trailer is answered, without it', async () => {
+  const upstream = await rawTokenUpstream('HTTP/1.1 204 No Content\r\ntrailer: x-checksum\r\n\r\n');
+  try {
+    const listener = createProxyRequestListener({ accountManager: refreshOnly, upstream: `http://127.0.0.1:${upstream.port}`, config: {} });
+    const res = await throughListener(listener, '/v1/oauth/token', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{"grant_type":"refresh_token"}',
+      // Bounded: the failure this guards leaves the request unanswered.
+      signal: AbortSignal.timeout(5000),
+    });
+    assert.equal(res.status, 204);
+    assert.equal(res.headers.get('trailer'), null);
+  } finally {
+    upstream.close();
+  }
+});
+
+test('relayRaw (POST /v1/oauth/token): an HTTP/1.0 client is answered without the upstream\'s Trailer', async () => {
+  const upstream = await rawTokenUpstream(
+    'HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntrailer: x-checksum\r\ntransfer-encoding: chunked\r\n\r\n' +
+    '11\r\n{"access_token":1\r\n1\r\n}\r\n0\r\nx-checksum: abc\r\n\r\n',
+  );
+  const proxy = http.createServer(createProxyRequestListener({ accountManager: refreshOnly, upstream: `http://127.0.0.1:${upstream.port}`, config: {} }));
+  const port = await listen(proxy);
+  try {
+    // HTTP/1.0 by hand: an answer to it is never chunked. Bounded, as above.
+    const raw = await new Promise((resolve) => {
+      let got = '';
+      const s = net.connect(port, '127.0.0.1', () => s.write('POST /v1/oauth/token HTTP/1.0\r\nHost: 127.0.0.1\r\ncontent-type: application/json\r\ncontent-length: 2\r\n\r\n{}'));
+      const deadline = setTimeout(() => { s.destroy(); resolve(got); }, 5000);
+      s.on('data', (d) => { got += d; });
+      s.on('close', () => { clearTimeout(deadline); resolve(got); });
+      s.on('error', () => {});
+    });
+    assert.match(raw, /^HTTP\/1\.1 200 /);
+    assert.doesNotMatch(raw.split('\r\n\r\n')[0], /^trailer:/im);
+    assert.equal(raw.split('\r\n\r\n').slice(1).join('\r\n\r\n'), '{"access_token":1}');
+  } finally {
+    proxy.closeAllConnections?.(); proxy.close();
+    upstream.close();
+  }
+});
+
 test('relayRaw (POST /v1/oauth/token) with stripOverageHeaders unset forwards everything unchanged', async () => {
   const upstream = upstreamWithHeaders();
   const upstreamPort = await listen(upstream);
