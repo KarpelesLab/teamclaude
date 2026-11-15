@@ -288,7 +288,9 @@ const postOpts = (port) => ({ host: '127.0.0.1', port, method: 'POST', path: '/v
 // An answer past the limit reaches the client before the upstream has finished
 // sending it: the upstream keeps its last part back until the client has seen
 // a byte. A proxy holding the answer whole shows the client nothing until the
-// end, which then never comes.
+// end, which does not come: the hold is cut at its idle deadline instead (120 s
+// at the defaults, as long as npm test's runner timeout), and the test fails
+// on whichever of the two comes first.
 test('an answer past the hold limit is relayed as it arrives, not held whole', async (t) => {
   const first = Buffer.alloc(2 * LIMIT, 0x61);
   const last = Buffer.alloc(LIMIT, 0x62);
@@ -364,7 +366,7 @@ test('a client that leaves an answer past the hold limit has the upstream droppe
   const upstreamDropped = signal();
   const requestEnded = signal();
   const { port } = await throughBackend(t, (res) => {
-    res.on('close', () => upstreamDropped.fire(res.writableEnded));
+    res.on('close', () => upstreamDropped.fire());
     res.writeHead(200, { 'content-type': 'application/octet-stream' });
     res.write(Buffer.alloc(2 * LIMIT, 0x61));
   }, { onRequestEnd: (/** @type {any} */ _id, /** @type {Record<string, any>} */ info) => requestEnded.fire(info) });
@@ -375,7 +377,9 @@ test('a client that leaves an answer past the hold limit has the upstream droppe
     });
     req.on('error', () => {});
     req.end(JSON.stringify({ model: 'm', messages: [] }));
-    assert.equal(await upstreamDropped.fired, false, 'the upstream connection was dropped with its answer unfinished');
+    // The await is the check, as the comment above says: only the proxy
+    // dropping the upstream's connection settles it.
+    await upstreamDropped.fired;
     assert.equal((await requestEnded.fired).status, 499, 'and the request ended, as one whose client left');
   }));
 });

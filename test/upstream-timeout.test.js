@@ -384,7 +384,7 @@ test('a held answer that goes quiet is cut at its idle deadline, as a quiet stre
     const got = await postQuiet(port, '/v1/messages');
     assert.equal(got.ended, false, 'the connection closed, with no clean end');
     assert.equal(got.complete, false);
-    assert.ok(errors.some(l => /Upstream error \(account "backend"\).*idle for 300ms/.test(l)), `the body-idle deadline is what ended it: ${errors.join(' | ')}`);
+    assert.ok(errors.some(l => /Upstream error \(account "backend"\).*idle for 300ms/.test(l)), `the hold's idle deadline is what ended it: ${errors.join(' | ')}`);
   });
 });
 
