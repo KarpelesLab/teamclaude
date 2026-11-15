@@ -1,6 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
+import http from 'node:http';
 import { AccountManager } from '../src/account-manager.js';
+import { refreshAccessToken } from '../src/oauth.js';
+import { refreshCodexToken } from '../src/codex-auth.js';
 
 // An account whose token is already expiring, so ensureTokenFresh always tries.
 function mgr(refreshFn) {
@@ -182,4 +185,111 @@ test('an account with a third-party upstream is never refreshed against Anthropi
   await m.ensureTokenFresh(0, true);
   assert.strictEqual(calls, 0, 'the refresh token was not sent anywhere');
   assert.strictEqual(m.accounts[0].credential, 'third-party-key', 'the credential is untouched');
+});
+
+// Whether a refresh token is dead is the token endpoint's answer, not the
+// status alone: whatever stands in front of the endpoint (a firewall, a proxy,
+// a CDN) can answer a 403 of its own, and a token taken for dead is not sent
+// again until a new one arrives, while credential sync, told through
+// onAccountError, empties the row holding it. These drive the real refresh
+// functions against a local token endpoint.
+
+/** A token endpoint answering every request with `status` and `body`, as `type`. */
+async function tokenEndpoint(status, body, type) {
+  const srv = http.createServer((req, res) => { req.resume(); res.writeHead(status, { 'content-type': type }); res.end(body); });
+  await new Promise((resolve) => srv.listen(0, '127.0.0.1', resolve));
+  return { url: `http://127.0.0.1:${srv.address().port}/token`, close: () => srv.close() };
+}
+
+/** Two refreshes of an expiring account against one answer: the account, the refreshes sent, the errors reported. */
+async function refreshAgainst([status, body, type = 'application/json'], { provider = undefined } = {}) {
+  const endpoint = await tokenEndpoint(status, body, type);
+  let calls = 0;
+  const via = (fn) => (rt, _endpoint, routing, opts) => { calls++; return fn(rt, endpoint.url, routing, opts); };
+  const m = new AccountManager([{
+    name: 'a', type: 'oauth', ...(provider ? { provider, accountId: 'acct-a' } : {}),
+    accessToken: 'at-old', refreshToken: 'rt-a', expiresAt: Date.now() - 1000,
+  }], 0.98, { refreshFn: via(refreshAccessToken), codexRefreshFn: via(refreshCodexToken) });
+  let errors = 0;
+  m.onAccountError(() => { errors++; });
+  try {
+    await m.ensureTokenFresh(0);
+    await m.ensureTokenFresh(0);
+  } finally {
+    endpoint.close();
+  }
+  return { account: m.accounts[0], calls, errors };
+}
+
+function assertKept({ account, calls, errors }, status, what) {
+  assert.strictEqual(account.status, 'active', what);
+  assert.strictEqual(account._deadRefreshToken, null, what);
+  assert.strictEqual(account.refreshToken, 'rt-a', what);
+  assert.strictEqual(errors, 0, `credential sync is not told the token is dead: ${what}`);
+  assert.strictEqual(calls, 2, `the token is tried again on the next call: ${what}`);
+  assert.strictEqual(account._lastRefreshFailure?.status, status, `the failure is kept as the reason: ${what}`);
+}
+
+test('a 400, 401 or 403 that is not an OAuth answer does not mark the refresh token dead', async () => {
+  for (const answer of [
+    [403, '<html><body>Access denied</body></html>', 'text/html'],
+    [401, '', 'text/plain'],
+    [400, 'Bad Request', 'text/plain'],
+    [403, '{"error":'],
+  ]) {
+    assertKept(await refreshAgainst(answer), answer[0], `${answer[0]} ${answer[1]}`);
+  }
+});
+
+// About the client or the request, which are the same for every account, so
+// marking each account's token dead would empty every row in the store at once;
+// or a code that proves nothing. A bare access_denied counts only as a hold
+// (account_on_hold, see refresh-account-on-hold.test.js). Flat, as RFC 6749
+// writes them, or nested as an Anthropic API error.
+test('an OAuth error other than invalid_grant does not mark the refresh token dead', async () => {
+  for (const [status, body] of [
+    [401, { error: 'invalid_client', error_description: 'not the token' }],
+    [400, { error: 'unauthorized_client' }], [400, { error: 'invalid_request' }],
+    [400, { error: 'unsupported_grant_type' }], [400, { error: 'some_new_code' }], [403, { error: 'access_denied' }],
+    [403, { type: 'error', error: { type: 'permission_error', message: 'Request not allowed' } }],
+    [401, { type: 'error', error: { type: 'invalid_client', message: 'not the token' } }],
+  ]) {
+    assertKept(await refreshAgainst([status, JSON.stringify(body)]), status, `${status} ${JSON.stringify(body)}`);
+  }
+});
+
+// The same code nested as an Anthropic API error, where Claude Code's own
+// refresh reads it (`error.type`). Which shape upstream sends is not verified.
+test('invalid_grant nested as an Anthropic API error marks the refresh token dead too, and it is sent once', async () => {
+  for (const status of [400, 401, 403]) {
+    const { account, calls, errors } = await refreshAgainst([status, JSON.stringify({ type: 'error', error: { type: 'invalid_grant', message: 'Refresh token not found or invalid' } })]);
+    assert.strictEqual(account.status, 'error', String(status));
+    assert.strictEqual(account.errorReason.code, 'refresh_rejected', String(status));
+    assert.strictEqual(account._deadRefreshToken, 'rt-a', String(status));
+    assert.strictEqual(errors, 1, String(status));
+    assert.strictEqual(calls, 1, String(status));
+  }
+});
+
+test('the token endpoint\'s invalid_grant still marks the refresh token dead, and it is sent once', async () => {
+  for (const status of [400, 401, 403]) {
+    const { account, calls, errors } = await refreshAgainst([status, JSON.stringify({ error: 'invalid_grant', error_description: 'Refresh token not found or invalid' })]);
+    assert.strictEqual(account.status, 'error', String(status));
+    assert.strictEqual(account.errorReason.code, 'refresh_rejected', String(status));
+    assert.strictEqual(account._deadRefreshToken, 'rt-a', String(status));
+    assert.strictEqual(errors, 1, String(status));
+    assert.strictEqual(calls, 1, String(status));
+  }
+});
+
+// The Codex refresh does not parse its answer's body, so its error says nothing
+// about the grant, and its status decides, as it did before.
+test('a Codex refresh rejected with a 400, 401 or 403 still marks the refresh token dead', async () => {
+  for (const status of [400, 401, 403]) {
+    const { account, calls, errors } = await refreshAgainst([status, JSON.stringify({ error: 'invalid_grant' })], { provider: 'codex' });
+    assert.strictEqual(account.status, 'error', String(status));
+    assert.strictEqual(account._deadRefreshToken, 'rt-a', String(status));
+    assert.strictEqual(errors, 1, String(status));
+    assert.strictEqual(calls, 1, String(status));
+  }
 });
