@@ -203,6 +203,29 @@ test('holdBody rejects on a failed read, as buffer() did', async () => {
   await assert.rejects(holdBody(failing, 1024), /socket reset/);
 });
 
+// The hold limit is a whole number of bytes, parsed as upstream-fetch.js
+// parses TEAMCLAUDE_UPSTREAM_MAX_SOCKETS and ..._QUEUE_TIMEOUT_MS. Read as any
+// positive number, a fraction was taken as given (0.5 made every answer with a
+// byte in it too large to hold: each relayed token refresh was a 502 "larger
+// than 0.5 bytes"), and so were Infinity, 1e400 and integers past
+// Number.MAX_SAFE_INTEGER. Anything but a safe positive integer is the default
+// now; what Number() reads as one (hexadecimal, an exponent, surrounding
+// spaces) is used, as documented.
+test('the hold limit is a whole number of bytes, and any other setting is the default', async () => {
+  const { resolveBufferedResponseLimit } = await import('../src/server.js');
+  const DEFAULT = 64 * 1024 * 1024;
+  for (const value of [null, '', '0', '-1', 'abc', '64MiB', '0.5', '1.5', '4096.7', 'Infinity', '-Infinity', '1e400', '1e20', '9007199254740993']) {
+    await withEnv({ TEAMCLAUDE_UPSTREAM_MAX_HELD_BYTES: value }, () => {
+      assert.equal(resolveBufferedResponseLimit(), DEFAULT, `${JSON.stringify(value)} is read as the default`);
+    });
+  }
+  for (const [value, limit] of [['1', 1], ['4096', 4096], ['0x1000', 4096], ['1e3', 1000], [' 4096 ', 4096], ['9007199254740991', Number.MAX_SAFE_INTEGER]]) {
+    await withEnv({ TEAMCLAUDE_UPSTREAM_MAX_HELD_BYTES: value }, () => {
+      assert.equal(resolveBufferedResponseLimit(), limit, `${value} is used as given`);
+    });
+  }
+});
+
 // ── end to end, through an account's own upstream ───────────────────────────
 
 // The limit is 64 MiB unless TEAMCLAUDE_UPSTREAM_MAX_HELD_BYTES says otherwise;

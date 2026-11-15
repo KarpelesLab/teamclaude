@@ -296,13 +296,18 @@ const BUFFERED_RESPONSE_LIMIT = 64 * 1024 * 1024;
 /**
  * The limit in force. Read per call like the body idle timeout, so a test can
  * shrink it through TEAMCLAUDE_UPSTREAM_MAX_HELD_BYTES without reloading the
- * module (and without pushing 64 MiB through loopback to cross it). Unset,
- * empty or non-positive means the default.
+ * module (and without pushing 64 MiB through loopback to cross it). The
+ * setting is a whole number of bytes, parsed as upstream-fetch.js parses
+ * TEAMCLAUDE_UPSTREAM_MAX_SOCKETS and ..._QUEUE_TIMEOUT_MS (positiveInt):
+ * Number() of the text, which takes `0x1000`, `1e3` and surrounding spaces
+ * too, and the default unless that is a whole number from 1 to
+ * Number.MAX_SAFE_INTEGER (so unset, empty, zero, negative, a fraction,
+ * Infinity or `64MiB`).
  * @returns {number}
  */
 export function resolveBufferedResponseLimit() {
   const env = Number(envVar('UPSTREAM_MAX_HELD_BYTES'));
-  return env > 0 ? env : BUFFERED_RESPONSE_LIMIT;
+  return Number.isSafeInteger(env) && env > 0 ? env : BUFFERED_RESPONSE_LIMIT;
 }
 
 /**
