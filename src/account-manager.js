@@ -700,10 +700,11 @@ export class AccountManager {
    * @param {Object} [opts.sessionTracker]
    * @param {Object} [opts.expiryRouting]
    * @param {boolean} [opts.preferSoonestWeeklyReset]  earliest-deadline-first rotation (see setPreferSoonestWeeklyReset)
+   * @param {boolean} [opts.switchOnSessionReset]  move to an account whose 5h window just reset (see setSwitchOnSessionReset)
    * @param {string} [opts.advisorEligibility]  'strict' (default) or 'prefer'
    * @param {{ host: string, port: number }|null} [opts.listener]  this server's own address, so an accounts[].routing that points back at it is refused (see accountRouting)
    */
-  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, refreshCoordinator = (_account, refresh, _info) => refresh(), throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, adaptive, sessionTracker, expiryRouting, preferSoonestWeeklyReset = false, advisorEligibility, listener = null } = {}) {
+  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, refreshCoordinator = (_account, refresh, _info) => refresh(), throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, adaptive, sessionTracker, expiryRouting, preferSoonestWeeklyReset = false, switchOnSessionReset = true, advisorEligibility, listener = null } = {}) {
     // How long a just-minted token is trusted against a forced refresh.
     this._forcedRefreshFloorMs = forcedRefreshFloorMs;
     // Injectable for tests (mirrors Prober's probeFn); defaults to the real
@@ -806,6 +807,7 @@ export class AccountManager {
     this._obsGen = 0;
     this.setExpiryRouting(expiryRouting);
     this.setPreferSoonestWeeklyReset(preferSoonestWeeklyReset);
+    this.setSwitchOnSessionReset(switchOnSessionReset);
     // The rollover mechanism's whole state for the sticky current account: one
     // observation, { idx, windows: name → reset }, of the account traffic was
     // resting on when a request last arrived to find it there. Null while the
@@ -1540,10 +1542,14 @@ export class AccountManager {
     // one provider that is a single slot for several fleets, so a request whose
     // provider does not own it borrows the slot for the walk and hands it back.
     //
-    // With one provider `borrowed` is always false, so the `providerCursors`
-    // entry this method writes has no reader at all. Its one reader is the
-    // `providerCursors.get(provider)` inside `if (borrowed)`, which only a
-    // borrowed walk reaches.
+    // When every request's provider owns the slot, `borrowed` is always false,
+    // the re-seed below never runs, and nothing reads the `providerCursors`
+    // entry this method writes. For a provider that does not own the slot the
+    // entry is read twice over: by the re-seed, and by
+    // `_currentIndexForProvider`, which status's `currentAccounts`,
+    // `currentIndexes` and route targets, the TUI's ► in a mixed fleet,
+    // `releasePins` and `_unstrandCursor` go by. It names an account by
+    // position, so removeAccount renumbers it.
     const owner = providerOf(this.accounts[this.currentIndex]);
     const borrowed = !!this.accounts.length && owner !== provider;
     const saved = this.currentIndex;
@@ -2801,11 +2807,21 @@ export class AccountManager {
     return this._currentIndexForProvider(provider);
   }
 
-  /** The cursor owned by one provider, falling back to the account that its
-   * next request would start from before that provider has seen traffic. */
+  /** The shared slot for the provider that owns it, else the cursor owned by
+   * one provider, falling back to the account that its next request would
+   * start from before that provider has seen traffic. */
   _currentIndexForProvider(provider) {
     const excluded = this._excludeOtherProviders(null, provider);
     const allowed = index => index != null && this.accounts[index] && !excluded?.has(index);
+    // The provider that owns the shared slot walks from the slot, not from its
+    // cursor: getActiveAccount borrows the slot only for the others. So the
+    // slot is its answer, as it is currentAccount's; where preemption then
+    // lands that walk is defaultTargets' to say. Asked of the cursor first,
+    // status named an account the provider's walk no longer starts from: one it
+    // had rested on before a removal handed it the slot, or before another
+    // provider's walk parked the slot on a shared API key, which reads as this
+    // provider's.
+    if (allowed(this.currentIndex) && providerOf(this.accounts[this.currentIndex]) === provider) return this.currentIndex;
     const own = this.providerCursors.get(provider);
     if (allowed(own)) return own;
     if (allowed(this.currentIndex)) return this.currentIndex;
@@ -3623,6 +3639,21 @@ export class AccountManager {
    */
   setPreferSoonestWeeklyReset(enabled) {
     this.preferSoonestWeeklyReset = enabled === true;
+  }
+
+  /**
+   * The session-reset switch (_switchOnSessionReset), on by default. When an
+   * account's 5-hour window resets and its weekly window lapses sooner than the
+   * current account's, the cursor moves to it even though the current account
+   * is healthy, and every conversation behind the cursor loses its prompt
+   * cache. Off, the reset only returns the account to rotation: traffic stays
+   * where it is until rotation has to pick. Only a literal `false` turns it off,
+   * so a hand-edited `"false"` keeps today's behaviour. Applied live on config
+   * reload.
+   * @param {boolean} enabled
+   */
+  setSwitchOnSessionReset(enabled) {
+    this.switchOnSessionReset = enabled !== false;
   }
 
   /**
@@ -4850,7 +4881,7 @@ export class AccountManager {
     // the switch runs the same `_isAvailable(acc)` the knob-off path runs; a
     // model-scoped filter there is a live routing change on the path that
     // promises none.
-    if (sessionReset.length) {
+    if (sessionReset.length && this.switchOnSessionReset) {
       this._switchOnSessionReset(sessionReset, this.expiryRouting.enabled ? model : null, scope ?? partition, adv);
     }
     return changed;
@@ -6150,6 +6181,16 @@ export class AccountManager {
         };
         const newTokens = await this._refreshCoordinator(account, refresh, { force });
         if (newTokens == null) return;
+        // A removal (the TUI, remove_account, a reload, a tombstone) can land while
+        // the grant is in flight and renumber the fleet, so `accountIndex` may now
+        // name a different account: persisting against it would write these
+        // tokens into that account's config row. Everything below goes by the
+        // refreshed account's CURRENT index; one no longer in the fleet has no
+        // row to persist to (removeAccount leaves it at index -1).
+        if (this.accounts[account.index] !== account) {
+          console.log(`[TeamClaude] Discarding refresh result for account "${safeLine(account.name, 64)}" — it was removed while the refresh was in flight`);
+          return;
+        }
         if (account.refreshToken !== sent) {
           console.log(`[TeamClaude] Discarding refresh result for account "${safeLine(account.name, 64)}" — its tokens were replaced while the refresh was in flight`);
           return;
@@ -6164,7 +6205,7 @@ export class AccountManager {
         // Set before the listener runs: it is what lets the sync store them.
         account._minted = minted;
         console.log(`[TeamClaude] Token refreshed for account "${safeLine(account.name, 64)}"`);
-        this._onTokenRefresh?.(accountIndex, newTokens);
+        this._onTokenRefresh?.(account.index, newTokens);
       } catch (/** @type {any} */ err) {
         console.error(`[TeamClaude] Token refresh failed for "${safeLine(account.name, 64)}": ${err.message}`);
         // Why, until a refresh succeeds: what the client is told when this
@@ -6173,7 +6214,7 @@ export class AccountManager {
         // The refresh never reached the token endpoint: the account's own
         // routing proxy is down. The forward that follows would fail the same
         // way, so hold the account out of rotation now rather than after it.
-        if (isRoutingFailure(err)) this.markRoutingFailed(accountIndex);
+        if (isRoutingFailure(err)) this.markRoutingFailed(account.index);
         // Reserve 'error' (which drops the account from rotation until re-login)
         // for a GENUINE auth rejection: the refresh token itself is no longer
         // valid — revoked, or invalidated by an account/plan migration. A
@@ -6377,6 +6418,13 @@ export class AccountManager {
     if (removed === this._manualAccount) this._manualAccount = null;
     this._onAccountRemoved?.(removed);
     this.accounts.forEach((a, i) => a.index = i);
+    // Work still holding the removed account (a request awaiting upstream, a
+    // token refresh, a sync pass) reaches the manager by `account.index`. Left
+    // at its old value, that index now names whichever account slid into the
+    // slot, and a 401, a quota reading or new tokens would land on it. At -1 it
+    // names no account, and every index-taking method already ignores one it
+    // cannot find.
+    removed.index = -1;
     if (this.currentIndex >= this.accounts.length) {
       this.currentIndex = Math.max(0, this.accounts.length - 1);
     } else if (this.currentIndex > index) {
@@ -6393,6 +6441,19 @@ export class AccountManager {
     for (const [name, idx] of [...this.routeCursors.entries()]) {
       if (idx === index) this.routeCursors.delete(name);
       else if (idx > index) this.routeCursors.set(name, idx - 1);
+    }
+    // And each provider's cursor. Left at its old number, one above the removed
+    // account names the account above it: the next walk of a provider that does
+    // not hold currentIndex re-seeds from there (see getActiveAccount), so its
+    // traffic moved accounts on a removal that had nothing to do with it, and
+    // status and the TUI named that account as its current one meanwhile. One on
+    // the removed account is dropped, as a route's is, rather than handed to
+    // whichever account slid into its slot: a provider without the shared slot
+    // then re-picks on merit, and one that holds it goes by currentIndex, which
+    // the neighbor rule above has placed.
+    for (const [provider, idx] of [...this.providerCursors.entries()]) {
+      if (idx === index) this.providerCursors.delete(provider);
+      else if (idx > index) this.providerCursors.set(provider, idx - 1);
     }
     // Session pins are positions in the same list and shift the same way, and so
     // are the rollover observations hanging off them and off the current account.
