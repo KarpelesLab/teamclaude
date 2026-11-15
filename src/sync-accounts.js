@@ -3,7 +3,7 @@ import { sameIdentity } from './identity.js';
 import { safeLine } from './safe-text.js';
 import { removedAccountIds, addedAccountIds, configIndexFor } from './account-pairing.js';
 import { ensureAccountIds } from './account-id.js';
-import { accountSwitchThreshold, accountAllowsExtraUsage, accountRouting } from './account-manager.js';
+import { accountSwitchThreshold, accountAllowsExtraUsage, accountRouting, accountEndsAt } from './account-manager.js';
 import { localListener } from './upstream-proxy.js';
 import { accountCredit } from './api-credit.js';
 
@@ -124,6 +124,10 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     // A cordon applies on reload too: placement reads it at the next request,
     // and a conversation already on the account is kept there (account-manager.js).
     accountManager.setCordoned(mgr.index, !!diskAcct.cordoned);
+    // An end time set, moved or cleared on disk (`teamclaude ends`) is read by
+    // the very next selection. Through the constructor's own parse, so a value
+    // refused at startup is refused here, and a removed key clears it.
+    mgr.endsAt = accountEndsAt(diskAcct);
     mgr.maxSpend = diskAcct.maxSpend ?? null;
     // Same for a per-account switch threshold (#409): thresholdFor() reads it
     // straight off the account, so a disk edit takes effect on the very next
@@ -200,6 +204,8 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
       if (Number.isFinite(diskAcct.displayOrder)) cfgAcct.displayOrder = diskAcct.displayOrder; else delete cfgAcct.displayOrder;
       if (diskAcct.disabled) cfgAcct.disabled = true; else delete cfgAcct.disabled;
       if (diskAcct.cordoned) cfgAcct.cordoned = true; else delete cfgAcct.cordoned;
+      // As written, not as parsed: the entry keeps the operator's own text.
+      if (diskAcct.endsAt != null) cfgAcct.endsAt = diskAcct.endsAt; else delete cfgAcct.endsAt;
       if (diskAcct.allowExtraUsage === true) cfgAcct.allowExtraUsage = true; else delete cfgAcct.allowExtraUsage;
       if (diskAcct.preferExtraUsage === true) cfgAcct.preferExtraUsage = true; else delete cfgAcct.preferExtraUsage;
       // Both polarities are mirrored, unlike the flags above: `false` is the
@@ -213,17 +219,20 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     if (mgr.disabled !== wantDisabled) accountManager.setDisabled(mgr.index, wantDisabled);
 
     // Existing account — resolve fresh credentials from disk
-    /** @type {{ accessToken?: string, refreshToken?: string, expiresAt?: number, apiKey?: string }|null} */
+    /** @type {{ accessToken?: string, refreshToken?: string, expiresAt?: number, refreshTokenExpiresAt?: number, apiKey?: string }|null} */
     let freshCred = null;
     if (diskAcct.type === 'oauth' && diskAcct.importFrom) {
       try {
         const creds = await importCredentials(diskAcct.importFrom);
-        freshCred = { accessToken: creds.accessToken, refreshToken: creds.refreshToken, expiresAt: creds.expiresAt };
+        // The refresh token's own expiry rides with the token it describes, here
+        // and below: a newer sign-in on disk brings its date (or none), and a
+        // staler copy never gets as far as updateAccountTokens.
+        freshCred = { accessToken: creds.accessToken, refreshToken: creds.refreshToken, expiresAt: creds.expiresAt, refreshTokenExpiresAt: creds.refreshTokenExpiresAt };
       } catch (/** @type {any} */ err) {
         console.error(`[TeamClaude] Re-import failed for "${safeLine(diskAcct.name, 64)}": ${err.message}`);
       }
     } else if (diskAcct.type === 'oauth' && diskAcct.accessToken) {
-      freshCred = { accessToken: diskAcct.accessToken, refreshToken: diskAcct.refreshToken, expiresAt: diskAcct.expiresAt };
+      freshCred = { accessToken: diskAcct.accessToken, refreshToken: diskAcct.refreshToken, expiresAt: diskAcct.expiresAt, refreshTokenExpiresAt: diskAcct.refreshTokenExpiresAt };
     } else if (diskAcct.type === 'apikey' && diskAcct.apiKey) {
       freshCred = { apiKey: diskAcct.apiKey };
     }

@@ -83,6 +83,32 @@ test('formatMoney renders amount and cap, and stays readable for an unknown curr
   assert.equal(formatMoney(null), 'unknown');
 });
 
+test("an exponent in no currency's minor unit is rendered as unknown, never thrown", () => {
+  // The exponent is the payload's own: one of -1 threw a RangeError out of the
+  // status line, the TUI row and the probe's "started spending" log.
+  const withExponent = (exponent) => ({ ...BILLABLE, spend: { ...BILLABLE.spend, used: { amount_minor: 4237, currency: 'USD', exponent } } });
+  for (const exponent of [-1, 101, 7, 2.5]) {
+    const spend = normalizeSpend(withExponent(exponent));
+    assert.equal(formatMoney(spend), 'unknown', `formatMoney, exponent ${exponent}`);
+    assert.match(spendLine({ quota: { spend } }, paint), /billing real money — unknown/, `spendLine, exponent ${exponent}`);
+    assert.equal(spendTag({ spend }), 'unknown', `spendTag, exponent ${exponent}`);
+    // The money cap still sees the exponent and sets no cap rather than a wrong one.
+    assert.doesNotMatch(spendLine({ quota: { spend }, maxSpend: 20 }, paint), /cap/, `cap, exponent ${exponent}`);
+  }
+  const am = new AccountManager([{ name: 'work', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 }], 0.98);
+  const said = [];
+  const realLog = console.log;
+  console.log = (m) => said.push(String(m));
+  try {
+    am.applyUsageData(0, normalizeUsagePayload({ ...withExponent(-1), limits: [] }));
+  } finally {
+    console.log = realLog;
+  }
+  assert.match(said.find(l => /started spending real money/.test(l)) ?? '', /: unknown$/);
+  // The ends of the range still render: 0 (yen) above, 6 here.
+  assert.equal(formatMoney({ usedMinor: 1234567, limitMinor: null, currency: 'USD', exponent: 6 }), '$1.234567');
+});
+
 test('the probe carries spend onto the quota and announces the transition once', () => {
   const am = new AccountManager([{ name: 'work', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 }], 0.98);
   const said = [];

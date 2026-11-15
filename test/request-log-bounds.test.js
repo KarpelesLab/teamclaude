@@ -1,11 +1,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import { EventEmitter } from 'node:events';
+import { ReadableStream } from 'node:stream/web';
+import { TextEncoder } from 'node:util';
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AccountManager } from '../src/account-manager.js';
-import { createProxyServer, resolveLogLevel, resolveLogMaxBodyBytes } from '../src/server.js';
+import { createProxyServer, resolveLogLevel, resolveLogMaxBodyBytes, streamResponse } from '../src/server.js';
+import { withEnv } from '../test-helpers/env.js';
 
 function listen(server) {
   return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
@@ -321,4 +325,103 @@ test('logMaxBodyBytes truncates the request body and still forwards it whole', {
   } finally {
     proxy.close(); upstream.close(); rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// A relay waits on the client's socket and on the log's file in turn, and
+// 'drain' fires once. With the client's wait armed only after the log's, a
+// drain that fired while the relay waited on the log was lost, and nothing woke
+// the relay again: with a log on it stopped for good at the first chunk that
+// filled the client's socket (on acaa750, a 2 MiB event stream sent in 64 KiB
+// chunks stopped at 64 KiB). The client here reads as fast as it can. A relay
+// that stops leaves the request open, which the runner's timeout reports; the
+// servers are closed in an after hook, which a timed-out test still runs, so
+// that such a run ends instead of keeping the test process alive.
+/**
+ * @param {import('node:test').TestContext} t
+ * @param {string} contentType
+ * @param {number} total
+ * @param {{ holdLastUntilFirstByte?: boolean }} [opts]  keep the last chunk
+ *   back until the client has a byte, so that only a proxy relaying the answer
+ *   as it arrives ever sees its end
+ */
+async function relayWithLog(t, contentType, total, { holdLastUntilFirstByte = false } = {}) {
+  const dir = mkdtempSync(join(tmpdir(), 'tc-logdrain-'));
+  const CHUNK = 64 * 1024;
+  const chunk = Buffer.alloc(CHUNK, 0x61);
+  let clientHasBytes = () => {};
+  const firstByte = new Promise((resolve) => { clientHasBytes = () => resolve(undefined); });
+  const upstream = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', async () => {
+      res.writeHead(200, { 'content-type': contentType });
+      for (let sent = 0; sent < total - CHUNK; sent += CHUNK) {
+        if (!res.write(chunk)) await new Promise(r => res.once('drain', r));
+      }
+      if (holdLastUntilFirstByte) await firstByte;
+      res.end(chunk);
+    });
+  });
+  const upPort = await listen(upstream);
+  const am = new AccountManager([{ name: 'backend', type: 'apikey', apiKey: 'k1', upstream: `http://127.0.0.1:${upPort}` }], 0.98);
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: 'http://127.0.0.1:9', logDir: dir });
+  const proxyPort = await listen(proxy);
+  t.after(() => {
+    proxy.closeAllConnections(); upstream.closeAllConnections();
+    proxy.close(); upstream.close(); rmSync(dir, { recursive: true, force: true });
+  });
+  const log = console.log;
+  console.log = () => {};
+  try {
+    return await new Promise((resolve, reject) => {
+      const req = http.request({ host: '127.0.0.1', port: proxyPort, method: 'POST', path: '/v1/messages', headers: { 'content-type': 'application/json', 'x-api-key': 'k' } }, (res) => {
+        let received = 0;
+        res.on('data', (c) => { clientHasBytes(); received += c.length; });
+        res.on('end', () => resolve({ received }));
+        res.on('error', reject);
+      });
+      req.on('error', reject);
+      req.end('{"model":"m","messages":[],"stream":true}');
+    });
+  } finally {
+    console.log = log;
+  }
+}
+
+// Each drain wait listens for 'drain' and for 'close', and removes both when
+// either fires: the 'close' one left behind would add one listener per
+// backpressure cycle for as long as a stream runs to a slow client. Here every
+// write is queued and drains a tick later, for 50 cycles.
+test('a relay through many backpressure cycles keeps its close listeners bounded', async () => {
+  const res = new class extends EventEmitter {
+    destroyed = false; writableEnded = false; headersSent = true; maxClose = 0;
+    write() { this.maxClose = Math.max(this.maxClose, this.listenerCount('close')); setImmediate(() => this.emit('drain')); return false; }
+    end() { this.writableEnded = true; }
+  }();
+  let n = 0;
+  const stream = new ReadableStream({
+    pull(controller) { if (n < 50) controller.enqueue(new TextEncoder().encode(`event: ping\ndata: {"n":${n++}}\n\n`)); else controller.close(); },
+  });
+  await streamResponse(stream, res, 0, { recordTokenUsage() {} }, null);
+  assert.equal(n, 50);
+  assert.equal(res.writableEnded, true);
+  assert.ok(res.maxClose <= 2, `at most the relay's own close listener and one drain wait's, saw ${res.maxClose}`);
+});
+
+test('an event stream relayed with a request log on reaches the client whole', async (t) => {
+  const total = 2 * 1024 * 1024;
+  const got = await relayWithLog(t, 'text/event-stream', total);
+  assert.equal(got.received, total, 'every byte reached the client');
+});
+
+// The same, for an answer past the forward path's hold limit (64 MiB unless
+// TEAMCLAUDE_UPSTREAM_MAX_HELD_BYTES says otherwise; 64 KiB here, so the same
+// 2 MiB crosses it), which is relayed the way a stream is: with a log on it
+// must still arrive whole, and as it arrives. The upstream holds its last chunk
+// back until the client has a byte, so a proxy holding the answer whole never
+// sees its end and never shows the client anything.
+test('an answer past the hold limit relayed with a request log on reaches the client whole, as it arrives', async (t) => {
+  const total = 2 * 1024 * 1024;
+  const got = await withEnv({ TEAMCLAUDE_UPSTREAM_MAX_HELD_BYTES: 64 * 1024 },
+    () => relayWithLog(t, 'application/octet-stream', total, { holdLastUntilFirstByte: true }));
+  assert.equal(got.received, total, 'every byte reached the client');
 });

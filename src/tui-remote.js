@@ -396,6 +396,7 @@ export function createAttachSession({ control, config, onQuit, pollMs = DEFAULT_
     accountManager: am,
     config,
     remote: true,
+    resetActions: null,
     // Titles come from this machine's Claude Code sessions. Attaching to a
     // server on another host leaves the ids unresolved, which shows the short
     // id rather than a wrong name.

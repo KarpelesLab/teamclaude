@@ -15,6 +15,9 @@ import { createConnectHandler } from '../src/mitm.js';
 import { KEEP_ALIVE_TIMEOUT_MS } from '../src/server.js';
 import { allowLoopbackForward } from '../src/forward-target.js';
 import { AccountManager } from '../src/account-manager.js';
+import { closeUsageStore, openUsageStore, usageStoreAvailable } from '../src/usage/db.js';
+
+const USAGE_STORE_AVAILABLE = usageStoreAvailable();
 
 // The MITM now TERMINATES the tunnel (real h2/h1 server) and forwards each
 // request with the shared buffering/retrying proxy listener — so these tests
@@ -69,7 +72,7 @@ function makeUpstream(handler) {
 }
 
 // Build the teamclaude proxy (CONNECT → terminate + forward) against `upPort`.
-function makeProxy(am, upPort, { leafCertPem, leafKeyPem }, { logDir = null, hooks = {}, sx = null } = {}) {
+function makeProxy(am, upPort, { leafCertPem, leafKeyPem }, { logDir = null, hooks = {}, sx = null, usageStore = undefined } = {}) {
   const proxy = http.createServer();
   allowLoopbackForward(proxy); // tunnel-mode targets in these tests are on this machine
   proxy.on('connect', createConnectHandler({
@@ -77,13 +80,18 @@ function makeProxy(am, upPort, { leafCertPem, leafKeyPem }, { logDir = null, hoo
     config: { upstream: `http://127.0.0.1:${upPort}` },
     accountManager: am,
     ensureLeaf: async () => ({ key: leafKeyPem, cert: leafCertPem }),
-    logDir, hooks, log: () => {}, sx,
+    logDir, hooks, log: () => {}, sx, usageStore,
   }));
   return proxy;
 }
 
 function oauthAccount(name, token, extra = {}) {
   return { name, type: 'oauth', accessToken: token, refreshToken: 'r', expiresAt: Date.now() + 3600_000, ...extra };
+}
+
+// node:sqlite hands back null-prototype rows; compare against plain object literals.
+function rawRows(store, sql, ...args) {
+  return store.db.prepare(sql).all(...args).map(row => ({ ...row }));
 }
 
 test('MITM h2: authorization injected, x-api-key dropped, quota observed, body relayed', T, async () => {
@@ -128,6 +136,122 @@ test('MITM h2: authorization injected, x-api-key dropped, quota observed, body r
     tlsSock.destroy(); closeHard(proxy); closeHard(upstream);
   }
 });
+
+// A client token refresh (/v1/oauth/token) takes relayRaw, not the forward
+// path, and inside an h2 tunnel its answer is written by the h2 server, whose
+// writeHead throws on most connection-specific headers. relayRaw used to drop
+// only transfer-encoding and connection, so an upstream sending keep-alive,
+// upgrade, proxy-connection or a te other than "trailers" (a Node upstream
+// sends Keep-Alive by default) made the refresh's answer, its 502 and the
+// listener's last-resort 502 all throw, and the rejection that escaped took
+// the daemon down. Every name in the set goes now, as on the other paths;
+// trailer, which h2 accepts, is checked for that reason alone. connection is
+// sent as "trailers", the one value writeHead throws on rather than dropping
+// itself, so the drop relayRaw already made stays tested.
+test('MITM h2: a token refresh is answered without the upstream\'s connection-specific headers', T, async () => {
+  const { caCertPem, leafCertPem, leafKeyPem } = generateCertChain('localhost');
+  const upstream = makeUpstream((req) => ({
+    status: 200,
+    headers: {
+      'content-type': 'application/json',
+      connection: 'trailers',
+      'keep-alive': 'timeout=5',
+      upgrade: 'h2c',
+      'proxy-connection': 'keep-alive',
+      te: 'gzip',
+      trailer: 'x-checksum',
+      'x-saw-path': req.url,
+    },
+    body: '{"access_token":"new"}',
+  }));
+  const upPort = await listen(upstream);
+  const am = new AccountManager([oauthAccount('acct@x', 'REAL-TOKEN')], 0.98);
+  const proxy = makeProxy(am, upPort, { caCertPem, leafCertPem, leafKeyPem });
+  const proxyPort = await listen(proxy);
+
+  const tlsSock = await connectThroughProxy(proxyPort, `127.0.0.1:${upPort}`, caCertPem, ['h2']);
+  try {
+    assert.equal(tlsSock.alpnProtocol, 'h2');
+    const client = http2.connect('https://localhost', { createConnection: () => tlsSock });
+    const req = client.request({ ':method': 'POST', ':path': '/v1/oauth/token', 'content-type': 'application/json' });
+    let resp, body = '';
+    req.on('response', (h) => { resp = h; });
+    req.setEncoding('utf8'); req.on('data', (d) => { body += d; }); req.end('{"grant_type":"refresh_token"}');
+    // The failure this guards leaves the stream unanswered; the test's own
+    // timeout is the bound on that, not a deadline here.
+    await new Promise((resolve) => req.once('close', resolve));
+
+    assert.equal(resp?.[':status'], 200);
+    assert.equal(body, '{"access_token":"new"}');
+    assert.equal(resp['x-saw-path'], '/v1/oauth/token');
+    for (const name of ['keep-alive', 'upgrade', 'proxy-connection', 'te', 'trailer']) {
+      assert.equal(resp[name], undefined, `${name} must not be relayed`);
+    }
+    client.close();
+  } finally {
+    tlsSock.destroy(); closeHard(proxy); closeHard(upstream);
+  }
+});
+
+// HTTP2-Settings is one more name the h2 server's writeHead throws on, and it
+// was in no path's filter: an upstream answer carrying it took the daemon down
+// from each of the four paths behind the MITM that copy the upstream's
+// headers, by an uncaught exception from relayStream and an unhandled
+// rejection from the other three. One case per path: the forward path,
+// relayRaw, relayStream (a client-credential path) and relayOnClientCredential
+// (a GET the pooled token draws a scope 403 on, sent again on the client's
+// own).
+const HTTP2_SETTINGS_CASES = [
+  { label: '/v1/messages', method: 'POST', path: '/v1/messages' },
+  { label: '/v1/oauth/token', method: 'POST', path: '/v1/oauth/token' },
+  { label: '/api/oauth/profile', method: 'GET', path: '/api/oauth/profile' },
+  { label: 'a scope-403 retry', method: 'GET', path: '/api/profile-required' },
+];
+for (const { label, method, path } of HTTP2_SETTINGS_CASES) {
+  test(`MITM h2: an upstream answer to ${label} carrying HTTP2-Settings is relayed without it`, T, async () => {
+    const { caCertPem, leafCertPem, leafKeyPem } = generateCertChain('localhost');
+    const seen = [];
+    const upstream = makeUpstream((req) => {
+      seen.push(req.headers.authorization);
+      // The pooled token is refused for the profile scope; the client's own is served.
+      if (req.url === '/api/profile-required' && req.headers.authorization !== 'Bearer client-own-token') {
+        return {
+          status: 403,
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ type: 'error', error: { type: 'permission_error', message: 'OAuth token does not meet scope requirement user:profile', details: { error_code: 'oauth_scope_insufficient', required_scopes: ['user:profile'], match: 'any' } } }),
+        };
+      }
+      return { status: 200, headers: { 'content-type': 'application/json', 'http2-settings': 'AAMAAABkAAQAoAAAAAIAAAAA', 'x-saw-path': req.url }, body: '{"ok":true}' };
+    });
+    const upPort = await listen(upstream);
+    const am = new AccountManager([oauthAccount('acct@x', 'REAL-TOKEN')], 0.98);
+    const proxy = makeProxy(am, upPort, { caCertPem, leafCertPem, leafKeyPem });
+    const proxyPort = await listen(proxy);
+
+    const tlsSock = await connectThroughProxy(proxyPort, `127.0.0.1:${upPort}`, caCertPem, ['h2']);
+    try {
+      assert.equal(tlsSock.alpnProtocol, 'h2');
+      const client = http2.connect('https://localhost', { createConnection: () => tlsSock });
+      const req = client.request({ ':method': method, ':path': path, 'content-type': 'application/json', authorization: 'Bearer client-own-token' });
+      let resp, body = '';
+      req.on('response', (h) => { resp = h; });
+      req.setEncoding('utf8'); req.on('data', (d) => { body += d; });
+      req.end(method === 'POST' ? '{"model":"x","messages":[]}' : undefined);
+      // As in the token-refresh test above: the failure leaves the stream unanswered.
+      await new Promise((resolve) => req.once('close', resolve));
+
+      assert.equal(resp?.[':status'], 200);
+      assert.equal(body, '{"ok":true}');
+      assert.equal(resp['x-saw-path'], path);
+      assert.equal(resp['http2-settings'], undefined);
+      // The scope case reached its retry: the pooled token first, then the client's own.
+      if (path === '/api/profile-required') assert.deepEqual(seen, ['Bearer REAL-TOKEN', 'Bearer client-own-token']);
+      client.close();
+    } finally {
+      tlsSock.destroy(); closeHard(proxy); closeHard(upstream);
+    }
+  });
+}
 
 test('MITM h1: over http/1.1, authorization is injected and the body relayed', T, async () => {
   const { caCertPem, leafCertPem, leafKeyPem } = generateCertChain('localhost');
@@ -565,5 +689,57 @@ test('MITM h1: the terminating server advertises the base idle window and reuses
   } finally {
     agent.destroy();
     tlsSock.destroy(); closeHard(proxy); closeHard(upstream);
+  }
+});
+
+// createConnectHandler threads usageStore into its inner
+// createProxyRequestListener, so a request made over a CONNECT tunnel is
+// recorded like a base-URL one. Drives a real CONNECT + TLS request end to end (same harness as the tests
+// above) against a real in-memory store, then reads the row back with plain SQL.
+test('MITM: a request through the tunnel writes exactly one usage row', { ...T, skip: !USAGE_STORE_AVAILABLE && 'node:sqlite needs Node 22.5+' }, async () => {
+  const { caCertPem, leafCertPem, leafKeyPem } = generateCertChain('localhost');
+  const upstream = makeUpstream(() => ({
+    status: 200,
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'served-model', usage: { input_tokens: 3, output_tokens: 5 } }),
+  }));
+  const upPort = await listen(upstream);
+
+  const am = new AccountManager([oauthAccount('acct@x', 'REAL-TOKEN')], 0.98);
+  const usageStore = openUsageStore({ path: ':memory:' });
+  const proxy = makeProxy(am, upPort, { caCertPem, leafCertPem, leafKeyPem }, { usageStore });
+  const proxyPort = await listen(proxy);
+
+  const tlsSock = await connectThroughProxy(proxyPort, `127.0.0.1:${upPort}`, caCertPem, ['h2', 'http/1.1']);
+  try {
+    const client = http2.connect('https://localhost', { createConnection: () => tlsSock });
+    const req = client.request({ ':method': 'POST', ':path': '/v1/messages', authorization: 'Bearer FAKE', 'content-type': 'application/json' });
+    let resp; req.on('response', (h) => { resp = h; });
+    req.resume(); req.end('{"model":"x"}');
+    await once(req, 'close');
+    client.close();
+
+    assert.equal(resp[':status'], 200);
+
+    // No config.proxy is set anywhere in this harness, so usageCallerLabel
+    // resolves every caller to '(open)' — the same value the base HTTP path
+    // would use unconfigured. It reaches this row via the SAME
+    // createProxyRequestListener the base listener uses (mitm.js reuses it for
+    // the tunnel's terminating server), through the single recordRequest call
+    // in its outer finally block. The row's model is the REQUESTED model
+    // (ctx.model, from the client's own body — "x" here), not the upstream
+    // response's `model` field, which this fake upstream sets to something
+    // else on purpose to make that distinction observable.
+    const rows = rawRows(usageStore, `
+      SELECT dc.label AS caller, da.label AS account, dm.label AS model,
+             u.status, u.input, u.output
+      FROM usage u
+      JOIN dim dc ON dc.id = u.caller_id  AND dc.kind = 'caller'
+      JOIN dim da ON da.id = u.account_id AND da.kind = 'account'
+      JOIN dim dm ON dm.id = u.model_id   AND dm.kind = 'model'
+    `);
+    assert.deepEqual(rows, [{ caller: '(open)', account: 'acct@x', model: 'x', status: 200, input: 3, output: 5 }]);
+  } finally {
+    tlsSock.destroy(); closeHard(proxy); closeHard(upstream); closeUsageStore(usageStore);
   }
 });

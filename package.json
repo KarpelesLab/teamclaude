@@ -1,6 +1,6 @@
 {
   "name": "@karpeleslab/teamclaude",
-  "version": "1.1.28",
+  "version": "1.1.29",
   "description": "Multi-account proxy for Claude Code and Codex: pools Claude Max, ChatGPT/Codex, API-key and third-party backend accounts, and rotates on quota",
   "type": "module",
   "main": "src/index.js",
@@ -13,7 +13,7 @@
   ],
   "scripts": {
     "start": "node src/index.js",
-    "test": "node --test --test-timeout=120000",
+    "test": "node --test --import ./test-helpers/isolate-env.js --test-timeout=120000",
     "lint": "eslint .",
     "typecheck": "tsc -p tsconfig.json",
     "typecheck:strict": "node scripts/typecheck-strict.mjs"
