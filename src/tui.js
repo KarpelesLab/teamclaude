@@ -2538,6 +2538,7 @@ export class TUI {
           amAcct.refreshToken = creds.refreshToken;
           amAcct.expiresAt = creds.expiresAt;
           amAcct.refreshTokenExpiresAt = knownRefreshTokenExpiry(creds.refreshTokenExpiresAt);
+          amAcct.longLived = false;
           if (entry.accountUuid) amAcct.accountUuid = entry.accountUuid;
           if (entry.orgUuid) amAcct.orgUuid = entry.orgUuid;
           if (entry.orgName) amAcct.orgName = entry.orgName;

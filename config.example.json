@@ -68,6 +68,13 @@
       "routing": "socks5h://alice:s3cret@proxy.example.com:1080"
     },
     {
+      "name": "year-token",
+      "type": "oauth",
+      "longLived": true,
+      "accessToken": "sk-ant-oat01-your-year-long-access-token",
+      "expiresAt": 1826000000000
+    },
+    {
       "name": "codex@example.com",
       "type": "oauth",
       "provider": "codex",

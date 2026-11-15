@@ -153,6 +153,24 @@ test('armed: one reset is spent on the account that would otherwise wait longest
   assert.ok(blockedUntil(am.accounts[0]) > 0);
 });
 
+// A long-lived token carries `user:inference` alone: the status read and the
+// claim would both draw a scope denial, and a refused claim is treated as one
+// that may have landed, which holds the resets of the whole fleet.
+test('a long-lived account is never asked for a reset, alone or beside another', async () => {
+  const alone = harness({ accounts: [oauth('year', { longLived: true })] });
+  const none = await alone.redeemer.maybeRedeemForPool(alone.am.accounts);
+  assert.equal(none.redeemed, false);
+  assert.equal(none.reason, 'no Claude account holds a usable reset');
+  assert.equal(alone.calls.status + alone.calls.claim.length, 0);
+  assert.equal(alone.redeemer.fleetHoldUntil, 0);
+
+  // fableSpent gives the second account the longer wait, so it would be the
+  // one chosen if it were a candidate.
+  const { am, redeemer, calls } = harness({ accounts: [oauth('b'), oauth('year', { longLived: true })] });
+  assert.equal((await redeemer.maybeRedeemForPool(am.accounts)).redeemed, true);
+  assert.deepEqual(calls.claim, ['b']);
+});
+
 test('a Fable-only wall spends a held Fable grant even when next is weekly', async () => {
   const { am, redeemer, calls } = harness({ status: () => grantBlock([weeklyGrant, fableGrant]) });
   assert.equal((await redeemer.maybeRedeemForPool(am.accounts)).redeemed, true);
