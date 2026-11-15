@@ -5,9 +5,11 @@
 // Node's global fetch can't use a CONNECT proxy without `undici` (a dependency —
 // and "zero dependencies" is a project feature), so when sx is enabled we issue
 // the request with `https.request` over a tunneled TLS socket and return a small
-// object exposing exactly the fetch-Response surface src/server.js relies on:
-// `status`, `headers.get()/.entries()`, `text()`, `arrayBuffer()`, and `body`
+// object exposing the fetch-Response surface its callers rely on: `status`,
+// `headers.get()/.entries()`, `json()`, `text()`, `arrayBuffer()`, and `body`
 // (a web ReadableStream, so streamResponse()'s getReader()/cancel() is untouched).
+// src/server.js reads only `body`, never a whole-body method, so that it can
+// bound what it holds (see holdBody there).
 
 import http from 'node:http';
 import https from 'node:https';
@@ -117,7 +119,7 @@ export const DEFAULT_HEADERS_TIMEOUT_MS = 120_000;
  * @param {number|null|undefined} [fallbackMs]
  * @returns {number}
  */
-function resolveHeadersTimeout(perCall, fallbackMs) {
+export function resolveHeadersTimeout(perCall, fallbackMs) {
   if (perCall != null) return perCall;
   const env = Number(envVar('UPSTREAM_HEADERS_TIMEOUT_MS'));
   return env > 0 ? env : positiveInt(fallbackMs, DEFAULT_HEADERS_TIMEOUT_MS);
