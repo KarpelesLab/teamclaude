@@ -374,7 +374,16 @@ Two boundaries worth knowing:
 
 - `chatgpt.com` is intercepted **only when a Codex account is configured**. An
   Anthropic-only fleet tunnels it untouched — intercepting a host nobody asked
-  the proxy to read is not a neutral default.
+  the proxy to read is not a neutral default. A Codex account added while the
+  proxy runs (by a login, a reload or credential sync) is pooled through MITM
+  at once only if the certificate the proxy presents already names
+  `chatgpt.com`, as one left by an earlier Codex account does. Otherwise that
+  starts with the proxy's next restart, and until then `chatgpt.com` is
+  tunnelled: the Codex CLI runs on its own ChatGPT login, nothing is pooled or
+  booked against the fleet, and a `CONNECT` pinned to a Codex account is
+  refused with `503`.
+  `teamclaude env` and `teamclaude run` warn while that restart is due (see
+  [the trust model](proxy-modes.md#trust-model)).
 - `ab.chatgpt.com` is never intercepted. It is OpenAI's telemetry endpoint,
   carries no inference, and there is nothing there to rewrite.
 - On the intercepted `chatgpt.com`, only `/backend-api/codex/*` is pooled.

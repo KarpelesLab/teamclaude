@@ -1351,7 +1351,13 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
   // minted lazily on the first intercepted CONNECT.
   // Every host the leaf must cover, not just the Anthropic upstream: a Codex
   // account is reached on chatgpt.com, and MITM cannot intercept a host its
-  // certificate does not name.
+  // certificate does not name. Taken here, when the proxy starts; the leaf is
+  // read for it at the first intercepted CONNECT, and every terminating server
+  // presents that one. Re-minted for a host that an account added later needs,
+  // it would come with a new CA (see ensureCerts), so it stays as read, and the
+  // connect handler checks a host off this list against the names on it. A
+  // start renews a stored chain that falls short, if the port is free
+  // (index.js).
   const mitmHostList = mitmHosts(config);
   let certsPromise = null;
   const ensureLeaf = async () => {
@@ -1361,7 +1367,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
     const c = await certsPromise;
     return { key: c.leafKeyPem, cert: c.leafCertPem };
   };
-  server.on('connect', createConnectHandler({ config, accountManager, ensureLeaf, logDir, hooks, log: logLine, sx, egress, clientUsage, dimensionUsage, drain, usageStore }));
+  server.on('connect', createConnectHandler({ config, accountManager, ensureLeaf, leafHosts: mitmHostList, logDir, hooks, log: logLine, sx, egress, clientUsage, dimensionUsage, drain, usageStore }));
   // Remote Control's real-time channel is a WebSocket, not a request/response
   // call — Node fires 'upgrade' for that handshake, never 'request', so it
   // needs its own listener (base-URL routing path; the MITM path wires the
