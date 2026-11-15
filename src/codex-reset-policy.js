@@ -18,6 +18,9 @@
 // a floor on how many days a credit must buy, a cap on how large a share of
 // one reset cohort may be redeemed, and a cap on redemptions per day.
 //
+// Codex only. A Claude banked reset leaves the weekly timer where it was, so
+// none of this applies to it and claude-resets.js reads none of these knobs.
+//
 // Pure on purpose, like shouldRedeemReset in codex-reset-credits.js: every
 // function here answers from values the caller already holds, so the whole
 // decision table is exercised without a request and the redeemer that calls
@@ -25,7 +28,6 @@
 // codex-reset-credits.js, which imports it — the dependency runs one way.
 
 import { providerOf } from './provider.js';
-import { safeLine } from './safe-text.js';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const WEEK_MS = 7 * DAY_MS;
@@ -37,6 +39,8 @@ const WEEK_MS = 7 * DAY_MS;
 /**
  * One past redemption the redeemer remembers, for the cohort and per-day caps.
  * `cohort` is the cohort the account was in BEFORE the credit moved its reset.
+ * `manual` marks one the operator made from the TUI resets panel: it counts
+ * towards its cohort's share, and not towards the per-day cap.
  *
  * @typedef {{account: object, name: string, cohort: number|null, at: number, manual: boolean}} RedeemRecord
  */
@@ -56,13 +60,20 @@ export const DEFAULT_REDEEM_POLICY = Object.freeze({ minDaysToReset: 0, maxShare
  *    outside the range) is off.
  *  - `autoRedeemMaxPerDay`: a whole number >= 0; 0 is off.
  *
+ * Only a number, or a string that spells one, is read as a value. `true`, an
+ * array or an object would each coerce to a number, and a knob nobody set must
+ * not start limiting on the strength of that.
+ *
  * @param {Record<string, any>|null|undefined} config
  * @returns {RedeemPolicy}
  */
 export function redeemPolicyFrom(config) {
-  const minDays = Number(config?.autoRedeemMinDaysToReset);
-  const share = Number(config?.autoRedeemMaxShare);
-  const perDay = Number(config?.autoRedeemMaxPerDay);
+  /** @param {unknown} value */
+  const knob = value => (typeof value === 'number' ? value
+    : typeof value === 'string' && value.trim() !== '' ? Number(value) : NaN);
+  const minDays = knob(config?.autoRedeemMinDaysToReset);
+  const share = knob(config?.autoRedeemMaxShare);
+  const perDay = knob(config?.autoRedeemMaxPerDay);
   return {
     minDaysToReset: Number.isFinite(minDays) && minDays > 0 ? minDays : 0,
     maxShare: Number.isFinite(share) && share > 0 && share < 1 ? share : 1,
@@ -124,9 +135,10 @@ export function minDaysReason(account, minDaysToReset, now = Date.now()) {
 }
 
 /**
- * The reset cohort this account belongs to: the 24-hour bucket its natural
- * weekly reset falls in. Accounts in one cohort come back together, so they
- * are the ones a share cap keeps apart. Null when the reset is unknown.
+ * The reset cohort this account belongs to: the UTC calendar day its natural
+ * weekly reset falls on. Accounts in one cohort come back together, so they
+ * are the ones a share cap keeps apart. Two resets an hour apart on either
+ * side of 00:00 UTC are in different cohorts. Null when the reset is unknown.
  *
  * @param {Record<string, any>|null|undefined} account
  * @returns {number|null}
@@ -161,13 +173,22 @@ export function recentRedemptions(ledger, now) {
   return (ledger || []).filter(r => r && now - r.at < WEEK_MS);
 }
 
-/** @param {RedeemRecord[]} ledger @param {number} now */
+/**
+ * How many AUTOMATIC redemptions landed in the last 24 hours. A manual one is
+ * the operator's own decision and is not counted: the per-day cap limits what
+ * the proxy spends unattended, so a redemption made by hand must not hold the
+ * automatic ones back for a day.
+ *
+ * @param {RedeemRecord[]} ledger
+ * @param {number} now
+ */
 export function redeemedLast24h(ledger, now) {
-  return recentRedemptions(ledger, now).filter(r => now - r.at < DAY_MS).length;
+  return recentRedemptions(ledger, now).filter(r => !r.manual && now - r.at < DAY_MS).length;
 }
 
 /**
- * Whether the per-day cap allows one more automatic redemption.
+ * Whether the per-day cap allows one more automatic redemption. Counts what
+ * redeemedLast24h counts: automatic redemptions only.
  *
  * @param {RedeemRecord[]} ledger
  * @param {number} maxPerDay
@@ -192,6 +213,13 @@ export function dailyCapVerdict(ledger, maxPerDay, now) {
  *
  * `allowed` is the share of that size rounded UP, so a cap never reads as
  * "nobody" on a small cohort: a half share of one account is one account.
+ * The product is rounded up from just under itself, because a share that is
+ * not exact in binary overshoots a whole number (0.28 * 25 is
+ * 7.000000000000001) and a plain ceiling would allow one more than the cap.
+ *
+ * A manual redemption counts here like an automatic one, in the cohort's size
+ * and in the slots used: it moved an account's timer just the same. An account
+ * with no stated reset is in no cohort, and this cap does not hold it.
  *
  * @param {Object} args
  * @param {Record<string, any>} args.account
@@ -211,7 +239,7 @@ export function shareCapVerdict({ account, members, ledger, maxShare, now }) {
   for (const r of moved) population.add(/** @type {Record<string, any>} */ (r.account));
   const size = population.size;
   const used = moved.length;
-  const allowed = Math.ceil(maxShare * size);
+  const allowed = Math.ceil(maxShare * size - 1e-9);
   if (used < allowed) return { ok: true, reason: null, cohort, size, allowed, used };
   const pct = Math.round(maxShare * 100);
   return {
@@ -276,9 +304,4 @@ export function autoRedeemStanding({ account, autoRedeemResets, policy, members,
 function formatDays(days) {
   const rounded = Math.round(days * 10) / 10;
   return `${Number.isInteger(rounded) ? rounded : rounded.toFixed(1)}d`;
-}
-
-/** A name fit for a log line. @param {Record<string, any>} account */
-export function redeemName(account) {
-  return safeLine(account?.name, 64);
 }

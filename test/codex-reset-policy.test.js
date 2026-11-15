@@ -53,6 +53,9 @@ test('each knob is normalised to its own range, and a bad value is off rather th
   // A per-day cap is a count.
   assert.equal(redeemPolicyFrom({ autoRedeemMaxPerDay: 1.5 }).maxPerDay, 0);
   assert.equal(redeemPolicyFrom({ autoRedeemMaxPerDay: '2' }).maxPerDay, 2);
+  // Values that would coerce to a number without being one.
+  assert.deepEqual(redeemPolicyFrom({ autoRedeemMinDaysToReset: true, autoRedeemMaxShare: [0.5], autoRedeemMaxPerDay: true }), DEFAULT_REDEEM_POLICY);
+  assert.deepEqual(redeemPolicyFrom({ autoRedeemMinDaysToReset: null, autoRedeemMaxShare: '', autoRedeemMaxPerDay: [3] }), DEFAULT_REDEEM_POLICY);
 });
 
 // ── the value of a credit ───────────────────────────────────────────────────
@@ -95,13 +98,18 @@ test('with the floor on, an account whose reset is unknown cannot be shown to cl
 
 // ── cohorts ─────────────────────────────────────────────────────────────────
 
-test('accounts whose resets fall in the same 24-hour bucket share a cohort', () => {
+test('accounts whose resets fall on the same UTC calendar day share a cohort', () => {
   const a = codex('a', 2);
   const b = { ...a, quota: { ...a.quota, unified7dReset: a.quota.unified7dReset + 6 * 60 * 60 * 1000 } };
   const c = codex('c', 3);
   assert.equal(resetCohort(a), resetCohort(b));
   assert.notEqual(resetCohort(a), resetCohort(c));
   assert.equal(resetCohort(codex('d', null)), null);
+  // A calendar day, not a 24-hour span: two resets two hours apart on either
+  // side of 00:00 UTC are different cohorts. NOW is 12:00 UTC.
+  const lateEvening = { ...a, quota: { ...a.quota, unified7dReset: NOW + 11 * 60 * 60 * 1000 } };
+  const earlyMorning = { ...a, quota: { ...a.quota, unified7dReset: NOW + 13 * 60 * 60 * 1000 } };
+  assert.notEqual(resetCohort(lateEvening), resetCohort(earlyMorning));
 });
 
 test('only an armed Codex account is counted in a cohort', () => {
@@ -152,6 +160,24 @@ test('the share is rounded up, so a small cohort is never "nobody"', () => {
   assert.equal(shareCapVerdict({ account: three[0], members: three, ledger: [], maxShare: 0.5, now: NOW }).allowed, 2);
 });
 
+test('a share that is not exact in binary does not round a whole number up to the next one', () => {
+  // 0.28 * 25 is 7.000000000000001 in floating point; the cap allows 7, not 8.
+  const pool = Array.from({ length: 25 }, (_, i) => codex('m' + i, 2, { index: i }));
+  assert.equal(shareCapVerdict({ account: pool[0], members: pool, ledger: [], maxShare: 0.28, now: NOW }).allowed, 7);
+  const cohort = resetCohort(pool[0]);
+  const ledger = pool.slice(0, 7).map(account => ({ account, name: account.name, cohort, at: NOW, manual: false }));
+  assert.equal(shareCapVerdict({ account: pool[7], members: pool, ledger, maxShare: 0.28, now: NOW }).ok, false);
+});
+
+test('a manual redemption takes a slot of its cohort, and keeps the cohort at its size', () => {
+  const members = [codex('a', 2, { index: 0 }), codex('b', 2, { index: 1 })];
+  const cohort = resetCohort(members[0]);
+  const ledger = [{ account: members[0], name: 'a', cohort, at: NOW, manual: true }];
+  members[0].quota.unified7dReset = NOW + 7 * DAY;
+  const v = shareCapVerdict({ account: members[1], members, ledger, maxShare: 0.5, now: NOW });
+  assert.deepEqual({ ok: v.ok, size: v.size, allowed: v.allowed, used: v.used }, { ok: false, size: 2, allowed: 1, used: 1 });
+});
+
 test('a redemption from another cohort, or from more than a week ago, is not charged to this one', () => {
   const members = [codex('a', 2), codex('b', 5)];
   const ledger = [
@@ -183,6 +209,15 @@ test('the per-day cap counts a rolling 24 hours and says when it is reached', ()
   const capped = dailyCapVerdict(ledger, 1, NOW);
   assert.equal(capped.ok, false);
   assert.match(capped.reason, /daily cap of 1 auto-redemption is reached \(1 in the last 24h\)/);
+});
+
+test('the per-day cap counts automatic redemptions only', () => {
+  const manual = { account: {}, name: 'a', cohort: 1, at: NOW - 60 * 60 * 1000, manual: true };
+  assert.equal(redeemedLast24h([manual], NOW), 0);
+  assert.equal(dailyCapVerdict([manual], 1, NOW).ok, true, 'a redemption made by hand does not hold the automatic ones back');
+  const automatic = { ...manual, manual: false };
+  assert.equal(dailyCapVerdict([manual, automatic], 1, NOW).ok, false);
+  assert.equal(dailyCapVerdict([manual, automatic], 1, NOW).redeemedLast24h, 1);
 });
 
 // ── ordering ────────────────────────────────────────────────────────────────

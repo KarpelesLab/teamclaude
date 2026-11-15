@@ -573,52 +573,53 @@ That has two consequences the switch above knows nothing about.
   full pool, then a dry fleet, together, every seven days.
 
 Three keys shape what the switch spends, all off unless set, so a fleet that
-never sets them behaves exactly as before:
+never sets them behaves exactly as before. They narrow the automatic policy and
+never widen it: every condition above still has to hold.
 
 - [`autoRedeemMinDaysToReset`](configuration.md) — never auto-redeem an
   account whose natural reset is closer than this many days. The account is
-  skipped with a line in the log saying what the credit would have bought.
+  skipped with a line in the log saying what the credit would have bought. An
+  account whose reset time is not known cannot be shown to clear the floor and
+  is skipped too. The floor also holds for a credit that is about to expire.
 - [`autoRedeemMaxShare`](configuration.md) — of the armed accounts whose
-  natural resets fall in the same 24-hour cohort, redeem at most this share
-  (rounded up), most-exhausted first, so the rest keep their phase. The cohort
-  is sized as it was before any of it was redeemed this week; otherwise each
-  redemption would shrink it and let the next one through.
+  natural resets fall on the same UTC calendar day (a **cohort**), redeem at
+  most this share (rounded up), most-exhausted first, so the rest keep their
+  phase. The cohort is sized as it was before any of it was redeemed this week;
+  otherwise each redemption would shrink it and let the next one through. A
+  cohort is a calendar day, not a 24-hour span: two resets an hour apart on
+  either side of 00:00 UTC are in different cohorts. An account whose reset
+  time is not known is in no cohort, and this cap does not hold it.
 - [`autoRedeemMaxPerDay`](configuration.md) — at most this many automatic
-  redemptions per rolling 24 hours.
+  redemptions per rolling 24 hours, across all Codex accounts.
 
-Every account the policy passes over is logged once per reason:
+A credit you spend by hand from the resets panel is not stopped by any of the
+three. It is still recorded: it counts towards its cohort's share, because it
+moved that account's timer like any other redemption, and it does not count
+towards `autoRedeemMaxPerDay`, which limits only what is spent automatically.
+
+The record of past redemptions covers one week and is kept in memory. A restart
+forgets it: the per-day count starts again at zero and a cohort is sized on the
+accounts it has at that moment. The three keys are read at each refusal, so a
+change applies on the next reload without a restart.
+
+All three concern Codex accounts only. A
+[Claude banked reset](#claude-banked-usage-limit-resets) leaves the weekly
+timer where it was, so none of them is applied to it.
+
+Every account the policy passes over is logged, once per reason and at most
+every ten minutes while the reason stands:
 `[TeamClaude] Codex rate-limit reset on "<name>" skipped — <reason>`.
 
-`teamclaude status` prints a `Redeem` line under each Codex account — `armed`
-or `exempt — <reason>`, and what a credit spent now is worth (`credit worth
-0.43 of a week (3.0d to reset)`). The JSON carries the same under
-`accounts[].autoRedeem` (`{ armed, exemptReason, creditValueWeeks }`, `null` on
-a non-Codex row) and the fleet's `redeemPolicy`
-(`{ minDaysToReset, maxShare, maxPerDay, redeemedLast24h }`). `armed` is about
-the policy and the caps, not the moment: an armed account whose weekly window
-is still healthy is armed and simply not exhausted.
-
-### Spending a credit by hand
-
-`teamclaude redeem <name>` spends one credit on a named Codex account now,
-through the same redeemer the switch uses (`POST /teamclaude/redeem` with
-`{"account": "<name>", "force": false}`), so the same cooldowns, idempotency
-key and redemption ledger apply. It is the operator's own action, so the fleet
-switch and the per-account opt-out — both about the *automatic* policy — do not
-gate it, and neither do the share and per-day caps. What does hold is
-everything about the credit itself: the account's **weekly window must be
-spent** (a credit is scarce and unrecoverable, and clearing a healthy window
-wastes it), and the credit must clear `autoRedeemMinDaysToReset` unless
-`--force` says you have weighed that. `--force` reaches past the floor and
-nothing else. After it lands, the pool holds off automatic redemptions for the
-same hours a successful automatic one does. A client key may not call it.
-
-`teamclaude redeem --plan` (`GET /teamclaude/redeem/plan`) prints what the
-policy would do right now — one line per Codex account with its standing, the
-credit's value and the last probed credit count, and which account an
-automatic attempt would reach for first — without spending anything or asking
-upstream anything: it is a dry run of the decision, and the decision's own
-network steps are exactly what it leaves out.
+While `autoRedeemResets` is on, `teamclaude status` prints a `Redeem` line
+under each Codex account — `armed` or `exempt — <reason>`, and what a credit
+spent now is worth (`credit worth 0.43 of a week (3.0d to reset)`). The JSON
+carries the same under `accounts[].autoRedeem`
+(`{ armed, exemptReason, creditValueWeeks }`; `null` on a non-Codex row, and on
+every row while the switch is off) and the fleet's `redeemPolicy`
+(`{ minDaysToReset, maxShare, maxPerDay, redeemedLast24h }`, where
+`redeemedLast24h` counts automatic redemptions). `armed` is about the policy
+and the caps, not the moment: an armed account whose weekly window is still
+healthy is armed and simply not exhausted.
 
 ## Claude banked usage-limit resets
 

@@ -1,10 +1,5 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
-import { mkdtemp, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
 import { autoRedeemLine, renderStatus } from '../src/status-renderer.js';
@@ -12,12 +7,12 @@ import { ResetCreditRedeemer, redeemPreconditions, shouldRedeemReset } from '../
 
 // The spending strategy, through the redeemer and the control plane: the
 // minimum-days floor, the cohort share cap and the per-day cap deciding which
-// account a dry pool spends on; the operator's own `redeem` and `--plan`; and
-// the policy's standing on every status surface. Nothing here reaches the
-// network — both endpoints are faked, as in codex-reset-credits.test.js.
+// account a dry pool spends on; a redemption made by hand from the resets
+// panel entering the same ledger; and the policy's standing on every status
+// surface. Nothing here reaches the network — both endpoints are faked, as in
+// codex-reset-credits.test.js.
 
 const DAY = 24 * 60 * 60 * 1000;
-const cliPath = fileURLToPath(new URL('../src/index.js', import.meta.url));
 
 function codex(name, extra = {}) {
   return { name, type: 'oauth', provider: 'codex', accountId: 'acct-' + name, accessToken: 't-' + name, refreshToken: 'r', expiresAt: Date.now() + 3600_000, ...extra };
@@ -29,6 +24,16 @@ function spent(account, days, now = Date.now()) {
   account.quota.unified7dReset = days == null ? null : now + days * DAY;
   account.quota.unified5h = 0.1;
   return account;
+}
+
+/**
+ * Put every account's natural reset on ONE UTC calendar day, `daysAhead` days
+ * from now and an hour apart. A cohort is a calendar day, so resets written as
+ * "3 and 3.3 days from now" share one only at some hours of the day.
+ */
+function sameUtcDay(accounts, daysAhead, now = Date.now()) {
+  const dayStart = (Math.floor(now / DAY) + daysAhead) * DAY;
+  accounts.forEach((account, i) => { account.quota.unified7dReset = dayStart + (i + 1) * 60 * 60 * 1000; });
 }
 
 function credit(extra = {}) {
@@ -109,10 +114,11 @@ test('an unchanged skip is logged once, not once per refused request', async () 
 // ── the share cap at the refusal ────────────────────────────────────────────
 
 test('a half share of one cohort redeems two of four and then holds, however dry the pool stays', async () => {
-  // Four accounts resetting within the same day; the fleet hold after each
+  // Four accounts resetting on the same UTC day; the fleet hold after each
   // success is stepped past by moving the clock, as a real week would.
-  const { am, redeemer, calls, log } = harness({ days: [3, 3.1, 3.2, 3.3], config: { autoRedeemResets: true, autoRedeemMaxShare: 0.5 }, caughtUp: false });
+  const { am, redeemer, calls, log } = harness({ days: [3, 3, 3, 3], config: { autoRedeemResets: true, autoRedeemMaxShare: 0.5 }, caughtUp: false });
   let clock = Date.now();
+  sameUtcDay(am.accounts, 3, clock);
   redeemer.now = () => clock;
   // The accounts a redemption has not touched: the ones still on their natural
   // phase, which a real re-read would leave spent while the redeemed ones serve.
@@ -190,86 +196,66 @@ test('the per-day cap stops the fleet after N automatic redemptions in 24 hours,
   assert.equal(calls.consume.length, 2);
 });
 
-// ── the operator's own hand ─────────────────────────────────────────────────
+// ── a redemption made by hand ───────────────────────────────────────────────
 
-test('redeemOne spends on a named account regardless of the fleet switch, but never on a healthy window', async () => {
-  const { am, redeemer, calls } = harness({ days: [3], config: { autoRedeemResets: false } });
-  const result = await redeemer.redeemOne(am.accounts[0]);
-  assert.equal(result.redeemed, true, 'the switch governs the automatic policy, not the operator');
-  assert.deepEqual(calls.consume, ['a']);
-  assert.match(result.reason, /requested by the operator \(worth 0\.43 of a week\)/);
+// The resets panel (reset-actions.js) spends through redeemGrant with
+// `manual: true`. That is the same call the automatic walk ends in, so the
+// ledger sees both.
 
-  const healthy = harness({ days: [3] });
-  healthy.am.accounts[0].quota.unified7d = 0.4;
-  const refused = await healthy.redeemer.redeemOne(healthy.am.accounts[0]);
-  assert.equal(refused.redeemed, false);
-  assert.equal(refused.reason, 'weekly window is not exhausted');
-  assert.deepEqual(healthy.calls.consume, []);
-});
-
-test('redeemOne honours the floor unless forced, and force reaches past nothing else', async () => {
-  const { am, redeemer, calls } = harness({ days: [1], config: { autoRedeemResets: true, autoRedeemMinDaysToReset: 2 } });
-  const floored = await redeemer.redeemOne(am.accounts[0]);
-  assert.equal(floored.redeemed, false);
-  assert.match(floored.reason, /under the 2d minimum.*pass --force/);
-  assert.deepEqual(calls.consume, []);
-
-  const forced = await redeemer.redeemOne(am.accounts[0], { force: true });
-  assert.equal(forced.redeemed, true);
-  assert.match(forced.reason, /floor overridden/);
-
-  const healthy = harness({ days: [1] });
-  healthy.am.accounts[0].quota.unified7d = 0.4;
-  assert.equal((await healthy.redeemer.redeemOne(healthy.am.accounts[0], { force: true })).reason, 'weekly window is not exhausted');
-});
-
-test('redeemOne refuses an Anthropic account and an account holding nothing', async () => {
-  const { redeemer } = harness();
-  const am = new AccountManager([{ name: 'claude', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 }], 0.98);
-  assert.equal((await redeemer.redeemOne(am.accounts[0])).reason, 'not a Codex account');
-
-  const empty = harness({ days: [3], credits: { a: [] } });
-  const result = await empty.redeemer.redeemOne(empty.am.accounts[0]);
-  assert.equal(result.redeemed, false);
-  assert.equal(result.reason, 'holds no redeemable credit');
-});
-
-test('a manual redemption is counted in the ledger and holds the automatic pool like any other', async () => {
-  const { am, redeemer } = harness({ days: [3, 3] });
-  assert.equal((await redeemer.redeemOne(am.accounts[0])).redeemed, true);
+test('a manual redemption takes a slot of its cohort, so the share cap holds the rest', async () => {
+  const { am, redeemer, calls, log } = harness({ days: [3, 3], config: { autoRedeemResets: true, autoRedeemMaxShare: 0.5 }, caughtUp: false });
+  let clock = Date.now();
+  redeemer.now = () => clock;
+  sameUtcDay(am.accounts, 3, clock);
+  const [a, b] = am.accounts;
+  assert.equal((await redeemer.redeemGrant(a, 'a-1', { manual: true })).redeemed, true);
   assert.equal(redeemer.ledger.length, 1);
   assert.equal(redeemer.ledger[0].manual, true);
-  assert.equal(redeemer.policyStatus().redeemedLast24h, 1);
-  const next = await redeemer.maybeRedeemForPool([am.accounts[1]]);
+  assert.equal(redeemer.ledger[0].account, a);
+  // Past the fleet hold a redemption arms, the other half of the cohort is
+  // still held: one of two at a half share is the whole allowance.
+  clock += 7 * 60 * 60 * 1000;
+  const next = await redeemer.maybeRedeemForPool([b]);
   assert.equal(next.redeemed, false);
-  assert.match(next.reason, /cooling down after a recent redemption attempt/);
+  assert.match(next.reason, /cohort of 2 already had 1 redeemed, the 50% share cap allows 1/);
+  assert.deepEqual(calls.consume, ['a']);
+  assert.ok(log.some(line => /"b" skipped — its reset cohort of 2 already had 1 redeemed/.test(line)));
 });
 
-// ── the dry run ─────────────────────────────────────────────────────────────
-
-test('the plan states every account and names the one a refusal would reach first, spending nothing', async () => {
-  const { am, redeemer, calls } = harness({ days: [1, 4], config: { autoRedeemResets: true, autoRedeemMinDaysToReset: 2, autoRedeemMaxShare: 0.5 } });
-  am.accounts[0].quota.resetCredits = { available: 1, applicable: 1, seenAt: Date.now() };
-  const plan = redeemer.plan();
-  assert.deepEqual(calls, { consume: [], details: [] });
-  assert.equal(plan.wouldRedeem, 'b');
-  assert.deepEqual(plan.policy, { minDaysToReset: 2, maxShare: 0.5, maxPerDay: 0, redeemedLast24h: 0 });
-  const [a, b] = plan.accounts;
-  assert.equal(a.armed, false);
-  assert.match(a.verdict, /^exempt — natural weekly reset is 1d away/);
-  assert.equal(a.creditsHeld, 1);
-  assert.equal(b.armed, true);
-  assert.equal(b.verdict, 'would redeem when the pool is dry');
-  assert.equal(b.creditValueWeeks, 0.57);
-  assert.equal(b.daysToReset, 4);
+test('a manual redemption does not count against the per-day cap', async () => {
+  const { am, redeemer, calls } = harness({ days: [3, 5], config: { autoRedeemResets: true, autoRedeemMaxPerDay: 1 }, caughtUp: false });
+  let clock = Date.now();
+  redeemer.now = () => clock;
+  const [a, b] = am.accounts;
+  assert.equal((await redeemer.redeemGrant(a, 'a-1', { manual: true })).redeemed, true);
+  assert.equal(redeemer.policyStatus().redeemedLast24h, 0);
+  clock += 7 * 60 * 60 * 1000;
+  assert.equal((await redeemer.maybeRedeemForPool([b])).redeemed, true, 'the one automatic redemption of the day is still there to spend');
+  assert.deepEqual(calls.consume, ['a', 'b']);
+  assert.equal(redeemer.policyStatus().redeemedLast24h, 1);
 });
 
-test('the plan says when an armed account is simply not exhausted, or could still serve', () => {
-  const { am, redeemer } = harness({ days: [3] });
-  am.accounts[0].quota.unified7d = 0.3;
-  const plan = redeemer.plan();
-  assert.equal(plan.wouldRedeem, null);
-  assert.equal(plan.accounts[0].verdict, 'armed — weekly window is not exhausted');
+test('a redemption whose answer was lost is charged to the cohort the account was in when it was sent', async () => {
+  let answers = 0;
+  const { am, redeemer } = harness({
+    days: [3], config: { autoRedeemResets: true },
+    code: () => (answers++ === 0 ? { error: 'socket hang up' } : { code: 'already_redeemed', windowsReset: 1, credit: null }),
+  });
+  let clock = Date.now();
+  redeemer.now = () => clock;
+  const [a] = am.accounts;
+  const before = a.quota.unified7dReset;
+  const lost = await redeemer.maybeRedeemForPool([a]);
+  assert.equal(lost.redeemed, false);
+  assert.equal(redeemer.ledger.length, 0, 'no verdict, no record');
+  // The POST did land: a quota read in between already shows the moved timer.
+  a.quota.unified7dReset = clock + 7 * DAY;
+  clock += 31 * 60 * 1000;
+  const replay = await redeemer.maybeRedeemForPool([a]);
+  assert.equal(replay.redeemed, true);
+  assert.equal(replay.code, 'already_redeemed');
+  assert.equal(redeemer.ledger.length, 1);
+  assert.equal(redeemer.ledger[0].cohort, Math.floor(before / DAY));
 });
 
 // ── the status payload ──────────────────────────────────────────────────────
@@ -278,6 +264,10 @@ test('describe answers for a Codex row and null for any other', () => {
   const { am, redeemer } = harness({ days: [3.5], config: { autoRedeemResets: true } });
   assert.deepEqual(redeemer.describe(am.accounts[0]), { armed: true, exemptReason: null, creditValueWeeks: 0.5 });
   assert.equal(redeemer.describe({ name: 'claude', type: 'oauth', quota: {} }), null);
+  // With the fleet switch off nothing is spent automatically, so there is no
+  // standing to report and the status screen prints no Redeem line.
+  const off = harness({ days: [3.5], config: { autoRedeemResets: false, autoRedeemMinDaysToReset: 2 } });
+  assert.equal(off.redeemer.describe(off.am.accounts[0]), null);
   assert.deepEqual(redeemer.policyStatus(), { minDaysToReset: 0, maxShare: 1, maxPerDay: 0, redeemedLast24h: 0 });
 });
 
@@ -305,8 +295,6 @@ const listen = server => new Promise(resolve => server.listen(0, '127.0.0.1', ()
 async function controlPlane({ days = [3], config = { autoRedeemResets: true }, withHooks = true } = {}) {
   const h = harness({ days, config });
   const hooks = withHooks ? {
-    redeemCodexReset: (account, opts) => h.redeemer.redeemOne(account, opts),
-    planCodexRedeem: () => h.redeemer.plan(),
     describeAutoRedeem: account => h.redeemer.describe(account),
     getStatusExtra: () => ({ redeemPolicy: h.redeemer.policyStatus() }),
   } : {};
@@ -331,132 +319,12 @@ test('/teamclaude/status carries each Codex account\'s standing and the fleet po
   }
 });
 
-test('a server built without the hooks answers status as before and the redeem routes with 501', async () => {
+test('a server built without the hooks answers status as before', async () => {
   const cp = await controlPlane({ withHooks: false });
   try {
     const { data } = await cp.call('/teamclaude/status');
     assert.equal('autoRedeem' in data.accounts[0], false);
     assert.equal('redeemPolicy' in data, false);
-    assert.equal((await cp.call('/teamclaude/redeem', { method: 'POST', body: { account: 'a' } })).status, 501);
-    assert.equal((await cp.call('/teamclaude/redeem/plan')).status, 501);
-  } finally {
-    cp.close();
-  }
-});
-
-test('POST /teamclaude/redeem spends on the named account and reports a policy "no" as a 200 that says so', async () => {
-  const cp = await controlPlane({ days: [1], config: { autoRedeemResets: false, autoRedeemMinDaysToReset: 2 } });
-  try {
-    const floored = await cp.call('/teamclaude/redeem', { method: 'POST', body: { account: 'a' } });
-    assert.equal(floored.status, 200);
-    assert.equal(floored.data.redeemed, false);
-    assert.match(floored.data.reason, /under the 2d minimum/);
-    assert.deepEqual(cp.calls.consume, []);
-
-    const forced = await cp.call('/teamclaude/redeem', { method: 'POST', body: { account: 'a', force: true } });
-    assert.equal(forced.status, 200);
-    assert.equal(forced.data.redeemed, true);
-    assert.equal(forced.data.account, 'a');
-    assert.equal(forced.data.code, 'reset');
-    assert.equal(forced.data.windowsReset, 1);
-    assert.deepEqual(cp.calls.consume, ['a']);
-  } finally {
-    cp.close();
-  }
-});
-
-test('POST /teamclaude/redeem refuses a missing or unknown account, a bad body, and a client key', async () => {
-  const cp = await controlPlane();
-  try {
-    const missing = await cp.call('/teamclaude/redeem', { method: 'POST', body: {} });
-    assert.equal(missing.status, 400);
-    assert.deepEqual(missing.data.accounts, ['a']);
-    const unknown = await cp.call('/teamclaude/redeem', { method: 'POST', body: { account: 'nobody' } });
-    assert.equal(unknown.status, 404);
-    assert.match(unknown.data.error, /no such account "nobody"/);
-    const bad = await fetch(`http://127.0.0.1:${cp.port}/teamclaude/redeem`, { method: 'POST', headers: { 'x-api-key': 'tc-test' }, body: '{not json' });
-    assert.equal(bad.status, 400);
-    await bad.text();
-    const tenant = await cp.call('/teamclaude/redeem', { method: 'POST', body: { account: 'a' }, key: 'tc-tenant' });
-    assert.equal(tenant.status, 403);
-    assert.match(tenant.data.error, /cannot spend reset credits/);
-    assert.deepEqual(cp.calls.consume, []);
-  } finally {
-    cp.close();
-  }
-});
-
-test('GET /teamclaude/redeem/plan is the dry run, with the switch beside it', async () => {
-  const cp = await controlPlane({ days: [4] });
-  try {
-    const { status, data } = await cp.call('/teamclaude/redeem/plan');
-    assert.equal(status, 200);
-    assert.equal(data.ok, true);
-    assert.equal(data.autoRedeemResets, true);
-    assert.equal(data.wouldRedeem, 'a');
-    assert.equal(data.accounts[0].verdict, 'would redeem when the pool is dry');
-    assert.deepEqual(cp.calls, { consume: [], details: [] });
-  } finally {
-    cp.close();
-  }
-});
-
-// ── the CLI ─────────────────────────────────────────────────────────────────
-
-async function writeConfig(port) {
-  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-redeem-'));
-  const path = join(dir, 'config.json');
-  await writeFile(path, JSON.stringify({ proxy: { port, apiKey: 'tc-test' }, upstream: 'https://api.anthropic.com', upstreamProxy: false, accounts: [] }));
-  return path;
-}
-
-function runCli(configPath, cliArgs) {
-  const child = spawn(process.execPath, [cliPath, ...cliArgs], {
-    env: { ...process.env, TEAMCLAUDE_CONFIG: configPath },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  let stdout = '';
-  let stderr = '';
-  child.stdout.setEncoding('utf8');
-  child.stderr.setEncoding('utf8');
-  child.stdout.on('data', c => { stdout += c; });
-  child.stderr.on('data', c => { stderr += c; });
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('CLI did not exit')); }, 20_000);
-    child.on('error', err => { clearTimeout(timer); reject(err); });
-    child.on('exit', code => { clearTimeout(timer); resolve({ code, stdout, stderr }); });
-  });
-}
-
-test('teamclaude redeem <name> and --plan drive the running server', async () => {
-  const cp = await controlPlane({ days: [1, 4], config: { autoRedeemResets: true, autoRedeemMinDaysToReset: 2 } });
-  const configPath = await writeConfig(cp.port);
-  try {
-    const plan = await runCli(configPath, ['redeem', '--plan']);
-    assert.equal(plan.code, 0, plan.stderr);
-    assert.match(plan.stdout, /Auto-redeem: on\s+min days to reset: 2\s+max share per cohort: off\s+max per day: off\s+redeemed last 24h: 0/);
-    assert.match(plan.stdout, /a: exempt — natural weekly reset is 1d away.*credit worth 0\.14 of a week \(1d to reset\)/);
-    assert.match(plan.stdout, /b: would redeem when the pool is dry — credit worth 0\.57 of a week \(4d to reset\)/);
-    assert.match(plan.stdout, /Would redeem first: b/);
-    assert.deepEqual(cp.calls.consume, []);
-
-    const floored = await runCli(configPath, ['redeem', 'a']);
-    assert.equal(floored.code, 1);
-    assert.match(floored.stderr, /Not redeemed on "a": natural weekly reset is 1d away.*pass --force/);
-
-    const forced = await runCli(configPath, ['redeem', 'a', '--force']);
-    assert.equal(forced.code, 0, forced.stderr);
-    assert.match(forced.stdout, /Redeemed a reset credit on "a" — 1 window\(s\) reset \(reset\)/);
-    assert.deepEqual(cp.calls.consume, ['a']);
-
-    const unknown = await runCli(configPath, ['redeem', 'nobody']);
-    assert.equal(unknown.code, 1);
-    assert.match(unknown.stderr, /no such account "nobody"/);
-    assert.match(unknown.stderr, /Known accounts:/);
-
-    const usage = await runCli(configPath, ['redeem']);
-    assert.equal(usage.code, 1);
-    assert.match(usage.stderr, /Usage: teamclaude redeem/);
   } finally {
     cp.close();
   }
