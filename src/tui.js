@@ -14,6 +14,7 @@ import { mintAccountId } from './account-id.js';
 import { ACCOUNT_REFUSAL_CODES } from './account-refusal.js';
 import { formatPercent, heldFableResets, heldResetCredits, showSessionRow, showWeeklyRow, unavailableLine } from './status-renderer.js';
 import { cacheUsageLabel, cacheUsageState } from './usage-label.js';
+import { statusLabel } from './error-type.js';
 import { resolveMaxUsage, resolveMaxSpendMinor, switchThresholdDiffs, modelLabel, EFFORT_SEP } from './model.js';
 import { parseProxyUrl, proxyToUrl, describeProxy, describeSelfProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy, localListener, isSelfProxy } from './upstream-proxy.js';
 import { describeRouting, parseRoutingUrl, routingToUrl, checkRouting } from './account-routing.js';
@@ -1107,7 +1108,7 @@ export class TUI {
     const pin = (info.pinned || r?.pinned) ? dim(' [pin]') : '';
     const cacheLabel = cacheUsageLabel(info.cacheUsage);
     const cache = cacheLabel && CACHE_PAINT[cacheUsageState(info.cacheUsage)](cacheLabel);
-    this._addLog(`${this._sessionTag(sid)} ${info.method} ${info.path}${model} → ${acct}${pin} (${info.status}, ${dur}s)${cache ? ` ${cache}` : ''}`);
+    this._addLog(`${this._sessionTag(sid)} ${info.method} ${info.path}${model} → ${acct}${pin} (${statusLabel(info.status, info.errorType)}, ${dur}s)${cache ? ` ${cache}` : ''}`);
     if (this.active.size === 0) this._retick();   // animating → idle
   }
 

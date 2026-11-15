@@ -2749,7 +2749,9 @@ test('a paint clears the window; with the knob on the switch waits for a request
     const now = Date.now();
     bucket(am, 0, 'unified7d', 0.5, 200, now);
     bucket(am, 1, 'unified7d', 0.5, 20, now);   // its weekly expires sooner
-    assert.equal(am.setCurrentAccount(0), true);
+    // An automatic placement: these tests are about the session-reset switch, and a
+    // manual choice (#668) holds the cursor against it (manual-switch-priority.test.js).
+    am._setCurrent(am.accounts[0]);
     am.accounts[1].quota.unified5h = 0.5;
     am.accounts[1].quota.unified5hReset = now - 1000;   // the reset the switch acts on
     return am;
@@ -2890,7 +2892,9 @@ test('the session-reset switch admits on the order the pick uses', () => {
     bucket(am, 0, 'unified7dFable', 0.5, 300, now);
     bucket(am, 1, 'unified7d', 0.5, sharedOnReset, now);
     bucket(am, 1, 'unified7dFable', 0.5, 10, now);
-    assert.equal(am.setCurrentAccount(0), true);
+    // An automatic placement: these tests are about the session-reset switch, and a
+    // manual choice (#668) holds the cursor against it (manual-switch-priority.test.js).
+    am._setCurrent(am.accounts[0]);
     am.accounts[1].quota.unified5h = 0.5;
     am.accounts[1].quota.unified5hReset = now - 1000;
     assert.equal(am._rankedReset(am.accounts[1], FABLE) < am._rankedReset(am.accounts[0], FABLE), true,
@@ -2921,7 +2925,9 @@ test('with the knob OFF the switch is handed no model, whatever the request carr
     // which is the only shape in which the two filters can disagree.
     bucket(am, 1, 'unified7dFable', 0.99, 40, now);
     bucket(am, 1, 'unified7d', 0.10, 40, now);
-    assert.equal(am.setCurrentAccount(0), true);
+    // An automatic placement: these tests are about the session-reset switch, and a
+    // manual choice (#668) holds the cursor against it (manual-switch-priority.test.js).
+    am._setCurrent(am.accounts[0]);
     am.accounts[1].quota.unified5h = 0.5;
     am.accounts[1].quota.unified5hReset = now - 1000;
     return am;
@@ -2976,7 +2982,9 @@ test('the 5h session-reset switch cannot spend the roll of the account it leaves
   bucket(am, 0, 'unified7d', 0.4, 10);
   bucket(am, 1, 'unified7d', 0.4, 20);
   bucket(am, 2, 'unified7d', 0.4, 30);
-  assert.equal(am.setCurrentAccount(0), true);
+  // An automatic placement: these tests are about the session-reset switch, and a
+  // manual choice (#668) holds the cursor against it (manual-switch-priority.test.js).
+  am._setCurrent(am.accounts[0]);
   assert.equal(serve(am, null, OPUS).name, 'a', 'the fixture must start on a');
 
   // a's weekly rolls, and b's 5h window expires in the same instant — so the
