@@ -298,19 +298,36 @@ const BUFFERED_RESPONSE_LIMIT = 64 * 1024 * 1024;
  * replays what was read ahead of the rest of the same stream, for a caller that
  * relays it instead; one that does not cancels it, which drops the upstream
  * connection. A failed read rejects, as buffer() and text() did, so each
- * caller's error handling is unchanged.
+ * caller's error handling is unchanged. So does an upstream that goes quiet for
+ * `idleMs` while the body is held, with the same transient
+ * TEAMCLAUDE_BODY_TIMEOUT a stream that goes quiet raises (readWithIdleTimeout),
+ * after the body is cancelled: a held answer has no reader but this one, so
+ * without the deadline a silent upstream kept the request, its socket and its
+ * admission permit for as long as it kept the connection open (a forwarded
+ * request also ends when its client leaves; the token-refresh passthrough's
+ * has no such signal). The replay's reads are its relay's to time
+ * (streamResponse's).
  * @param {ReadableStream<Uint8Array>|null} stream
  * @param {number} [limit]
+ * @param {number} [idleMs]  defaults to TEAMCLAUDE_UPSTREAM_BODY_TIMEOUT_MS's reading
  * @returns {Promise<{ buf: Buffer|null, body: ReadableStream<Uint8Array>|null }>}
  */
-export async function holdBody(stream, limit = BUFFERED_RESPONSE_LIMIT) {
+export async function holdBody(stream, limit = BUFFERED_RESPONSE_LIMIT, idleMs = resolveBodyIdleTimeout()) {
   if (!stream) return { buf: Buffer.alloc(0), body: null };
   const reader = stream.getReader();
   /** @type {Uint8Array[]} */
   let chunks = [];
   let length = 0;
   while (true) {
-    const { done, value } = await reader.read();
+    /** @type {ReadableStreamReadResult<Uint8Array>} */
+    let next;
+    try {
+      next = await readWithIdleTimeout(reader, idleMs);
+    } catch (err) {
+      reader.cancel().catch(() => {});
+      throw err;
+    }
+    const { done, value } = next;
     if (done) return { buf: Buffer.concat(chunks, length), body: null };
     chunks.push(value);
     length += value.byteLength;
@@ -5190,13 +5207,21 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
 // cut — it fires only when the socket produces nothing for the whole window,
 // converting a mid-stream hang into a fast failure that evicts the dead socket
 // (reader.cancel destroys the underlying connection on both the direct-fetch and
-// the sx-tunnel path, since both hand back a web ReadableStream). Override with
-// TEAMCLAUDE_UPSTREAM_BODY_TIMEOUT_MS.
+// the sx-tunnel path, since both hand back a web ReadableStream). It times the
+// reads of a body being relayed (streamResponse) or held whole (holdBody); the
+// bounded diagnostic reads of an error body (readErrorBody, inspectBillingError)
+// are not timed. Override with TEAMCLAUDE_UPSTREAM_BODY_TIMEOUT_MS.
 const DEFAULT_BODY_IDLE_TIMEOUT_MS = 120_000;
+
+// The longest delay setTimeout keeps: it holds the delay in a signed 32-bit
+// integer and fires one past it after 1 ms, which cut every body at once under
+// a setting meant to disable the deadline in practice. So a larger setting is
+// read as this (about 24.8 days).
+const MAX_TIMER_MS = 2 ** 31 - 1;
 
 function resolveBodyIdleTimeout() {
   const env = Number(envVar('UPSTREAM_BODY_TIMEOUT_MS'));
-  return env > 0 ? env : DEFAULT_BODY_IDLE_TIMEOUT_MS;
+  return env > 0 ? Math.min(env, MAX_TIMER_MS) : DEFAULT_BODY_IDLE_TIMEOUT_MS;
 }
 
 // Race a single reader.read() against an inactivity deadline. Resolves to the
