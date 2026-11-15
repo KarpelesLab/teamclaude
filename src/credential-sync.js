@@ -54,15 +54,16 @@
 // most (REMOVAL_PENDING_MAX_MS), and ends at once when this install is found
 // signed out of callback.net (made while signed out, a removal records nothing
 // at all): past either, nothing is written, the removal is logged as not
-// recorded, and the next pass adds the account back from its row like any
-// other. While it is pending it also wins over a sign-in made on another
-// install meanwhile, which is why it does not stay pending longer: a row
-// cannot tell a sign-in from a renewal. A pass deletes a
-// tombstone older than a week. Nothing checks that every install has seen it by
-// then: one that ran no pass in that week and still holds the account, with a
-// refresh token that still renews, stores it again (at its first pass after
-// signing back in to callback.net if it renewed the token while signed out, at
-// its next renewal if it was switched off), and the others add it back.
+// recorded, and the account comes back from its row like any other, at the
+// next pass that reads it (the pass that gave the removal up, when one did).
+// While it is pending it also wins over a sign-in made on another install
+// meanwhile, which is why it does not stay pending longer: a row cannot tell a
+// sign-in from a renewal. A pass deletes a tombstone older than a week.
+// Nothing checks that every install has seen it by then: one that ran no pass
+// in that week and still holds the account, with a refresh token that still
+// renews, stores it again (at its first pass after signing back in to
+// callback.net if it renewed the token while signed out, at its next renewal
+// if it was switched off), and the others add it back.
 //
 // An account IN ERROR (upstream rejected its token; it needs a re-login) is
 // never written to the store: what it holds is dead, and stored it would
@@ -121,13 +122,15 @@ const REMOVAL_LOCK_WAIT_MS = LOCK_TIMEOUT_S * 1000 + LOCKED_RECHECK_MS;
 /** A removal the store did not take: tried again after each pause, then by each pass. */
 const REMOVAL_RETRY_MS = [60_000, 5 * 60_000, 15 * 60_000];
 /**
- * A removal still not recorded this long after it was made is given up on. A
- * pending removal is written over whatever its row then holds, and a row cannot
- * tell a sign-in from a renewal: one that lived as long as the process would,
- * days later, write its tombstone over a sign-in made on another install and
- * destroy a working token. Given up on, the account reappears here from its
- * row, which shows and loses nothing. An hour covers every timed retry
- * (REMOVAL_RETRY_MS and the waits for the lock, about 23 minutes in all).
+ * A removal still not recorded more than this long after it was made is given
+ * up on. A pending removal is written over whatever its row then holds, and a
+ * row cannot tell a sign-in from a renewal: one that lived as long as the
+ * process would, days later, write its tombstone over a sign-in made on
+ * another install and destroy a working token. Given up on, the account comes
+ * back here from its row, enabled and without the settings it had here, and
+ * the one line logged says to remove it again. An hour covers every timed
+ * retry (REMOVAL_RETRY_MS and the waits for the lock, about 23 minutes in
+ * all).
  */
 export const REMOVAL_PENDING_MAX_MS = 3600_000;
 /** Rounds of lock-or-wait before this refresh gives up (the next request asks again). */
@@ -413,7 +416,8 @@ export class CredentialSync {
      * Marked before anything is awaited, so a pass running meanwhile does not
      * add the account back from its row, and each pass tries to write it
      * again, for REMOVAL_PENDING_MAX_MS at most. In memory only: a restart
-     * forgets it, and the next start's pass adds the account back from its row.
+     * forgets it, with no line to say so, and the next start's pass adds the
+     * account back from its row.
      * @type {Map<string, Record<string, any>>}
      */
     this.pendingRemovals = new Map();
@@ -861,9 +865,10 @@ export class CredentialSync {
 
   /**
    * Give up on a pending removal: nothing is written, it is settled, and its
-   * row is from then on a row like any other, which the next pass adds the
-   * account back from. Said once, since the account was removed here and the
-   * other installs were never told.
+   * row is from then on a row like any other, which the next pass to read it
+   * adds the account back from (a pass giving it up reads the rows after).
+   * Said once, since the account was removed here, comes back, and the other
+   * installs were never told.
    * @param {string} key
    * @param {Record<string, any>} account
    * @param {string} why
@@ -871,7 +876,7 @@ export class CredentialSync {
   _abandonRemoval(key, account, why) {
     if (this.pendingRemovals.get(key) !== account) return;
     this.pendingRemovals.delete(key);
-    this.log(`[TeamClaude] callback.net: the removal of "${safeLine(account.name, 64)}" was not recorded for your other installs (${why}); the account may reappear from them`);
+    this.log(`[TeamClaude] callback.net: the removal of "${safeLine(account.name, 64)}" was not recorded for your other installs (${why}); the account comes back here at the next pass that reads its row: remove it again then`);
   }
 
   /**

@@ -739,7 +739,7 @@ test('a removal settled during a retry pause takes no lock when it wakes', async
   assert.equal(checks, 0, 'not even a sign-in check');
 });
 
-const NOT_RECORDED = (name, why) => new RegExp(`the removal of "${name}" was not recorded for your other installs \\(${why}\\); the account may reappear from them`);
+const NOT_RECORDED = (name, why) => new RegExp(`the removal of "${name}" was not recorded for your other installs \\(${why}\\); the account comes back here at the next pass that reads its row: remove it again then`);
 
 test('a sign-out while a removal is pending ends it: nothing is written, and the pass after signing back in adds the account back', async () => {
   const store = makeStore();
@@ -781,6 +781,8 @@ test('a pass that finds this install signed out ends a pending removal', async (
   assert.equal(tombstoneOf(store.byKey(key).Data), null);
 });
 
+const LAPSED = 'callback\\.net did not take it within an hour';
+
 test('a removal pending for more than an hour is dropped, and does not tombstone a sign-in made on another install since', async () => {
   const store = makeStore();
   const key = syncKeyFor(claude('b'));
@@ -794,15 +796,18 @@ test('a removal pending for more than an hour is dropped, and does not tombstone
   home.am.removeAccount(1);
   assert.deepEqual(await home.settled(), [false]);
   assert.equal(home.sync.pendingRemovals.size, 1);
-  // Past the bound, by the least the clock can tell.
-  store.tick(removedAt + REMOVAL_PENDING_MAX_MS + 1 - store.now());
+  // Past the hour, by the least the clock can tell. Here and in the next test
+  // the hour is the test's own number, not REMOVAL_PENDING_MAX_MS: ticked by
+  // the bound, they passed with a bound of a week, and between them they pin
+  // it to the hour.
+  store.tick(removedAt + H + 1 - store.now());
   // Signed in again on office meanwhile; then the store is back in reach of home.
   const entry = claude('b', { accessToken: 'at-b-new', refreshToken: 'rt-b-new', expiresAt: store.now() + 8 * H });
   assert.equal(await office.sync.storeSignIn(entry), true);
   down = false;
   const r = await home.sync.sync();
   assert.equal(home.sync.pendingRemovals.size, 0);
-  assert.equal(home.logs.filter((l) => NOT_RECORDED('b', 'callback\\.net did not take it within an hour').test(l)).length, 1, home.logs.join('\n'));
+  assert.equal(home.logs.filter((l) => NOT_RECORDED('b', LAPSED).test(l)).length, 1, home.logs.join('\n'));
   assert.equal(tombstoneOf(store.byKey(key).Data), null, 'no tombstone over the sign-in');
   assert.equal(store.blob(key).accessToken, 'at-b-new', 'the sign-in stands');
   assert.equal(r.added, 1, 'the same pass adds the account back from its row');
@@ -811,6 +816,23 @@ test('a removal pending for more than an hour is dropped, and does not tombstone
   assert.deepEqual(office.am.accounts.map((a) => a.name), ['a', 'b']);
   assert.equal((await home.sync.sync()).added, 0);
   assert.equal(tombstoneOf(store.byKey(key).Data), null, 'nor by a later pass');
+});
+
+test('a removal given up on brings the account back enabled, without the settings it had here', async () => {
+  const store = makeStore();
+  const home = setup([claude('a'), claude('b', { priority: 7, disabled: true, routing: 'socks5://127.0.0.1:1080' })], { store });
+  await home.sync.sync();
+  assert.ok(home.am.accounts[1].routing, 'routed, before');
+  let down = true;
+  home.sync.api = async (...args) => { if (down) throw new Error('fetch failed'); return store.api(...args); };
+  home.am.removeAccount(1);
+  assert.deepEqual(await home.settled(), [false]);
+  store.tick(2 * H);
+  down = false;
+  assert.equal((await home.sync.sync()).added, 1);
+  const b = home.am.accounts.find((a) => a.name === 'b');
+  // Priority, disabled and routing are this install's own and never travel: they went with the removal.
+  assert.deepEqual({ disabled: b.disabled, priority: b.priority, routing: b.routing ?? null, status: b.status }, { disabled: false, priority: 0, routing: null, status: 'active' });
 });
 
 test('a removal pending for exactly an hour is still written by the pass', async () => {
@@ -825,7 +847,7 @@ test('a removal pending for exactly an hour is still written by the pass', async
   const removedAt = store.now();
   home.am.removeAccount(1);
   assert.deepEqual(await home.settled(), [false]);
-  store.tick(removedAt + REMOVAL_PENDING_MAX_MS - store.now());
+  store.tick(removedAt + H - store.now());
   down = false;
   assert.equal((await home.sync.sync()).added, 0);
   assert.notEqual(tombstoneOf(store.byKey(key).Data), null, 'within the bound: it lands');
@@ -853,7 +875,7 @@ test('a timed retry that comes round after the hour drops the removal, and makes
   assert.deepEqual(store.calls.slice(after).map((c) => `${c.method} ${c.path}`), [], 'no lock, no write');
   assert.equal(tombstoneOf(store.byKey(key).Data), null);
   assert.equal(home.sync.pendingRemovals.size, 0);
-  assert.equal(home.logs.filter((l) => NOT_RECORDED('b', 'callback\\.net did not take it within an hour').test(l)).length, 1, home.logs.join('\n'));
+  assert.equal(home.logs.filter((l) => NOT_RECORDED('b', LAPSED).test(l)).length, 1, home.logs.join('\n'));
   assert.equal((await home.sync.sync()).added, 1, 'the next pass adds it back from its row');
 });
 
@@ -865,7 +887,7 @@ test('a removal that passes the hour while it waits for the lock writes nothing,
   assert.equal(tombstoneOf(store.byKey(key).Data), null);
   assert.equal(home.sync.pendingRemovals.size, 0);
   assert.equal(store.byKey(key).Locked, null, 'the lock it took is released');
-  assert.equal(home.logs.filter((l) => NOT_RECORDED('b', 'callback\\.net did not take it within an hour').test(l)).length, 1, home.logs.join('\n'));
+  assert.equal(home.logs.filter((l) => NOT_RECORDED('b', LAPSED).test(l)).length, 1, home.logs.join('\n'));
 });
 
 test('an API-key account of the same name does not count as the removed account being back', async () => {
