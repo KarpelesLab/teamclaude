@@ -1316,7 +1316,29 @@ export class AccountManager {
     return tier ? { account, paid: tier === 'paid', fallback: true } : null;
   }
 
-  /** @param {Set<number>|null} exclude
+  /**
+   * Whether the `preferExtraUsage` preference applies to this request, as the
+   * exclude set that confines selection to the preferred subscriptions, or
+   * null when the request is routed as it would be without the key.
+   *
+   * It applies only when every one of these holds, in this order:
+   *  - some account sets `preferExtraUsage` (otherwise nothing here runs);
+   *  - the operator's manual choice is not in charge (_manualSelection);
+   *  - no eligible route pin covers the request, since a pin outranks it;
+   *  - some account can serve normally, and none of those is a subscription.
+   *    A subscription under its threshold is always used first, and when
+   *    nothing at all can serve there is no API capacity to go ahead of, so
+   *    the ordinary exhausted-fleet fallback (_selectFallback) decides;
+   *  - a preferred subscription qualifies (_preferredFallbackCandidates).
+   *
+   * So the only thing the preference ever changes is which of two is used
+   * first: an API key or backend with normal capacity, or a preferred
+   * subscription past its switch threshold.
+   *
+   * The returned set names every account but the candidates, the caller's own
+   * exclusions included, so it replaces `exclude` rather than adding to it.
+   *
+   * @param {Set<number>|null} exclude
    * @param {string|null} model
    * @param {string|null} advisorModel
    * @param {string} provider
@@ -1335,12 +1357,39 @@ export class AccountManager {
     return new Set(this.accounts.filter(a => !selected.has(a.index)).map(a => a.index));
   }
 
-  /** @param {Set<number>|null} exclude
+  /**
+   * The subscriptions the preference may spend on for this request: the one
+   * place the spending order of `preferExtraUsage` is decided. Selection, the
+   * session pin, the manual switch, eligibility() and the episode sweep all
+   * ask here, so none of them can spend what another would refuse.
+   *
+   * The order, cheapest first, and each step stops the ones after it:
+   *  1. A subscription under its switch threshold. While one can serve, the
+   *     answer is empty: normal rotation uses it.
+   *  2. Included quota past the threshold (the `free` tier). If ANY reachable
+   *     subscription has some, only those that also set `preferExtraUsage`
+   *     are candidates. When the only free quota is on subscriptions without
+   *     the key the answer is empty, so no preferred account is billed while
+   *     quota already paid for is left; the default order then applies (API
+   *     capacity first, and that free quota once the fleet is exhausted).
+   *  3. Paid credits (the `paid` tier), on accounts with both
+   *     `allowExtraUsage` and `preferExtraUsage`, only when step 2 found no
+   *     free quota anywhere.
+   *
+   * Last, an API account or backend with a strictly lower `priority` number
+   * than a candidate keeps its rank over it: a candidate must be at least as
+   * preferred as the best account that can serve normally.
+   *
+   * Every hard gate is fallbackTier's: a disabled, cordoned, capped,
+   * throttled or route-excluded account has no tier and is never a candidate.
+   *
+   * @param {Set<number>|null} exclude
    * @param {string|null} model
    * @param {string|null} advisorModel
    * @param {string} provider
    * @returns {Array<Record<string, any>>} */
   _preferredFallbackCandidates(exclude, model, advisorModel, provider) {
+    if (!this.accounts.some(a => a.preferExtraUsage)) return [];
     const reachable = this.accounts.filter(a => !exclude?.has(a.index) && canServeProvider(a, provider));
     const normal = reachable.filter(a => this._isAvailable(a, model, advisorModel));
     if (normal.some(isSubscriptionAccount)) return [];
@@ -1352,7 +1401,10 @@ export class AccountManager {
     return candidates.filter(a => (a.priority || 0) <= priority);
   }
 
-  /** @param {Record<string, any>} account
+  /** `account`'s tier as a preferred candidate for this request ('free' or
+   * 'paid'), or null when the preference may not spend on it (see
+   * _preferredFallbackCandidates).
+   * @param {Record<string, any>} account
    * @param {Set<number>|null} exclude
    * @param {string|null} model
    * @param {string|null} advisorModel
@@ -1988,15 +2040,29 @@ export class AccountManager {
       : `[TeamClaude] ${headroom} — "${safeLine(e.account.name, 64)}" no longer serves past its switch threshold${where}`);
   }
 
-  /** @param {{ account: Record<string, any>, paid: boolean, model: string|null }} episode
+  /**
+   * Whether a preferred episode whose account is under a 429 hold is still one
+   * the preference would be spending on once the hold ends, so the sweep can
+   * keep it rather than end it and announce and ramp it again a few seconds
+   * later (_sweepFallback).
+   *
+   * Needed because a throttled account has no fallbackTier, so for the length
+   * of the hold _preferredFallbackCandidates cannot name it. This asks the
+   * same spending order without that one gate: the account still has both
+   * keys, no subscription can serve normally, and, for a paid episode, no
+   * subscription has included quota left past its threshold. Any other reason
+   * the account cannot serve (disabled, capped, cordoned, error) answers false
+   * and the episode ends as it would without the preference.
+   *
+   * @param {{ account: Record<string, any>, paid: boolean, model: string|null }} episode
    * @param {Set<number>|null} exclude
    * @param {string|null} advisorModel
    * @returns {boolean} */
   _throttledPreferencePermitted(episode, exclude, advisorModel) {
     const { account, paid, model } = episode;
+    if (!account.allowExtraUsage || !account.preferExtraUsage) return false;
     // fallbackTier returns null during a throttle, even for an authorised episode.
     if (this.unavailableReason(account, model, advisorModel) !== 'throttled') return false;
-    if (!account.allowExtraUsage || !account.preferExtraUsage) return false;
     return !this.accounts.some(a => !exclude?.has(a.index) && isSubscriptionAccount(a)
       && (this._isAvailable(a, model, advisorModel) || (paid && this.fallbackTier(a, model, advisorModel) === 'free')));
   }
@@ -3340,7 +3406,16 @@ export class AccountManager {
     return this._activateFallback(pick, exclude, model, provider, advisorModel, preferExtraUsage);
   }
 
-  /** @param {{ account: Record<string, any>, paid: boolean }} pick
+  /**
+   * Make a fallback pick where the fleet rests: the second half of
+   * _selectFallback, shared with the manual switch onto a preferred
+   * subscription (_pickActiveAccount), which arrives with its pick already
+   * made. Moves the cursor unless the current account is barred for this model
+   * only, records the episode and starts the ramp when the episode is new.
+   * `preferExtraUsage` says the pick came from the preferred pool; otherwise
+   * the episode is marked preferred when the account is one the preference
+   * would have chosen anyway, which is what lets the sweep keep it.
+   * @param {{ account: Record<string, any>, paid: boolean }} pick
    * @param {Set<number>|null} exclude
    * @param {string|null} model
    * @param {string} provider
@@ -3699,7 +3774,15 @@ export class AccountManager {
     // _isAvailable also clears an expired throttle, so the specific reasons below
     // are only consulted once it has actually said no.
     if (!this._isAvailable(account)) {
-      if (this._preferredFallbackTier(account, null, null, null, providerOf(account))) return { eligible: true };
+      // Past its threshold, yet one of the subscriptions `preferExtraUsage`
+      // routes to ahead of API capacity, so requests do reach it. Not while
+      // the operator's manual choice rests on another account: the preference
+      // stands aside for that (_preferredExtraUsage). Never true in a fleet
+      // without the key.
+      if (this._preferredFallbackTier(account, null, null, null, providerOf(account))) {
+        const manual = this._manualSelection(null, null, null, providerOf(account));
+        if (!manual || manual.account === account) return { eligible: true };
+      }
       if (account.disabled) return { eligible: false, reason: 'disabled' };
       if (account.status === 'error') return { eligible: false, reason: isRefused(account) ? 'refused by upstream' : 'in an error state and needs a re-login' };
       if (account.status === 'exhausted') return { eligible: false, reason: 'out of quota' };

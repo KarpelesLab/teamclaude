@@ -103,9 +103,9 @@ Switched to "me@example.com"
 Warning: "me@example.com" is disabled, so requests will not route to it until that changes.
 ```
 
-A manual switch does not override `switchThreshold`, even when the target has `allowExtraUsage: true` and paid credits available. If another account can serve normally, rotation uses that account. An over-threshold target can still be selected by exhausted-fleet fallback; the switch does not make that target eligible for normal rotation. Once rotation moves away, a later automatic return to the account does not restore the earlier manual choice.
+So a switch to an account with `allowExtraUsage: true` holds only while that account is under its switch threshold. Past it, rotation moves to any account that can serve normally, as it does without a switch. The target can still be picked by the exhausted-fleet fallback like any other account, and once rotation has moved away, a later automatic return to the account does not bring the earlier choice back.
 
-`preferExtraUsage: true` alongside `allowExtraUsage: true` permits an explicit switch to use the target subscription's fallback capacity. The switch still yields to another subscription's normal capacity, and paid credits yield to eligible remaining included quota. An earlier switch cannot keep billing an exhausted subscription while another eligible subscription has included quota. Configurations without `preferExtraUsage` preserve the weak preference described above.
+With `preferExtraUsage: true` alongside `allowExtraUsage: true` on the target, the switch also keeps traffic on that subscription past its threshold, among the subscriptions the preference would use. It does not widen what may be spent: another subscription that can serve normally still goes first, paid credits still wait for included quota left on any subscription, and an API account with a strictly lower `priority` number still outranks it. Where one of those applies, the switch is reported as not taking effect and rotation proceeds as above. See [Extra-usage fallback](quota.md#extra-usage-fallback).
 
 Taking an account out of rotation, or moving it in the priority order, has a headless path too — the web equivalent of `teamclaude disable` / `enable` and `teamclaude priority --first` / `--last`, and what the browser dashboard's buttons call:
 
