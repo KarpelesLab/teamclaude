@@ -5206,8 +5206,12 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // an event stream is but unread: an answer that large is not a completion,
     // so there is no usage in it to lose, and lines in it that look like an
     // event stream's (a saved transcript) are not one's to book. The hold has
-    // its own silence budget (resolveHeldAnswerIdleTimeout), longer than a
-    // relay's: a non-streaming completion may be all silence after its head.
+    // its own silence budget (resolveHeldAnswerIdleTimeout), never shorter
+    // than a relay's: a non-streaming completion may be all silence after its
+    // head. At the defaults the two are both 120 s, so a hold is still cut at
+    // 120 s of silence; it waits longer whenever the head deadline is longer
+    // than the body-idle one: a Codex account (300 s), a raised headers
+    // timeout, or a lowered body-idle timeout.
     const held = isStreaming ? null : await holdBody(upstreamBody, undefined, resolveHeldAnswerIdleTimeout(account));
     if (held && !held.buf) {
       console.log(`[TeamClaude] A ${upstreamRes.status} answer from "${safeLine(account.name, 64)}" is larger than ${bufferedResponseLimitLabel()}; relaying it as it arrives instead of holding it`);
