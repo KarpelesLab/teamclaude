@@ -31,9 +31,15 @@ const SCHEDULE_TIMER_GRACE_MS = 60_000;
 
 // The warm-up is a `claude` run, so only an Anthropic subscription can take
 // it: a third-party backend has no 5-hour window of Anthropic's, and the server
-// refuses a Codex account outright.
+// refuses a Codex account outright. Nor can a subscription whose last reading
+// stated a weekly window and no 5-hour one (an Ultra plan once Anthropic lifts
+// its 5-hour limit): there is no timer to start, and with no reset ever
+// recorded it would be a target on every cycle, spending quota each time. A
+// 5-hour reading coming back sets the fact again (see noteSessionWindow in
+// account-manager.js), and the account is warmed from then on.
 export function warmApplicable(/** @type {any} */ account) {
-  return account.type === 'oauth' && !account.upstream && providerOf(account) === 'anthropic';
+  return account.type === 'oauth' && !account.upstream && providerOf(account) === 'anthropic'
+    && account.quota?.sessionWindowStated !== false;
 }
 
 export class Warmer {
@@ -190,21 +196,37 @@ export class Warmer {
   /**
    * True when `account` is a healthy, idle Anthropic OAuth account whose 5h
    * window is NOT already running. We skip:
-   *  - non-OAuth, third-party-backend and Codex accounts (see warmApplicable);
+   *  - non-OAuth, third-party-backend and Codex accounts, and a subscription
+   *    that meters no 5h window (see warmApplicable);
    *  - disabled / errored / exhausted / throttled accounts — warming them is
    *    pointless or would just 429;
+   *  - cordoned accounts: a warm-up opens a window for the conversations that
+   *    come next, and a cordoned account takes none;
    *  - accounts with a live 5h window — already warm, so warming again only burns
    *    quota for nothing.
    */
   _isWarmCandidate(account) {
     if (!warmApplicable(account) || !account.credential) return false;
-    if (account.disabled) return false;
+    if (account.disabled || account.cordoned) return false;
     if (account.status === 'error' || account.status === 'exhausted' || account.status === 'throttled') return false;
     return true;
   }
 
   _isWarmTarget(account, now = this.nowFn()) {
     if (!this._isWarmCandidate(account)) return false;
+    // Nor while the account sits out an entitlement cooldown (an OAuth policy
+    // 403). A warm-up is pinned, so nothing in the listener holds it back, and
+    // its refusal counts as a new denial: warming stepped the very cooldown it
+    // ignored from 5 minutes to 15, then 60. Skipping costs that slot's warm-up
+    // for the account - nothing retries it before the next slot - but a warm-up
+    // the policy refuses warms nothing either. Checked here, when the warm-up
+    // would be sent, not in _isWarmCandidate: a rolling slot still defers the
+    // account past its reset, and the deferred warm-up asks again when it fires.
+    // A routing cooldown is not checked: it lasts 30 seconds, a warm-up through a
+    // proxy that has recovered succeeds, and one through a proxy still down fails
+    // as the request that armed it did, arming it again for 30 seconds.
+    const am = /** @type {import('./account-manager.js').AccountManager} */ (this.am);
+    if (am.isEntitlementDenied(account.index, now)) return false;
     const reset = account.quota?.unified5hReset;
     return !(reset && now < reset); // a future reset ⇒ session already running
   }

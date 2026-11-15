@@ -193,6 +193,27 @@ test('a refresh that merely failed leaves the credential unreachable, not refuse
   assert.equal(saved, creds, 'nothing was renewed, so nothing changes');
 });
 
+// The token endpoint's answer decides, as in the account manager (oauth.js
+// isRefreshRejection): a page from something in front of it says nothing about
+// the refresh token, so the credential is unreachable, not refused, and --name
+// still gets it in. An empty 401 there is carried as no status, since
+// isTokenRejection reads a 401 as the upstream's verdict.
+test('a refresh answered by a page in front of the token endpoint leaves the credential unreachable, importable by name', async () => {
+  for (const [status, body] of [[403, '<html><body>Access denied</body></html>'], [401, '']]) {
+    const page = () => ({ ok: false, status, json: async () => { throw new SyntaxError('not JSON'); }, text: async () => body });
+    const up = upstream({ refresh: page });
+    const creds = { accessToken: 'stale-at', refreshToken: 'maybe-good-rt', expiresAt: Date.now() - 60_000 };
+    const { creds: saved, profile } = await withFetch(up.fetch, () => profileForCredentials(creds));
+    assert.deepEqual(up.refreshes().map(b => b.refresh_token), ['maybe-good-rt'], String(status));
+    assert.match(profile.error, new RegExp(`token refresh failed.*\\(${status}\\)`), String(status));
+    assert.equal(profile.status, status === 401 ? null : status, String(status));
+    assert.equal(isTokenRejection(profile), false, String(status));
+    assert.equal(canUpsertOAuthAccount(profile, true), true, `--name gets it in: ${status}`);
+    assert.equal(canUpsertOAuthAccount(profile, false), false, `an unnamed import still needs an identity: ${status}`);
+    assert.equal(saved, creds, String(status));
+  }
+});
+
 test('a 403 is not refreshed and not refused', async () => {
   const up = upstream({
     profiles: { 'good-at': () => reply(403, { error: { message: 'Request not allowed' } }) },

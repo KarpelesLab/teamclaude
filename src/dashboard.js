@@ -15,7 +15,7 @@
 // operator/OAuth-derived, but they still never reach innerHTML.
 
 import { createHash } from 'node:crypto';
-import { UNAVAILABLE_TEXT, RESET_CREDIT_MAX_AGE_MS, outsideSpendText, forecastText, showSessionRow, showWeeklyRow } from './status-renderer.js';
+import { UNAVAILABLE_TEXT, RESET_CREDIT_MAX_AGE_MS, outsideSpendText, forecastText, fleetForecastText, showSessionRow, showWeeklyRow, creditText } from './status-renderer.js';
 import { USAGE_WINDOWS } from './client-usage.js';
 import { EVENT_LOG_CAPACITY } from './event-log.js';
 import { CREDIT_EXPIRY_WINDOW_MS } from './codex-reset-credits.js';
@@ -470,6 +470,10 @@ export function accountBadges(account, current, currentAccounts, now, fleetThres
   ];
   if (isCurrent) badges.push({ cls: 'current', text: 'current' });
   badges.push({ cls: status, text: status });
+  // Cordoned: no new conversation goes here while the ones on it stay, with
+  // how many are left — what an operator waits to see reach 0 before a
+  // disable or a removal.
+  if (a.cordoned === true) badges.push({ cls: 'cordoned', text: 'cordoned' + (Number.isFinite(a.cordonRemaining) ? ' · ' + a.cordonRemaining + ' left' : '') });
   if (recent) badges.push({ cls: 'sessions', text: recent + ' recent' });
   if (known > recent) badges.push({ cls: 'sessions known', text: known + ' known' });
   // Free Codex rate-limit reset credits this account holds — what it could
@@ -489,7 +493,14 @@ export function accountBadges(account, current, currentAccounts, now, fleetThres
     var expires = Number.isFinite(reading.expiresAt)
       ? ' \u00b7 expires ' + new Date(reading.expiresAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
       : '';
-    badges.push({ cls: 'meta resets', text: credits + ' reset credit' + (credits === 1 ? '' : 's') + expires });
+    // Fable resets (oauth.js bankedResets) clear the Fable weekly only, so they
+    // are named apart from the resets that put every model back.
+    var fable = Number.isFinite(reading.fable) ? Math.min(Math.max(reading.fable, 0), credits) : 0;
+    var general = credits - fable;
+    var held = [];
+    if (general > 0) held.push(general + ' reset credit' + (general === 1 ? '' : 's'));
+    if (fable > 0) held.push(fable + ' Fable reset' + (fable === 1 ? '' : 's'));
+    badges.push({ cls: 'meta resets', text: held.join(', ') + expires });
   }
   // Arguments 5/6 are optional (the pre-#409 unit test above omits them): with
   // no account switchThreshold at all — the common case — thresholdBadgeText
@@ -507,6 +518,9 @@ export function accountBadges(account, current, currentAccounts, now, fleetThres
   // password-masked (describeRouting), and absent for an account on the fleet
   // path, which is the default and earns no badge.
   if (typeof a.routing === 'string' && a.routing) badges.push({ cls: 'meta routing', text: 'via ' + a.routing });
+  // Stays past the entitlement cooldown, until the account serves again.
+  var denial = a.entitlementDenial;
+  if (denial) badges.push({ cls: 'throttled', text: 'OAuth denied' + (denial.count > 1 ? ' \u00d7' + denial.count : '') });
   return badges;
 }
 
@@ -836,21 +850,24 @@ export function selfInstanceLabel(self) {
  * move, or {disabled} to take an account out of rotation or put it back.
  *
  * @param {any} name
- * @param {{ place?: string, priority?: number, disabled?: boolean }} spec
+ * @param {{ place?: string, priority?: number, disabled?: boolean, cordoned?: boolean }} spec
  * @param {string|null} key
  */
 export function accountControlRequest(name, spec, key) {
-  var isPriority = spec.disabled === undefined;
-  /** @type {{ account: any, place?: any, priority?: any, disabled?: any }} */
+  var isCordon = spec.cordoned !== undefined;
+  var isPriority = spec.disabled === undefined && !isCordon;
+  /** @type {{ account: any, place?: any, priority?: any, disabled?: any, cordoned?: any }} */
   var body = { account: name };
   if (isPriority) {
     if (spec.place) body.place = spec.place;
     else body.priority = spec.priority;
+  } else if (isCordon) {
+    body.cordoned = spec.cordoned;
   } else {
     body.disabled = spec.disabled;
   }
   return {
-    url: isPriority ? '/teamclaude/priority' : '/teamclaude/disable',
+    url: isPriority ? '/teamclaude/priority' : isCordon ? '/teamclaude/account-cordon' : '/teamclaude/disable',
     init: {
       method: 'POST',
       headers: { 'x-api-key': key || '', 'content-type': 'application/json' },
@@ -865,12 +882,22 @@ export function accountControlRequest(name, spec, key) {
  * 'first' or 'last'.
  *
  * @param {any} res
- * @param {{ place?: string, priority?: number, disabled?: boolean }} spec
+ * @param {{ place?: string, priority?: number, disabled?: boolean, cordoned?: boolean }} spec
  */
 export function accountControlOutcome(res, spec) {
   if (!res || !res.ok) return { kind: 'error', text: 'change failed' + (res && res.error ? ': ' + res.error : '') };
   if (spec.disabled !== undefined) {
     return { kind: 'ok', text: (res.disabled ? 'disabled ' : 'enabled ') + res.name };
+  }
+  // A cordon reports what it leaves running, which is what an operator waits
+  // on, and warns when no other account is left to take new conversations.
+  if (spec.cordoned !== undefined) {
+    if (!res.cordoned) return { kind: 'ok', text: 'uncordoned ' + res.name + ': it takes new conversations again' };
+    var left = Number.isFinite(res.remaining) ? res.remaining : null;
+    var text = 'cordoned ' + res.name + ': no new conversations'
+      + (left == null ? '' : ', ' + left + ' still on it' + (left === 0 ? ', so disabling or removing it ends nothing running' : ''));
+    if (res.inService === 0) return { kind: 'warn', text: text + '; no other account takes new conversations now' };
+    return { kind: 'ok', text: text };
   }
   return { kind: 'ok', text: res.name + ' priority ' + res.priority };
 }
@@ -1821,12 +1848,16 @@ export function problems(status) {
   }
 
   // Only the two states that do not clear themselves. `entitlement` is a
-  // five-minute cooldown and `upstream-rejected` is upstream's way of saying a
+  // cooldown of at most an hour and `upstream-rejected` is upstream's way of saying a
   // shared bucket is spent — both expire on their own, like `quota` and
   // `throttled`, and none of them wants a person.
   var ATTENTION = { error: 'needs a re-login', disabled: 'is disabled' };
   (s.accounts || []).forEach(function (a) {
-    var why = ATTENTION[a.unavailable];
+    // A refusal from upstream (account-refusal.js) is not cured by a re-login
+    // alone; any error code other than the two dead-token ones is one.
+    var code = a.errorReason && a.errorReason.code;
+    var refused = a.unavailable === 'error' && code && code !== 'refresh_rejected' && code !== 'credential_rejected';
+    var why = refused ? 'was refused by upstream' : ATTENTION[a.unavailable];
     if (why) out.push({ severity: 'warn', kind: 'account', text: 'Account ' + a.name + ' ' + why + '.' });
   });
 
@@ -1937,6 +1968,14 @@ export function accountMeters(account, fable, now) {
     // background Quota refresh.
     text = a.provider === 'grok' ? 'quota unknown: Grok states it only when asked (Refresh quota)'
       : 'quota unknown (no traffic observed yet)';
+  }
+  // An API key's prepaid credit (accounts[].credit): the share spent this
+  // cycle, counting down to its renewal. Money, not rate-limit headroom, so it
+  // is a column of its own beside Tokens.
+  if (a.credit) {
+    var credit = quotaMeter('Prepaid credit', a.credit.usedFraction, a.credit.cycleEnd);
+    var free = slots.indexOf(null);
+    if (free >= 0) slots[free] = credit; else extra.push(credit);
   }
   return { slots: slots, extra: extra, text: text };
 }
@@ -2646,8 +2685,8 @@ const SHARED_HELPERS = [
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
   probeIntervalOptions, probeIntervalRequest, probeIntervalOutcome, instanceNameRequest, instanceNameOutcome, instanceAddressRequest, instanceAddressOutcome, linkSelfWithAddress, selfInstanceLabel,
   passwordLoginRequest, passwordLoginOutcome, dashboardLoginRequest, dashboardLoginOutcome,
-  outsideSpendHideRequest, outsideSpendHideOutcome, outsideSpendText, forecastText, showSessionRow, showWeeklyRow, callerCan, callerNotice, cardNoteKey, accountEmailLine, cardNoteFor, backendQuotaRows,
-  canRefreshQuota, refreshQuotaRequest, refreshQuotaOutcome,
+  outsideSpendHideRequest, outsideSpendHideOutcome, outsideSpendText, forecastText, fleetForecastText, showSessionRow, showWeeklyRow, callerCan, callerNotice, cardNoteKey, accountEmailLine, cardNoteFor, backendQuotaRows,
+  canRefreshQuota, refreshQuotaRequest, refreshQuotaOutcome, creditText,
   codexResetsLeft, codexResetsSummary, canRedeemReset, redeemResetRequest, redeemResetOutcome, resetClickStep,
   codexResetExpiry, shortDate, resetsLeftText, resetCreditAlerts,
   meterTone, quotaMeter, exhaustedMeter, fableLabel, accountMeters, accountQuotaExhausted, poolSummary, accountGroup, groupLabel, providerTabs,
@@ -2819,7 +2858,7 @@ const PAGE = `<!doctype html>
   .tag { font-size: 12px; color: var(--dim); }
   .badge { font-size: 11px; line-height: 18px; padding: 0 7px; border-radius: 999px; border: 1px solid var(--line); white-space: nowrap; }
   .badge.active { color: var(--ok); border-color: var(--ok); }
-  .badge.throttled { color: var(--warn); border-color: var(--warn); }
+  .badge.throttled, .badge.cordoned { color: var(--warn); border-color: var(--warn); }
   .badge.error, .badge.exhausted, .badge.disabled { color: var(--bad); border-color: var(--bad); }
   .badge.current, .badge.drain { color: var(--accent); border-color: var(--accent); }
   .badge.plan { color: var(--text); background: var(--panel2); }
@@ -3553,8 +3592,15 @@ ${SHARED_HELPERS}
     var said = 0;
     var cn = cardNoteFor(cardNotes, key, Date.now());
     if (cn) { x.appendChild(el('div', 'cardnote ' + cn.kind, cn.text)); said++; }
-    if (a.unavailable) { x.appendChild(el('div', 'blocked', 'blocked: ' + (UNAVAILABLE_TEXT[a.unavailable] || a.unavailable))); said++; }
+    // A cordon is the badge's to say: the account still serves what is on it.
+    if (a.unavailable && a.unavailable !== 'cordoned') { x.appendChild(el('div', 'blocked', 'blocked: ' + (UNAVAILABLE_TEXT[a.unavailable] || a.unavailable))); said++; }
+    if (a.entitlementDenial) { x.appendChild(el('div', 'blocked', 'denied: ' + (a.entitlementDenial.detail || 'OAuth entitlement denied') + ' \u00b7 first ' + fmtAgo(a.entitlementDenial.since))); said++; }
     if (meters.text) { x.appendChild(el('div', 'usage', meters.text)); said++; }
+    // Prepaid API credit (accounts[].credit): its bar is one of the meters,
+    // and this is the amount left with where the figure comes from, in the
+    // words the status command prints.
+    var creditLine = a.credit ? creditText(a.credit, Date.now()) : null;
+    if (creditLine) { x.appendChild(el('div', 'usage', 'credit: ' + creditLine)); said++; }
     var q = a.quota || {};
     // Spend on this account that did not come through the proxy (#475).
     var outside = outsideSpendText(q.outsideSpend, s.outsideSpendHidePercent, q.planPeriod);
@@ -3869,9 +3915,22 @@ ${SHARED_HELPERS}
       var ctlDisable = button('btn', a.disabled ? 'Enable' : 'Disable', function () { doControlAccount(a.name, key, { disabled: !a.disabled }, ctlDisable); });
       act.appendChild(ctlDisable);
     }
-    // Only enable/disable for a disabled account: the rest would move an
-    // account that nothing will select anyway.
-    if (!a.disabled && callerCan(s.caller, '/teamclaude/priority')) {
+    // Cordon it, or put it back: no new conversation goes to it while the
+    // ones already on it stay, the graceful step before a disable or a
+    // removal. Drawn for a disabled account too, so an enable can bring it
+    // back cordoned.
+    if (callerCan(s.caller, '/teamclaude/account-cordon')) {
+      var cordoned = a.cordoned === true;
+      var ctlCordon = button('btn', cordoned ? 'Uncordon' : 'Cordon', function () { doControlAccount(a.name, key, { cordoned: !cordoned }, ctlCordon); });
+      ctlCordon.title = cordoned ? 'Send new conversations to this account again'
+        : 'Send no new conversations to this account; the ones on it stay until they finish';
+      act.appendChild(ctlCordon);
+    }
+    // Only enable/disable (and cordon) for a disabled account: the rest would
+    // move an account that nothing will select anyway. Not for a cordoned one
+    // either: nothing new goes there, so a move would read as doing something
+    // and would not, until the uncordon.
+    if (!a.disabled && a.cordoned !== true && callerCan(s.caller, '/teamclaude/priority')) {
       var ctlFirst = button('btn', 'Prioritize', function () { doControlAccount(a.name, key, { place: 'first' }, ctlFirst); });
       act.appendChild(ctlFirst);
       var ctlLast = button('btn', 'Deprioritize', function () { doControlAccount(a.name, key, { place: 'last' }, ctlLast); });
@@ -6112,6 +6171,8 @@ ${SHARED_HELPERS}
     sum.appendChild(el('span', '', ' · ' + (sess.active || 0) + ' active / ' + (sess.known || 0) + ' known conversations' + (up ? ' · ' + up : '')));
     var pinsText = sessionPinsText(s.sessionPins);
     if (pinsText) sum.appendChild(el('span', 'pin', ' · ' + pinsText));
+    var fleetText = fleetForecastText(s.fleetForecast, Date.now());
+    if (fleetText) sum.appendChild(el('span', '', ' · ' + fleetText));
     var probe = s.probe || {};
     var probeBtn = document.getElementById('probe');
     probeBtn.textContent = probe.running ? 'Probe running…' : 'Probe quotas';

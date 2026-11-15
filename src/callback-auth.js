@@ -75,30 +75,27 @@ const RENEW_AHEAD_MS = 120_000;
  * @property {boolean} [envelope]  resolve with the whole reply (`data` and `paging`) rather than `data` alone
  */
 
-let warnedBase = /** @type {string|null} */ (null);
-
 /**
  * The origin the API is reached at. An override must be https:, or plain http:
  * to this machine only (a test mock): the access token rides in a header to
  * whatever this names, so an inherited variable must not be able to point it at
  * a cleartext or arbitrary host silently.
  *
+ * An override that is SET but not acceptable throws: it is never replaced by the
+ * default. Whoever set it meant another store, and falling back would send this
+ * install's token to callback.net instead — a typo turned into a leak.
+ *
  * @param {NodeJS.ProcessEnv} [env]
- * @param {(message: string) => void} [warn]
  * @returns {string}
  */
-export function callbackBase(env = process.env, warn = (m) => console.error(m)) {
+export function callbackBase(env = process.env) {
   const raw = envVar('CALLBACK_API_BASE', env);
   if (!raw) return DEFAULT_BASE;
   let u = null;
-  try { u = new URL(raw); } catch { /* reported below */ }
+  try { u = new URL(raw); } catch { /* refused below */ }
   const loopback = u && /^(localhost|127\.\d{1,3}\.\d{1,3}\.\d{1,3}|\[::1\])$/.test(u.hostname);
   if (u && (u.protocol === 'https:' || (u.protocol === 'http:' && loopback))) return u.origin;
-  if (warnedBase !== raw) {
-    warnedBase = raw;
-    warn(`[TeamClaude] ignoring CALLBACK_API_BASE=${JSON.stringify(raw)}: it must be https:// (plain http:// is allowed for loopback only); using ${DEFAULT_BASE}`);
-  }
-  return DEFAULT_BASE;
+  throw new Error(`refusing to call the credential store: CALLBACK_API_BASE=${JSON.stringify(raw)} must be https:// (plain http:// is allowed for loopback only). Fix or unset it; it is not replaced by ${DEFAULT_BASE}, which would receive this install's token`);
 }
 
 /**

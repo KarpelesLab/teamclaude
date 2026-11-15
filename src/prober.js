@@ -8,6 +8,8 @@
 // probe reads a zero-spend endpoint and never consumes message quota.
 
 import { fetchUsage } from './oauth.js';
+import { parseResetStatus } from './claude-resets.js';
+import { rememberResetReading } from './reset-readings.js';
 import { fetchBackendQuota, hasBackendQuota } from './backend-quota.js';
 import { providerOf } from './provider.js';
 import { fetchCodexUsage } from './codex-usage.js';
@@ -19,6 +21,11 @@ import { fetchResetCreditDetails, creditDetailsDue, CREDIT_DETAILS_RETRY_MS } fr
 // would instead probe in a tight loop. The TUI and CLI accept any number of
 // seconds, so the ceiling lives here where the timer is armed.
 export const MAX_PROBE_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000;
+
+// How often an account's OAuth profile is read again once its plan is known. A
+// plan that lapses shows there (see AccountManager.applyProfileData), and it
+// changes far more rarely than quota does.
+export const PROFILE_RECHECK_MS = 60 * 60 * 1000;
 
 function clampInterval(ms) {
   return ms > 0 ? Math.min(ms, MAX_PROBE_INTERVAL_MS) : 0;
@@ -57,8 +64,14 @@ export class Prober {
   // notices below are produced later still, by a reload that changes the probe
   // interval, so a captured `console.log` would put them on a terminal the
   // alternate screen has already covered.
-  constructor(accountManager, { intervalMs = 0, probeFn = fetchUsage, codexProbeFn = fetchCodexUsage, grokProbeFn = fetchGrokUsage, codexCreditsFn = fetchResetCreditDetails, profileFn = null, backendFn = fetchBackendQuota, timeoutMs = 10_000, log = (/** @type {string} */ line) => console.log(line) } = {}) {
+  //
+  // `config` is the SHARED config object, not a snapshot: `probeDisabledAccounts`
+  // is read off it per cycle, so a TUI toggle or a reload applies on the next
+  // probe without a reschedule.
+  constructor(accountManager, { intervalMs = 0, probeFn = fetchUsage, codexProbeFn = fetchCodexUsage, grokProbeFn = fetchGrokUsage, codexCreditsFn = fetchResetCreditDetails, profileFn = null, profileIntervalMs = PROFILE_RECHECK_MS, backendFn = fetchBackendQuota, timeoutMs = 10_000, config = null, log = (/** @type {string} */ line) => console.log(line) } = {}) {
     this.am = accountManager;
+    /** @type {{ probeDisabledAccounts?: boolean } | null} */
+    this.config = config;
     this.intervalMs = clampInterval(intervalMs);
     this.probeFn = probeFn;
     this.codexProbeFn = codexProbeFn;
@@ -70,6 +83,9 @@ export class Prober {
     /** @type {WeakMap<object, number>} */
     this._creditReadFailedAt = new WeakMap();
     this.profileFn = profileFn;
+    this.profileIntervalMs = profileIntervalMs;
+    // By account object: names are not unique.
+    this.profileReadAt = new WeakMap();
     this.backendFn = backendFn;
     this.timeoutMs = timeoutMs;
     this.log = log;
@@ -163,9 +179,14 @@ export class Prober {
   // once more, and its access token cannot be trusted either. The manager's
   // dead-token guard is keyed on the token value, so a re-login lifts this skip
   // on its own.
+  //
+  // `probeDisabledAccounts` lifts the first skip, and only that one: the
+  // operator asked for a disabled account's quota to stay current while it is
+  // out of rotation, and accepts the refresh that comes with it. A dead token
+  // stays skipped either way.
   _probeable(account) {
     if (!account?.credential) return false;
-    if (account.disabled) return false;
+    if (account.disabled && this.config?.probeDisabledAccounts !== true) return false;
     if (account._deadRefreshToken && account._deadRefreshToken === account.refreshToken) return false;
     return true;
   }
@@ -209,14 +230,20 @@ export class Prober {
     if (isGrokProbeTarget(account)) return this._probePlanUsage(account, startedAt, this.grokProbeFn);
     try {
       await this.am.ensureTokenFresh(account.index);
-      let usage = await this._withTimeout(this.probeFn(account.credential, account.routing ?? null));
+      const readOptions = {
+        onPayload: (/** @type {any} */ data) => rememberResetReading(account, 'claude', { reset: parseResetStatus(data?.cedar_ember) }),
+      };
+      let usage = await this._withTimeout(this.probeFn(account.credential, account.routing ?? null, readOptions));
       if (usage?.status === 401) {
         // Token rejected: force refresh and retry once.
         await this.am.ensureTokenFresh(account.index, true);
-        usage = await this._withTimeout(this.probeFn(account.credential, account.routing ?? null));
+        usage = await this._withTimeout(this.probeFn(account.credential, account.routing ?? null, readOptions));
       }
 
       if (!usage || usage.error) {
+        rememberResetReading(account, 'claude', usage ?? { error: 'probe timed out' });
+        // A refused usage read can be the lapsed plan itself; the profile says.
+        if (usage) await this._readProfile(account);
         const finishedAt = Date.now();
         return this._recordAccount(account, {
           status: usage?.error ? 'error' : 'timeout',
@@ -228,15 +255,7 @@ export class Prober {
       }
 
       this.am.applyUsageData(account.index, usage);
-      const missingTier = !account.rateLimitTier && !account.seatTier
-        && account.hasClaudeMax == null && account.hasClaudePro == null;
-      // The email too: an account added before emails were kept has none, and
-      // the profile read costs no quota. Once found it is kept in the state
-      // file, so this is one read per account, not one per probe.
-      if ((missingTier || !account.email) && this.profileFn) {
-        const profile = await this._withTimeout(this.profileFn(account.credential, account.routing ?? null));
-        this.am.applyProfileData(account.index, profile);
-      }
+      await this._readProfile(account);
       const finishedAt = Date.now();
       return this._recordAccount(account, {
         status: 'ok',
@@ -255,6 +274,22 @@ export class Prober {
         durationMs: finishedAt - startedAt,
       });
     }
+  }
+
+  /** @param {Record<string, any>} account */
+  async _readProfile(account) {
+    if (!this.profileFn) return;
+    const missingTier = !account.rateLimitTier && !account.seatTier
+      && account.hasClaudeMax == null && account.hasClaudePro == null;
+    // The email too: an account added before emails were kept has none, and
+    // the profile read costs no quota. Once found it is kept in the state
+    // file, so the wait between re-reads applies again from then on.
+    const missingIdentity = missingTier || !account.email;
+    const now = Date.now();
+    if (!missingIdentity && now - (this.profileReadAt.get(account) ?? -Infinity) < this.profileIntervalMs) return;
+    this.profileReadAt.set(account, now);
+    const profile = await this._withTimeout(this.profileFn(account.credential, account.routing ?? null));
+    this.am.applyProfileData(account.index, profile);
   }
 
   async _probeCodex(account, startedAt) {

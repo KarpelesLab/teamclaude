@@ -218,7 +218,9 @@ teamclaude attach                # open the terminal UI of a running proxy
 teamclaude help                  # everything else
 ```
 
-Every command: [docs/usage.md](docs/usage.md#command-reference).
+In the local TUI, **r** opens the account picker and its **Resets** panel. Choose a banked Claude reset or Codex reset credit, press **Enter** to review the warnings, then **y** to spend it. **r** reads fresh details; **Esc** closes the panel. A spend cannot be undone.
+
+Every command: [docs/usage.md](docs/usage.md#command-reference). TUI keys: [docs/usage.md](docs/usage.md#tui-keyboard-shortcuts).
 
 ## Configuration
 

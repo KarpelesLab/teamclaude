@@ -98,7 +98,7 @@ On the proxy side, `teamclaude status` (or the TUI) counts the conversation unde
 
 In MITM mode the API host stays `api.anthropic.com`, so none of that applies. [Proxy modes](proxy-modes.md#mitm-proxy-mode-default) has the details. In short:
 
-- The proxy terminates only Anthropic's host (and `chatgpt.com` when the pool holds Codex accounts). Every other host goes through a blind `CONNECT` tunnel.
+- The proxy terminates only Anthropic's host (and `chatgpt.com` when the pool holds Codex accounts and its certificate names that host). Every other host goes through a blind `CONNECT` tunnel.
 - Sign-in and token refresh, Remote Control, claude.ai file transfers and artifacts go upstream with the extension's own login, never a pooled account.
 - The local CA is trusted only by processes that get `NODE_EXTRA_CA_CERTS`: here, the extension's Claude Code processes and what they start. It is never added to the system trust store.
 
@@ -122,7 +122,7 @@ A restart drops requests in flight, so do it between tasks. `teamclaude version`
 
 A copy installed with pnpm is updated with pnpm (`pnpm add -g @karpeleslab/teamclaude@latest`, which `teamclaude update` prints for such a copy); one installed with another tool, such as Yarn or Bun, with that tool. Restart the service after that update too.
 
-Restart it as well when `teamclaude env` or `teamclaude run` warns that the MITM certificate is due for renewal: it no longer names a host the proxy intercepts (such as `chatgpt.com` once the first Codex account is added) or has less than 30 days left. While the proxy runs they keep the certificate it presents, and a starting proxy renews it. The renewal comes with a new CA, so after the restart, run `teamclaude env --mitm` again and check that the `NODE_EXTRA_CA_CERTS` path is unchanged (it is, unless you moved the config); conversations opened before the restart need reopening.
+Restart it as well when `teamclaude env` or `teamclaude run` warns that the MITM certificate is due for renewal: it does not name a host the accounts need (such as `chatgpt.com` once the first Codex account is added, which the running proxy tunnels untouched, on the client's own login, until then) or has less than 30 days left. While the proxy runs they keep the certificate it presents, and a starting proxy renews it. The renewal comes with a new CA, so after the restart, run `teamclaude env --mitm` again and check that the `NODE_EXTRA_CA_CERTS` path is unchanged (it is, unless you moved the config); conversations opened before the restart need reopening.
 
 ## Turning it off
 

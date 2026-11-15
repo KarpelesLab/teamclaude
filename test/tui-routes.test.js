@@ -234,9 +234,9 @@ test('TUI: the F7 (Fable) marker sits on exactly one account — the routing tar
     stripAnsi(tui._renderAcct(i, 8, true, routes, [], familyTarget)));
   const marked = rows.filter(r => /►\s*F7/.test(r));
   assert.equal(marked.length, 1, 'exactly one F7 marker across all accounts');
-  // ...and it is NOT the Fable-spent account a (which instead shows the ⊘ tag).
+  // ...and it is NOT the Fable-spent account a (whose bar reads ⊘F instead).
   assert.ok(!/►\s*F7/.test(rows[0]), 'the Fable-spent account carries no F7 marker');
-  assert.match(rows[0], /⊘ Fable/, 'the Fable-spent account is tagged blocked');
+  assert.match(rows[0], /⊘F/, 'the Fable-spent account is marked blocked');
 });
 
 test('TUI routes editor: delete removes the selected route', async () => {

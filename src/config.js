@@ -31,6 +31,16 @@ export function getStatePath() {
 }
 
 /**
+ * Path to the quota series behind the fleet forecast (a sibling of the state
+ * file, see quota-series.js). Kept out of the state file: it is the one piece
+ * of runtime state that grows with time, so it carries bounds of its own.
+ */
+export function getQuotaSeriesPath() {
+  const cfg = getConfigPath();
+  return cfg.endsWith('.json') ? cfg.replace(/\.json$/, '.quota-series.json') : cfg + '.quota-series';
+}
+
+/**
  * Path to the crash log (a sibling of the config), where a fatal error is
  * recorded before the process exits.
  */
@@ -53,6 +63,48 @@ export async function saveState(state) {
 }
 
 /**
+ * One writer and at most one pending snapshot, read only when its write starts.
+ * Each caller waits for the batch containing its request, including final saves.
+ * @param {() => any} readState
+ * @param {{save?: (state: any) => Promise<void>, onError?: (err: any) => void}} [opts]
+ */
+export function createStatePersister(readState, { save = saveState, onError = () => {} } = {}) {
+  /** @typedef {{promise: Promise<void>, resolve: () => void}} Batch */
+  /** @type {Batch|null} */
+  let active = null;
+  /** @type {Batch|null} */
+  let pending = null;
+  /** @returns {Batch} */
+  const batch = () => {
+    let resolve = () => {};
+    /** @type {Promise<void>} */
+    const promise = new Promise(done => { resolve = done; });
+    return { promise, resolve };
+  };
+  /** @param {Batch} current */
+  const start = async current => {
+    active = current;
+    try { await save(readState()); }
+    catch (err) { onError(err); }
+    finally {
+      active = null;
+      current.resolve();
+      if (pending) {
+        const next = pending;
+        pending = null;
+        void start(next);
+      }
+    }
+  };
+  return () => {
+    if (active) return (pending ??= batch()).promise;
+    const current = batch();
+    void start(current);
+    return current.promise;
+  };
+}
+
+/**
  * Write a JSON document so that the file at `path` is, at every instant, either
  * the previous complete document or the new one.
  *
@@ -68,8 +120,12 @@ export async function saveState(state) {
  * "enforce 0600 on every save" behaviour of the old code holds: a config that
  * was once world-readable becomes 0600 on the next save, and the tokens are
  * never on disk under a looser mode even for an instant.
+ *
+ * `space` is JSON.stringify's indent: 2 for the hand-readable files, 0 for
+ * the quota series, whose thousands of rows would otherwise take a line per
+ * number.
  */
-export async function writeJsonAtomic(path, value) {
+export async function writeJsonAtomic(path, value, { space = 2 } = {}) {
   // A rename replaces the NAME, so a config that is a symlink (a dotfiles
   // checkout, say) would silently become a regular file where the old in-place
   // write followed the link. Resolve it first; a dangling or absent path is
@@ -80,7 +136,7 @@ export async function writeJsonAtomic(path, value) {
   try {
     const fh = await open(tmp, 'w', 0o600);
     try {
-      await fh.writeFile(JSON.stringify(value, null, 2) + '\n');
+      await fh.writeFile(JSON.stringify(value, null, space) + '\n');
       await fh.sync();
     } finally {
       await fh.close();
@@ -106,8 +162,10 @@ export function createDefaultConfig() {
     switchThreshold: 0.98,
     holdSeconds: 0,
     distributeSessions: false,
+    persistSessionAffinity: false,
     sessionTitles: { enabled: false, width: 18 },
     quotaBarPercent: false,
+    probeDisabledAccounts: false,
     accountSort: 'arranged',
     eventLogging: 'hide',
     defaultClientMode: 'mitm',
@@ -118,6 +176,7 @@ export function createDefaultConfig() {
     blockedModels: [],
     stripOverageHeaders: false,
     synthesizeQuotaHeaders: false,
+    poolQuotaHeaders: false,
     accounts: [],
   };
 }
@@ -194,7 +253,17 @@ export async function loadOrCreateConfig() {
 //
 //   path     <configPath>.lock
 //   acquire  open(O_CREAT|O_EXCL, 0600), then write {"pid":<pid>,"at":<ms epoch>}
-//   stale    `at` older than 10 s, or the pid no longer alive: unlink and retry
+//   stale    `at` older than 10 s, or the pid no longer alive: break it and retry.
+//            Breaking is serialised by a second exclusive file, `<lock>.steal`,
+//            and re-checks staleness while holding it, so two waiters that both
+//            judged the old lock stale cannot both unlink (the slower one would
+//            remove the fresh lock the faster one just took). A `.steal` file
+//            older than 10 s is a crashed breaker's and is removed. This
+//            narrows the race, it does not close it: a live holder past 10 s
+//            can release, and a third party can take the lock, between the
+//            re-judge and the unlink; with three or more waiters, removing a
+//            crashed guard races the same way. Only writers that honour the
+//            guard are excluded.
 //   busy     poll every 25 ms for at most 2 s, then write WITHOUT the lock
 //   release  unlink
 //
@@ -232,6 +301,35 @@ function lockIsStale(lockPath, staleMs = LOCK_STALE_MS) {
   try { process.kill(pid, 0); return false; } catch (err) { return err.code === 'ESRCH'; }
 }
 
+/** Break a stale lock. True when this caller attempted the break and should
+ * retry the acquire at once; false when another waiter holds the break guard
+ * (or the lock turned out live), so the caller should poll as for a busy lock.
+ * @param {string} lockPath
+ * @param {number} [staleMs]
+ * @returns {Promise<boolean>} */
+async function breakStaleLock(lockPath, staleMs = LOCK_STALE_MS) {
+  const guardPath = `${lockPath}.steal`;
+  try {
+    closeSync(openSync(guardPath, 'wx', 0o600));
+  } catch (err) {
+    if (/** @type {NodeJS.ErrnoException} */ (err).code === 'EEXIST') {
+      // A breaker holds it for microseconds; one this old crashed holding it.
+      try { if (Date.now() - statSync(guardPath).mtimeMs > LOCK_STALE_MS) await unlink(guardPath); } catch { /* released under us */ }
+    }
+    return false;
+  }
+  try {
+    // Re-judge under the guard: the lock we saw may have been replaced since.
+    if (!lockIsStale(lockPath, staleMs)) return false;
+    // Retry at once only if the lock is really gone; a stale lock we cannot
+    // remove (EPERM, EBUSY) must fall back to the wait budget, not spin.
+    try { await unlink(lockPath); } catch (err) { return /** @type {NodeJS.ErrnoException} */ (err).code === 'ENOENT'; }
+    return true;
+  } finally {
+    await unlink(guardPath).catch(() => {});
+  }
+}
+
 /**
  * True when the lock is ours; false when we gave up and proceed without it
  * (or, `strict`, refuse to: the caller decides, and nothing is logged here).
@@ -250,10 +348,8 @@ async function acquireConfigLock(lockPath, strict = false) {
         return false;
       }
     }
-    if (lockIsStale(lockPath, strict ? STRICT_LOCK_STALE_MS : LOCK_STALE_MS)) {
-      await unlink(lockPath).catch(() => {});
-      continue;
-    }
+    const staleMs = strict ? STRICT_LOCK_STALE_MS : LOCK_STALE_MS;
+    if (lockIsStale(lockPath, staleMs) && await breakStaleLock(lockPath, staleMs)) continue;
     if (Date.now() >= deadline) {
       if (!strict) console.error(`[TeamClaude] ${lockPath} is still held by another process after ${waitMs}ms; writing the config without it`);
       return false;
@@ -276,9 +372,10 @@ const lockQueues = new Map();
  * degrades to a possible lost update, the account store (sync-store.js) would
  * hand one renewal lock to two machines, so a lock that cannot be had rejects
  * with code LOCK_BUSY instead, and a holder still alive keeps it for up to a
- * minute. A lock left by a process that died is still taken over by the
- * delete-and-retry above, which two waiters can race; that needs a crash
- * first, and the store's renewal lock still has its own lease behind it.
+ * minute. A lock left by a process that died is still broken as above; the
+ * `.steal` guard narrows the race between two breakers without closing it,
+ * which needs a crash first, and the store's renewal lock still has its own
+ * lease behind it.
  * @template T
  * @param {string} configPath
  * @param {() => Promise<T>} fn

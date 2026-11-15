@@ -3,6 +3,7 @@ import { SessionTitles } from './session-titles.js';
 import { modelGlobMatches, resolveSwitchThreshold } from './model.js';
 import { safeLine } from './safe-text.js';
 import { providerOf } from './provider.js';
+import { sanitizeCreditView } from './api-credit.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
 // Attach mode — the dashboard against a server running somewhere else (a
@@ -261,6 +262,16 @@ export class RemoteAccountManager {
       orgName: a?.orgName == null ? a?.orgName : text(a.orgName, NAME_MAX),
       email: a?.email == null ? a?.email : text(a.email, NAME_MAX),
       unavailable: a?.unavailable == null ? a?.unavailable : text(a.unavailable, 64),
+      // Its detail, remedy and link are drawn under the row; anything but an object reads as no reason.
+      // The detail can carry a whole appeal link (up to 2048 characters), so it is not cut short.
+      errorReason: a?.errorReason && typeof a.errorReason === 'object'
+        ? {
+          code: text(a.errorReason.code, 64),
+          detail: text(a.errorReason.detail, 2200),
+          remedy: text(a.errorReason.remedy, 64),
+          link: a.errorReason.link == null ? null : text(a.errorReason.link, 2048),
+        }
+        : null,
       // Booleans that decide a red "billing" tag: anything but a literal true
       // from the other end reads as off, never as a claim that money moves.
       allowExtraUsage: a?.allowExtraUsage === true,
@@ -269,6 +280,9 @@ export class RemoteAccountManager {
       // into the frame, so it gets the same scrub as everything else.
       routing: a?.routing == null ? a?.routing : text(a.routing, 128),
       quota: { ...(a?.quota || {}) },
+      // Prepaid credit: its currency, source and error text are drawn into the
+      // row, so the view is rebuilt from known fields rather than spread.
+      credit: sanitizeCreditView(a?.credit),
     }));
     // -1 when the payload names an account that is no longer listed: nothing is
     // marked current, which is the truth, rather than defaulting to the first row.
@@ -383,6 +397,7 @@ export function createAttachSession({ control, config, onQuit, pollMs = DEFAULT_
     accountManager: am,
     config,
     remote: true,
+    resetActions: null,
     // Titles come from this machine's Claude Code sessions. Attaching to a
     // server on another host leaves the ids unresolved, which shows the short
     // id rather than a wrong name.

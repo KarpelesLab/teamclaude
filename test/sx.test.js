@@ -297,19 +297,29 @@ test('the TLS handshake over a tunnel is bounded', T, async () => {
 // crosses the network in the clear. An override is honoured only over https, or
 // over plain http to this machine (a test mock).
 test('SX_API_BASE must be https, or http to loopback', () => {
-  const warnings = [];
-  const warn = (m) => warnings.push(m);
-  assert.equal(sxBase({}, warn), 'https://api.sx.org');
-  assert.equal(sxBase({ SX_API_BASE: 'https://mock.example/' }, warn), 'https://mock.example');
-  assert.equal(sxBase({ SX_API_BASE: 'http://127.0.0.1:4321' }, warn), 'http://127.0.0.1:4321');
-  assert.equal(sxBase({ SX_API_BASE: 'http://localhost:4321' }, warn), 'http://localhost:4321');
-  assert.equal(warnings.length, 0);
+  assert.equal(sxBase({}), 'https://api.sx.org');
+  assert.equal(sxBase({ SX_API_BASE: 'https://mock.example/' }), 'https://mock.example');
+  assert.equal(sxBase({ SX_API_BASE: 'http://127.0.0.1:4321' }), 'http://127.0.0.1:4321');
+  assert.equal(sxBase({ SX_API_BASE: 'http://localhost:4321' }), 'http://localhost:4321');
+  // An override that is set but not acceptable is refused, never replaced by the
+  // default: that would send the key to a host it was not meant for.
   for (const bad of ['http://api.sx.org', 'http://10.0.0.5:80', 'ftp://x', 'not a url']) {
-    assert.equal(sxBase({ SX_API_BASE: bad }, warn), 'https://api.sx.org', bad);
+    assert.throws(() => sxBase({ SX_API_BASE: bad }), /SX_API_BASE.*must be https/, bad);
   }
-  assert.equal(warnings.length, 4);
-  assert.match(warnings[0], /ignoring SX_API_BASE.*https/);
-  // Reported once per value, not once per request.
-  sxBase({ SX_API_BASE: 'not a url' }, warn);
-  assert.equal(warnings.length, 4);
+});
+
+test('an SX_API_BASE that is set but not acceptable sends nothing, to the default or anywhere', T, async () => {
+  const realFetch = globalThis.fetch;
+  const sent = [];
+  globalThis.fetch = async (url) => { sent.push(String(url)); throw new TypeError('fetch failed'); };
+  process.env.SX_API_BASE = 'http://sx.example.net';
+  try {
+    const sx = new SxManager();
+    const r = await sx.configure('KEY');
+    assert.equal(r.ok, false, 'provisioning is refused');
+    assert.match(r.error, /SX_API_BASE/);
+    assert.equal(sx.isProvisioned(), false);
+    assert.equal(await sx.getBalance(), null);
+    assert.deepEqual(sent, [], 'no request went out');
+  } finally { delete process.env.SX_API_BASE; globalThis.fetch = realFetch; }
 });

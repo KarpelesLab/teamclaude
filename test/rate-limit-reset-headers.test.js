@@ -60,10 +60,13 @@ async function assertExhausted(res, am, diagnostic) {
   assert.ok(Math.abs(Date.parse(reset) - earliest) < 10, 'the earliest account reset is advertised');
   assert.ok(Number.isInteger(retry) && retry >= 1);
   assert.ok(Math.abs(retry - Math.ceil((Date.parse(reset) - Date.now()) / 1000)) <= 1);
-  assert.deepEqual(await res.json(), {
+  const body = await res.json();
+  assert.deepEqual(body, {
     type: 'error',
-    error: { type: 'rate_limit_error', message: `All accounts reached usage limits. Next account resets at ${reset}.` },
+    error: { type: 'rate_limit_error', message: `All accounts reached usage limits. Next account resets at ${reset}.`, details: body.error?.details },
   });
+  assert.equal(body.error.details.error_code, 'pool_exhausted');
+  assert.equal(body.error.details.resets_at, reset, 'the details name the reset the header advertises');
   diagnostic?.(`HTTP 429; retry-after: ${retry}; ${RESET}: ${reset}`);
 }
 

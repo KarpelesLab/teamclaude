@@ -80,12 +80,31 @@ export const ADAPTIVE_DEFAULTS = {
   // as fast as the taper shrinks and the two cancel, leaving no protection at
   // the wall at all — the cap is what lets the taper win there.
   maxBurnBoost: 4,
+
+  // "burndown" (this file's score, and the default) or "pressure": a new
+  // session's score is P / (1 + load), P being the expiry pressure the band
+  // already computes (room under the account's caps per second to its governing
+  // weekly reset), so sessions land in proportion to how soon each account's
+  // quota expires. Only placement reads it: whether a pinned session moves
+  // stays on burndown. See AccountManager._placementPressure.
+  scoring: 'burndown',
+  // Under "pressure" only: scale a placement's score by the room left in the
+  // account's 5-hour window, so an account near that wall takes fewer new
+  // sessions. See fiveHourHeadroomFraction.
+  pressureFiveHour: false,
+  // Under "pressure" only: how far below an account's own 5-hour cap (or below a
+  // full window, with no cap) new sessions stop being placed on it, while
+  // another account of its priority can take them. 0 turns it off. See
+  // AccountManager._withoutFiveHourSoft.
+  fiveHourSoftMargin: 0,
 };
+
+const SCORING_MODES = ['burndown', 'pressure'];
 
 // The fields that are fractions of a window, or EWMA weights: bounded to the
 // unit interval, and the alphas additionally non-zero (an alpha of 0 would
 // mean "never learn", which is a request the learner cannot honour).
-const UNIT_FIELDS = ['minReserve', 'maxReserve'];
+const UNIT_FIELDS = ['minReserve', 'maxReserve', 'fiveHourSoftMargin'];
 const ALPHA_FIELDS = ['burnAlpha', 'concBackoff', 'concGrowth', 'concBackoffTo'];
 const POSITIVE_FIELDS = ['maxSampleAgeMs', 'lookaheadMs', 'burnWindowMs', 'initialConcCap', 'minConcCap', 'maxConcCap'];
 
@@ -104,7 +123,7 @@ const POSITIVE_FIELDS = ['maxSampleAgeMs', 'lookaheadMs', 'burnWindowMs', 'initi
 export function validateAdaptiveConfig(raw) {
   if (raw == null) return {};
   if (typeof raw !== 'object' || Array.isArray(raw)) {
-    throw new Error('adaptiveDistribution must be an object of numeric fields');
+    throw new Error('adaptiveDistribution must be an object');
   }
   const shown = v => (typeof v === 'string' ? JSON.stringify(v) : String(v));
   const out = {};
@@ -112,7 +131,15 @@ export function validateAdaptiveConfig(raw) {
     if (!Object.hasOwn(ADAPTIVE_DEFAULTS, field)) {
       throw new Error(`adaptiveDistribution.${field} is not a setting (known fields: ${Object.keys(ADAPTIVE_DEFAULTS).join(', ')})`);
     }
-    if (typeof value !== 'number' || !Number.isFinite(value)) {
+    if (field === 'scoring') {
+      if (!SCORING_MODES.includes(value)) {
+        throw new Error(`adaptiveDistribution.scoring must be ${SCORING_MODES.map(m => `"${m}"`).join(' or ')}, got ${shown(value)}`);
+      }
+    } else if (field === 'pressureFiveHour') {
+      if (typeof value !== 'boolean') {
+        throw new Error(`adaptiveDistribution.pressureFiveHour must be true or false, got ${shown(value)}`);
+      }
+    } else if (typeof value !== 'number' || !Number.isFinite(value)) {
       throw new Error(`adaptiveDistribution.${field} must be a finite number, got ${shown(value)}`);
     }
     out[field] = value;
@@ -371,6 +398,18 @@ export class ConcurrencyLearner {
 }
 
 /**
+ * The share of a 5-hour window's usable room still free: 1 when it is untouched,
+ * 0 at or past `limit`, the point where the account leaves rotation.
+ *
+ * @param {number} use  the window's utilization
+ * @param {number} limit  the lower of the account's 5-hour cap and switch threshold
+ * @returns {number}
+ */
+export function fiveHourHeadroomFraction(use, limit) {
+  return limit > 0 ? clamp((limit - use) / limit, 0, 1) : 0;
+}
+
+/**
  * Score one candidate account. Higher wins. Returns the components too, so the
  * status surface and the tests can state WHY an account was chosen rather than
  * just that it was.
@@ -380,8 +419,24 @@ export class ConcurrencyLearner {
  *   weight or null),
  *   reserve (fraction), load (active sessions + in-flight), concCap,
  *   maxRemaining (the largest `remaining` among the candidates)
+ *   pressure (expiry pressure per second; read only when opts.scoring is
+ *   "pressure", which reads nothing else but load and fiveHourFactor)
+ *   fiveHourFactor (fiveHourHeadroomFraction, under "pressure" with
+ *   pressureFiveHour on; absent counts as 1)
  */
 export function scoreCandidate(c, opts = ADAPTIVE_DEFAULTS) {
+  // Pressure: the caller has priced the account's expiring quota (c.pressure),
+  // so the score is that over the load already there. Nothing else enters, and a
+  // pressure that is not a positive number scores 0, so a fleet nothing can be
+  // priced on falls through to the even walk like a fully reserved one.
+  if (opts.scoring === 'pressure') {
+    const { pressure: p, load, fiveHourFactor } = /** @type {{ pressure?: number, load: number, fiveHourFactor?: number }} */ (c);
+    const pressure = p != null && p > 0 && Number.isFinite(p) ? p : 0;
+    const speed = 1 / (1 + Math.max(0, load));
+    const factor = fiveHourFactor != null && Number.isFinite(fiveHourFactor) ? fiveHourFactor : 1;
+    return { score: pressure * factor * speed, burn: 1, taper: 1, speed, head: pressure, remaining: pressure };
+  }
+
   // Fractional headroom to the point where this bucket rotates the account out.
   // An unknown utilization is treated as an empty window: an account nothing is
   // known about must not be picked FIRST under a rule that prefers the most

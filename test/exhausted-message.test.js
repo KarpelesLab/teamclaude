@@ -244,7 +244,7 @@ test('exactly as many dead accounts as the cap are all named, with no "more"', (
 // clock `computeRetryAfter` already reads — so it waits with the quota group.
 test('an entitlement-denied account is not told to log in again', () => {
   const am = fleet(oauth('a'), oauth('b'));
-  am.markEntitlementDenied(1, 300);
+  am.markEntitlementDenied(1, { seconds: 300 });
   assert.equal(am.unavailableReason(am.accounts[1], 'claude-opus-5'), 'entitlement');
 
   const msg = said(am, 'claude-opus-5', 60);
@@ -255,7 +255,7 @@ test('an entitlement-denied account is not told to log in again', () => {
 test('an entitlement denial beside a dead credential stays in the waiting group', () => {
   const am = fleet(oauth('dead'), oauth('denied'));
   am.accounts[0].status = 'error';
-  am.markEntitlementDenied(1, 300);
+  am.markEntitlementDenied(1, { seconds: 300 });
   const msg = said(am, null, 60);
   assert.match(msg, /account "dead" needs re-login/);
   assert.doesNotMatch(msg, /"denied"/);

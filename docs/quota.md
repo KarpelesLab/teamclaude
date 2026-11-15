@@ -1,6 +1,6 @@
 # Quota
 
-How TeamClaude learns each account's quota, the two optional background jobs, and what happens when everything is spent.
+How TeamClaude learns each account's quota, the two optional background jobs, an API-key account's prepaid credit, and what happens when everything is spent.
 
 ## How quota is observed
 
@@ -8,11 +8,22 @@ TeamClaude is **passive** by default: it reads `anthropic-ratelimit-unified-*` h
 
 Observed quota is persisted to `teamclaude.state.json` next to the config, so rotation state survives a restart. Stale windows are discarded automatically, and the file is safe to delete — quota is simply re-learned from traffic.
 
+### Accounts without a 5-hour window
+
+Not every subscription meters both windows. Anthropic is removing the 5-hour limit from its **Ultra** plan (the former Max 20x) one verified account at a time, while the weekly limit stays; some Codex plans have never had one. Such an account rotates on its weekly window alone. TeamClaude records the fact per account (`sessionWindowStated: false` in `teamclaude status --json`), keeps it across restarts, and reads it from either source:
+
+- A **response** that states the weekly window and carries no `anthropic-ratelimit-unified-5h-*` header at all. Only a response that was served counts: an error status, or a `rejected` overall, weekly or Fable status, is no evidence about the plan, since a weekly-rejection 429 on a metered account can carry the weekly headers alone. A 5-hour reading taken before the change is left in place and keeps gating until its own reset: one response is weaker evidence of absence than the usage endpoint. A reading with no reset is cleared instead, since nothing would ever expire it: an idle account reads 0% with no reset, which would otherwise show as a Session row at 0% for good. A reading that runs out on such an account counts as a session reset, the event that can move rotation onto an account whose weekly window ends sooner, only when it was holding the account out of rotation (at its `unified5h` switch threshold or `maxUsage` cap): its expiry then brings the account back just as a reset does. A reading below both kept nothing out, and no fresh 5-hour allowance follows it.
+- The **[quota probe](#quota-probe)**, when its payload has a weekly reading and names no 5-hour window: `five_hour` carries neither a utilization nor a reset, and the `limits` list, where the payload has one, has no `session` entry. A payload that still names the window without a reading concludes nothing, the same as a response carrying a 5-hour reset without its utilization. The probe reads every limit at once, so it also clears a 5-hour reading left from before the change, along with a stored upstream `rejected` verdict, unless a weekly reading at its switch threshold still accounts for that verdict. Clearing a reading that was holding the account out of rotation counts as a session reset, by the same rule as a reading that runs out.
+
+On the Anthropic side only a subscription records it from headers; a third-party backend that answers in Anthropic's header names does not. [Keep-warm](#keep-warm) skips the account from then on. Once no 5-hour reading is left (cleared as above, or run out at its reset), `teamclaude status`, the TUI and the dashboard drop the Session row (the TUI row draws the weekly bar alone: across both bar cells where the table draws two, in the one slot where it draws one; see [usage](usage.md)), and a `unified5h` switch threshold or `maxUsage` cap has nothing to apply to. Until then the old reading is still drawn, and still gates, as it would on any account. A response or probe that states a 5-hour window again (a downgrade, or the limit coming back) reverses all of it.
+
+The wire shape after the change has not been seen on a live Ultra account yet. The rule above assumes the 5-hour headers are simply dropped and the usage endpoint reports `five_hour` as null or leaves it out, and drops the `session` entry from `limits`.
+
 ## Fleet quota endpoint
 
 `GET /teamclaude/quota` returns the quota data intended for lightweight consumers such as a Claude Code status line. It includes every account's observed limits plus tier-weighted fleet aggregates for the shared 5-hour window, shared weekly window, Sonnet weekly window, and Fable weekly window. Sonnet and Fable fall back to the shared weekly bucket on accounts where Anthropic does not report a dedicated bucket. Windows reported by a third-party backend (see below) fill the `fiveHour`, `weeklyShared` and `monthly` buckets with a `backend*` source on accounts that have no Anthropic readings of their own; `monthly` exists only for such backends. Backend windows join only the per-account buckets: they are excluded from the aggregates by source, whatever tier the account claims. Each backend bucket also carries `observedAt`, the millisecond timestamp of the probe that read it: a probe that fails keeps the last good reading rather than clearing it, and a window with no reset never expires, so the age is what tells a fresh value from an old one. Its top-level `warmup` object reports whether keep-warm is off, interval-based, scheduled for a daily reset target, or running on an anchored five-hour cadence. Scheduled modes include the configured timezone, missed-run policy, and next warm-up/reset timestamps; rolling mode also includes `anchorResetAt`, `cadenceSeconds`, `nearResetToleranceSeconds`, and `postResetBufferSeconds`.
 
-Subscription capacity is weighted relative to Claude Pro: Pro and Team Standard are `1`, Max 5x and Team tier 1 are `5`, and Max 20x and Team tier 2 are `20`. TeamClaude reads the organization and seat tier from the OAuth profile. An unrecognized tier remains visible under `accounts` and `unknownTiers` but is excluded from the aggregate instead of being assigned a guessed weight. API-key token and request limits remain per-account because their units cannot be combined with subscription utilization.
+Subscription capacity is weighted relative to Claude Pro: Pro and Team Standard are `1`, Max 5x and Team tier 1 are `5`, and Max 20x and Team tier 2 are `20`. Anthropic renamed Max 20x to Ultra (at the same weekly limit) and Max 5x to Max on 2026-10-30, and the tier string a renamed account reports has not been observed yet. A rate-limit tier containing `ultra` is weighed as `20`; any other new string, such as one for the renamed Max plan that no longer contains `5x`, is reported under `unknownTiers` until it has been observed and added. The `fiveHour` aggregate covers the accounts that hold a 5-hour reading. An account [without that window](#accounts-without-a-5-hour-window) stops contributing to it once its last reading is gone, cleared by a probe, reaching its own reset, or carrying no reset at all; a response alone leaves the reading in place, so until then it still counts, as it still gates selection. It counts towards the weekly aggregates either way. Each entry under `accounts` carries `sessionWindow`: `false` when the plan meters no 5-hour window, `true` when it does, `null` before a reading has said; it tells "no limit" from "not reported yet", where `buckets.fiveHour` is null for both. The `fiveHour` aggregate also carries `exemptAccounts` and `exemptWeight`, the count and tier weight of the accounts it leaves out for that reason (only accounts with a tier weight: a Codex account has none, so a Codex plan without the window is in neither the aggregate nor these counts), so a consumer can tell a nearly spent session quota from one that applies to a small part of the fleet. When no account holds a 5-hour reading the aggregate is `null`, as before, and the per-account `sessionWindow` says why. TeamClaude reads the organization and seat tier from the OAuth profile. An unrecognized tier remains visible under `accounts` and `unknownTiers` but is excluded from the aggregate instead of being assigned a guessed weight. API-key token and request limits remain per-account because their units cannot be combined with subscription utilization. An API-key account with a [prepaid-credit](#prepaid-api-credit) setting also carries a `credit` object (money, not a window, so it joins no aggregate).
 
 Remote callers authenticate exactly like the other control endpoints:
 
@@ -44,9 +55,13 @@ A single-account refresh takes the same identifiers as `POST /teamclaude/switch`
 
 It reads each OAuth account's utilization from its provider's read-only usage endpoint, which reports quota **without consuming any message quota**. Anthropic accounts use `/api/oauth/usage`; Codex accounts use ChatGPT's internal `/backend-api/wham/usage` endpoint and require their `ChatGPT-Account-Id`; Grok accounts use the billing endpoint Grok Build reads its usage from (`GET https://cli-chat-proxy.grok.com/v1/billing?format=credits`), whose plan percentage and period end become the weekly bar (Monthly for a monthly plan). Grok responses carry no usage headers, so for a Grok account the probe is the only source of a reading. API-key and third-party accounts are skipped. The Codex endpoint is not part of the public OpenAI API and may change without notice. Minimum interval is 5s. Each cycle reads the usage endpoint once per account, so a short interval with many accounts makes many reads. A Codex account holding a [free reset credit](accounts.md#free-rate-limit-reset-credits) may also have its credit list read, to learn when the credits expire, at most once every 6 hours unless its count changes; a cycle still running when the next is due is skipped rather than stacked. Changing it takes effect on a running server immediately.
 
+Disabled accounts are skipped by default. Set [`probeDisabledAccounts`](configuration.md) to `true` (or **g** → Probe disabled in the TUI) to keep their quota fresh too. The probe then refreshes a disabled account's OAuth token when it is due, as it does for any other account.
+
 The probe is also the only source for the **Sonnet 7-day** bucket, when your plan exposes it. The Fable weekly bucket arrives passively in the response headers (`anthropic-ratelimit-unified-7d_oi-*`), so Fable-aware routing works without turning the probe on. Both families are read from the payload's `limits[]`, where upstream enumerates the model-scoped weekly caps an account actually has.
 
 It is likewise the only source for Claude's [banked usage-limit resets](accounts.md#claude-banked-usage-limit-resets), read from the same call.
+
+For Anthropic accounts the probe also reads the OAuth profile (`/api/oauth/profile`, also zero-spend): on every cycle while the account has no plan or tier on record, then on the first cycle at least an hour after the last read. A profile that stops showing the account's Max or Pro plan is reported in status; see [When a plan lapses](accounts.md#when-a-plan-lapses).
 
 ### Revalidating a spent family bucket
 
@@ -121,6 +136,30 @@ The burn-rate learner behind [adaptive distribution](routing.md#adaptive-distrib
 
 What the rate is. It is the learner's moving average of how fast utilization rose, measured over windows of `burnWindowMs` between readings no more than `maxSampleAgeMs` apart (see [`adaptiveDistribution`](configuration.md)). It counts all spend on the account, the proxy's and [outside spend](#spend-from-outside-the-proxy) alike. Like any moving average it reflects the recent past: a burst that has stopped keeps the forecast short until flat readings bring the rate down, and an account with no fresh readings keeps its last rate. The projection starts when the utilization was read, not at the status read, so an old reading counts down rather than repeating the same distance; once its projected time has passed, the status text drops it. With the [quota probe](#quota-probe) off, an idle account gets no readings, so its forecast is as old as its last traffic.
 
+## Fleet forecast
+
+The burn-rate forecast answers for one account. The fleet forecast ([#550](https://github.com/KarpelesLab/teamclaude/issues/550)) answers for the whole pool: when is every account out at once, and when does the first one come back? `fleetForecast` in `/teamclaude/status`:
+
+```json
+"fleetForecast": { "allOutAt": 1780000000000, "firstBackAt": 1780014400000, "boundBy": "weekly", "ratePerDay": 1.38 }
+```
+
+`allOutAt` is the first moment every account is blocked (the current time when they all already are), and `firstBackAt` the first moment after it that one is usable again; both are ms epoch. `boundBy` is the bucket that blocks most of the fleet at `allOutAt`: `weekly` or `5h`. `ratePerDay` is the fleet's measured weekly spend, in shares of one account's week per day (`1.38` uses 138% of a week per day, spread over the accounts).
+
+`teamclaude status` and the dashboard show it as one line, only when there is a forecast: `all accounts out in ~31h (weekly), first back 4h later`.
+
+It is `null` until the proxy has 48 hours of samples, `null` when the samples cover too little of a rate window to trust (under 6 hours of the weekly window, or under 1 hour of the last 6 hours), and `null` when nothing runs out within 14 days.
+
+How it works. Every 15 minutes the proxy stores one sample per account from the readings it already has: weekly and 5-hour utilization and when each window resets. It makes no extra upstream call, so an account is sampled only once the proxy has read it, from traffic or the [quota probe](#quota-probe). The forecast then simulates the fleet forward from the current readings:
+
+- Each bucket has its own measured rate. The weekly rate is the fleet's summed weekly increase over the last 24 hours, or the last 7 days once the samples cover at least 6 of them, shaped by hour of day (UTC): a flat evening rate carried through the night would call the wall too early. The 5-hour rate is the summed increase over the last 6 hours, flat. Each rate is divided by the time the samples actually cover inside its window, not by the whole window: two samples more than 30 minutes apart are a gap, such as a stopped proxy, and a gap does not count as a quiet fleet.
+- Spend goes to the fullest account still under its [switch thresholds](#switch-threshold), as rotation does, so the order in which accounts fill is the order they would be used.
+- An account is blocked while either bucket is at or over its threshold, and comes back at that bucket's reset. A weekly reset is followed by the next one 7 days later, a 5-hour reset by the next one 5 hours later.
+
+A window reset shows in the samples as a drop, or as an empty reading where the proxy had cleared the window at its reset; a drop is never counted as negative spend, and the first reading of the new window counts in full. The forecast covers Anthropic subscription accounts in rotation. Codex accounts are a separate pool, a disabled account is not in rotation, and an API key meters no window.
+
+The samples are kept in `teamclaude.quota-series.json` next to the config, not in the state file. The file is written atomically, keeps 7 days and at most 800 samples per account, and drops the history of an account at the next sample after it is removed. A missing or corrupt file is empty history, so it is safe to delete; the forecast is `null` again until 48 hours of new samples accumulate.
+
 ## Keep-warm
 
 The rolling **5-hour session window** only starts once an account sends a real message. So when your active account runs out and rotation moves to a cold account, that account's 5h window starts *then* — right when you need its full headroom. Keep-warm ([#76](https://github.com/KarpelesLab/teamclaude/issues/76)) starts the timer on idle accounts ahead of time, so the next account is already partway (or fully) through a fresh window when it's needed.
@@ -133,7 +172,7 @@ teamclaude warmup off                                      # disable either mode
 teamclaude warmup                                          # show current setting
 ```
 
-> ⚠️ **This spends a little quota — unlike the passive quota probe.** The 5h timer can't be started by a read-only call, so keep-warm sends a real (minimal) message: for each eligible idle account it spawns a one-shot `claude -p --bare --model haiku --output-format text "hi"` pointed at this proxy, pinned to that account. It only warms accounts whose 5h window is **not already running**, skips disabled/throttled/errored, third-party-backend and Codex accounts, and uses the cheapest model — but it does consume a few tokens and a slice of the 5h/weekly buckets per account per window. Requires the `claude` CLI on `PATH`. Minimum interval 60s; changes apply live. Status shows under `warm` in `teamclaude status --json`.
+> ⚠️ **This spends a little quota — unlike the passive quota probe.** The 5h timer can't be started by a read-only call, so keep-warm sends a real (minimal) message: for each eligible idle account it spawns a one-shot `claude -p --bare --model haiku --output-format text "hi"` pointed at this proxy, pinned to that account. It only warms accounts whose 5h window is **not already running**, skips disabled/throttled/errored, third-party-backend and Codex accounts and any account that [meters no 5-hour window](#accounts-without-a-5-hour-window), and uses the cheapest model — but it does consume a few tokens and a slice of the 5h/weekly buckets per account per window. Requires the `claude` CLI on `PATH`. Minimum interval 60s; changes apply live. Status shows under `warm` in `teamclaude status --json`.
 
 Reset mode stores the target wall time and IANA timezone in the config, then subtracts Anthropic's fixed five-hour window to find each warm-up. It recalculates the next calendar occurrence after startup, config reload, and every run, so daylight-saving changes do not drift the schedule. It follows cron semantics: if TeamClaude was stopped at the scheduled time, that run is skipped and the server waits for the next future occurrence. The CLI confirmation prints the resolved local time, UTC time, timezone offset, and next occurrence.
 
@@ -167,6 +206,8 @@ teamclaude threshold unified7d=default  # drop it again
 ```
 
 A running server picks the change up on the reload the command sends it. This is the only way to edit a per-bucket table in place: the TUI shows it read-only, and the single-number form there would flatten it.
+
+A switch moves a conversation to an account that has none of it cached. The opt-in `compactBeforeSwitch` has Claude Code compact a long conversation shortly before its account reaches this threshold; see [Compact before a switch](routing.md#compact-before-a-switch) for what it changes in what the client receives.
 
 ### Per-account thresholds
 
@@ -231,7 +272,7 @@ At the cap, that account receives **nothing**:
 
 A family reading (Fable, Sonnet) at or past the cap is kept until its window resets, or for a week when no reset time is known. An uncapped spent family reading is revalidated after 30 minutes instead, because only a request of that family can refresh it; for a capped one that request would go past the cap.
 
-With [expiry-pressure routing](routing.md#expiry-pressure-routing) on, a capped account's pressure is the room left under its cap, not under 100%: an account at 0.6 with a 0.7 cap has 0.1 to spend before its reset. For a family window the shared weekly cap also bounds that room, since family spend counts against both.
+With [expiry-pressure routing](routing.md#expiry-pressure-routing) on, a capped account's pressure is the room left under its cap, not under 100%: an account at 0.6 with a 0.7 cap has 0.1 to spend before its reset. For a family window the shared weekly cap also bounds that room, since family spend counts against both (by [how much](routing.md#model-aware-routing) was measured on one pool).
 
 Caps are model-scoped exactly like thresholds. `unified5h` and `unified7d` stop every model; `unified7dFable` stops only Fable, so the example above keeps serving Opus and Sonnet from the same account after Fable is done. The cap binds at the level you set (`>=`), and a window that has reset is never capped on the old reading.
 
@@ -257,15 +298,15 @@ A usage cap is about quota. On a seat with **extra usage** enabled the interesti
 { "name": "work@example.com", "type": "oauth", "maxSpend": 20 }
 ```
 
-Written in the account's billing currency (`20` is $20.00), and judged against the month-to-date extra-usage figure the usage endpoint reports — the same figure `teamclaude status` prints as `$14.35 of $10,000.00 used this month`. At the cap the account receives nothing, exactly like a usage cap: rotation skips it, the exhausted-fleet probe skips it, a pin gets the exhausted answer. When upstream's figure resets with the month, the next probe lifts the cap by itself.
+Written in the account's billing currency (`20` is $20.00), and judged against the month-to-date extra-usage figure the usage endpoint reports — the same figure `teamclaude status` prints as `$14.35 of $10,000.00 used this month`. At the cap the account stops **billing**, not serving: for the rest of the month it is held to its included quota, as if every bucket a request meters had a hard `maxUsage` of `1.0`. A request is admitted only when it is provably free — the shared session (5h) and weekly readings both known and under 100%, and for a model with its own weekly bucket (Fable, Sonnet, or a route's `bucket`) that bucket under 100% too, since family usage meters into both. Anything else — a bucket at 100%, a shared reading not yet taken or past its reset, a fresh upstream `rejected` status — bars the request, because an unknown reading is no proof the request is free. A family bucket with no reading is the exception: most plans meter no Sonnet bucket, and a family window past its reset starts again from zero, so the shared buckets govern, as they do everywhere else. A plan that states it meters no weekly window (a Team seat) is judged on its session window alone. A barred request is skipped exactly like a usage cap: rotation skips the account, the exhausted-fleet probe skips it, the [extra-usage fallback](#extra-usage-fallback) never bills it, a pin gets the exhausted answer. So a Fable request can be barred while Opus still runs on the same account. When upstream's figure resets with the month, the next probe lifts the cap by itself.
 
 **`maxSpend` requires the quota probe.** The spend figure comes only from probe readings — a response carries no month-to-date amount — so it is refreshed on the probe's schedule (`quotaProbeSeconds`, or `teamclaude probe N`; see [Quota probe](#quota-probe)) and by the TUI's **`p`** refresh, never by the request in flight. The cap therefore binds within one probe interval of the figure being reached, not on the request that crosses it: what one interval can bill is the slack to budget for, and with the probe off the figure only moves when you press **`p`**, so the cap effectively never binds.
 
 - The cap binds at the level set (`>=`). `0` means "not one cent": an account that has billed nothing is still admitted, the first billed cent bars it.
 - Only an account that **can** bill is judged. With extra usage off upstream no request costs money, and barring the account would only waste the quota it still has.
-- It is a total, not a preference — nothing overrides it. Combine it with `"maxUsage": 1.0` to stop before billing can start, and keep `maxSpend` as the backstop: it bounds the month's total to the cap plus whatever one probe interval can bill, not to the cent.
+- It is a total, not a preference — nothing overrides it. Combine it with `"maxUsage": 1.0` to stop before billing can start, and keep `maxSpend` as the backstop: it bounds the month's total to the cap plus whatever one probe interval can bill, not to the cent. The same slack applies once the cap holds: the bucket readings are refreshed by responses and the probe, so a request in flight when a bucket fills is billed.
 
-The TUI row shows the amount once anything has been billed, and the cap after it: `$14.35/20`. `teamclaude status` prints the same on the account's `Spend` line, and names the reason `extra-usage spend cap reached (maxSpend)` while the cap holds.
+The TUI row shows the amount once anything has been billed, and the cap after it: `$14.35/20`. `teamclaude status` prints the same on the account's `Spend` line, and says `spend cap reached` there once the figure reaches it. The account's unavailable reason reads `extra-usage spend cap reached (maxSpend)` only while the cap bars it, judged on the shared session and weekly buckets; a bar on one model family alone (Fable, say) applies per request and does not show there.
 
 No CLI editor, matching `maxUsage`: hand-edit the config and let a running server pick it up on reload (**`R`** in the TUI, or `POST /teamclaude/reload`).
 
@@ -291,7 +332,7 @@ By default, once every account is past its switch threshold the proxy answers 42
 - **It goes back on its own.** As soon as any account's window resets — the paid one's included — selection returns to normal, and the "billing" mark clears even if no request for that model has come in since.
 - **Only the quota verdicts are overridden** — the switch threshold (a spent Fable bucket included, for Fable requests only) and, for the paid tier, a remembered upstream `rejected` status. Everything else still binds: `disabled`, `maxUsage`, `maxSpend`, a live upstream 429 hold, an entitlement cooldown, an error state, routes and model ownership, and the Claude/Codex partition. An account whose usage probe reports overage switched off upstream is skipped, since it would only 429; with no probe data, upstream decides.
 
-Utilization goes past 100% in overage, so `maxUsage` above 1.0 is a spend limit: `"maxUsage": 1.5` lets an account run to 150% of its plan and then stop, like any other cap. To bound the bill in money instead, set `maxSpend` — see [Per-account spend caps](#per-account-spend-caps) above; the fallback never admits an account at its spend cap.
+Utilization goes past 100% in overage, so `maxUsage` above 1.0 is a spend limit: `"maxUsage": 1.5` lets an account run to 150% of its plan and then stop, like any other cap. To bound the bill in money instead, set `maxSpend` — see [Per-account spend caps](#per-account-spend-caps) above; the fallback never bills an account at its spend cap (it may still use that account's free quota, like any other).
 
 The switch onto the fallback and back off it is logged once each, per model scope (a Fable-only episode is not ended by Opus traffic that still has headroom), and a failover hop onto it is logged once per episode too — the free-quota and the paid step each get their own line. While an account is **billing** — at 100% of a governing bucket, or with its month's spend seen rising — `teamclaude status` marks it:
 
@@ -338,9 +379,88 @@ Provider support lives entirely in `src/backend-quota.js`, matched by the host o
 - **Kimi for Coding** (`api.kimi.com`, `api.kimi.ai`) — whichever of the 5-hour, weekly and monthly windows the plan reports, in one reading. Plans differ here (newer ones drop the weekly window for a monthly one), so any of the three may be absent, and an absent one is never filled in from Kimi's legacy counters. Kimi's ratio pools lag behind an active session and can read zero while the legacy counters move; a zero ratio beside a moved counter with the same reset is treated as a placeholder and the counter wins.
 - **Moonshot Open Platform** (`api.moonshot.ai`, `api.moonshot.cn`) — the pay-as-you-go balance, as money in the region's currency.
 
+## Prepaid API credit
+
+The `Tok` and `Req` bars on an [API-key account](accounts.md#api-key) are per-minute **rate-limit** headroom, read from the `anthropic-ratelimit-tokens-*` and `-requests-*` headers and cleared when the minute resets. They are not money. A key that draws on **prepaid credit** has a second question: how much of the credit is left before it renews. The usual case is the monthly API credit a Claude Max ($100) or Ultra ($200) plan grants a linked Claude Console organization: it is spent first, expires at the end of each billing cycle with no rollover, and covers the Claude API and the Agent SDK (`claude -p`) but not interactive Claude Code. Such a key is typically kept as a **disabled** account that only pinned, scheduled `claude -p` jobs reach, so its Tok/Req bars read `-` nearly always.
+
+`accounts[].credit` tells TeamClaude about the credit:
+
+```json
+{
+  "name": "api-credit",
+  "type": "apikey",
+  "apiKey": "sk-ant-api03-…",
+  "disabled": true,
+  "credit": {
+    "amount": 200,
+    "currency": "USD",
+    "cycleStart": "2026-11-02",
+    "adminKey": "sk-ant-admin01-…",
+    "refreshMinutes": 15
+  }
+}
+```
+
+- `amount` is the credit per cycle, in dollars (`200` is $200.00). `currency` may be left out; only `USD` is accepted, since Anthropic prices and reports cost in USD.
+- `cycleStart` is any date whose **day of the month** is the renewal day; the Console's Billing page shows the credit's expiry date. The cycle runs from 00:00 UTC on that day to the same day next month. A day past a month's end lands on that month's last day for that month only: an anchor of the 31st renews on Jan 31, Feb 28 (29 in a leap year), Mar 31, Apr 30, and never drifts to the 28th for good. UTC midnight, because the cost report below is bucketed by UTC day and Anthropic publishes no time of day for the renewal ("shortly after your plan payment is processed").
+- Only Anthropic API-key accounts without an `upstream` take the setting; anywhere else it is ignored with one line saying so.
+
+What is left is the amount minus the spend since the cycle began, from one of two sources. Every payload and display says which, and as of when.
+
+### With an Admin API key: the organization's cost report (authoritative)
+
+With `credit.adminKey` set, TeamClaude reads the organization's spend since the cycle start from Anthropic's [Usage and Cost API](https://platform.claude.com/docs/en/manage-claude/usage-cost-api) (`GET /v1/organizations/cost_report`), every `refreshMinutes` (default 15, at least 1). The credit is organization-wide — every API key and workspace in the linked organization draws from the same balance — so the organization's spend is the right number, whichever key spent it.
+
+- **Opt-in by the key's presence, and zero-spend.** The read sends no message, refreshes no token and touches no quota. It therefore runs for a **disabled** account too, with no `probeDisabledAccounts` needed: the pinned-only credit key is exactly the case it is for. It does not depend on the [quota probe](#quota-probe) being on.
+- **Admin keys** are created at [platform.claude.com/settings/admin-keys](https://platform.claude.com/settings/admin-keys) by an organization member with the admin role, and start with `sk-ant-admin01-`. They carry full admin access to the organization (Console admin keys have no scopes), so treat one like the account's own key: TeamClaude sends it to `api.anthropic.com` only (through the account's own [`routing`](accounts.md#per-account-routing-routing) proxy when it has one), and never logs it, prints it or puts it in a status, quota or MCP payload — an upstream error that quotes it back reads `[admin key]` instead. The Admin API is unavailable to individual accounts, so the Console organization must be set up first.
+- **Freshness.** Anthropic says cost data "typically appears within 5 minutes of API request completion, though delays might occasionally be longer". `asOf` is when TeamClaude read the report.
+- **Failures.** A failed read keeps the last good reading of the cycle on display, says what failed, and waits the refresh interval doubled per consecutive failure, up to six hours. A **401 or 403** is reported as a credential problem on that account (`cr key!` on the TUI row before a first reading), never as zero spend. Reloading a config with a different admin key reads it at once and drops what the old key read.
+- **A new cycle** is read as soon as it begins.
+
+The newer [Usage and Cost Analytics API](https://platform.claude.com/docs/en/manage-claude/usage-cost-analytics-api) refreshes "within 4 hours ... up to 24 hours", so the legacy endpoint is used for freshness; swapping is one module (`src/anthropic-cost-report.js`).
+
+### Without one: an estimate from the replies this proxy served
+
+With no admin key, TeamClaude prices every reply it serves on the account from the reply's own `usage` block — input, output, cache reads, and 5-minute and 1-hour cache writes, streamed or not — with a built-in copy of Anthropic's [price table](https://platform.claude.com/docs/en/about-claude/pricing), and keeps the running sum for the cycle in `teamclaude.state.json`, so it survives a restart. It is labeled an **estimate**:
+
+- It sees **only traffic through this proxy**. Another key in the same organization, the Console's playground, or this key used directly all spend the same credit unseen. The figure it shows as left is therefore an **upper bound** (`at most $X left`, and `~` on the TUI row), and `trackedSince` says when it started watching in this cycle.
+- A reply on a **model the table does not price** adds nothing and marks the estimate **incomplete**, naming the model (`?` on the TUI row). So does a reply served in fast mode on a model without a fast-mode price, or on Priority Tier.
+- Priced from the reply's own fields: fast mode (`speed: "fast"`), US-only inference (`inference_geo: "us"`, 1.1x), the Batch API tier (`service_tier: "batch"`, half price), Claude Haiku 5.5's higher price for prompts over 100,000 tokens, and web searches ($10 per 1,000). The model is the one the request named, as everywhere else the proxy attributes usage.
+- **Known limits**: code execution is billed by container time with free hours a month, which a reply cannot price, so it is left out; Message Batches results are not read, so batch work is not seen; cache-creation tokens a usage block does not split by TTL are priced at the 5-minute rate (the default TTL); the table is as of its read date (in the source), and a price change or a new model needs a release.
+
+The two sources are kept apart rather than added together: the cost report carries no watermark saying up to when it is complete, so local spend after a report could not be added without counting some of it twice or missing some.
+
+### Where it shows
+
+- **TUI**: the account row keeps `Tok` and `Req` and adds a `Cr` bar — the share of the credit spent, paced against the cycle like a weekly bar, its countdown the time to the renewal — and a tag with what is left: `$154.33 left`, `~$88.00 left` for the estimate, `$12.30 over` once the spend has gone past the amount (nothing is left of the included credit), a trailing `?` for an incomplete estimate and `!` for a failing read, `cr ?` before the first reading. The bar is the first thing to go on a narrow terminal; the tag stays. Attach mode draws the same from the status payload.
+- **`teamclaude status`**: a `Credit` line, e.g. `$154.33 of $200.00 left ($45.67 spent) · renews in 20d (2026-11-27) · Admin API cost report, read 4m ago`, or `at most $88.00 of $100.00 left ($12.00 spent) · … · estimate: replies through this proxy only, since 2026-11-06`.
+- **Web dashboard**: a `Credit` bar and the same line on the account's card.
+- **`GET /teamclaude/status`, `GET /teamclaude/quota` and the MCP `get_status` / `get_quota` tools**: a `credit` object on the account, present only when it has a credit setting:
+
+  | Field | Meaning |
+  | --- | --- |
+  | `source` | `admin` (the cost report) or `local` (the estimate) |
+  | `estimate`, `upperBound` | `true` for `local` |
+  | `currency`, `exponent` | `USD`, `2`: the amounts below are in cents, the shape of a subscription's `spend` |
+  | `amountMinor` | the credit per cycle |
+  | `spentMinor` | spend this cycle; `null` while the admin source has no reading for the cycle |
+  | `remainingMinor` | `amountMinor - spentMinor`, never below `0`; `null` with `spentMinor` |
+  | `exceededMinor` | how far the spend went past the amount, else `0` |
+  | `usedFraction` | `spentMinor / amountMinor`, past `1` when exceeded |
+  | `cycleStart`, `cycleEnd` | the current cycle, ISO 8601 |
+  | `asOf` | when the figure was read (admin) or built (local) |
+  | `trackedSince`, `lastReplyAt`, `replies` | local only: since when this cycle's replies were watched, the last one, and how many |
+  | `nextRefreshAt` | admin only: the next scheduled read |
+  | `incomplete` | local only: `{ replies, models: [{ model, replies, reason }] }` for replies that could not be priced, else `null` |
+  | `error` | admin only: `{ kind, status, message, at }` for a failing read (`kind` `credential` for a 401/403), else `null` |
+
+No CLI editor: hand-edit the config and let a running server pick it up on reload (**`R`** in the TUI, or `POST /teamclaude/reload`).
+
 ## Hold on exhaustion
 
 By default, when all accounts are exhausted TeamClaude returns a `429` immediately, which causes Claude Code to abort the current task. With `holdSeconds` set, the proxy **holds the HTTP connection open** instead and polls silently every ~60 seconds; the instant any account's quota resets, the request is forwarded and Claude Code resumes — the interruption never happens.
+
+The refusal is still a `rate_limit_error` with the same message and `retry-after` header. Its body also carries `error.details`, so a client or a monitoring system can tell it from an upstream rate limit without reading the sentence. `error_code` is `pool_exhausted` when eligible accounts exist but are blocked, and `no_eligible_account` when none can serve the request at all (a configuration problem, not exhaustion). `retry_after_seconds` matches the header. `resets_at` is the ISO-8601 time the blocking window actually lifts, or `null` when no reset is known: a dead credential, an untimed block, or no eligible account.
 
 Set it in the config file (`~/.config/teamclaude.json`):
 
