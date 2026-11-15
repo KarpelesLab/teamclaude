@@ -707,6 +707,146 @@ test('an account the store does not carry by identity is still renewed under the
   assert.deepEqual(lone.refreshed, ['rt-n-1']);
 });
 
+// A renewal writes the row from the account that renewed it. One matched to
+// the row by its refresh token alone carries no identity of its own.
+test('a renewal by an account held without its identity keeps the row\'s identity and name, and another install adds it whole', async () => {
+  const store = makeStore();
+  const a = claude('a', { hasClaudeMax: true, rateLimitTier: 'tier-a' });
+  const key = syncKeyFor(a);
+  store.put(key, encodeBlob(a, { accessToken: a.accessToken, refreshToken: a.refreshToken, expiresAt: T0 - H }, { now: T0, by: 'office' }));
+  // `teamclaude import` of that expired token renews it before reading the profile.
+  const imported = { name: 'imported account', type: 'oauth', accessToken: a.accessToken, refreshToken: a.refreshToken, expiresAt: T0 - H };
+  const tokens = await refreshOutsideProxy(imported, async () => ({ accessToken: 'at-a-2', refreshToken: 'rt-a-2', expiresAt: T0 + 8 * H }),
+    { force: true, api: store.api, isSignedIn: async () => true, log: () => {}, now: store.now, by: 'laptop' });
+  assert.equal(tokens?.refreshToken, 'rt-a-2');
+  const blob = store.blob(key);
+  assert.equal(blob.refreshToken, 'rt-a-2', 'the renewal is stored');
+  for (const f of ['accountUuid', 'orgUuid', 'orgName', 'hasClaudeMax', 'rateLimitTier']) assert.equal(blob[f], a[f], f);
+  assert.equal(blob.name, 'a');
+  // An install without the account adds it as the row describes it, and syncs it.
+  const other = setup([], { store });
+  await other.sync.sync();
+  assert.equal(other.admitted.length, 1);
+  assert.equal(other.admitted[0].name, 'a');
+  assert.equal(isSyncable(other.admitted[0]), true);
+});
+
+test('a renewal by an account missing part of its identity keeps the rest from the row; what it has decides', async () => {
+  const store = makeStore();
+  const a = claude('a', { hasClaudeMax: true, rateLimitTier: 'tier-a' });
+  store.put(syncKeyFor(a), encodeBlob(a, { accessToken: a.accessToken, refreshToken: a.refreshToken, expiresAt: a.expiresAt }, { now: T0, by: 'office' }));
+  const { am } = setup([claude('a', { orgName: undefined, hasClaudeMax: false })], { store });
+  await am.ensureTokenFresh(0, true);
+  const blob = store.blob(syncKeyFor(a));
+  assert.equal(blob.refreshToken, 'rt-a-1-renewed-rt');
+  assert.equal(blob.orgName, 'Org a');
+  assert.equal(blob.rateLimitTier, 'tier-a');
+  assert.equal(blob.hasClaudeMax, false, 'the account\'s own reading');
+});
+
+test('an account renewing under the lock of a row of another identity takes nothing from that row', async () => {
+  const store = makeStore();
+  const a = claude('a', { hasClaudeMax: true, rateLimitTier: 'tier-a' });
+  // The row names a, yet holds the refresh token b has.
+  store.put(syncKeyFor(a), encodeBlob(a, { accessToken: 'at-b-1', refreshToken: 'rt-b-1', expiresAt: T0 + 8 * H }, { now: T0, by: 'office' }));
+  const { am, refreshed } = setup([claude('b')], { store });
+  await am.ensureTokenFresh(0, true);
+  assert.deepEqual(refreshed, ['rt-b-1']);
+  const blob = store.blob(syncKeyFor(a));
+  assert.equal(blob.accountUuid, 'uuid-b');
+  assert.equal(blob.hasClaudeMax, undefined);
+  assert.equal(blob.rateLimitTier, undefined);
+});
+
+test('a Codex account renewing keeps its row\'s other fields, and takes nothing from a row of another Codex account', async () => {
+  const store = makeStore();
+  const c = codex('c', { rateLimitTier: 'tier-c' });
+  store.put(syncKeyFor(c), encodeBlob({ ...c, name: 'c at the office' }, { accessToken: c.accessToken, refreshToken: c.refreshToken, expiresAt: c.expiresAt }, { now: T0, by: 'office' }));
+  const own = setup([codex('c')], { store });
+  await own.am.ensureTokenFresh(0, true);
+  let blob = store.blob(syncKeyFor(c));
+  assert.equal(blob.refreshToken, 'rt-c-1-renewed-rt');
+  assert.equal(blob.rateLimitTier, 'tier-c');
+  assert.equal(blob.name, 'c', 'an account with its identity names the row, as before');
+  // The row names c, yet holds the refresh token d has.
+  store.put(`${KEY_PREFIX}codex.acct-c2`, encodeBlob({ ...c, accountId: 'acct-c2', name: 'c2' }, { accessToken: 'at-d-1', refreshToken: 'rt-d-1', expiresAt: T0 + 8 * H }, { now: T0, by: 'office' }));
+  const other = setup([codex('d')], { store });
+  await other.am.ensureTokenFresh(0, true);
+  blob = store.blob(`${KEY_PREFIX}codex.acct-c2`);
+  assert.equal(blob.refreshToken, 'rt-d-1-renewed-rt');
+  assert.equal(blob.accountId, 'acct-d');
+  assert.equal(blob.rateLimitTier, undefined);
+});
+
+// Every write over a row other than a sign-in keeps the row's fields the
+// account lacks: the pass storing a renewal, the token listener, an emptying.
+const rowWithMore = (store, tokens) => store.put(syncKeyFor(claude('a')), encodeBlob(claude('a', { rateLimitTier: 'tier-a' }), tokens, { now: T0, by: 'office' }));
+const keptFromRow = (store) => {
+  const blob = store.blob(syncKeyFor(claude('a')));
+  assert.equal(blob.orgName, 'Org a');
+  assert.equal(blob.rateLimitTier, 'tier-a');
+  return blob;
+};
+
+test('the pass storing a renewal keeps the row\'s fields the account lacks', async () => {
+  const store = makeStore();
+  rowWithMore(store, { accessToken: 'at-a-0', refreshToken: 'rt-a-0', expiresAt: T0 + H });
+  const { sync } = setup([claude('a', { orgName: undefined })], { store });
+  assert.equal((await sync.sync()).pushed, 1);
+  assert.equal(keptFromRow(store).refreshToken, 'rt-a-1');
+});
+
+test('a renewal stored from the token listener keeps the row\'s fields the account lacks', async () => {
+  const store = makeStore();
+  rowWithMore(store, { accessToken: 'at-a-1', refreshToken: 'rt-a-1', expiresAt: T0 + 8 * H });
+  const { sync, am } = setup([claude('a', { orgName: undefined })], { store, minted: false });
+  await sync.sync();
+  am.accounts[0]._minted = true;
+  await sync.onLocalTokens(0, { accessToken: 'at-a-2', refreshToken: 'rt-a-2', expiresAt: T0 + 9 * H });
+  assert.equal(keptFromRow(store).refreshToken, 'rt-a-2');
+});
+
+test('emptying a row that holds the rejected token keeps the row\'s fields the account lacks', async () => {
+  const store = makeStore();
+  rowWithMore(store, { accessToken: 'at-a-1', refreshToken: 'rt-a-1', expiresAt: T0 + 8 * H });
+  const { sync, am } = setup([claude('a', { orgName: undefined })], { store });
+  am.accounts[0].status = 'error';
+  am.accounts[0]._deadRefreshToken = 'rt-a-1';
+  assert.equal((await sync.sync()).emptied, 1);
+  assert.equal(keptFromRow(store).refreshToken, '');
+});
+
+// Rewritten by another version between the read and the lock, the row holds
+// nothing to keep: the renewal is stored as the account describes it.
+test('a renewal by an account held without its identity is still stored over a row that no longer reads once locked', async () => {
+  const store = makeStore();
+  const a = claude('a');
+  const row = store.put(syncKeyFor(a), encodeBlob(a, { accessToken: a.accessToken, refreshToken: a.refreshToken, expiresAt: T0 - H }, { now: T0, by: 'office' }));
+  const api = async (method, path, params, opts) => {
+    if (path.endsWith(':lock')) row.Data = JSON.stringify({ v: 2, by: 'newer' });
+    return store.api(method, path, params, opts);
+  };
+  const imported = { name: 'imported account', type: 'oauth', accessToken: a.accessToken, refreshToken: a.refreshToken, expiresAt: T0 - H };
+  const tokens = await refreshOutsideProxy(imported, async () => ({ accessToken: 'at-a-2', refreshToken: 'rt-a-2', expiresAt: T0 + 8 * H }),
+    { force: true, api, isSignedIn: async () => true, log: () => {}, now: store.now, by: 'laptop' });
+  assert.equal(tokens?.refreshToken, 'rt-a-2');
+  assert.equal(store.blob(syncKeyFor(a)).refreshToken, 'rt-a-2', 'the renewal is stored');
+});
+
+// A sign-in's entry is what the sign-in read: a plan field the sign-in no
+// longer reads is not kept from the row.
+test('a sign-in is stored as its entry stands, without what the row said before', async () => {
+  const store = makeStore();
+  const a = claude('a', { seatTier: 'team-premium', organizationType: 'claude_team' });
+  store.put(syncKeyFor(a), encodeBlob(a, { accessToken: a.accessToken, refreshToken: a.refreshToken, expiresAt: a.expiresAt }, { now: T0, by: 'office' }));
+  const { sync } = setup([], { store });
+  assert.equal(await sync.storeSignIn({ ...claude('a'), seatTier: null, organizationType: null, accessToken: 'at-a-login', refreshToken: 'rt-a-login', expiresAt: T0 + 8 * H }), true);
+  const blob = store.blob(syncKeyFor(a));
+  assert.equal(blob.refreshToken, 'rt-a-login');
+  assert.equal(blob.seatTier, undefined);
+  assert.equal(blob.organizationType, undefined);
+});
+
 test('a forced refresh waits for the lock holder even while the clock calls the token good', async () => {
   // The 401 said it is dead whatever the clock says; "keep it" is no answer.
   const { sync, am, store, refreshed, sleeps } = setup([claude('a', { expiresAt: Date.now() + 2 * 60_000 })]);
