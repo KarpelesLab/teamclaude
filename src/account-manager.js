@@ -6308,7 +6308,16 @@ export class AccountManager {
         console.error(`[TeamClaude] Token refresh failed for "${safeLine(account.name, 64)}": ${err.message}`);
         // Why, until a refresh succeeds: what the client is told when this
         // account then fails its request (the coordinator's reason, a 429).
-        account._lastRefreshFailure = { at: Date.now(), reason: safeLine(String(err?.message || err), 300), status: err?.status };
+        // Only while the account still holds the refresh token that was sent,
+        // or when the failure leaves a hold that governs tokens that arrived
+        // meanwhile too: a 429 (the hold on renewals below) or a routing
+        // failure (markRoutingFailed, out of rotation). Any other failure of
+        // the old token is not theirs, and their clients would be told the old
+        // token's reason: the request in flight among them, which is answered
+        // from this when the tokens that arrived have expired too.
+        if (account.refreshToken === sent || err?.status === 429 || isRoutingFailure(err)) {
+          account._lastRefreshFailure = { at: Date.now(), reason: safeLine(String(err?.message || err), 300), status: err?.status };
+        }
         // The refresh never reached the token endpoint: the account's own
         // routing proxy is down. The forward that follows would fail the same
         // way, so hold the account out of rotation now rather than after it.
@@ -6470,7 +6479,11 @@ export class AccountManager {
   }
 
   /**
-   * Update a specific account's OAuth tokens (e.g. after intercepting a token refresh).
+   * Update a specific account's OAuth tokens with ones from elsewhere: a
+   * reload that found them changed on disk (which is how a `teamclaude login`
+   * or `import` reaches the running proxy), or a token taken from callback.net.
+   * Of the token fields it writes only those it is given: one left out keeps
+   * the account's own, except the expiry, which goes with the access token.
    * @param {number} accountIndex
    * @param {{ accessToken?: string, refreshToken?: string, expiresAt?: number }} tokens
    */
@@ -6478,9 +6491,14 @@ export class AccountManager {
     const account = this.accounts[accountIndex];
     if (!account || account.type !== 'oauth') return;
 
-    account.credential = accessToken;
+    if (accessToken) account.credential = accessToken;
     if (refreshToken) account.refreshToken = refreshToken;
-    account.expiresAt = expiresAt;
+    // An expiry describes the access token it comes with: given an access
+    // token without one, the account has no known expiry, as a restart from
+    // the same entry would read it. Keeping the one it had could renew the
+    // token on another token's schedule, with whatever refresh token the
+    // account still holds.
+    if (accessToken || expiresAt) account.expiresAt = expiresAt;
     // Tokens from elsewhere (the store, a reload from disk) were not minted here.
     account._minted = false;
     // A failed renewal of the tokens these replace no longer explains anything.
@@ -6488,10 +6506,19 @@ export class AccountManager {
     // Nor does a lapsed plan restored from the last run: a sign-in may be on a
     // renewed one, and the next profile read reports the loss again if not.
     account.subscriptionLost = null;
+    // Any error, a refusal (markRefused) included. This is where a sign-in
+    // reaches a running proxy, by a reload or from the store, and a renewal
+    // made elsewhere arrives the same way, with nothing to tell the two apart.
+    // A trade-off: each time new tokens bring back an account upstream still
+    // refuses, the first request sent to it is refused again and fails over
+    // (the account leaves rotation again), and until then status shows it
+    // active, without the refusal.
     if (account.status === 'error') account.status = 'active';
     console.log(`[TeamClaude] Updated tokens for account "${safeLine(account.name, 64)}"`);
+    // What the account now holds, not what came in: the listener writes these
+    // onto the account's config row, and a field left out would blank it there.
     this._onTokenRefresh?.(accountIndex, {
-      accessToken,
+      accessToken: account.credential,
       refreshToken: account.refreshToken,
       expiresAt: account.expiresAt,
     });

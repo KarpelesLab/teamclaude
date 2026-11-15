@@ -5,6 +5,8 @@ import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer, exhaustedMessage } from '../src/server.js';
 import { accountRefusal } from '../src/account-refusal.js';
 import { unavailableLine } from '../src/status-renderer.js';
+import { syncAccountsFromDisk } from '../src/sync-accounts.js';
+import { ensureAccountIds } from '../src/account-id.js';
 
 // Upstream refuses some accounts outright: an identity check, a hold, a disabled
 // organization. Retrying another request on the same account cannot succeed, so
@@ -249,6 +251,24 @@ test('an account refused again after a re-login records the new refusal', () => 
   assert.equal(am.getStatus().accounts[0].status, 'active');
   am.markRefused(am.accounts[0], { code: 'verification_required', message: KYC_MESSAGE, link: 'https://claude.ai/settings/verify' });
   assert.equal(am.getStatus().accounts[0].errorReason?.code, 'verification_required');
+});
+
+// The remedy status names is a re-login, and `teamclaude login` (or the TUI's)
+// reaches the running proxy by rewriting the account's config row and a reload.
+test('a re-login brings a refused account back through the reload; a reload of the same tokens does not', async () => {
+  const disk = { accounts: accounts() };
+  ensureAccountIds(disk.accounts);
+  const memConfig = { accounts: disk.accounts.map((a) => ({ ...a })) };
+  const am = new AccountManager(memConfig.accounts.map((a) => ({ ...a })), 0.98);
+  am.markRefused(am.accounts[0], { code: 'account_on_hold', message: HOLD_MESSAGE, link: 'https://claude.ai/restricted' });
+  await syncAccountsFromDisk(disk, memConfig, am);
+  assert.equal(am.getStatus().accounts[0].errorReason?.code, 'account_on_hold', 'nothing new on disk');
+  disk.accounts[0] = { ...disk.accounts[0], accessToken: 'a-login', refreshToken: 'ra-login', expiresAt: Date.now() + 8 * HOUR };
+  await syncAccountsFromDisk(disk, memConfig, am);
+  const row = am.getStatus().accounts[0];
+  assert.equal(row.status, 'active');
+  assert.equal(row.errorReason, null);
+  assert.equal(am.accounts[0].credential, 'a-login');
 });
 
 test('a 429 that lands after the refusal does not turn it into a hold that lapses', () => {
