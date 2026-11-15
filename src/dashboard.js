@@ -2404,7 +2404,8 @@ export function stackSeries(series, n) {
 // The average is of full buckets: from `from`, the first bucket recording
 // covers (recordedFrom), so a 30-day range on a history three days old
 // averages three days, not thirty; and without the bucket still filling,
-// which would pull it down, so it is the same figure the chart's line names.
+// which would pull it down. That matches the chart's line only while the line
+// is the flat average of those buckets; a 7-day average is another figure.
 // With no full bucket yet it is the one there is.
 /** @param {number[]|null|undefined} values @param {number} [from] */
 export function seriesStats(values, from) {
@@ -2787,7 +2788,7 @@ export function insightsPace(data, metric, days) {
     var peak = peakBucket(v, from);
     if (!peak) return null;
     return { kind: 'peak', label: 'Busiest hour', value: peak.value, text: fmt(peak.value),
-      sub: insightsBucketLabel(b[peak.index], 'hour', true) + (peak.ratio ? ' · ' + peak.ratio.toFixed(1) + '× the average full hour' : ''),
+      sub: insightsBucketLabel(b[peak.index], 'hour', true) + (peak.index === n - 1 ? ' (so far)' : '') + (peak.ratio ? ' · ' + peak.ratio.toFixed(1) + '× the average full hour' : ''),
       how: 'The hour with the most, against the average full hour.', rate: null, soFar: null, left: null, month: null, against: null };
   }
   var want = days || 7;
@@ -2813,6 +2814,11 @@ export function insightsPace(data, metric, days) {
   var inUnit = function (x, u) { return Number((x / u.scale).toFixed(u.dec)); };
   /** @param {number} x  a count of units @param {{ dec: number, pre: string, suf: string }} u */
   var show = function (x, u) { return u.pre + (u.dec ? x.toFixed(u.dec) : Math.round(x).toLocaleString('en-US')) + u.suf; };
+  // The rate as the line prints it (fmtUsd's cents, fmtTokens' figures). The
+  // projection multiplies this one, not the exact average, so "287k/day" for
+  // 20 days reads 5.74M and the printed sum works out by hand.
+  var tu = unitFor(rate);
+  var shownRate = cost ? (rate >= 1000 ? Math.round(rate) : Math.round(rate * 100) / 100) : inUnit(rate, tu) * tu.scale;
   var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(b[n - 1]));
   if (m) {
     var first = m[1] + '-' + m[2] + '-01';
@@ -2829,9 +2835,9 @@ export function insightsPace(data, metric, days) {
       var dayOf = Number(m[3]);
       var left = new Date(Number(m[1]), Number(m[2]), 0).getDate() - dayOf;
       var month = new Date(Number(m[1]), Number(m[2]) - 1, 1).toLocaleDateString([], { month: 'long' });
-      var u = unitFor(soFar + rate * left);
+      var u = unitFor(soFar + shownRate * left);
       var partSoFar = inUnit(soFar, u);
-      var partLeft = inUnit(rate * left, u);
+      var partLeft = inUnit(shownRate * left, u);
       var sum = Number((partSoFar + partLeft).toFixed(u.dec));
       // This month's first full days against the same days of last month,
       // only when every day of last month is in the reply and on record (part
@@ -2863,8 +2869,8 @@ export function insightsPace(data, metric, days) {
         rate: rate, soFar: soFar, left: left, month: month, against: against };
     }
   }
-  var ru = unitFor(rate * 30);
-  var run = inUnit(rate * 30, ru);
+  var ru = unitFor(shownRate * 30);
+  var run = inUnit(shownRate * 30, ru);
   return { kind: 'run', label: '30-day pace', value: run * ru.scale, text: show(run, ru), sub: '30 days at ' + fmt(rate) + '/day, the average of ' + span,
     how: 'Projected: the average of ' + span + ', times 30.', rate: rate, soFar: null, left: null, month: null, against: null };
 }

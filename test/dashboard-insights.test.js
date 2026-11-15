@@ -480,6 +480,10 @@ test('the pace: a range that misses the 1st is a 30-day run rate, hours are the 
   assert.equal(peak.kind, 'peak');
   assert.equal(peak.label, 'Busiest hour');
   assert.equal(peak.value, 5);
+  assert.ok(!peak.sub.includes('so far'), 'a finished hour is not marked');
+  const filling = /** @type {any} */ (insightsPace({ ...hours, cost: { ...hours.cost, values: [...hours.cost.values.slice(0, -1), 9] } }, 'cost'));
+  assert.equal(filling.value, 9);
+  assert.match(filling.sub, /\(so far\)/, 'the busiest hour is the one still filling');
   assert.equal(insightsPace({ ...week, since: null }, 'cost'), null, 'nothing recorded');
   assert.equal(insightsPace(costReply([4]), 'cost'), null, 'no full day yet');
   assert.equal(insightsPace(data, 'cost'), null, 'no estimate to project');
@@ -661,12 +665,19 @@ test('the pace adds up: the figure is the sum of the parts as printed', () => {
   const run = /** @type {any} */ (insightsPace(week, 'cost'));
   assert.equal(run.sub, '30 days at $10.25/day, the average of the last 7 full days');
   assert.equal(run.text, '$308');
-  // Tokens: both parts at the figure's precision, so 2.59M + 5.75M is 8.34M,
-  // where the unrounded 8,333,150 would print as 8.33M.
+  // Tokens: both parts at the figure's precision, and the days left at the
+  // rate as printed: 287k × 20 is 5.74M (the exact 287,350 a day would make
+  // it 5.75M), and 2.59M + 5.74M is 8.33M.
   const tokens = /** @type {any} */ (insightsPace(costReply([...Array(13).fill(287.35), 0]), 'tokens'));
-  assert.equal(tokens.sub, monthName(10) + ': 2.59M so far + 5.75M for the 20 days left (287k/day)');
-  assert.equal(tokens.text, '8.34M');
-  assert.equal(fmtTokens(2586150 + 287350 * 20), '8.33M');
+  assert.equal(tokens.sub, monthName(10) + ': 2.59M so far + 5.74M for the 20 days left (287k/day)');
+  assert.equal(tokens.text, '8.33M');
+  // The 30-day pace too: 12.7M a day printed, so 381M, not the 380M that the
+  // exact 12,665,000 a day would give.
+  const tokenWeek = costReply([...Array(13).fill(12665), 1]);
+  tokenWeek.buckets = dayRun('2026-11-03', 14);
+  const tokenRun = /** @type {any} */ (insightsPace(tokenWeek, 'tokens'));
+  assert.equal(tokenRun.sub, '30 days at 12.7M/day, the average of the last 7 full days');
+  assert.equal(tokenRun.text, '381M');
 });
 
 test('nothing priced: the cost has no estimate anywhere, not $0', () => {
