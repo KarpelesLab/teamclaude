@@ -35,7 +35,9 @@
   "expiryRouting": {
     "enabled": false,
     "tolerance": 1.5,
-    "preempt": true
+    "preempt": true,
+    "reclaimHours": 0,
+    "reclaimAcrossOrganizations": false
   },
   "accounts": [
     {

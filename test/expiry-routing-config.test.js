@@ -21,7 +21,7 @@ test('the knob is off unless the config says exactly true', () => {
 });
 
 test('an absent config is the same as an absent knob', () => {
-  assert.deepEqual(mgr(undefined).expiryRouting, { enabled: false, tolerance: 1.5, preempt: true });
+  assert.deepEqual(mgr(undefined).expiryRouting, { enabled: false, tolerance: 1.5, preempt: true, reclaimHours: 0, reclaimAcrossOrganizations: false });
   assert.deepEqual(mgr(null).expiryRouting, mgr(undefined).expiryRouting);
   assert.deepEqual(mgr({}).expiryRouting, mgr(undefined).expiryRouting);
 });
@@ -52,15 +52,15 @@ test('preempt defaults on and takes only a real boolean', () => {
 test('the knob hot-applies, and re-normalises what it is given', () => {
   const am = mgr({ enabled: true, tolerance: 4 });
   am.setExpiryRouting({ enabled: false, tolerance: 0.25 });
-  assert.deepEqual(am.expiryRouting, { enabled: false, tolerance: 1, preempt: true });
+  assert.deepEqual(am.expiryRouting, { enabled: false, tolerance: 1, preempt: true, reclaimHours: 0, reclaimAcrossOrganizations: false });
   am.setExpiryRouting(undefined);
-  assert.deepEqual(am.expiryRouting, { enabled: false, tolerance: 1.5, preempt: true });
+  assert.deepEqual(am.expiryRouting, { enabled: false, tolerance: 1.5, preempt: true, reclaimHours: 0, reclaimAcrossOrganizations: false });
 });
 
 test('status echoes the resolved knob, not the config that was written', () => {
   const am = mgr({ enabled: true, tolerance: 0.25 });
   const status = am.getStatus();
-  assert.deepEqual(status.expiryRouting, { enabled: true, tolerance: 1, preempt: true });
+  assert.deepEqual(status.expiryRouting, { enabled: true, tolerance: 1, preempt: true, reclaimHours: 0, reclaimAcrossOrganizations: false });
   // A copy: mutating the payload must not reconfigure the router.
   status.expiryRouting.enabled = false;
   assert.equal(am.expiryRouting.enabled, true);
