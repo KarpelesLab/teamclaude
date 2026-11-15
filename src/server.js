@@ -37,8 +37,6 @@ import { codexSpentWindows, isAccountWideCodexWindow } from './codex-quota.js';
 import { atomicConfigUpdate } from './config.js';
 import { ConfigOpError, setThreshold, thresholdRatio } from './config-ops.js';
 import { envVar, legacyControlUrl } from './brand.js';
-import { recordRequest } from './usage/record.js';
-import { handleUsageRoute } from './usage/routes.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
 
@@ -48,12 +46,6 @@ export const HOP_BY_HOP_HEADERS = new Set([
 ]);
 // Path prefix for the deprecated URL-based account pin (superseded by TC_ACCT).
 const PIN_PREFIX = '/tc-acct/';
-// Stand-in for a request built with no usage store (most tests, and any
-// createProxyRequestListener call that omits one): `disabled` makes
-// recordRequest's guard() a no-op, and `now`/`memo` keep usageSummary's
-// default-parameter evaluation and memo lookup safe on this object too, for
-// the one direct-call path (test) that might reach it.
-export const NO_USAGE_STORE = /** @type {import('./usage/db.js').Store} */ (/** @type {any} */ ({ disabled: true, now: Date.now, memo: new Map() }));
 
 /**
  * Does the request path carry a dot-segment (`.` or `..`, in any percent-encoded
@@ -779,39 +771,20 @@ export function callerView(client, scope) {
 }
 
 /**
- * The `caller` label a usage row is booked against. A `clientKeys` match names
- * itself, same as `req.tcClient`. Traffic without one is split three ways
- * rather than lumped together: '(open)' when the proxy has no key at all,
- * '(local)' for a key-exempt loopback caller, '(shared)' for `proxy.apiKey`.
- * The parentheses keep them apart from a key that happens to be named 'local'.
- * @param {string|null} client  resolveClientAuth's `.client` (already null for an unmatched/absent key)
- * @param {boolean} isLocal
- * @param {any} proxyConfig  config.proxy
- */
-export function usageCallerLabel(client, isLocal, proxyConfig) {
-  if (client) return client;
-  const hasCredential = !!(proxyConfig?.apiKey
-    || (Array.isArray(proxyConfig?.clientKeys) && proxyConfig.clientKeys.some((/** @type {any} */ e) => e?.key)));
-  if (!hasCredential) return '(open)';
-  if (isLocal) return '(local)';
-  return '(shared)';
-}
-
-/**
  * @param {any} accountManager
  * @param {any} config
  * @param {any} [hooks]
  * @param {any} [sx]
  * @param {any} [clientUsage]
  * @param {any} [dimensionUsage]
- * @param {{ bindHost?: string|null, usageStore?: any, drain?: import('./drain.js').DrainState|null }} [opts]  `bindHost`: the address the caller
+ * @param {{ bindHost?: string|null, drain?: import('./drain.js').DrainState|null }} [opts]  `bindHost`: the address the caller
  *   binds, when it is not `config.proxy.host` (TEAMCLAUDE_HOST overrides it). The
  *   DNS-rebinding Host check accepts that address as naming this machine; given
  *   only the config value, a server bound off-box through the env var refused a
  *   key-less caller naming the very address it listens on (#423). `drain`: the drain state the caller
  *   also holds (drain.js), so a graceful shutdown waits on the same count the listener keeps.
  */
-export function createProxyServer(accountManager, config, hooks = {}, sx = null, clientUsage = null, dimensionUsage = null, { bindHost = null, drain: sharedDrain = null, usageStore = NO_USAGE_STORE } = {}) {
+export function createProxyServer(accountManager, config, hooks = {}, sx = null, clientUsage = null, dimensionUsage = null, { bindHost = null, drain: sharedDrain = null } = {}) {
   const boundHost = () => bindHost || config.proxy?.host;
   const drain = sharedDrain ?? createDrainState();
   const upstream = config.upstream || 'https://api.anthropic.com';
@@ -980,13 +953,6 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           return;
         }
       }
-
-      // SQLite usage dashboard (per caller/model/account, windowed). Gated the
-      // same as every other control route above; internally a no-op prefix
-      // test for anything else, so it costs the forwarded inference path
-      // nothing. `usageStore` may be the disabled NO_USAGE_STORE sentinel —
-      // handleUsageRoute answers `available: false` rather than failing.
-      if (handleUsageRoute(req, res, usageStore)) return;
 
       // Status endpoint
       if (req.method === 'GET' && req.url === '/teamclaude/status') {
@@ -1459,7 +1425,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
   // Opt-in egress pin: null unless config.egress.pin is set, and then shared by
   // the base listener and the MITM one so both honour the same hold.
   const egress = createEgressGuard(config, logLine);
-  const forward = createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config, egress, clientUsage, dimensionUsage, drain, usageStore });
+  const forward = createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config, egress, clientUsage, dimensionUsage, drain });
   const server = http.createServer(requestHandler);
   server.keepAliveTimeout = KEEP_ALIVE_TIMEOUT_MS;
 
@@ -1507,7 +1473,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
     const c = await certsPromise;
     return { key: c.leafKeyPem, cert: c.leafCertPem };
   };
-  server.on('connect', createConnectHandler({ config, accountManager, ensureLeaf, leafHosts: mitmHostList, logDir, hooks, log: logLine, sx, egress, clientUsage, dimensionUsage, drain, usageStore }));
+  server.on('connect', createConnectHandler({ config, accountManager, ensureLeaf, leafHosts: mitmHostList, logDir, hooks, log: logLine, sx, egress, clientUsage, dimensionUsage, drain }));
   // Remote Control's real-time channel is a WebSocket, not a request/response
   // call — Node fires 'upgrade' for that handshake, never 'request', so it
   // needs its own listener (base-URL routing path; the MITM path wires the
@@ -2076,10 +2042,9 @@ let lastRequestId = 0;
  * @param {Object|null} [opts.clientUsage]
  * @param {string|null} [opts.forcedClient]
  * @param {Object|null} [opts.dimensionUsage]
- * @param {any} [opts.usageStore]  SQLite usage store (src/usage/db.js); defaults to the disabled sentinel
  * @param {import('./drain.js').DrainState|null} [opts.drain]  the shared drain state (drain.js); a listener made without one keeps its own, which never drains
  */
-export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null, holdMs = 0, config = {}, forcedPin = null, egress = null, clientUsage = null, forcedClient = null, dimensionUsage = null, drain = null, usageStore = NO_USAGE_STORE }) {
+export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null, holdMs = 0, config = {}, forcedPin = null, egress = null, clientUsage = null, forcedClient = null, dimensionUsage = null, drain = null }) {
   const drainState = drain ?? createDrainState();
   return async (req, res) => {
     // Set before anything else, so every response from this listener carries the
@@ -2440,20 +2405,10 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // are dropped with the other proxy-control headers.
       const stripHeaders = usageDimensionHeaderNames(config.proxy);
 
-      // The SQLite usage row's `caller` (distinct from `client`: never null,
-      // so a caller with no clientKeys entry is still one dimension value
-      // rather than lost to `unknown`) and its token accumulator, filled as
-      // the response is parsed (parseSSEDataLine / extractUsageFromBody) and
-      // written once, in the request's own finally block below, alongside
-      // whichever account/status/model that path already settled on.
-      const proxyConfig = /** @type {any} */ (config).proxy;
-      const caller = usageCallerLabel(client, loopbackExempt(req.headers, req.socket?.remoteAddress, proxyConfig), proxyConfig);
-      const usage = { input: 0, cacheRead: 0, cacheWrite: 0, output: 0 };
-
       // stripOverage, synthesizeQuota and poolQuota are sampled once here, at dispatch:
       // retries and holds of this request keep them, and a reload applies to
       // subsequent requests.
-      const ctx = { account: null, callerRequestId: callerId, status: null, attempt: 0, tried: new Set(), reauthed: new Set(), model, advisorModel, streamRequested: parseRequestStream(body), fleetMessageThreads: config?.messageThreads === true, pinnedIndex, pinChain, provider, holdBudgetMs: holdMs, pinKey, onMessage, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, stripOverage: shouldStripOverageHeaders(config), synthesizeQuota: shouldSynthesizeQuotaHeaders(config), poolQuota: shouldPoolQuotaHeaders(config), logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config), cacheUsage: /** @type {Record<string, any>|null} */ (null), errorType: /** @type {string|null} */ (null), usage };
+      const ctx = { account: null, callerRequestId: callerId, status: null, attempt: 0, tried: new Set(), reauthed: new Set(), model, advisorModel, streamRequested: parseRequestStream(body), fleetMessageThreads: config?.messageThreads === true, pinnedIndex, pinChain, provider, holdBudgetMs: holdMs, pinKey, onMessage, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, stripOverage: shouldStripOverageHeaders(config), synthesizeQuota: shouldSynthesizeQuotaHeaders(config), poolQuota: shouldPoolQuotaHeaders(config), logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config), cacheUsage: /** @type {Record<string, any>|null} */ (null), errorType: /** @type {string|null} */ (null) };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request.
@@ -2510,29 +2465,6 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         // a second time for one request.
         openEntry = null;
         if (!hideActivity) hooks.onRequestEnd?.(reqId, { callerRequestId: callerId, method: req.method, path: req.url, account: ctx.account, status: ctx.status, model: ctx.model, effort, sessionId, pinned: ctx.pinnedIndex != null, client, attempts: ctx.attempt || 0, cacheUsage: ctx.cacheUsage, errorType: ctx.errorType });
-        // One SQLite row per request, written here because this is the one
-        // place every terminal outcome of forwardRequest already funnels
-        // through — success, a hop that exhausted retries, the pool-exhausted
-        // 429/502 refusal (ctx.account/.status are set before every return in
-        // forwardRequest; see resolveAccountPin's callers) — rather than a
-        // record call copied into each of those branches. Cache tokens land in
-        // ctx.usage from streamResponse/extractUsageFromBody; a refusal that
-        // never reached an account leaves it at its zero default. ctx.account
-        // also carries activity-log placeholders like "(none available)", which
-        // are not accounts and go to `unknown`. A stream the proxy had to cut
-        // after its 200 head (proxyClosed) is a 502 here, not the upstream's 200.
-        /** @type {any} */
-        const settled = ctx;
-        // A telemetry batch the activity log hides (eventLogging) is not usage
-        // either: it would add a zero-token row under no model for every batch.
-        const served = /** @type {any[]} */ (/** @type {any} */ (accountManager).accounts).some(a => a.name === settled.account);
-        if (!hideActivity) recordRequest(usageStore, {
-          caller,
-          account: served ? settled.account : null,
-          model: ctx.model,
-          status: settled.proxyClosed && (settled.status ?? 200) < 300 ? 502 : settled.status,
-          ...ctx.usage,
-        });
       }
     } catch (err) {
       reportFailure('[TeamClaude] Unhandled error:', err);
@@ -5309,7 +5241,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       const l = getLog();
       const bw = l ? l.bodyWriter('RESPONSE BODY (streamed)', contentType) : null;
       try {
-        ({ failed: streamFailed } = await streamResponse(held?.body ?? upstreamBody, res, account.index, accountManager, bw, ctx.onUsage, ctx.pinKey, ctx.model, ctx.onMessage, (/** @type {Record<string, any>} */ u) => { ctx.cacheUsage = u; bookUsageTotals(ctx.usage, u); }, isStreaming));
+        ({ failed: streamFailed } = await streamResponse(held?.body ?? upstreamBody, res, account.index, accountManager, bw, ctx.onUsage, ctx.pinKey, ctx.model, ctx.onMessage, (/** @type {Record<string, any>} */ u) => { ctx.cacheUsage = u; }, isStreaming));
         // Reached only when the stream completed. A stream that dies upstream
         // throws out of streamResponse, so it never marks itself delivered —
         // which is the failure the token counters cannot see, since a stream
@@ -5334,7 +5266,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       if (upstreamRes.status >= 400 && buf.length <= ERROR_BODY_INSPECTION_LIMIT && isJsonContentType(contentType)) {
         ctx.errorType = upstreamErrorType(buf);
       }
-      extractUsageFromBody(buf, account.index, accountManager, ctx.onUsage, ctx.pinKey, ctx.model, ctx.onMessage, (/** @type {Record<string, any>} */ u) => { ctx.cacheUsage = u; bookUsageTotals(ctx.usage, u); });
+      extractUsageFromBody(buf, account.index, accountManager, ctx.onUsage, ctx.pinKey, ctx.model, ctx.onMessage, (/** @type {Record<string, any>} */ u) => { ctx.cacheUsage = u; });
       const l = getLog();
       if (l) { l.body('RESPONSE BODY', buf, contentType); l.end(); }
       res.end(buf);
@@ -5551,21 +5483,6 @@ export function readWithIdleTimeout(reader, ms) {
 }
 
 /**
- * Copy the usage a response booked into the SQLite row's totals (src/usage/record.js).
- * Called from the `onTotals` hook of streamResponse / extractUsageFromBody.
- * @param {{ input: number, cacheRead: number, cacheWrite: number, output: number }|Record<string, never>} totals
- * @param {Record<string, any>} usage
- */
-export function bookUsageTotals(totals, usage) {
-  Object.assign(totals, {
-    input: usage.input_tokens || 0,
-    cacheRead: usage.cache_read_input_tokens || 0,
-    cacheWrite: usage.cache_creation_input_tokens || 0,
-    output: usage.output_tokens || 0,
-  });
-}
-
-/**
  * Relay a response body to the client as it arrives: an event stream, whose
  * usage is parsed from its SSE event lines along the way, or, with `scanUsage`
  * false, an answer the forward path would not hold (see
@@ -5595,7 +5512,6 @@ export async function streamResponse(webStream, res, accountIndex, accountManage
   const decoder = new TextDecoder();
   let errored = false;
   // The message's usage, merged across its two reports and recorded once below.
-  /** @type {{ input_tokens?: number, cache_read_input_tokens?: number, cache_creation_input_tokens?: number, output_tokens?: number }} */
   const merged = {};
   // A Responses turn settles both sides on ONE terminal event, so this stream
   // remembers that it did — the incremental counters would book the turn again
@@ -5811,7 +5727,6 @@ function parseSSEDataLine(line, accountIndex, accountManager, onUsage = null, me
 }
 
 /**
- * Non-streaming counterpart of parseSSEDataLine. Exported for tests.
  * @param {Buffer} buffer
  * @param {number} accountIndex
  * @param {any} accountManager
@@ -5821,7 +5736,7 @@ function parseSSEDataLine(line, accountIndex, accountManager, onUsage = null, me
  * @param {((messageId: string) => void)|null} [onMessage] told the id of the message the body is
  * @param {((usage: Record<string, any>) => void)|null} [onTotals] told the usage that was booked
  */
-export function extractUsageFromBody(buffer, accountIndex, accountManager, onUsage = null, pinKey = null, model = null, onMessage = null, onTotals = null) {
+function extractUsageFromBody(buffer, accountIndex, accountManager, onUsage = null, pinKey = null, model = null, onMessage = null, onTotals = null) {
   try {
     const json = JSON.parse(buffer.toString());
     if (json?.type === 'message' && typeof json.id === 'string') onMessage?.(json.id);

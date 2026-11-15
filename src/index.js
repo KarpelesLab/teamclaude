@@ -5,13 +5,12 @@ import { createInterface } from 'node:readline';
 import { createWriteStream, existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import net from 'node:net';
-import { loadOrCreateConfig, loadConfig, loadConfigPersistingIds, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, getQuotaSeriesPath, getUsageDbPath, loadState, createStatePersister } from './config.js';
+import { loadOrCreateConfig, loadConfig, loadConfigPersistingIds, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, getQuotaSeriesPath, loadState, createStatePersister } from './config.js';
 import { loadQuotaSeries, saveQuotaSeries } from './quota-series.js';
 import { installCrashHandlers } from './crash-log.js';
 import { AccountManager, distributionMode, accountRouting } from './account-manager.js';
 import { validateAdaptiveConfig } from './adaptive-distribution.js';
-import { createProxyServer, NO_USAGE_STORE, reloadedHeaderFlags, resolveAccountPin } from './server.js';
-import { openUsageStore, startTicks, closeUsageStore } from './usage/db.js';
+import { createProxyServer, reloadedHeaderFlags, resolveAccountPin } from './server.js';
 import { createDrainState, resolveDrainTimeoutSeconds } from './drain.js';
 import { compactBeforeSwitchStatus } from './compact-before-switch.js';
 import { importCredentials, loginOAuth, loginOAuthWithPastedCode, startOAuthLogin, fetchProfile, profileForCredentials, refreshAccessToken, isTokenExpired, isTokenExpiringSoon } from './oauth.js';
@@ -336,7 +335,6 @@ switch (command) {
 
 // ── server ──────────────────────────────────────────────────
 
-
 async function serverCommand() {
   // Installed first: the server is the long-lived process, it runs under a TUI
   // that repaints over anything Node prints on the way out, and a crash here
@@ -441,18 +439,6 @@ async function serverCommand() {
   const dimensionUsage = new UsageDimensionTracker();
   if (savedState?.usageDimensions) dimensionUsage.restore(savedState.usageDimensions);
 
-  // SQLite usage history (src/usage/db.js), served at /teamclaude/usage. Off
-  // unless proxy.usageHistory is true, and read at start. A store that fails to
-  // open is not fatal — it serves `disabled` rather than taking the proxy down
-  // over a full disk or a corrupt file it could not recreate — so this only
-  // ever logs, never throws.
-  const usageStore = config.proxy?.usageHistory === true
-    ? openUsageStore({
-      path: getUsageDbPath(),
-      onError: (label, err) => console.error(`[TeamClaude] usage ${label}: ${err.message}`),
-    })
-    : NO_USAGE_STORE;
-  if (config.proxy?.usageHistory === true && usageStore.disabled) console.error(`[TeamClaude] usage history disabled: ${usageStore.reason}`);
   // The quota series behind the fleet forecast (#550), in its own file beside
   // the state file. Missing or corrupt reads as empty history.
   accountManager.quotaSeries = await loadQuotaSeries(getQuotaSeriesPath());
@@ -1039,7 +1025,7 @@ async function serverCommand() {
   // Shared with the listener (drain.js): POST /teamclaude/drain flips it, and a graceful
   // shutdown waits on the same in-flight count.
   const drain = createDrainState();
-  const server = createProxyServer(accountManager, config, hooks, sx, clientUsage, dimensionUsage, { bindHost, drain, usageStore });
+  const server = createProxyServer(accountManager, config, hooks, sx, clientUsage, dimensionUsage, { bindHost, drain });
   // Said once, at start: a value that is set but cannot turn the drain on would otherwise
   // leave SIGTERM stopping at once with nothing to say why.
   const rawDrain = config.proxy?.drainTimeoutSeconds;
@@ -1113,8 +1099,6 @@ async function serverCommand() {
     warnRefreshTokenExpiry(accountManager.accounts);
   }, 60_000);
   quotaSeriesInterval.unref?.();
-  // WAL checkpoint + retention sweep; a no-op timer when the store is disabled.
-  startTicks(usageStore);
 
   // Start the opt-in quota probe (no-op when quotaProbeSeconds is 0).
   prober = new Prober(accountManager, {
@@ -1203,10 +1187,8 @@ async function serverCommand() {
       // The requests that finished while draining moved quota and usage
       // counters after the save above, and the periodic save is already off.
       await persistQuotaState();
-      closeUsageStore(usageStore);
       process.exit(0);
     }
-    closeUsageStore(usageStore);
     // Don't linger waiting on keep-alive / streaming connections: actively
     // destroy them so server.close() can complete promptly, and hard-exit after a
     // short grace period in case anything still hangs.
