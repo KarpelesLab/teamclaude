@@ -106,3 +106,27 @@ test('affinity: a pinned account that is out of usage does release the conversat
     assert.deepEqual(seen, ['t-a', 't-b']);
   });
 });
+
+// A cordon keeps a running conversation where it is, and so does affinity
+// across a temporary failure. Together the conversation must still come back.
+test('affinity: a cordoned account keeps its conversation through a 5xx hop', async () => {
+  await withFleet('affinity', refuseNth(2, 503, { 'retry-after': '1' }), async ({ am, proxyPort, seen }) => {
+    assert.equal((await post(proxyPort, 'sess-1')).status, 200);
+    am.setCordoned(0, true);
+    assert.equal((await post(proxyPort, 'sess-1')).status, 200);
+    assert.deepEqual(seen, ['t-a', 't-a', 't-b'], 'the overloaded response hops once');
+    assert.equal((await post(proxyPort, 'sess-1')).status, 200);
+    assert.deepEqual(seen, ['t-a', 't-a', 't-b', 't-a']);
+  });
+});
+
+test('affinity: a cordoned account keeps its conversation through a rate-limit 429', async () => {
+  await withFleet('affinity', refuseNth(2, 429, { 'retry-after': '1' }), async ({ am, proxyPort, seen }) => {
+    assert.equal((await post(proxyPort, 'sess-1')).status, 200);
+    am.setCordoned(0, true);
+    assert.equal((await post(proxyPort, 'sess-1')).status, 200);
+    assert.deepEqual(seen, ['t-a', 't-a', 't-a'], 'the request waits in place');
+    assert.equal((await post(proxyPort, 'sess-1')).status, 200);
+    assert.deepEqual(seen, ['t-a', 't-a', 't-a', 't-a']);
+  });
+});

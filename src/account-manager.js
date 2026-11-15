@@ -2830,7 +2830,8 @@ export class AccountManager {
    * lands the conversation on another account and re-pins it there, and the
    * mode promised the conversation stays put until its account is out of usage.
    * A 429 pause is not that: _isAvailable does not read the pause, so the
-   * request waits in place instead.
+   * request waits in place instead. Nor is a cordon on an account the
+   * conversation is already on: the cordon keeps it there (_keepOnCordoned).
    * @param {string|null|undefined} pinKey
    * @param {number} accountIndex
    * @param {*} [model]
@@ -2839,7 +2840,10 @@ export class AccountManager {
     if (this.distributionMode !== 'affinity' || !pinKey) return false;
     if (!this.sessionTracker.pinnedAccounts(pinKey).includes(accountIndex)) return false;
     const account = this.accounts[accountIndex];
-    return !!account && this._isAvailable(account, model, advisorModel);
+    if (!account) return false;
+    if (this._isAvailable(account, model, advisorModel)) return true;
+    return this.unavailableReason(account, model, advisorModel) === 'cordoned'
+      && this.cordonKeeps(pinKey, model).has(accountIndex);
   }
 
   /**
@@ -4088,8 +4092,10 @@ export class AccountManager {
    *  cordon (`unavailableReason` says `cordoned` and nothing else), and only
    *  where upstream's own movers would not move it anyway: a governing-window
    *  rollover and a strictly better-priority account, as for the sessions
-   *  _selectDrainingSession keeps. A conversation with no pin on a cordoned
-   *  account is new to it, and placement reads the account as unavailable.
+   *  _selectDrainingSession keeps. Affinity mode applies neither mover, as
+   *  _selectForSession does not for a healthy pin. A conversation with no pin
+   *  on a cordoned account is new to it, and placement reads the account as
+   *  unavailable.
    *  @param {string} sessionId @param {Set<number>|null} exclude
    *  @param {*} model  loosely typed, like the availability checks it feeds
    *  @param {*} advisorModel */
@@ -4098,6 +4104,7 @@ export class AccountManager {
       const pinned = this.accounts[idx];
       if (!pinned || exclude?.has(idx)) continue;
       if (this.unavailableReason(pinned, model, advisorModel) !== 'cordoned') continue;
+      if (this.distributionMode === 'affinity') return pinned;
       if (this.expiryRouting?.enabled && this.expiryRouting?.preempt
           && this._pinRolledOver(sessionId, pinned, model)) return null;
       const betterExists = this.accounts.some(a =>
