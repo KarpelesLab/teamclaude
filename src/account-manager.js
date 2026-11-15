@@ -2524,7 +2524,17 @@ export class AccountManager {
       const betterExists = this.accounts.some(a =>
         this._isAvailable(a, model, advisorModel) && !exclude?.has(a.index) && (a.priority || 0) < (pinned.priority || 0));
       if (!betterExists) {
-        if (fallback) return this._activateFallback({ account: pinned, paid: fallback === 'paid' }, exclude, model, this._selectingProvider ?? DEFAULT_PROVIDER, advisorModel);
+        // A pin past its threshold that the preference may spend on: the turn
+        // stays where the conversation is. Only the episode is recorded, for
+        // the log line and `onExtraUsage`. Returning a pin never moves the
+        // cursor, here as above: with conversations on two preferred
+        // subscriptions a move per turn flipped `current` on every request
+        // and released the operator's manual switch each time. Nor does it
+        // ramp, since no traffic moved onto the account.
+        if (fallback) {
+          this._noteFallback(this._cursorKey(model, null, this._selectingProvider ?? DEFAULT_PROVIDER),
+            { account: pinned, paid: fallback === 'paid' }, model, false, advisorModel, true);
+        }
         return pinned;
       }
     }

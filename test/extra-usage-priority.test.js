@@ -438,6 +438,34 @@ for (const disabled of [false, true]) {
   });
 }
 
+// A turn that returns to its pinned account decides nothing about where the
+// fleet rests. With conversations on two preferred subscriptions, moving the
+// cursor per turn flipped `current` on every request and released the
+// operator's manual switch each time it landed on the other account.
+test('turns pinned to two preferred subscriptions leave the cursor and a manual switch alone', t => {
+  t.mock.method(console, 'log', () => {});
+  const am = new AccountManager([
+    oauth('s1', { allowExtraUsage: true, preferExtraUsage: true }),
+    oauth('s2', { allowExtraUsage: true, preferExtraUsage: true }),
+    { name: 'api', type: 'apikey', apiKey: 'api-key', priority: 100 },
+  ], 0.98);
+  am._nextProbeAt = Date.now() + 60_000;
+  for (const account of am.accounts.slice(0, 2)) account.quota.unified7d = 0.99;
+  am.setDistributeSessions(true);
+  am.recordSession('one', 0, OPUS);
+  am.recordSession('two', 1, OPUS);
+  am.setCurrentAccount(0);
+  const seen = [];
+  for (const sessionId of ['one', 'two', 'one', 'two']) {
+    const picked = am.getActiveAccount(null, OPUS, null, sessionId);
+    if (picked) am.recordSession(sessionId, picked.index, OPUS);
+    seen.push({ selected: picked?.name, current: am.getStatus().currentAccount, manual: am._manualAccount?.name });
+  }
+  assert.deepEqual(seen, ['s1', 's2', 's1', 's2'].map(selected => ({ selected, current: 's1', manual: 's1' })));
+  // The switch is still in charge of traffic that has no pin.
+  assert.equal(am.getActiveAccount(null, OPUS, null, 'three')?.name, 's1');
+});
+
 test('removing the preference restores single-account legacy billing episodes', async t => {
   t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
   const config = { accounts: [
