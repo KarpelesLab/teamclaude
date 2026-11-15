@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AccountManager } from '../src/account-manager.js';
 import { TUI } from '../src/tui.js';
+import { createProxyServer } from '../src/server.js';
 
 const MODEL = 'claude-opus-5-5';
 
@@ -132,4 +133,76 @@ test('the embedded TUI switch survives the next request and routing preview', ()
   assert.equal(am.currentIndex, 1);
   assert.equal(am.getActiveAccount(null, MODEL).name, 'manual');
   assert.equal(am.previewRouteIndex(MODEL), 1);
+});
+
+// With distribution on, a new conversation is placed within the best priority
+// tier and never reads the manual choice. The switch endpoints ask for that
+// check (`manualSwitch`); the plain flag does not carry it.
+const DISTRIBUTION_MODES = [true, 'adaptive', 'load'];
+
+for (const mode of DISTRIBUTION_MODES) {
+  test(`distributeSessions ${mode}: a switch to an outranked account is reported as not taking effect`, () => {
+    const am = manager({ distributeSessions: mode });
+    assert.equal(am.setCurrentAccount(1), true);
+    // What the switch endpoint reports must match where new conversations go.
+    for (let i = 0; i < 4; i++) assert.equal(am.getActiveAccount(null, MODEL, null, `session-${i}`).name, 'automatic');
+    assert.equal(am.getActiveAccount(null, MODEL).name, 'automatic');
+    const { eligible, reason } = am.eligibility(1, { manualSwitch: true });
+    assert.equal(eligible, false);
+    assert.match(reason, /outranked by higher-priority account "automatic".*distributeSessions/);
+  });
+
+  test(`distributeSessions ${mode}: a switch to a top-priority account is still eligible`, () => {
+    const am = manager({ distributeSessions: mode });
+    assert.equal(am.setCurrentAccount(0), true);
+    assert.deepEqual(am.eligibility(0, { manualSwitch: true }), { eligible: true });
+  });
+
+  test(`distributeSessions ${mode}: another provider's higher-priority account does not outrank a switch`, () => {
+    const oauth = (name, extra = {}) => ({ name, type: 'oauth', accessToken: `t-${name}`, refreshToken: `r-${name}`, expiresAt: Date.now() + 3600_000, ...extra });
+    const am = new AccountManager([
+      oauth('cx', { priority: 0, provider: 'codex' }),
+      oauth('c1', { priority: 10 }),
+      oauth('c2', { priority: 10 }),
+    ], 0.98, { distributeSessions: mode });
+    am.setCurrentAccount(1);
+    // Claude traffic never reaches the Codex account, so nothing outranks c1.
+    for (let i = 0; i < 4; i++) assert.notEqual(am.getActiveAccount(null, MODEL, null, `session-${i}`).name, 'cx');
+    assert.deepEqual(am.eligibility(1, { manualSwitch: true }), { eligible: true });
+  });
+}
+
+test('without manualSwitch eligibility does not read distribution, so a pinned session is not reported as failing', () => {
+  const am = manager({ distributeSessions: 'adaptive' });
+  am.setCurrentAccount(1);
+  assert.deepEqual(am.eligibility(1), { eligible: true });
+});
+
+async function endpointAnswers() {
+  const am = manager({ distributeSessions: 'adaptive' });
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: 'http://127.0.0.1:9' });
+  const port = await new Promise(resolve => proxy.listen(0, '127.0.0.1', () => resolve(proxy.address().port)));
+  const post = async (path, body) => {
+    const res = await fetch(`http://127.0.0.1:${port}${path}`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': 'k' }, body: JSON.stringify(body),
+    });
+    return res.json();
+  };
+  try {
+    return {
+      switched: await post('/teamclaude/switch', { account: 'manual' }),
+      pinned: await post('/teamclaude/session-pin', { sessionId: '3f2a1b9c-0000-4000-8000-000000000001', account: 'manual' }),
+    };
+  } finally {
+    proxy.close();
+  }
+}
+
+test('the switch endpoint reports the outranked switch, the session-pin endpoint does not', async () => {
+  const { switched, pinned } = await endpointAnswers();
+  assert.equal(switched.eligible, false);
+  assert.match(switched.reason, /outranked by higher-priority account "automatic"/);
+  // A hard session pin is routed regardless of priority.
+  assert.equal(pinned.eligible, true);
+  assert.equal(pinned.reason, undefined);
 });
