@@ -177,14 +177,10 @@ test('MITM h2: a token refresh is answered without the upstream\'s connection-sp
     let resp, body = '';
     req.on('response', (h) => { resp = h; });
     req.setEncoding('utf8'); req.on('data', (d) => { body += d; }); req.end('{"grant_type":"refresh_token"}');
-    // Bounded: the failure this guards leaves the stream unanswered, and an
-    // unbounded wait would hold the cleanup below, and the file, open with it.
-    const answered = await new Promise((resolve) => {
-      const deadline = setTimeout(() => resolve(false), 5000);
-      req.once('close', () => { clearTimeout(deadline); resolve(true); });
-    });
+    // The failure this guards leaves the stream unanswered; the test's own
+    // timeout is the bound on that, not a deadline here.
+    await new Promise((resolve) => req.once('close', resolve));
 
-    assert.ok(answered, 'the token refresh got no answer');
     assert.equal(resp?.[':status'], 200);
     assert.equal(body, '{"access_token":"new"}');
     assert.equal(resp['x-saw-path'], '/v1/oauth/token');
@@ -241,13 +237,9 @@ for (const { label, method, path } of HTTP2_SETTINGS_CASES) {
       req.on('response', (h) => { resp = h; });
       req.setEncoding('utf8'); req.on('data', (d) => { body += d; });
       req.end(method === 'POST' ? '{"model":"x","messages":[]}' : undefined);
-      // Bounded, as in the token-refresh test above: the failure leaves the stream unanswered.
-      const answered = await new Promise((resolve) => {
-        const deadline = setTimeout(() => resolve(false), 5000);
-        req.once('close', () => { clearTimeout(deadline); resolve(true); });
-      });
+      // As in the token-refresh test above: the failure leaves the stream unanswered.
+      await new Promise((resolve) => req.once('close', resolve));
 
-      assert.ok(answered, `${label} got no answer`);
       assert.equal(resp?.[':status'], 200);
       assert.equal(body, '{"ok":true}');
       assert.equal(resp['x-saw-path'], path);

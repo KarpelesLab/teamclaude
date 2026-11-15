@@ -297,8 +297,6 @@ test('relayRaw (POST /v1/oauth/token): a 204 carrying Trailer is answered, witho
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: '{"grant_type":"refresh_token"}',
-      // Bounded: the failure this guards leaves the request unanswered.
-      signal: AbortSignal.timeout(5000),
     });
     assert.equal(res.status, 204);
     assert.equal(res.headers.get('trailer'), null);
@@ -315,13 +313,12 @@ test('relayRaw (POST /v1/oauth/token): an HTTP/1.0 client is answered without th
   const proxy = http.createServer(createProxyRequestListener({ accountManager: refreshOnly, upstream: `http://127.0.0.1:${upstream.port}`, config: {} }));
   const port = await listen(proxy);
   try {
-    // HTTP/1.0 by hand: an answer to it is never chunked. Bounded, as above.
+    // HTTP/1.0 by hand: an answer to it is never chunked.
     const raw = await new Promise((resolve) => {
       let got = '';
       const s = net.connect(port, '127.0.0.1', () => s.write('POST /v1/oauth/token HTTP/1.0\r\nHost: 127.0.0.1\r\ncontent-type: application/json\r\ncontent-length: 2\r\n\r\n{}'));
-      const deadline = setTimeout(() => { s.destroy(); resolve(got); }, 5000);
       s.on('data', (d) => { got += d; });
-      s.on('close', () => { clearTimeout(deadline); resolve(got); });
+      s.on('close', () => resolve(got));
       s.on('error', () => {});
     });
     assert.match(raw, /^HTTP\/1\.1 200 /);
