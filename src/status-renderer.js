@@ -4,6 +4,8 @@ import { safeLine, sanitizeText } from './safe-text.js';
 import { isRefused } from './account-refusal.js';
 import { ROUTE_COLORS } from './config-ops.js';
 import { describeRouting } from './account-routing.js';
+import { describeEndsAt } from './ends-at.js';
+import { accountRefreshTokenExpiry, loginCommandFor } from './refresh-token-expiry.js';
 
 const ESC = '\x1b[';
 const RESET = `${ESC}0m`;
@@ -82,12 +84,16 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
     if (threshold) lines.push(`  ${threshold}`);
     const egress = egressProxyLine(account, paint);
     if (egress) lines.push(`  ${egress}`);
+    const ends = endsAtLine(account, now, paint);
+    if (ends) lines.push(`  ${ends}`);
     const why = unavailableLine(account, paint);
     if (why) lines.push(`  ${why}`);
     const denied = entitlementLine(account, now, paint);
     if (denied) lines.push(`  ${denied}`);
     const unserved = modelDenialLine(account, now, paint);
     if (unserved) lines.push(`  ${unserved}`);
+    const login = loginExpiryLine(account, paint, now);
+    if (login) lines.push(`  ${login}`);
     const plan = subscriptionLostLine(account, paint, now);
     if (plan) lines.push(`  ${plan}`);
     const spend = spendLine(account, paint);
@@ -579,6 +585,23 @@ export function unavailableLine(account, paint) {
   return `${paint.dim('Blocked'.padEnd(8))} ${paint.yellow(text)}`;
 }
 
+/**
+ * When the account's refresh token lapses and a new sign-in is due — only for
+ * an account whose provider or imported credential file stated the date
+ * (#674); most rows have none and get no line. Yellow, with the command, once
+ * it is within the warning window or past.
+ * @param {any} account
+ * @param {ReturnType<typeof colors>} paint
+ * @param {number} [now]
+ */
+export function loginExpiryLine(account, paint, now = Date.now()) {
+  const view = accountRefreshTokenExpiry(account, now);
+  if (!view) return null;
+  const label = paint.dim('Login'.padEnd(8));
+  if (!view.warn) return `${label} ${view.text}`;
+  return `${label} ${paint.yellow(view.text)} ${paint.gray(`\u2014 run: ${loginCommandFor(account)}`)}`;
+}
+
 // Upstream's refusal outlives its cooldown, so the account reads as denied
 // until it serves again rather than healthy between re-checks.
 /** @param {any} account @param {number} now @param {ReturnType<typeof colors>} paint */
@@ -675,6 +698,22 @@ export function egressProxyLine(account, paint) {
   const text = typeof r === 'string' ? r : describeRouting(r);
   if (!text) return null;
   return `${paint.dim('Egress'.padEnd(8))} ${paint.cyan(`via ${text}`)}`;
+}
+
+/**
+ * "Ends     2026-12-01 (in 6 days)" — the end time the operator set for the
+ * account (accounts[].endsAt), or null when it has none. Yellow while it is
+ * ahead, since that is when it moves traffic; gray once passed, when it is
+ * only a record.
+ * @param {any} account
+ * @param {number} now
+ * @param {any} paint
+ */
+export function endsAtLine(account, now, paint) {
+  const endsAt = account?.endsAt;
+  // The payload can come from another process: only a real instant is drawn.
+  if (typeof endsAt !== 'number' || !Number.isFinite(endsAt) || endsAt <= 0) return null;
+  return `${paint.dim('Ends'.padEnd(8))} ${(endsAt > now ? paint.yellow : paint.gray)(describeEndsAt(endsAt, now))}`;
 }
 
 function colors(enabled) {

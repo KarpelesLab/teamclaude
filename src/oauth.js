@@ -11,6 +11,7 @@ import { LOGIN_TIMEOUT_MS, codeRace, openBrowser, pasteFromTerminal } from './lo
 import { safeLine } from './safe-text.js';
 import { resetRetryAt } from './reset-readings.js';
 import { anthropicLink } from './account-refusal.js';
+import { refreshTokenExpiryFromResponse, withFamilyExpiry } from './refresh-token-expiry.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
 const execFileAsync = promisify(execFile);
@@ -383,6 +384,12 @@ export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_
  * and the expiry is `expires_at` (seconds or milliseconds) or `expires_in`
  * seconds when either is a finite number — or one hour from now when neither
  * is, which just makes the next refresh happen early.
+ *
+ * `refreshTokenExpiresAt` (epoch ms) is on the result only when the response
+ * states when the refresh token itself lapses; see refreshTokenExpiryFromResponse
+ * for the two spellings read and why. It is what THIS response said: a caller
+ * refreshing a token it already has a date for keeps the earlier of the two
+ * (withFamilyExpiry), and a new sign-in takes it as it is.
  */
 export function tokenPairFromResponse(data, { previousRefreshToken = undefined, now = Date.now() } = {}) {
   const accessToken = data?.access_token;
@@ -394,7 +401,8 @@ export function tokenPairFromResponse(data, { previousRefreshToken = undefined, 
   const expiresIn = Number(data.expires_in);
   const expiresAt = normalizeExpiresAt(data.expires_at)
     ?? (Number.isFinite(expiresIn) && expiresIn > 0 ? now + expiresIn * 1000 : now + 3600 * 1000);
-  return { accessToken, refreshToken, expiresAt };
+  const refreshTokenExpiresAt = refreshTokenExpiryFromResponse(data, now);
+  return { accessToken, refreshToken, expiresAt, ...(refreshTokenExpiresAt != null && { refreshTokenExpiresAt }) };
 }
 
 /**
@@ -529,12 +537,12 @@ export async function fetchProfile(accessToken, routing = null) {
  * @param {import('./account-routing.js').RoutingProxy|null} [routing] - the
  * account's own egress proxy; every call here (the profile, and the refresh it
  * may need first) is that account's traffic. Null goes by the fleet path.
- * @param {{ renew?: (creds: Record<string, any>) => Promise<{ accessToken: string, refreshToken: string, expiresAt: number }> }} [opts]
+ * @param {{ renew?: (creds: Record<string, any>) => Promise<{ accessToken: string, refreshToken: string, expiresAt: number, refreshTokenExpiresAt?: number|null }> }} [opts]
  * renew: the refresh itself, which the caller can put behind the callback.net
  * lock (credential-sync.js refreshOutsideProxy); the default is a plain one.
  * @returns {Promise<{ creds: Record<string, any>, profile: Record<string, any> }>}
  */
-export async function profileForCredentials(creds, routing = null, { renew = (c) => refreshAccessToken(c.refreshToken, undefined, routing) } = {}) {
+export async function profileForCredentials(creds, routing = null, { renew = (c) => refreshAccessToken(c.refreshToken, undefined, routing).then((/** @type {any} */ t) => withFamilyExpiry(c, t)) } = {}) {
   /** @type {Record<string, any>|null} */
   let profile = isTokenExpired(creds.expiresAt) ? null : await fetchProfile(creds.accessToken, routing);
   if (profile && profile.status !== 401) return { creds, profile };
@@ -570,7 +578,12 @@ export async function profileForCredentials(creds, routing = null, { renew = (c)
     };
   }
 
+  // `renewed` carries the refresh token's own expiry when one is known (the
+  // default renewal and the callback.net one both keep the earlier date of a
+  // rotation). Without one, the date `creds` came with is not copied onto it:
+  // the renewal may be a token another install stored, which is another family.
   const fresh = { ...creds, ...renewed };
+  if (renewed.refreshTokenExpiresAt == null) delete fresh.refreshTokenExpiresAt;
   return { creds: fresh, profile: await fetchProfile(fresh.accessToken, routing) };
 }
 

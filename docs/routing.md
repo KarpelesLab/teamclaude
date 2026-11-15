@@ -24,6 +24,29 @@ When it does have to pick, ranking is: lowest `priority` number first, then, amo
 
 Separately, and on by default, an account whose 5-hour window resets takes the traffic straight away when its weekly window lapses sooner than the current account's, even though the current account is healthy (the log says `session quota reset and weekly expires sooner — switching to it`). Each such move costs the conversations on the old account their prompt cache, and with [keep-warm](quota.md#keep-warm) running every idle account's window resets every five hours. Set `"switchOnSessionReset": false` to keep traffic on a working account. The reset account still rejoins rotation and wins it on its sooner weekly when rotation next has to pick. Set an explicit order with `teamclaude priority <name> <n>`, or `--first` / `--last`. `teamclaude login --api` adds a key at priority 100 — a metered key is a last resort behind the subscriptions unless you say otherwise ([API key](accounts.md#api-key)).
 
+### An account with an end date
+
+Some accounts stop being usable at a time no usage response reports: a subscription you cancelled that runs to the end of its paid month, a trial. Whatever weekly quota such an account holds at that moment is lost, the same way quota is lost at a weekly reset. Tell the proxy when:
+
+```bash
+teamclaude ends me@example.com 2026-12-01            # start of that day, local time
+teamclaude ends me@example.com 2026-12-01T09:00:00Z  # an exact instant
+teamclaude ends me@example.com --clear
+```
+
+This writes `"endsAt"` on the account's entry (an ISO 8601 string or epoch milliseconds; `ends` also takes epoch milliseconds) and reloads a running server. From then on the account's **deadline** is the earlier of its governing weekly reset and its end time, and everything that ranks accounts by how soon their quota expires reads the deadline in place of the weekly reset:
+
+- the equal-priority tiebreak above (soonest first),
+- `preferSoonestWeeklyReset`, which moves traffic to the account with the soonest deadline,
+- the session-reset switch, which moves to an account whose 5-hour window came back when its deadline is sooner than the current account's,
+- [expiry pressure](#expiry-pressure-routing) and the adaptive `"scoring": "pressure"` placement, where the time left to spend the headroom is the time to the deadline, so the account's pressure rises as its end approaches.
+
+An account with no weekly reading yet has its end time as its deadline, and a fresh window on it is priced over the time left rather than a full week.
+
+It only ranks. `priority` still comes first, so an ending account in a lower tier is not pulled ahead of a preferred one: give it the same or a lower priority number if you want it drained. Thresholds, caps, cordons, pins and routes are untouched, and no account becomes available or unavailable because of an end time. Once the time has passed it has no effect at all: the account is not disabled, and what the ended subscription does is reported by upstream and handled as it is for any account ([billing refusals](#billing-refusals), a plan that left the OAuth profile). `teamclaude status` shows the date on the account (`Ends     2026-12-01 (in 6 days)`), the TUI row carries an `ends 6d` tag, and each account in `status --json` and `GET /teamclaude/status` carries `endsAt` as epoch milliseconds (`null` when unset).
+
+Without `preferSoonestWeeklyReset` or `expiryRouting` the deadline is consulted only when selection has to pick, as the weekly reset is: an account being spent is left until it reaches `switchThreshold`.
+
 ## The two kinds of 429
 
 Reacting the wrong way to either one makes things worse, so they are handled separately.

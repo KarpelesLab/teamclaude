@@ -20,6 +20,7 @@ import { resolveMaxUsage, resolveMaxSpendMinor, switchThresholdDiffs, modelLabel
 import { parseProxyUrl, proxyToUrl, describeProxy, describeSelfProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy, localListener, isSelfProxy } from './upstream-proxy.js';
 import { describeRouting, parseRoutingUrl, routingToUrl, checkRouting } from './account-routing.js';
 import { sanitizeText, safeLine } from './safe-text.js';
+import { refreshTokenExpiryWarning, knownRefreshTokenExpiry, setRefreshTokenExpiry } from './refresh-token-expiry.js';
 // The setting rules live in one module; the CLI, the MCP tools and this screen
 // all read them from there, so they cannot drift apart (#426).
 import { MAX_PROBE_SECONDS, ROUTE_COLORS } from './config-ops.js';
@@ -507,6 +508,25 @@ export function routingTag(account) {
   if (!r) return '';
   const text = typeof r === 'string' ? r : describeRouting(r);
   return text ? `via ${text}` : '';
+}
+
+/**
+ * "ends 6d" — how long until the end time the operator set for the account
+ * (accounts[].endsAt), "ended" once it has passed, or '' when it has none.
+ * The countdown rather than the date: the row has a few columns to spare, and
+ * how soon is what explains why this account is being spent first.
+ * `teamclaude status` prints the date.
+ * @param {any} account
+ * @param {number} [now]
+ */
+export function endsTag(account, now = Date.now()) {
+  const endsAt = account?.endsAt;
+  if (typeof endsAt !== 'number' || !Number.isFinite(endsAt) || endsAt <= 0) return '';
+  const left = endsAt - now;
+  if (left <= 0) return 'ended';
+  if (left >= 86400000) return `ends ${Math.floor(left / 86400000)}d`;
+  if (left >= 3600000) return `ends ${Math.floor(left / 3600000)}h`;
+  return `ends ${Math.max(1, Math.floor(left / 60000))}m`;
 }
 
 // The status cell's name for an errorReason code. A code it does not know keeps `error`.
@@ -2490,6 +2510,8 @@ export class TUI {
         refreshToken: creds.refreshToken,
         expiresAt: creds.expiresAt,
       };
+      // When the refresh token lapses, where the credential file says.
+      setRefreshTokenExpiry(entry, creds.refreshTokenExpiresAt);
 
       // Same rule as the login path: a name match counts only where it is not
       // standing in for a different account+org. Both organizations of one person
@@ -2500,6 +2522,8 @@ export class TUI {
       if (idx >= 0) {
         const prev = this.config.accounts[idx];
         this.config.accounts[idx] = updateAccountEntry(prev, entry);
+        // A new refresh token: the date the row held was about the old one.
+        setRefreshTokenExpiry(this.config.accounts[idx], creds.refreshTokenExpiresAt);
         // The account to update is the one built from this entry. Identity cannot
         // answer that: the entry may have matched on a bare name while carrying no
         // UUID, and then no account matches the freshly profiled identity at all.
@@ -2513,6 +2537,7 @@ export class TUI {
           amAcct.credential = creds.accessToken;
           amAcct.refreshToken = creds.refreshToken;
           amAcct.expiresAt = creds.expiresAt;
+          amAcct.refreshTokenExpiresAt = knownRefreshTokenExpiry(creds.refreshTokenExpiresAt);
           if (entry.accountUuid) amAcct.accountUuid = entry.accountUuid;
           if (entry.orgUuid) amAcct.orgUuid = entry.orgUuid;
           if (entry.orgName) amAcct.orgName = entry.orgName;
@@ -3165,6 +3190,12 @@ export class TUI {
         const tag = switchThresholdTag(a, key => this.am.thresholdFor(key));
         return tag ? Math.max(w, 2 + vw(tag)) : w;
       }, 0);
+      // Same rule again for the end-time tag: silent for every account that
+      // has none.
+      const endsW = members.reduce((/** @type {number} */ w, /** @type {any} */ a) => {
+        const tag = endsTag(a);
+        return tag ? Math.max(w, 2 + vw(tag)) : w;
+      }, 0);
       // Same rule again for the routing tag: silent for every account on the
       // fleet path, so it costs the budget nothing there.
       const routeW = members.reduce((/** @type {number} */ w, /** @type {any} */ a) => {
@@ -3182,7 +3213,7 @@ export class TUI {
       // that, a routed credit account reserved 82 columns at W=80 before any bar and fitLine cut the address off
       // (Copilot's review of #649).
       const layout = (/** @type {number} */ tagW) => {
-        const fixedWithRoute = 20 + typeCell + NAME_MIN + routeCells + tagW + spendW + creditW + switchW + routeW + prepaidW;
+        const fixedWithRoute = 20 + typeCell + NAME_MIN + routeCells + tagW + spendW + creditW + switchW + endsW + routeW + prepaidW;
         const routeTags = routeW === 0 || fixedWithRoute + BAR_MIN <= W;
         return { fixed: routeTags ? fixedWithRoute : fixedWithRoute - routeW, routeTags };
       };
@@ -3280,7 +3311,13 @@ export class TUI {
   _rowLines(/** @type {number} */ idx, /** @type {any} */ L, /** @type {Set<number>} */ current) {
     const a = this.am.accounts[idx];
     const row = this._renderRow(idx, L, current);
-    if (this._unavailable(a) !== 'error') return [row];
+    if (this._unavailable(a) !== 'error') {
+      // A known refresh-token expiry gets a line only once it is close (or
+      // past): on every row it would double the list for a date weeks away,
+      // which `teamclaude status` shows.
+      const soon = refreshTokenExpiryWarning(a);
+      return soon ? [row, ...wrapWords(soon, L.width - 4).map(l => `    ${yellow(l)}`)] : [row];
+    }
     const plain = (/** @type {string} */ s) => s;
     const why = unavailableLine({ ...a, unavailable: 'error', onExtraUsage: this._onExtraUsage(a) }, { dim: plain, yellow: plain, red: plain });
     return [row, ...wrapWords(why ?? '', L.width - 4).map(l => `    ${yellow(l)}`)];
@@ -3677,6 +3714,10 @@ export class TUI {
     // the fleet's own numbers) — see switchThresholdTag.
     const switchTag = switchThresholdTag(a, key => this.am.thresholdFor(key));
     if (switchTag) line += `  ${cyan(switchTag)}`;
+    // The end time the operator set, as a countdown: yellow while it is ahead
+    // and moving traffic here, dim once it has passed.
+    const ends = endsTag(a);
+    if (ends) line += `  ${(ends === 'ended' ? dim : yellow)(ends)}`;
     // Routing tag trails even that: where the account's traffic physically
     // leaves the machine, when the operator pinned it to its own proxy.
     // Left out when the row's budget had no room for it (`routeTags`, budgetFor).

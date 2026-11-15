@@ -96,6 +96,7 @@ import { isTokenExpired } from './oauth.js';
 import { providerOf } from './provider.js';
 import { sameIdentity } from './identity.js';
 import { safeLine } from './safe-text.js';
+import { setRefreshTokenExpiry, withFamilyExpiry } from './refresh-token-expiry.js';
 
 /** Rows this proxy owns start with this; anything else in the store is left alone. */
 export const KEY_PREFIX = 'teamrouter.';
@@ -138,11 +139,11 @@ const MAX_PAGES = 50;
 export const TOMBSTONE_TTL_MS = 7 * 24 * 3600 * 1000;
 
 /**
- * @typedef {{ accessToken: string, refreshToken: string, expiresAt: number }} Tokens
+ * @typedef {{ accessToken: string, refreshToken: string, expiresAt: number, refreshTokenExpiresAt?: number|null }} Tokens
  * @typedef {{ v: number, provider: string, name: string, accountUuid?: string, orgUuid?: string, orgName?: string,
  *   accountId?: string, userId?: string, organizationType?: string, rateLimitTier?: string, seatTier?: string,
  *   hasClaudeMax?: boolean|null, hasClaudePro?: boolean|null, accessToken: string, refreshToken: string,
- *   expiresAt: number, updatedAt: number, by: string }} Blob
+ *   expiresAt: number, refreshTokenExpiresAt?: number, updatedAt: number, by: string }} Blob
  * @typedef {{ id: string, key: string, blob: Blob|null, deletedAt: number|null, updated: number }} Row
  * @typedef {(method: string, path: string, params?: Record<string, any>|null, opts?: any) => Promise<any>} Api
  */
@@ -193,6 +194,11 @@ export function encodeBlob(a, tokens, { now = Date.now(), by = hostname() } = {}
   blob.accessToken = tokens.accessToken;
   blob.refreshToken = tokens.refreshToken;
   blob.expiresAt = tokens.expiresAt;
+  // When the refresh token itself lapses, where that is known. It is taken
+  // from `tokens`, never from the account: the date describes this refresh
+  // token, and travels in the one blob that holds it. An install that predates
+  // the field ignores it, and a blob such an install wrote carries none.
+  setRefreshTokenExpiry(blob, tokens.refreshTokenExpiresAt);
   blob.updatedAt = now;
   blob.by = by;
   return blob;
@@ -260,6 +266,7 @@ export function decodeBlob(text) {
   // An empty refresh token is the "needs a sign-in" marker (see needsSignIn).
   if (typeof b.accessToken !== 'string' || !b.accessToken || typeof b.refreshToken !== 'string') return null;
   if (!Number.isFinite(b.expiresAt) || typeof b.name !== 'string') return null;
+  setRefreshTokenExpiry(b, b.refreshTokenExpiresAt); // anything but a date reads as none
   return b;
 }
 
@@ -291,6 +298,7 @@ export function entryFromBlob(/** @type {Blob} */ blob) {
   entry.accessToken = blob.accessToken;
   entry.refreshToken = blob.refreshToken;
   entry.expiresAt = blob.expiresAt;
+  if (blob.refreshTokenExpiresAt != null) entry.refreshTokenExpiresAt = blob.refreshTokenExpiresAt;
   return entry;
 }
 
@@ -304,7 +312,7 @@ export function needsSignIn(blob) {
 }
 
 /** @param {Blob} blob @returns {Tokens} */
-const tokensOf = (blob) => ({ accessToken: blob.accessToken, refreshToken: blob.refreshToken, expiresAt: blob.expiresAt });
+const tokensOf = (blob) => setRefreshTokenExpiry({ accessToken: blob.accessToken, refreshToken: blob.refreshToken, expiresAt: blob.expiresAt }, blob.refreshTokenExpiresAt);
 
 /** Whether a blob carries a token that supersedes what an account holds. */
 function supersedes(/** @type {Blob|null} */ blob, /** @type {Record<string, any>} */ account) {
@@ -600,7 +608,7 @@ export class CredentialSync {
 
   /** @param {Record<string, any>} account @returns {Tokens} */
   _tokens(account) {
-    return { accessToken: account.credential, refreshToken: account.refreshToken, expiresAt: Number(account.expiresAt) || 0 };
+    return setRefreshTokenExpiry({ accessToken: account.credential, refreshToken: account.refreshToken, expiresAt: Number(account.expiresAt) || 0 }, account.refreshTokenExpiresAt);
   }
 
   /**
@@ -779,6 +787,7 @@ export class CredentialSync {
         return false;
       }
       const blob = /** @type {Blob} */ (current.blob);
+      // No refreshTokenExpiresAt: the marker holds no refresh token for a date to describe.
       await this._patch(current, account, { accessToken: blob.accessToken, refreshToken: '', expiresAt: blob.expiresAt });
       this.log(`[TeamClaude] Account "${name}": its token on callback.net was rejected; emptied it there, so it waits for a sign-in or an install with a working token`);
       return true;
@@ -990,6 +999,14 @@ export class CredentialSync {
    * @returns {Promise<Tokens|null>}
    */
   async coordinateRefresh(account, refresh, { force = false } = {}) {
+    // What the provider call returns is a rotation of the account's own token,
+    // so it keeps that token's expiry unless the response states an earlier
+    // one — before it is stored, so the row carries the date with the token.
+    const renew = refresh;
+    // Read before the call: a sign-in installed while the grant is in flight
+    // brings another token's date, which is not this rotation's to carry.
+    const held = { refreshTokenExpiresAt: account.refreshTokenExpiresAt };
+    refresh = async (opts) => withFamilyExpiry(held, await renew(opts));
     if (!await this.isSignedIn()) return refresh();
     const name = safeLine(account.name, 64);
     let row;
