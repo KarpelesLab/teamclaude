@@ -50,9 +50,14 @@
 // not take at once (out of reach, or the lock held throughout) stays pending on
 // the install that made it, in memory: no pass there adds the account back from
 // its row, and the tombstone is tried again a minute, five and fifteen minutes
-// later, then at each pass, until it lands; a sign-out in between does not end
-// it (made while signed out, a removal records nothing at all). Until then it
-// also wins over a sign-in made on another install meanwhile. A pass deletes a
+// later, then at each pass, until it lands. It stays pending for an hour at
+// most (REMOVAL_PENDING_MAX_MS), and ends at once when this install is found
+// signed out of callback.net (made while signed out, a removal records nothing
+// at all): past either, nothing is written, the removal is logged as not
+// recorded, and the next pass adds the account back from its row like any
+// other. While it is pending it also wins over a sign-in made on another
+// install meanwhile, which is why it does not stay pending longer: a row
+// cannot tell a sign-in from a renewal. A pass deletes a
 // tombstone older than a week. Nothing checks that every install has seen it by
 // then: one that ran no pass in that week and still holds the account, with a
 // refresh token that still renews, stores it again (at its first pass after
@@ -114,6 +119,16 @@ const LOCKED_WAIT_MS = 30_000;
 const REMOVAL_LOCK_WAIT_MS = LOCK_TIMEOUT_S * 1000 + LOCKED_RECHECK_MS;
 /** A removal the store did not take: tried again after each pause, then by each pass. */
 const REMOVAL_RETRY_MS = [60_000, 5 * 60_000, 15 * 60_000];
+/**
+ * A removal still not recorded this long after it was made is given up on. A
+ * pending removal is written over whatever its row then holds, and a row cannot
+ * tell a sign-in from a renewal: one that lived as long as the process would,
+ * days later, write its tombstone over a sign-in made on another install and
+ * destroy a working token. Given up on, the account reappears here from its
+ * row, which shows and loses nothing. An hour covers every timed retry
+ * (REMOVAL_RETRY_MS and the waits for the lock, about 23 minutes in all).
+ */
+export const REMOVAL_PENDING_MAX_MS = 3600_000;
 /** Rounds of lock-or-wait before this refresh gives up (the next request asks again). */
 const MAX_LOCK_ROUNDS = 3;
 export const SYNC_INTERVAL_MS = 24 * 3600 * 1000;
@@ -361,11 +376,17 @@ export class CredentialSync {
      * Removals made here whose tombstone is not written yet: key → the account.
      * Marked before anything is awaited, so a pass running meanwhile does not
      * add the account back from its row, and each pass tries to write it
-     * again. In memory only: a restart forgets it, and the next start's pass
-     * adds the account back from its row.
+     * again, for REMOVAL_PENDING_MAX_MS at most. In memory only: a restart
+     * forgets it, and the next start's pass adds the account back from its row.
      * @type {Map<string, Record<string, any>>}
      */
     this.pendingRemovals = new Map();
+    /**
+     * When each pending removal was made, by this install's clock: what its
+     * age is measured from (REMOVAL_PENDING_MAX_MS).
+     * @type {WeakMap<Record<string, any>, number>}
+     */
+    this._removedAt = new WeakMap();
     /**
      * Accounts a pass is evicting for a tombstone (evictAccount): their removal
      * is in the store already, so it is neither written nor pending.
@@ -440,8 +461,16 @@ export class CredentialSync {
   /** @param {string} reason */
   async _sync(reason) {
     const result = { signedIn: false, adopted: 0, pushed: 0, created: 0, added: 0, evicted: 0, expired: 0, emptied: 0, rows: 0 };
-    if (!await this.isSignedIn()) { this.rows.clear(); return result; }
+    if (!await this.isSignedIn()) {
+      this.rows.clear();
+      // Nothing can be recorded, and nothing says when it could be.
+      for (const [key, account] of [...this.pendingRemovals]) this._abandonRemoval(key, account, 'this install is signed out of callback.net');
+      return result;
+    }
     result.signedIn = true;
+    // A removal pending too long is given up on before the rows are read, so
+    // this pass already treats its row like any other.
+    for (const [key, account] of [...this.pendingRemovals]) this._dropIfLapsed(key, account);
     try {
       this.rows = await this._list();
       const matched = new Set();
@@ -732,12 +761,13 @@ export class CredentialSync {
    * undo the removal everywhere. A held lock is waited for, at most one lease
    * and a re-check past it (REMOVAL_LOCK_WAIT_MS). Until the tombstone is
    * written the removal is pending (see pendingRemovals), and it is tried
-   * again after each of REMOVAL_RETRY_MS, then by each pass. `wait: false`,
-   * for a CLI command that must not hang, makes one attempt: no wait for the
-   * lock and no retry here. Signed out of callback.net at the removal,
-   * nothing is recorded; a sign-out after it does not end it. An account a
-   * pass evicts for a
-   * tombstone is removed in the store already, and nothing is written.
+   * again after each of REMOVAL_RETRY_MS, then by each pass, until it is
+   * REMOVAL_PENDING_MAX_MS old. `wait: false`, for a CLI command that must
+   * not hang, makes one attempt: no wait for the lock and no retry here.
+   * Signed out of callback.net at the removal, nothing is recorded; found
+   * signed out after it, the removal is given up on. An account a pass
+   * evicts for a tombstone is removed in the store already, and nothing is
+   * written.
    * Resolves with whether a tombstone was written.
    * @param {Record<string, any>} account
    * @param {{ wait?: boolean }} [opts]
@@ -749,6 +779,7 @@ export class CredentialSync {
     // Before anything is awaited: a pass running meanwhile must not add the
     // account back from its row.
     this.pendingRemovals.set(key, account);
+    this._removedAt.set(account, this.now());
     if (!await this.isSignedIn()) {
       this._settleRemoval(key, account);
       return false;
@@ -783,12 +814,44 @@ export class CredentialSync {
   }
 
   /**
+   * Give up on a pending removal: nothing is written, it is settled, and its
+   * row is from then on a row like any other, which the next pass adds the
+   * account back from. Said once, since the account was removed here and the
+   * other installs were never told.
+   * @param {string} key
+   * @param {Record<string, any>} account
+   * @param {string} why
+   */
+  _abandonRemoval(key, account, why) {
+    if (this.pendingRemovals.get(key) !== account) return;
+    this.pendingRemovals.delete(key);
+    this.log(`[TeamClaude] callback.net: the removal of "${safeLine(account.name, 64)}" was not recorded for your other installs (${why}); the account may reappear from them`);
+  }
+
+  /**
+   * Give up on a pending removal made more than REMOVAL_PENDING_MAX_MS ago
+   * (see there for why it must not outlive that).
+   * @param {string} key
+   * @param {Record<string, any>} account
+   * @returns {boolean} whether it was given up on
+   */
+  _dropIfLapsed(key, account) {
+    if (this.pendingRemovals.get(key) !== account) return false;
+    const since = this._removedAt.get(account);
+    if (since == null || this.now() - since <= REMOVAL_PENDING_MAX_MS) return false;
+    this._abandonRemoval(key, account, 'callback.net did not take it within an hour');
+    return true;
+  }
+
+  /**
    * Write a pending removal's tombstone. Settled once it is written, and when
    * there is nothing to write: no row (or the row gone since it was read), a
    * tombstone there already, a sign-in here since (storeSignIn), or the
-   * account back on this install. Left pending, to be tried again, when
-   * signed out of callback.net, when the store cannot be reached, or when the
-   * lock is not had within `waitMs`.
+   * account back on this install. Given up on, and settled, when it is older
+   * than REMOVAL_PENDING_MAX_MS (checked on entry, and again with the lock
+   * held, just before the write) or when this install is signed out of
+   * callback.net. Left pending, to be tried again, when the store cannot be
+   * reached or when the lock is not had within `waitMs`.
    * @param {Record<string, any>} account
    * @param {number} waitMs  how long a held lock is waited for
    * @returns {Promise<boolean>} whether a tombstone was written
@@ -799,10 +862,15 @@ export class CredentialSync {
     const settle = () => { this._settleRemoval(key, account); return false; };
     // Settled meanwhile (written by a pass, dropped by a sign-in here): done.
     if (this.pendingRemovals.get(key) !== account) return false;
+    if (this._dropIfLapsed(key, account)) return false;
     try {
-      // Signed out since the removal: kept, for the first pass after signing
-      // back in. (Signed out at the removal, nothing is recorded at all.)
-      if (!await this.isSignedIn()) return false;
+      // Signed out since the removal: given up on, rather than kept for a
+      // sign-in that may be days away. (Signed out at the removal, nothing is
+      // recorded at all.)
+      if (!await this.isSignedIn()) {
+        this._abandonRemoval(key, account, 'this install is signed out of callback.net');
+        return false;
+      }
       const row = await this._findRow(account);
       if (!row) return settle();
       const lease = await this._lockWaiting(row, waitMs, () => this.pendingRemovals.get(key) === account);
@@ -815,6 +883,8 @@ export class CredentialSync {
         const current = rowOf({ ...lease.locked, Data: lease.locked?.Data ?? '' });
         this.rows.set(current.key, current);
         if (current.deletedAt != null || this.pendingRemovals.get(key) !== account || this._backHere(key, account)) return settle();
+        // The wait for the lock may have taken it past the bound.
+        if (this._dropIfLapsed(key, account)) return false;
         const stone = tombstone(this.now());
         const r = await this.api('PATCH', `User/Credential/${row.id}`, { Data: JSON.stringify(stone) });
         const fresh = rowOf({ ...r, Data: JSON.stringify(stone) });
