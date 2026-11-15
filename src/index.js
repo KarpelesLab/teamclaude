@@ -47,6 +47,7 @@ import { SxManager } from './sx.js';
 import { autoUpdate, checkForUpdate, currentVersion, resolveVersionLabel, runUpdate, installKind, updateAvailableFromCache, updateCommandFor, PKG_NAME } from './updater.js';
 import { renderStatus, formatPercent } from './status-renderer.js';
 import { sanitizeText, safeLine } from './safe-text.js';
+import { parseEndsAt, describeEndsAt } from './ends-at.js';
 import { modelLabel } from './model.js';
 import { cacheUsageLabel } from './usage-label.js';
 import { ClientUsageTracker, UsageDimensionTracker } from './client-usage.js';
@@ -123,6 +124,7 @@ import {
   upsertRoute,
   setAccountDisabled,
   setAccountCordoned,
+  setAccountEndsAt,
   setAccountPriority,
   renameAccount,
 } from './config-ops.js';
@@ -246,6 +248,10 @@ switch (command) {
     break;
   case 'uncordon':
     await setCordonedCommand(false);
+    process.exit(0);
+    break;
+  case 'ends':
+    await endsCommand();
     process.exit(0);
     break;
   case 'release':
@@ -2942,6 +2948,56 @@ async function setCordonedCommand(cordoned) {
   }
 }
 
+// ── ends ────────────────────────────────────────────────────
+
+/**
+ * `teamclaude ends <name> <time>` / `ends <name> --clear`: record when an
+ * account stops being usable (a cancelled subscription's last paid day, the
+ * end of a trial), so selection spends it before then. Written the way
+ * priority is, then picked up by a running server's reload.
+ */
+async function endsCommand() {
+  await loadOrCreateConfig();
+  const usage = () => {
+    console.error('Usage: teamclaude ends <account-name|email> <time> [--org <name|uuid>]');
+    console.error('       teamclaude ends <account-name|email> --clear');
+    console.error('<time> is an ISO 8601 date or date-time (2026-12-01, 2026-12-01T09:00:00Z) or epoch');
+    console.error('milliseconds. A date alone is the start of that day in local time.');
+  };
+  const name = args[1] && !args[1].startsWith('--') ? args[1] : null;
+  const orgFilter = argValue('--org');
+  const clear = args.includes('--clear');
+  // The time in any position after the name (e.g. after --org): the first
+  // token that is neither a flag nor --org's own value.
+  const orgAt = args.indexOf('--org');
+  const time = args.slice(2).find((t, i) => !t.startsWith('--') && i + 2 !== orgAt + 1);
+  if (!name || (clear ? time != null : time == null)) {
+    usage();
+    process.exit(1);
+  }
+  // Refused before the file is opened, with the usage: a time that does not
+  // parse is a mistyped command, not a fact about the config.
+  if (!clear && parseEndsAt(time) == null) {
+    console.error(`"${safeLine(time, 80)}" is not a time.`);
+    usage();
+    process.exit(1);
+  }
+
+  const { config, result } = await updateConfigOrExit(disk => {
+    requireAccount(disk.accounts, name, orgFilter);
+    return setAccountEndsAt(disk, name, clear ? null : /** @type {string} */ (time), { orgFilter: orgFilter ?? undefined });
+  });
+  if (result.endsAt == null) {
+    console.log(`Cleared the end time of "${result.name}"`);
+  } else {
+    const now = Date.now();
+    console.log(`Account "${result.name}" ends ${describeEndsAt(result.endsAt, now)}`);
+    // Accepted, since it is what the operator said, but it will do nothing.
+    if (result.endsAt <= now) console.log('That time has already passed, so it has no effect on which account is chosen.');
+  }
+  await notifyRunningServer(config);
+}
+
 // ── release ─────────────────────────────────────────────────
 
 /**
@@ -3119,6 +3175,9 @@ Commands:
   release <name>      Unpin the conversations on an account, leaving it in service;
                       each is placed again on its next request
   priority <name> <n> Set rotation priority (lower = preferred; --first/--last)
+  ends <name> <time>  Record when an account stops being usable, so it is spent
+                      before then: an ISO date or date-time, or epoch ms; a date
+                      alone is the start of that day, local time (--clear to unset)
   rename <name> <new> Rename an account, updating the routes that list it
   route [list|add|rm] Per-model routing: pin model globs to specific accounts
                       (add <name> --match "<glob>" [--accounts "<name>"] [--bucket <b>])

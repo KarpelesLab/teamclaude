@@ -15,6 +15,7 @@ import { forecastWindow } from './forecast.js';
 import { forecastFleet } from './fleet-forecast.js';
 import { QuotaSeries } from './quota-series.js';
 import { safeLine } from './safe-text.js';
+import { parseEndsAt } from './ends-at.js';
 import { isRefused } from './account-refusal.js';
 import { parseRoutingUrl, describeRouting, routingToUrl, isRoutingFailure } from './account-routing.js';
 import { isSelfProxy } from './upstream-proxy.js';
@@ -409,6 +410,25 @@ export function accountRouting(acct, listener = null) {
   }
 }
 
+/**
+ * The moment an account stops being usable (accounts[].endsAt), as epoch
+ * milliseconds, or null. The entry may hold epoch ms or an ISO 8601 string and
+ * keeps whichever the operator wrote; this is the one place it becomes a
+ * number. A value that is not a time is dropped with one line saying so, and
+ * the account is then ranked on its weekly reset alone, as if the key were
+ * absent. The constructor and the config reload both come through here.
+ * @param {Record<string, any>} acct
+ * @returns {number|null}
+ */
+export function accountEndsAt(acct) {
+  if (acct?.endsAt == null) return null;
+  const endsAt = parseEndsAt(acct.endsAt);
+  if (endsAt == null) {
+    console.log(`[TeamClaude] Account "${safeLine(acct?.name, 64)}": ignoring endsAt ${safeLine(JSON.stringify(acct.endsAt) ?? String(acct.endsAt), 80)} — an end time is epoch milliseconds or an ISO 8601 date such as 2026-12-01 or 2026-12-01T09:00:00Z`);
+  }
+  return endsAt;
+}
+
 function planOf(/** @type {Record<string, any>} */ account) {
   return account.hasClaudeMax === true ? 'Max' : account.hasClaudePro === true ? 'Pro' : null;
 }
@@ -466,6 +486,10 @@ function makeAccount(acct, index, listener = null) {
     // conversation is placed here, while a conversation already on it keeps
     // being served there (see unavailableReason and _keepOnCordoned).
     cordoned: !!acct.cordoned,
+    // When the operator knows the account stops being usable (accounts[].endsAt),
+    // epoch ms. Ranking only: see _deadline. Nothing reads it to decide whether
+    // the account may serve.
+    endsAt: accountEndsAt(acct),
     maxUsage: acct.maxUsage ?? null,
     // Money cap in the account's currency (accounts[].maxSpend). Like maxUsage a
     // total, not a preference: at the cap the account receives nothing.
@@ -2393,7 +2417,7 @@ export class AccountManager {
       // Soonest weekly reset breaks a tie, matching the rest of selection: on
       // an idle fleet every candidate scores identically, and without this the
       // winner would be array order.
-      const reset = this._governingWeeklyReset(c.account, model) || -Infinity;
+      const reset = this._deadline(c.account, this._governingWeeklyReset(c.account, model), now) || -Infinity;
       if (score > bestScore || (score === bestScore && reset < bestReset)) {
         best = c.account;
         bestScore = score;
@@ -2447,7 +2471,7 @@ export class AccountManager {
       const sessions = this.sessionTracker.activeCountFor(account.index, now);
       const inFlight = account.inFlight || 0;
       const pressure = pressures[i];
-      const reset = this._rankedReset(account, model);
+      const reset = this._rankedReset(account, model, now);
       const samePriority = priority === bestPriority;
       const sameSpend = samePriority && heldOff === bestSpent;
       const sameLoad = sameSpend && requests === bestRequests;
@@ -3297,7 +3321,10 @@ export class AccountManager {
     }
     const sooner = this._soonerResetPreemptor(account);
     if (sooner) {
-      return { eligible: false, reason: `outranked by "${sooner.name}", whose weekly quota resets sooner (preferSoonestWeeklyReset)` };
+      // Say which clock decided it: an account outranked by one that is about
+      // to end is not explained by a weekly reset its status row does not show.
+      const ending = this._rankingReset(sooner) === sooner.endsAt;
+      return { eligible: false, reason: `outranked by "${sooner.name}", ${ending ? 'which ends sooner' : 'whose weekly quota resets sooner'} (preferSoonestWeeklyReset)` };
     }
     // With distributeSessions on, a new conversation is placed within the best
     // priority tier of its own provider and never reads the manual choice, so
@@ -3615,16 +3642,16 @@ export class AccountManager {
   _soonerResetPreemptor(account, model = null, advisorModel = null, exclude = null) {
     if (!this.preferSoonestWeeklyReset || !account) return null;
     if (this._isManualChoice(account)) return null;
-    const mine = this._rankingReset(account, model);
-    if (!mine) return null;
     const now = Date.now();
+    const mine = this._rankingReset(account, model, now);
+    if (!mine) return null;
     let best = null;
     let bestReset = mine - SOONER_RESET_MARGIN_MS;
     for (const a of this.accounts) {
       if (a === account || exclude?.has(a.index)) continue;
       if ((a.priority || 0) !== (account.priority || 0)) continue;
       if (!this._isAvailable(a, model, advisorModel)) continue;
-      const reset = this._rankingReset(a, model);
+      const reset = this._rankingReset(a, model, now);
       if (!reset || reset <= now) continue;
       if (reset < bestReset) { best = a; bestReset = reset; }
     }
@@ -3757,7 +3784,10 @@ export class AccountManager {
   _placementPressure(account, model = null, now = Date.now()) {
     const [snapshotAccount] = this._bandSnapshot([account], model, now).accounts;
     const pressure = pressureOf(snapshotAccount, now);
-    const fresh = () => this._freshSpendable(account, model) / WEEKLY_WINDOW_SECONDS;
+    // A fresh window lasts a week unless the account ends first, in which case
+    // the same room has to be spent in the time that is left.
+    const fresh = () => this._freshSpendable(account, model)
+      / ((this._deadline(account, now + WEEKLY_WINDOW_SECONDS * 1000, now) - now) / 1000);
     switch (pressure.kind) {
       case 'known': return pressure.value > 0 || snapshotAccount.resetAt > now ? pressure.value : fresh();
       case 'absent':
@@ -3890,8 +3920,8 @@ export class AccountManager {
    * scoped bucket is the shared weekly — a clock nothing else in the decision
    * consulted. With the knob off it is `_governingWeeklyReset` unconditionally.
    */
-  _rankedReset(account, model) {
-    return this._rankingReset(account, model) || -Infinity;
+  _rankedReset(account, model, now = Date.now()) {
+    return this._rankingReset(account, model, now) || -Infinity;
   }
 
   /**
@@ -3901,10 +3931,48 @@ export class AccountManager {
    * opposite of the probe bias a selection tiebreak wants. Both callers come
    * through here so the two cannot rank on different clocks. Null means "not
    * known here", never "resets at the epoch".
+   *
+   * What comes back is the account's DEADLINE (see _deadline): that weekly
+   * reset, or the account's own end time when it is set and comes first.
+   * @param {Record<string, any>} account
+   * @param {string|null} [model]
+   * @param {number} [now]
+   * @returns {number|null}
    */
-  _rankingReset(account, model) {
-    if (!this.expiryRouting.enabled) return this._governingWeeklyReset(account, model);
-    return this._governingWindow(account, model).resetAt ?? null;
+  _rankingReset(account, model, now = Date.now()) {
+    const weekly = this.expiryRouting.enabled
+      ? this._governingWindow(account, model).resetAt ?? null
+      : this._governingWeeklyReset(account, model);
+    return this._deadline(account, weekly, now);
+  }
+
+  /**
+   * The moment `account`'s unspent weekly quota is lost: `weeklyReset`, or the
+   * account's end time (accounts[].endsAt) when that is still ahead and comes
+   * first. Quota left when a subscription ends is lost exactly as quota left at
+   * a weekly reset is, so every reader that ranks accounts by how soon their
+   * quota expires, or prices it per second remaining, takes the reset it would
+   * have used through here: the reset tiebreak and preferSoonestWeeklyReset
+   * (_rankingReset), the adaptive tiebreak, and the pressure ratio
+   * (_bandSnapshot, _placementPressure).
+   *
+   * Ranking only. An end time that has passed changes nothing here, and nothing
+   * reads this to decide whether an account may serve: what an ended
+   * subscription does is reported by upstream and handled where that arrives.
+   * Without an end time the argument comes back untouched, so an account that
+   * sets none is ranked exactly as before.
+   *
+   * Not applied to _governingWindow itself: rollover detection compares that
+   * window's reset against the one it last saw, and an end time is not a roll.
+   * @param {Record<string, any>} account
+   * @param {number|null|undefined} weeklyReset  epoch ms, or unknown
+   * @param {number} [now]
+   * @returns {number|null}
+   */
+  _deadline(account, weeklyReset, now = Date.now()) {
+    const endsAt = account.endsAt;
+    if (typeof endsAt !== 'number' || !(endsAt > now)) return weeklyReset ?? null;
+    return weeklyReset ? Math.min(weeklyReset, endsAt) : endsAt;
   }
 
   /**
@@ -3966,7 +4034,9 @@ export class AccountManager {
           // name it `utilization-not-finite`; coercing to null would report it
           // as a window nobody has reported yet, which wants a different action.
           utilization: typeof used === 'number' ? used : (used == null ? null : NaN),
-          resetAt: typeof reset === 'number' && reset ? reset : null,
+          // The ratio's denominator is the time left to spend the window, which
+          // an account about to end has less of than its reset says.
+          resetAt: this._deadline(a, typeof reset === 'number' && reset ? reset : null, now),
           limit: this._spendLimit(a, window, used),
         };
       }),
@@ -4842,7 +4912,7 @@ export class AccountManager {
       // through the same function, so the two cannot disagree about which of two
       // accounts is worth more.
       if (mine < theirs
-        || (mine === theirs && this._rankedReset(acc, model) < this._rankedReset(best, model))) best = acc;
+        || (mine === theirs && this._rankedReset(acc, model, now) < this._rankedReset(best, model, now))) best = acc;
     }
 
     // TWO guards, different properties, neither implying the other, and NOT
@@ -4987,7 +5057,7 @@ export class AccountManager {
       // bucket), so a Fable request spends the account whose Fable window
       // refreshes soonest while preserving accounts that reset later for
       // Opus/Sonnet. Unknown reset sorts first so we probe and fill it in.
-      const weeklyReset = this._rankedReset(account, model);
+      const weeklyReset = this._rankedReset(account, model, now);
       // With preferSoonestWeeklyReset on, the reset outranks pressure: spend
       // the window that expires first (earliest deadline first).
       const better = this.preferSoonestWeeklyReset
@@ -6507,6 +6577,9 @@ export class AccountManager {
         cordoned: a.cordoned === true,
         ...(a.cordoned === true ? { cordonRemaining: this.cordonRemaining(a.index, sessions.knownPerAccount) } : {}),
         maxUsage: a.maxUsage ?? null,
+        // The operator's end time for the account (accounts[].endsAt) as epoch
+        // ms, so an outside tool can read back what the ranking is using.
+        endsAt: a.endsAt ?? null,
         maxSpend: a.maxSpend ?? null,
         // Raw per-account override (issue #409), same shapes as the fleet-wide
         // field, so a remote reader (the attach-mode TUI, a status --json

@@ -78,7 +78,7 @@ curl -X POST http://localhost:3456/teamclaude/threshold \
 
 It is a setting, not a nudge: the number is written to the config file (under its lock, so an edit the CLI or TUI made meanwhile survives) and the server reloads to apply it. The answer carries the stored ratio and, when one number replaced a per-bucket table, `dropped` names the buckets that went. Per-account `accounts[].switchThreshold` overrides are untouched. A request authenticated with a `proxy.clientKeys` entry is refused with 403 — a client key is a tenant of the proxy, not its operator; the shared `proxy.apiKey` and key-exempt loopback callers are allowed.
 
-You usually don't need to call it directly. `login`, `import`, `enable`, `disable`, `cordon`, `uncordon`, `priority`, `route`, `threshold`, `distribute`, `probe` and `warmup` notify a running server themselves.
+You usually don't need to call it directly. `login`, `import`, `enable`, `disable`, `cordon`, `uncordon`, `priority`, `ends`, `route`, `threshold`, `distribute`, `probe` and `warmup` notify a running server themselves.
 
 Control-plane **writes** (`reload`, `switch`, `session-pin`, `threshold`, `priority`, `disable`, `account-cordon`, `account-release`) are refused when the request carries a browser `Origin` or a cross-site `Sec-Fetch-Site`. Loopback is exempt from the proxy API key so the CLI needs no configuration, but that exemption also covers any web page you happen to visit: a page can POST to `127.0.0.1` cross-origin without a preflight, and while it cannot read the reply, the write would still land. `curl` and the CLI send neither header and are unaffected. Reads (`status`) are not restricted — the same-origin policy already stops a page from seeing the response.
 
@@ -216,6 +216,7 @@ teamclaude cordon <name>      # Send it no new conversations; the ones on it sta
 teamclaude uncordon <name>    # Send it new conversations again
 teamclaude release <name>     # Unpin the conversations on it; each is placed again on its next request
 teamclaude priority <name> 1 # Set rotation priority (lower = preferred)
+teamclaude ends <name> 2026-12-01 # The account stops being usable then: spend it first (--clear to unset)
 teamclaude rename <name> <new> # Rename an account (and the routes that list it)
 teamclaude route list        # Manage per-model routes (add/rm)
 teamclaude threshold 90      # Utilization at which rotation leaves an account

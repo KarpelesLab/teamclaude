@@ -4,6 +4,7 @@ import { safeLine, sanitizeText } from './safe-text.js';
 import { isRefused } from './account-refusal.js';
 import { ROUTE_COLORS } from './config-ops.js';
 import { describeRouting } from './account-routing.js';
+import { describeEndsAt } from './ends-at.js';
 
 const ESC = '\x1b[';
 const RESET = `${ESC}0m`;
@@ -82,6 +83,8 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
     if (threshold) lines.push(`  ${threshold}`);
     const egress = egressProxyLine(account, paint);
     if (egress) lines.push(`  ${egress}`);
+    const ends = endsAtLine(account, now, paint);
+    if (ends) lines.push(`  ${ends}`);
     const why = unavailableLine(account, paint);
     if (why) lines.push(`  ${why}`);
     const denied = entitlementLine(account, now, paint);
@@ -675,6 +678,22 @@ export function egressProxyLine(account, paint) {
   const text = typeof r === 'string' ? r : describeRouting(r);
   if (!text) return null;
   return `${paint.dim('Egress'.padEnd(8))} ${paint.cyan(`via ${text}`)}`;
+}
+
+/**
+ * "Ends     2026-12-01 (in 6 days)" — the end time the operator set for the
+ * account (accounts[].endsAt), or null when it has none. Yellow while it is
+ * ahead, since that is when it moves traffic; gray once passed, when it is
+ * only a record.
+ * @param {any} account
+ * @param {number} now
+ * @param {any} paint
+ */
+export function endsAtLine(account, now, paint) {
+  const endsAt = account?.endsAt;
+  // The payload can come from another process: only a real instant is drawn.
+  if (typeof endsAt !== 'number' || !Number.isFinite(endsAt) || endsAt <= 0) return null;
+  return `${paint.dim('Ends'.padEnd(8))} ${(endsAt > now ? paint.yellow : paint.gray)(describeEndsAt(endsAt, now))}`;
 }
 
 function colors(enabled) {

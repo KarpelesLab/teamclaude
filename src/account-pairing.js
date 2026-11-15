@@ -219,7 +219,15 @@ export function mergeAccountsForSave(configAccounts, managerAccounts, diskAccoun
       expiresAt: am.expiresAt,
     } : a;
     const diskAcct = diskAccounts[rowFor.get(i)];
-    return diskAcct ? { ...diskAcct, ...live } : live;
+    if (!diskAcct) return live;
+    const entry = { ...diskAcct, ...live };
+    // `endsAt` is the one account field nothing in this process edits: it is
+    // set by `teamclaude ends` or by hand, on disk, and reaches memory at the
+    // next reload. So the row is the authority, in both directions. Without
+    // this a token-refresh save landing between that write and the reload
+    // would put back the end time just cleared, or drop the one just set.
+    if (diskAcct.endsAt != null) entry.endsAt = diskAcct.endsAt; else delete entry.endsAt;
+    return entry;
   });
 
   // Carry over rows that exist on disk and not in memory. The list used to be
