@@ -25,6 +25,7 @@ import { createEgressGuard } from './egress-guard.js';
 import { createDrainState, DRAIN_RETRY_AFTER_SECONDS } from './drain.js';
 import { isRoutingFailure, describeRouting } from './account-routing.js';
 import { safeLine } from './safe-text.js';
+import { upstreamErrorType } from './error-type.js';
 import { forwardRefusal, guardedLookup, FORBIDDEN_FORWARD } from './forward-target.js';
 import { renderDashboardHtml, dashboardCsp } from './dashboard.js';
 import { createUsageRecorder, resolveUsageDimensions, usageDimensionHeaderNames } from './client-usage.js';
@@ -1061,7 +1062,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         // request, so a bare "ok" would be a lie for a disabled or spent target.
         // The switch still happens (that is the TUI's behaviour) and the answer
         // says whether traffic will follow it.
-        const { eligible, reason } = accountManager.eligibility(index);
+        const { eligible, reason } = accountManager.eligibility(index, { manualSwitch: true });
         // Leave a trace where every other account change already leaves one: the
         // TUI swaps console.log for its activity pane and headless mode tees it
         // to the activity log, so this one line covers both. Without it a manual
@@ -1760,7 +1761,11 @@ export function relayHttpForward(req, res, stripOverage = false, /** @type {Reco
 // does not take `/v1/sessionsX`. The entry without that slash, the collection
 // itself, matches as well, since a session is created with a bare
 // POST /v1/sessions (classificationPath has already dropped any `?beta=true`).
+// Trusted-device enrollment must use the same login as Remote Control. A
+// pooled token enrolls the device under a different account, so the bridge
+// rejects it even after the client signs in again (observed with CC 2.1.322).
 const CLIENT_CREDENTIAL_PATHS = [
+  '/api/auth/trusted_devices/',
   '/v1/code/', '/api/oauth/', '/api/frame/', '/v1/mcp_servers/', '/v1/environments/', '/v1/sessions/', '/v2/session_ingress/', '/v2/ccr-sessions/',
 ];
 
@@ -2270,7 +2275,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // stripOverage, synthesizeQuota and poolQuota are sampled once here, at dispatch:
       // retries and holds of this request keep them, and a reload applies to
       // subsequent requests.
-      const ctx = { account: null, callerRequestId: callerId, status: null, attempt: 0, tried: new Set(), reauthed: new Set(), model, advisorModel, streamRequested: parseRequestStream(body), fleetMessageThreads: config?.messageThreads === true, pinnedIndex, pinChain, provider, holdBudgetMs: holdMs, pinKey, onMessage, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, stripOverage: shouldStripOverageHeaders(config), synthesizeQuota: shouldSynthesizeQuotaHeaders(config), poolQuota: shouldPoolQuotaHeaders(config), logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config), cacheUsage: /** @type {Record<string, any>|null} */ (null), usage };
+      const ctx = { account: null, callerRequestId: callerId, status: null, attempt: 0, tried: new Set(), reauthed: new Set(), model, advisorModel, streamRequested: parseRequestStream(body), fleetMessageThreads: config?.messageThreads === true, pinnedIndex, pinChain, provider, holdBudgetMs: holdMs, pinKey, onMessage, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, stripOverage: shouldStripOverageHeaders(config), synthesizeQuota: shouldSynthesizeQuotaHeaders(config), poolQuota: shouldPoolQuotaHeaders(config), logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config), cacheUsage: /** @type {Record<string, any>|null} */ (null), errorType: /** @type {string|null} */ (null), usage };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request.
@@ -2326,7 +2331,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         // marked open would send the outer catch to call that same throwing hook
         // a second time for one request.
         openEntry = null;
-        if (!hideActivity) hooks.onRequestEnd?.(reqId, { callerRequestId: callerId, method: req.method, path: req.url, account: ctx.account, status: ctx.status, model: ctx.model, effort, sessionId, pinned: ctx.pinnedIndex != null, client, attempts: ctx.attempt || 0, cacheUsage: ctx.cacheUsage });
+        if (!hideActivity) hooks.onRequestEnd?.(reqId, { callerRequestId: callerId, method: req.method, path: req.url, account: ctx.account, status: ctx.status, model: ctx.model, effort, sessionId, pinned: ctx.pinnedIndex != null, client, attempts: ctx.attempt || 0, cacheUsage: ctx.cacheUsage, errorType: ctx.errorType });
         // One SQLite row per request, written here because this is the one
         // place every terminal outcome of forwardRequest already funnels
         // through — success, a hop that exhausted retries, the pool-exhausted
@@ -2518,20 +2523,47 @@ function waitForRetry(ms, signal) {
 
 // Before a hold or an inline wait retries the request, forget the failures that
 // waiting can cure (rate limits, exhaustion, transient faults): they put an
-// account in ctx.tried for this request only. An account upstream refused (401,
-// 403) or whose token could not be renewed stays excluded, since waiting
-// changes neither. An account that is still unavailable by its own state is
-// skipped by selection regardless.
+// account in ctx.tried for this request only. An account upstream refused (a
+// 401, a 403, or a 400 that refuses the account) or whose token could not be
+// renewed stays excluded, since waiting changes neither. An account that is
+// still unavailable by its own state is skipped by selection regardless.
 /**
  * @param {Record<string, any>} ctx
  * @param {import('./account-manager.js').AccountManager} accountManager
  */
 function forgetRecoverableFailures(ctx, accountManager) {
   for (const i of [...ctx.tried]) {
-    const name = accountManager.accounts[i]?.name;
-    if (ctx.credentialRejected?.has(name) || ctx.unrenewed?.has(name)) continue;
+    const account = accountManager.accounts[i];
+    // By account (recordRefusal): a same-named account that was only out of
+    // quota is exactly what the wait is for.
+    if (ctx.refusedAccounts?.has(account) || ctx.unrenewedAccounts?.has(account)) continue;
     ctx.tried.delete(i);
   }
+}
+
+// Upstream refused this account's credential, or the account itself: a 400 that
+// refuses the account, a 401, a 403. The no-account branch needs to tell "every
+// account was refused" (fail fast, nothing to wait for) from "this one was,
+// others are just out of quota" (still worth holding for a reset).
+//
+// Refusals are recorded as the accounts themselves, and so are tokens that could
+// not be renewed (ctx.unrenewedAccounts), because names are not unique
+// (account-id.test.js keeps two entries of one name). Matched by name, a
+// same-named account that is merely out of quota counted as refused or
+// unrenewed: the request got the hard error instead of the quota answer or the
+// hold, and after a hold that account was never tried again. So every decision
+// reads the accounts, and the 502 describes each one by its own record (its
+// status, its verification hold, its refusal or failed renewal). The names
+// (ctx.credentialRejected, ctx.unrenewed) are only printed.
+/**
+ * @param {Record<string, any>} ctx
+ * @param {Record<string, any>} account
+ * @param {number} status
+ */
+function recordRefusal(ctx, account, status) {
+  (ctx.refusedAccounts ??= new Set()).add(account);
+  (ctx.credentialRejected ??= new Set()).add(account.name);
+  (ctx.rejectedStatus ??= new Map()).set(account, status);
 }
 
 function clientGone(res) {
@@ -3481,6 +3513,14 @@ const SSE_UNCOMMITTED_EVENTS = new Set(['response.created', 'response.queued', '
  */
 export const STREAM_FAILURE_CODES = new Set(['server_is_overloaded', 'server_error', 'rate_limit_exceeded', 'overloaded_error']);
 
+// The in-band failures that would have been a 5xx or a 429 as a status - the
+// provider's, not the request's - so a stream that reports one delivered
+// nothing (see the relay). Wider than the hop set above, which decides routing
+// and stays as it is: Anthropic also reports `api_error` (500),
+// `timeout_error` (504) and `rate_limit_error` (429) inside a stream that has
+// opened.
+const PROVIDER_FAILURE_CODES = new Set([...STREAM_FAILURE_CODES, 'api_error', 'timeout_error', 'rate_limit_error']);
+
 // How much of a stream the peek may hold before releasing it undecided. The
 // Codex lifecycle envelopes echo the whole request back, instructions included,
 // so `response.created` alone can run to tens of KiB.
@@ -3638,31 +3678,32 @@ export async function peekStreamFailure(stream, bounds = {}) {
  * lock denied) or the token endpoint's (a 429). A re-login does not touch either,
  * so it is advised only when the endpoint rejected the refresh token itself, and
  * for a refusal with no failed renewal behind it, with the status upstream
- * actually answered.
- * @param {{ accounts: Record<string, any>[] }} accountManager
- * @param {Set<string>} rejected  the refused accounts' names
- * @param {Map<string, number>|undefined} statuses  the status each one got
- * @param {Map<string, string|null>|undefined} holds  the identity-verification
- *   portal each held account pointed at
+ * actually answered. Each account is described by its own record
+ * (recordRefusal), never by the first account of its name.
+ * @param {Set<Record<string, any>>} refused  the refused accounts
+ * @param {Map<Record<string, any>, number>|undefined} statuses  the status each one got
+ * @param {Map<Record<string, any>, string|null>|undefined} holds  the
+ *   identity-verification portal each held account pointed at
  */
-function refusalMessage(accountManager, rejected, statuses, holds) {
-  const parts = [...rejected].map((name) => {
+function refusalMessage(refused, statuses, holds) {
+  const parts = [...refused].map((account) => {
+    const name = account.name;
     // A verification hold is neither a dead credential nor a quota window: the
     // token is valid, so "re-add it" sends the operator the wrong way, and the
     // portal link is the only actionable thing upstream tells us.
-    if (holds?.has(name)) {
-      const url = holds.get(name);
+    if (holds?.has(account)) {
+      const url = holds.get(account);
       return `upstream requires identity verification for account "${name}", whose credential itself is valid, so re-adding it will not help${url ? ` — complete it at ${url}` : ''}`;
     }
-    const account = accountManager.accounts.find(a => a.name === name);
     // Upstream refused the account itself: its words say what to do.
-    if (account && isRefused(account)) return `upstream refused account "${name}": ${account.errorReason.detail}`;
-    const failure = account?._lastRefreshFailure;
+    if (isRefused(account)) return `upstream refused account "${name}": ${account.errorReason.detail}`;
+    const failure = account._lastRefreshFailure;
     // A refresh token the endpoint rejected IS fixed by a re-login; say so then.
     if (failure) return `the token of "${name}" could not be renewed: ${failure.reason}${[400, 401, 403].includes(failure.status) ? '. Re-add it with: teamclaude login' : ''}`;
-    return `upstream refused the credential for account "${name}" (${statuses?.get(name) ?? 403}). Check the account, then re-add it with: teamclaude login`;
+    return `upstream refused the credential for account "${name}" (${statuses?.get(account) ?? 403}). Check the account, then re-add it with: teamclaude login`;
   });
-  const text = parts.join('; ');
+  // Two accounts of one name with the same story are told once.
+  const text = [...new Set(parts)].join('; ');
   return `${text.charAt(0).toUpperCase()}${text.slice(1)}`;
 }
 
@@ -3674,20 +3715,22 @@ function refusalMessage(accountManager, rejected, statuses, holds) {
  * a 403 — the client's own credential is fine.
  * @param {import('node:http').ServerResponse} res
  * @param {Record<string, any>} ctx
- * @param {{ accounts: Record<string, any>[] }} accountManager
  */
-function respondUnrenewed(res, ctx, accountManager) {
+function respondUnrenewed(res, ctx) {
   const names = [...ctx.unrenewed].map((/** @type {string} */ n) => `"${safeLine(n, 64)}"`).join(', ');
+  // The accounts themselves (recordRefusal), not the first account of a name.
+  /** @type {Record<string, any>[]} */
+  const accounts = [...(ctx.unrenewedAccounts ?? [])];
   // Each renewal's own failure, as refusalMessage names it: the store's lock
   // denied, or the token endpoint's answer.
-  const failures = [...ctx.unrenewed].map((/** @type {string} */ n) => accountManager.accounts.find((a) => a.name === n)?._lastRefreshFailure).filter(Boolean);
+  const failures = accounts.map(a => a._lastRefreshFailure).filter(Boolean);
   const reasons = failures.map(f => f.reason);
   // A refresh token the endpoint rejected IS fixed by a re-login; say so then.
   const relogin = failures.some(f => [400, 401, 403].includes(f.status)) ? ' Re-add it with: teamclaude login' : '';
   // Come back when a renewal may be tried again: the longest 429 hold among these
   // accounts (the token endpoint's Retry-After), or 30 s when none is held.
   const now = Date.now();
-  const held = Math.max(0, ...[...ctx.unrenewed].map((/** @type {string} */ n) => (accountManager.accounts.find((a) => a.name === n)?._refreshHeldUntil ?? 0) - now));
+  const held = Math.max(0, ...accounts.map(a => (a._refreshHeldUntil ?? 0) - now));
   const retryAfter = held > 0 ? Math.ceil(held / 1000) : 30;
   ctx.status = 503;
   ctx.account = `(${[...ctx.unrenewed].join(', ')} not renewed)`;
@@ -3868,15 +3911,31 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     return;
   }
   if (!account) {
-    // Every account this request reached held an expired token that could not be
-    // renewed, and nothing else was tried: say that, not a refusal or a quota.
-    if (ctx.unrenewed?.size && [...ctx.tried].every(i => ctx.unrenewed.has(accountManager.accounts[i]?.name))
-        && (ctx.pinnedIndex != null || ctx.tried.size === accountManager.accounts.length)) {
-      return respondUnrenewed(res, ctx, accountManager);
-    }
     const reachable = (ctx.pinnedIndex != null
       ? [accountManager.accounts[ctx.pinnedIndex]].filter(Boolean)
       : candidateAccounts(accountManager, ctx.model, ctx.provider)).filter(a => !a.disabled && !a.cordoned);
+    // "Every account" in the unrenewed and refused answers below: each account
+    // a new request could be placed on, and the cordoned account this
+    // conversation is kept on (_keepOnCordoned) - when that is the only one, its
+    // answer is the whole story. Read from the conversation's pin as it stands,
+    // so a conversation this turn moved off its cordoned account no longer
+    // counts it. Counting the whole fleet kept both answers from firing while any
+    // account sat disabled, cordoned, or on another provider or route.
+    const counted = new Set(reachable);
+    if (ctx.pinKey) {
+      for (const i of accountManager.cordonKeeps(ctx.pinKey, ctx.model)) {
+        const kept = accountManager.accounts[i];
+        if (kept && !kept.disabled) counted.add(kept);
+      }
+    }
+    // Every account this request reached held an expired token that could not be
+    // renewed, and nothing else was tried: say that, not a refusal or a quota.
+    // Matched by account (recordRefusal).
+    const unrenewed = ctx.unrenewedAccounts;
+    if (unrenewed?.size && [...ctx.tried].every(i => unrenewed.has(accountManager.accounts[i]))
+        && (ctx.pinnedIndex != null || (counted.size > 0 && [...counted].every(a => ctx.tried.has(a.index))))) {
+      return respondUnrenewed(res, ctx);
+    }
     if (reachable.length && reachable.every(a => accountManager.unavailableReason(a, ctx.model) === 'billing')) {
       ctx.status = 402;
       ctx.account = '(billing unavailable)';
@@ -3905,23 +3964,27 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // request — so fall through to the retry-after/hold path below rather than
     // failing fast on the strength of one bad credential. Reporting 502 there
     // would turn a recoverable exhaustion into a hard error, and silently skip
-    // the holdSeconds wait an unattended run depends on.
-    const rejected = ctx.credentialRejected;
-    const allRefused = rejected?.size > 0 && (ctx.pinnedIndex != null
-      ? rejected.has(accountManager.accounts[ctx.pinnedIndex]?.name)
-      : rejected.size === accountManager.accounts.length);
+    // the holdSeconds wait an unattended run depends on. Counted by account
+    // (recordRefusal).
+    const refused = ctx.refusedAccounts;
+    const allRefused = refused?.size > 0 && (ctx.pinnedIndex != null
+      ? refused.has(accountManager.accounts[ctx.pinnedIndex])
+      : counted.size > 0 && [...counted].every(a => refused.has(a)));
     if (allRefused) {
+      const rejected = ctx.credentialRejected;
       const names = [...rejected].map(n => `"${n}"`).join(', ');
-      const entitlementDenied = ctx.entitlementDenied;
-      const allEntitlementDenied = entitlementDenied?.size === rejected.size
-        && [...rejected].every(name => entitlementDenied.has(name));
+      // By account too: an entitlement denial and a plain refusal on two
+      // accounts of one name are not "every account returned entitlement denial".
+      const denied = ctx.entitlementDeniedAccounts;
+      const allEntitlementDenied = denied?.size === refused.size
+        && [...refused].every(a => denied.has(a));
       let message;
       if (allEntitlementDenied && ctx.pinnedIndex != null) {
         message = `No account served this request. The pinned account ${names} returned OAuth entitlement denial (${OAUTH_ENTITLEMENT_ERROR_CODE}). An explicit pin targets that account exactly; choose a different eligible account or change its organization's OAuth policy.`;
       } else if (allEntitlementDenied) {
-        message = `No account served this request. Every configured account returned OAuth entitlement denial (${OAUTH_ENTITLEMENT_ERROR_CODE}): ${names}. TeamClaude temporarily removed them from automatic rotation; retry after the cooldown or pin a different eligible account.`;
+        message = `No account served this request. Every account this request could use returned OAuth entitlement denial (${OAUTH_ENTITLEMENT_ERROR_CODE}): ${names}. TeamClaude temporarily removed them from automatic rotation; retry after the cooldown or pin a different eligible account.`;
       } else {
-        message = refusalMessage(accountManager, rejected, ctx.rejectedStatus, ctx.verificationHold);
+        message = refusalMessage(refused, ctx.rejectedStatus, ctx.verificationHold);
       }
       ctx.status = 502;
       ctx.account = `(${[...rejected].join(', ')} refused)`;
@@ -4076,13 +4139,15 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // its 401 would force a refresh that fails the same way, and the retry would
   // send it again. The account sits this request out.
   if (account.type === 'oauth' && account.refreshToken && !account.upstream && isTokenExpired(account.expiresAt)) {
+    // By account (recordRefusal); the name is only printed.
+    (ctx.unrenewedAccounts ??= new Set()).add(account);
     (ctx.unrenewed ??= new Set()).add(account.name);
     ctx.tried.add(account.index);
     console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}": token expired and not renewed; not sending it upstream`);
     if (ctx.pinnedIndex == null && retryCount < maxRetries) {
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
     }
-    return respondUnrenewed(res, ctx, accountManager);
+    return respondUnrenewed(res, ctx);
   }
   // The refresh just found this account's routing proxy down (it arms the
   // cooldown). The forward would leave by the same proxy and fail the same
@@ -4244,6 +4309,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // answered, so an earlier attempt's (a stream that died after
     // message_start, then a hop) do not stand in for a later one's (#642).
     ctx.cacheUsage = null;
+    // The same for the error type: the line names the answer it ends with.
+    ctx.errorType = null;
     let upstreamRes;
     let admittedLoad = 0;
     const entitlementEpoch = account.entitlementEpoch;
@@ -4488,7 +4555,13 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // hop ctx.rateLimitHopped is set, this branch does not run again for this
       // request, and the sx fresh-IP retry and the inline wait take over —
       // which is the right response to an IP-scoped limit.
-      if (!ctx.rateLimitHopped && retryCount < maxRetries) {
+      //
+      // Never for a pinned request (TC_ACCT, /tc-acct/, a session pin): a pin
+      // names the one account the client asked for, and docs/routing.md
+      // promises it never fails over - a rate limit is handled as for any pin
+      // to one account, below. The billing walk along a pin's list is separate
+      // (advancePinPastBilling) and unaffected.
+      if (ctx.pinnedIndex == null && !ctx.rateLimitHopped && retryCount < maxRetries) {
         // ctx.rolledOff as well as tried: an account a rollover moved this
         // request off was never sent a request, so it is not in `tried`, and
         // hopping back onto it would reverse that decision one step later.
@@ -4649,7 +4722,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // overloaded, not the account, and walking the fleet would just spend every
     // account'"'"'s cache discovering that. After the hop the response goes to the
     // client as it does today, with its own retry-after intact.
-    if (upstreamRes.status >= 500 && !res.headersSent && !ctx.serverErrorHopped && retryCount < maxRetries) {
+    // Never for a pinned request, as for the 429 hop above.
+    if (ctx.pinnedIndex == null && upstreamRes.status >= 500 && !res.headersSent && !ctx.serverErrorHopped && retryCount < maxRetries) {
       // Same exclusion as the 429 hop, and the same cursor-preserving pick.
       const alt = accountManager.pickAlternate(
         new Set([...ctx.tried, ...(ctx.rolledOff || []), account.index]),
@@ -4684,8 +4758,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       if (refusal) {
         await rest.cancel();
         accountManager.markRefused(account, refusal);
-        (ctx.credentialRejected ??= new Set()).add(account.name);
-        (ctx.rejectedStatus ??= new Map()).set(account.name, 400);
+        recordRefusal(ctx, account, 400);
         ctx.tried.add(account.index);
         console.error(`[TeamClaude] 400 on "${safeLine(account.name, 64)}"; upstream refused the account (${refusal.code}), failing over`);
         if (clientGone(res)) { ctx.abandoned = true; return; }
@@ -4747,13 +4820,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       const verification = account.type === 'oauth' && responseBody != null
         ? oauthVerificationHold(responseBody)
         : null;
-      if (verification) (ctx.verificationHold ??= new Map()).set(account.name, verification.url);
-      // A set, not a name: the no-account branch needs to tell "every account was
-      // refused" (fail fast, nothing to wait for) from "this one was, others are
-      // just out of quota" (still worth holding for a reset).
-      (ctx.credentialRejected ??= new Set()).add(account.name);
-      (ctx.rejectedStatus ??= new Map()).set(account.name, 403);
-      if (entitlementDenied) (ctx.entitlementDenied ??= new Set()).add(account.name);
+      if (verification) (ctx.verificationHold ??= new Map()).set(account, verification.url);
+      recordRefusal(ctx, account, 403);
+      if (entitlementDenied) (ctx.entitlementDeniedAccounts ??= new Set()).add(account);
       ctx.tried.add(account.index);
       const denials = account.entitlementDenial?.count || 0;
       const cooldown = deniedUntil
@@ -4799,8 +4868,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
           ? 'upstream rejected its API key (401)'
           : 'upstream rejected its token (401) and it has no refresh token');
       }
-      (ctx.credentialRejected ??= new Set()).add(account.name);
-      (ctx.rejectedStatus ??= new Map()).set(account.name, 401);
+      recordRefusal(ctx, account, 401);
       ctx.tried.add(account.index);
       console.error(`[TeamClaude] 401 on "${safeLine(account.name, 64)}"; failing over to another account`);
       if (clientGone(res)) { ctx.abandoned = true; return; }
@@ -4827,8 +4895,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // Same hop, same budget, same reason — a second account refusing the same
     // way is the provider talking, not the account — keyed on the first
     // decisive event instead of the status. The sibling is picked first so a
-    // request with nowhere to hop to is never held for nothing.
-    if (isStreaming && upstreamRes.status < 400 && upstreamBody && !res.headersSent
+    // request with nowhere to hop to is never held for nothing. Never for a
+    // pinned request, as for the 429 hop above.
+    if (ctx.pinnedIndex == null && isStreaming && upstreamRes.status < 400 && upstreamBody && !res.headersSent
         && !ctx.streamFailureHopped && retryCount < maxRetries) {
       const alt = accountManager.pickAlternate(
         new Set([...ctx.tried, ...(ctx.rolledOff || []), account.index]),
@@ -4915,19 +4984,27 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       return;
     }
 
+    // A 200 stream that reported its own failure (streamResponse): relayed
+    // whole, but not a completion.
+    /** @type {string|null} */
+    let streamFailed = null;
     if (isStreaming) {
       // Stream each chunk straight to the log as it is relayed — never hold the
       // whole (potentially ~1M-token) SSE body in memory.
       const l = getLog();
       const bw = l ? l.bodyWriter('RESPONSE BODY (streamed)', contentType) : null;
       try {
-        await streamResponse(upstreamBody, res, account.index, accountManager, bw, ctx.onUsage, ctx.pinKey, ctx.model, ctx.onMessage, (/** @type {Record<string, any>} */ u) => { ctx.cacheUsage = u; bookUsageTotals(ctx.usage, u); });
+        ({ failed: streamFailed } = await streamResponse(upstreamBody, res, account.index, accountManager, bw, ctx.onUsage, ctx.pinKey, ctx.model, ctx.onMessage, (/** @type {Record<string, any>} */ u) => { ctx.cacheUsage = u; bookUsageTotals(ctx.usage, u); }));
         // Reached only when the stream completed. A stream that dies upstream
         // throws out of streamResponse, so it never marks itself delivered —
         // which is the failure the token counters cannot see, since a stream
         // that emitted message_start has already recorded a usage report.
         if (clientGone(res)) ctx.abandoned = true;
-        else ctx.delivered = deliveredStatus;
+        // A provider-side failure the stream reported (PROVIDER_FAILURE_CODES) is
+        // the 5xx or 429 it would have been as a status (answeredStatus): nothing
+        // came back, and the session tracker counts it so. A request fault the
+        // stream reported is still an answer, as a 4xx is.
+        else ctx.delivered = deliveredStatus && !(streamFailed != null && PROVIDER_FAILURE_CODES.has(streamFailed));
       } finally {
         // Also on the failure path: without the note a capped body reads as a
         // stream that simply stopped, which is the other thing that happens here.
@@ -4936,6 +5013,12 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       l?.end();
     } else {
       const buf = await buffer(upstreamBody);
+      // The error body is already in hand here, so naming its type for the
+      // activity line costs one bounded parse and does not touch what the client
+      // gets. A JSON error only; past the inspection limit it is left unread.
+      if (upstreamRes.status >= 400 && buf.length <= ERROR_BODY_INSPECTION_LIMIT && isJsonContentType(contentType)) {
+        ctx.errorType = upstreamErrorType(buf);
+      }
       extractUsageFromBody(buf, account.index, accountManager, ctx.onUsage, ctx.pinKey, ctx.model, ctx.onMessage, (/** @type {Record<string, any>} */ u) => { ctx.cacheUsage = u; bookUsageTotals(ctx.usage, u); });
       const l = getLog();
       if (l) { l.body('RESPONSE BODY', buf, contentType); l.end(); }
@@ -4943,8 +5026,16 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       ctx.delivered = deliveredStatus;
     }
     // An entitlement denial needs more than a 2xx header: a completion, not a
-    // side endpoint or a redirect, delivered whole.
-    if (ctx.delivered && upstreamRes.status >= 200 && upstreamRes.status < 300
+    // side endpoint or a redirect, delivered whole - and not a stream that
+    // reported its own failure, of any kind. Such a stream reaches the relay
+    // whenever the peek above does not hop on it, among them: a pin (the peek
+    // is skipped), no sibling, a code not worth a hop, a failure after the
+    // first event, the stream relayed after the one hop, a peek bound running
+    // out. Short of the pin, which hopped before this change, each of those
+    // used to clear the denial: a pinned account's live cooldown, and for any
+    // request the escalation count of a cooldown that had run out. Counted
+    // conservatively, even after output: the cooldown then ends on its own step.
+    if (ctx.delivered && streamFailed == null && upstreamRes.status >= 200 && upstreamRes.status < 300
         && isCompletionPath(classificationPath(req.url))) {
       accountManager.clearEntitlementDenied(account, entitlementEpoch);
       accountManager.clearModelDenied(account, ctx.model, modelDenialEpoch);
@@ -5134,6 +5225,13 @@ export function bookUsageTotals(totals, usage) {
 /**
  * Stream an SSE response to the client, parsing usage data along the way.
  * `onTotals` is told the usage that was booked, once the stream ends.
+ *
+ * Resolves to what the stream said about itself: `failed` names the first
+ * `error` or `response.failed` event it carried (its code, or the event type
+ * when it names none), and is null for a stream that reported no failure. A
+ * 200 whose body reports its own failure was relayed whole but completed
+ * nothing, and the caller's success bookkeeping needs to know the difference.
+ * @returns {Promise<{ failed: string|null }>}
  */
 export async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter, onUsage = null, pinKey = null, model = null, onMessage = null, /** @type {((usage: Record<string, any>) => void)|null} */ onTotals = null) {
   const reader = webStream.getReader();
@@ -5156,7 +5254,9 @@ export async function streamResponse(webStream, res, accountIndex, accountManage
   // remembers that it did — the incremental counters would book the turn again
   // if a second terminal event arrived. See parseSSEDataLine.
   const responsesTurn = { settled: false };
-  const usage = createSseLineScanner(line => parseSSEDataLine(line, accountIndex, accountManager, onUsage, merged, responsesTurn, onMessage));
+  /** @type {{ failed: string|null }} */
+  const outcome = { failed: null };
+  const usage = createSseLineScanner(line => parseSSEDataLine(line, accountIndex, accountManager, onUsage, merged, responsesTurn, onMessage, outcome));
 
   try {
     while (true) {
@@ -5225,6 +5325,7 @@ export async function streamResponse(webStream, res, accountIndex, accountManage
     reader.cancel().catch(() => {});
     if (!errored && !res.writableEnded) res.end();
   }
+  return outcome;
 }
 
 // The longest line the usage scanner will hold while waiting for its newline.
@@ -5314,12 +5415,19 @@ export function createSseLineScanner(onLine, maxChars = SSE_MAX_LINE_CHARS) {
  * @param {Record<string, any>|null} [merged]
  * @param {{settled: boolean}|null} [responsesTurn] this stream's "already booked" flag
  * @param {((messageId: string) => void)|null} [onMessage] told the id `message_start` names
+ * @param {{failed: string|null}|null} [outcome] this stream's first reported failure, set once
  */
-function parseSSEDataLine(line, accountIndex, accountManager, onUsage = null, merged = null, responsesTurn = null, onMessage = null) {
+function parseSSEDataLine(line, accountIndex, accountManager, onUsage = null, merged = null, responsesTurn = null, onMessage = null, outcome = null) {
   if (!line.startsWith('data: ')) return;
 
   try {
     const data = JSON.parse(line.slice(6));
+    // Either dialect's own failure report, kept apart from the hop decision
+    // (peekStreamFailure): any failure counts here, not only the codes worth a
+    // hop, and wherever in the stream it arrives.
+    if (outcome && outcome.failed == null && (data.type === 'error' || data.type === 'response.failed')) {
+      outcome.failed = streamFailureCode(data) ?? data.type;
+    }
     if (data.type === 'message_start' && typeof data.message?.id === 'string') onMessage?.(data.message.id);
     if (data.type === 'message_start' && data.message?.usage) {
       accountManager.updateUsage(accountIndex, data.message.usage.input_tokens, 0);
