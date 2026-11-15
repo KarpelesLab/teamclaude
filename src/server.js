@@ -22,6 +22,7 @@ import { matchAccounts } from './identity.js';
 import { tunnelTls } from './sx.js';
 import { createEgressGuard } from './egress-guard.js';
 import { createDrainState, DRAIN_RETRY_AFTER_SECONDS } from './drain.js';
+import { resolveCompactBeforeSwitch, decideCompactBeforeSwitch, promptTooLongBody } from './compact-before-switch.js';
 import { isRoutingFailure, describeRouting } from './account-routing.js';
 import { safeLine } from './safe-text.js';
 import { upstreamErrorType } from './error-type.js';
@@ -2386,6 +2387,38 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         return;
       }
 
+      // compactBeforeSwitch (issue #709, off unless set): a long conversation
+      // whose account is about to reach a switch threshold is answered once
+      // with the API's own "prompt is too long" 400, so Claude Code compacts it
+      // on the account that still holds its cache and the switch that follows
+      // carries a summary. Nothing is forwarded and no quota is spent on it.
+      // The first test is the whole cost while the setting is off. Never for a
+      // request something pins to an account (TC_ACCT, `/tc-acct/`, which is
+      // also how keep-warm sends, an operator session pin): a pinned request
+      // does not rotate, so no switch is coming. Read live from the shared
+      // config, so a reload applies to the next request.
+      const compactAsk = /** @type {any} */ (config)?.compactBeforeSwitch && pinnedIndex == null && sessionId && pinKey && provider === DEFAULT_PROVIDER
+        ? compactAskFor(accountManager, config, { method: req.method, url: req.url, bodyBytes: body.length, pinKey, sessionId, model, advisorModel })
+        : null;
+      if (compactAsk && !res.headersSent && !clientGone(res)) {
+        const { account, window: near, settings, asks } = compactAsk;
+        // Recorded before the answer is written: the client's compaction
+        // request follows at once and must find the record.
+        asks.record(compactAsk.pinKey, compactAsk.sessionId, body.length, settings.cooldownMs);
+        // What a relayed upstream 400 gives the client to act on: the JSON
+        // error and `x-should-retry: false`, which the API sends with a 400.
+        // No `request-id`: upstream issued none, and inventing one would name a
+        // request that does not exist there.
+        res.writeHead(400, { 'Content-Type': 'application/json', 'x-should-retry': 'false' });
+        res.end(promptTooLongBody(body.length));
+        const pct = (/** @type {number} */ v) => `${Math.round(v * 100)}%`;
+        console.log(`[TeamClaude] Asked session ${compactAsk.sessionId.slice(0, 8)} to compact before "${safeLine(account.name, 64)}" switches: ${near.bucket} is at ${pct(near.utilization)}, switch threshold ${pct(near.threshold)}, request body ${body.length} bytes. Answered 400 "prompt is too long" here; nothing was sent upstream (compactBeforeSwitch)`);
+        recordEarlyOutcome(accountManager, { pinKey }, req.url, true);
+        openEntry = null;   // this path owns the close below; the outer catch must not repeat it
+        if (!hideActivity) hooks.onRequestEnd?.(reqId, { callerRequestId: callerId, method: req.method, path: req.url, account: `(compact before switch: ${safeLine(account.name, 64)})`, status: 400, model, effort, sessionId, pinned: false, client: req.tcClient ?? forcedClient ?? null });
+        return;
+      }
+
       // Per-client attribution: the base server stamps req.tcClient from the
       // key that authenticated; the MITM terminating server has no per-request
       // key (auth happened at CONNECT time) and carries it as forcedClient
@@ -2593,6 +2626,53 @@ function answeredStatus(status) {
 function isCompletionPath(url) {
   const path = String(url || '').split('?')[0];
   return path.endsWith('/v1/messages') || path.endsWith('/responses');
+}
+
+/**
+ * Whether this request is the one a long conversation is asked to compact on
+ * (`compactBeforeSwitch`, issue #709): the account holding the conversation,
+ * the window that is inside the margin and the settings in force, or null to
+ * forward the request as usual.
+ *
+ * Gathers the facts only the server has and hands them to the pure decision in
+ * compact-before-switch.js. The caller has already ruled out a pinned request,
+ * a request with no client session and another provider's path. Here:
+ *   - only a completion (`POST /v1/messages`); count_tokens and every other
+ *     endpoint are forwarded;
+ *   - the body size is tested first, so a short request costs one comparison;
+ *   - only a Claude subscription account on the fleet upstream. A switch off an
+ *     API key or a third-party backend is not the cache rewrite this avoids,
+ *     and those upstreams did not write the error being quoted;
+ *   - the account comes from AccountManager.conversationHost, which reads where
+ *     the conversation is and where selection would send it without selecting.
+ *
+ * Decides and reads; the caller records the ask. Any throw in here forwards the
+ * request: a feature that edits answers must not be able to fail one.
+ *
+ * @param {any} accountManager
+ * @param {any} config
+ * @param {{ method: string|undefined, url: string|undefined, bodyBytes: number, pinKey: string, sessionId: string, model: string|null, advisorModel: string|null }} request
+ * @returns {{ account: Record<string, any>, window: { bucket: string, utilization: number, threshold: number }, settings: import('./compact-before-switch.js').CompactSettings, asks: import('./compact-before-switch.js').CompactAsks, pinKey: string, sessionId: string }|null}
+ */
+function compactAskFor(accountManager, config, { method, url, bodyBytes, pinKey, sessionId, model, advisorModel }) {
+  try {
+    const settings = resolveCompactBeforeSwitch(config?.compactBeforeSwitch);
+    if (!settings || bodyBytes < settings.minBodyBytes) return null;
+    if (method !== 'POST' || !String(classificationPath(url) || '').split('?')[0].endsWith('/v1/messages')) return null;
+    const asks = accountManager.compactAsks;
+    if (!asks) return null;
+    const account = accountManager.conversationHost(pinKey, model, advisorModel, DEFAULT_PROVIDER);
+    if (!account || !isSubscriptionAccount(account) || providerOf(account) !== DEFAULT_PROVIDER || account.upstream) return null;
+    const decision = decideCompactBeforeSwitch({
+      settings, bodyBytes, pinKey, sessionId, asks,
+      windows: accountManager.switchWindows(account, model),
+    });
+    if (!decision.ask || !decision.window) return null;
+    return { account, window: /** @type {any} */ (decision.window), settings, asks, pinKey, sessionId };
+  } catch (/** @type {any} */ err) {
+    reportFailure('[TeamClaude] compactBeforeSwitch: the decision failed, forwarding the request:', err);
+    return null;
+  }
 }
 
 // Outcomes for the exits that return BEFORE beginSession. They never open an

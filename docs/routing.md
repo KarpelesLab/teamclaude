@@ -543,3 +543,47 @@ Rotation is transparent to your Claude Code session, but it's worth knowing how 
 In practice this rarely bites, because TeamClaude prefers to keep you on one account (see [Choosing an account](#choosing-an-account)) — a single account tends to serve a whole session and switches are infrequent.
 
 > [Keep-warm](quota.md#keep-warm) is unrelated to this — it starts an idle account's **5h session timer**, not its prompt cache. An account in another organization still takes a one-turn cache miss after a rotation, regardless.
+
+### Compact before a switch
+
+`compactBeforeSwitch` (off by default) has Claude Code compact a long conversation on the account that still holds its cache, shortly before that account reaches a [switch threshold](quota.md#switch-threshold). The switch that follows then carries a summary to the next account instead of the whole transcript, which that account would otherwise write to its cache at the cache-write price.
+
+```json
+"compactBeforeSwitch": true
+```
+
+or, with the defaults written out:
+
+```json
+"compactBeforeSwitch": { "margin": 0.04, "minBodyBytes": 400000, "cooldownSeconds": 1800 }
+```
+
+**What it does.** Only the client can compact its own conversation, and nothing lets a proxy start a compaction. What the proxy can do is answer one request with the Anthropic API's error for a prompt over the context limit:
+
+```json
+{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 107926 tokens > 107000 maximum"}}
+```
+
+with status `400`. Claude Code reacts to that error by compacting the conversation and retrying the turn. The request that was answered this way is not forwarded, so the provider never sees it and no quota is spent on it. The compaction request that follows is the same conversation, so it goes to the same account, where the transcript is expected to be a cache read.
+
+Read this before turning it on:
+
+- **The client is shown the provider's error wording for a request the provider never saw.** The proxy writes that answer itself. The first number is the request body size in bytes divided by 4, rounded up. The second is the largest multiple of 1000 below it. It is not a model's context limit: the conversation is usually well under the real one. The answer carries no `request-id` header, since upstream issued none.
+- **It relies on how Claude Code behaves, not on a documented contract.** The reporter of [#709](https://github.com/KarpelesLab/teamclaude/issues/709) observed Claude Code 2.1.325 compact and retry on this error, in `claude -p --continue` and in the stream-json mode the IDE extensions use, against a mock upstream. Other versions and other clients were not checked, and neither was what the client does if its compaction request itself fails. A client that does not compact on this error shows it to you as a failed turn.
+- **A compaction discards conversation detail.** The model continues from a summary. With this on, long conversations are compacted earlier than Claude Code would have compacted them by itself.
+- **The saving was inferred, not measured.** In #709 the compaction request shared its prefix with the earlier turns, block for block, so it should be served almost entirely from the cache on the account that served those turns. That was worked out from the structure of the requests against a mock upstream, not observed on a real account. On a pool whose accounts share one organization a switch often does not miss the cache in the first place (see above), and there is less to save.
+- **While an account sits inside the margin, every long conversation on it is asked once.** An account that approaches its weekly threshold slowly stays inside the margin for a long time, so more conversations are compacted than the one switch at the end would have cost. `margin` bounds that.
+
+**When a request is asked.** All of these hold:
+
+- it is a `POST /v1/messages` completion that carries a Claude Code session id. `count_tokens` and every other endpoint are forwarded;
+- its body is at least `minBodyBytes` (default `400000`, about 100k tokens). Body size stands in for the token count because it is known before anything is sent; in #709 bytes divided by 4 matched the client's own count within 1%;
+- the account that served this conversation's last request is a Claude subscription account, and it is the account this request would go to now. A conversation with no earlier request on record is not asked, and neither is one whose account the fleet has already left. Codex accounts, API-key accounts and third-party backends are never asked;
+- that account is within `margin` (default `0.04`) of its switch threshold on the 5-hour window or on the weekly window that gates the request's model, and is not yet at either. The thresholds are the ones rotation uses, per-bucket tables and [per-account thresholds](quota.md#per-account-thresholds) included. An account already at a threshold is not asked, because its compaction request would be sent to the next account, where nothing is cached;
+- nothing pins the request to an account: [`TC_ACCT`, the `/tc-acct/` prefix](#pin-a-session-to-one-account), an operator [session pin](#move-one-running-session) and [keep-warm](quota.md#keep-warm) requests are never asked, since a pinned request does not rotate.
+
+**How often.** A conversation is asked once per `cooldownSeconds` (default `1800`), which is what lets its compaction request through. A client session is asked at most once in two minutes. After those two minutes and until the cooldown ends, a request of that session is asked only if its body is at least as large as the one that was asked: a compacted conversation that its system prompt and tools keep above `minBodyBytes` is left alone until it has grown back. The record is kept in memory, one per server (the MITM tunnels share it), and a restart forgets it.
+
+**Session distribution.** With `distributeSessions` off, one account serves the fleet, so the account in question is the current one, and each long conversation on it is asked as it comes in. With it on, each conversation is held to the account it is pinned to, so only conversations on the account near its threshold are asked.
+
+Invalid values are not an error: anything other than `true` or an object is off, and a field that is not a usable number takes its default (`margin` above 0 and below 1, the other two above 0). The setting is read for each request, so `POST /teamclaude/reload` applies an edit to the next one. Each request answered this way writes one log line naming the session, the account and the window, and shows in the activity log with status `400` and `(compact before switch: <account>)` in place of the account. `GET /teamclaude/status` reports the setting as resolved and the count since start under `compactBeforeSwitch`. An error inside the decision forwards the request.
