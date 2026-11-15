@@ -140,6 +140,8 @@ On by default. Tune or disable via `stormRamp` in the config:
 - **`windowMs`** — after this long, pacing stops entirely (default 30s).
 - **`enabled: false`** — turn storm control off (send the full burst immediately, pre-#84 behavior).
 
+Each number has to be a finite number above 0, written without quotes, and `pollMs` (how often a waiting query re-checks the cap, default 50) a whole number of milliseconds from 5 to 536870911. A value that is not — `"1"`, `0`, a negative number, a field name the ramp does not know — is ignored with one line in the log, and that field keeps its default. `enabled` takes `true` or `false`; any other value is read for its truth, so `0`, `null` and `""` turn storm control off, and is named in the log. The block is read at startup; a reload does not apply a change to it.
+
 The same gate handles rate-limit 429s: TeamClaude pauses the account for the `retry-after` window so new queries wait instead of piling on, then releases the held queries through a fresh ramp (staggered, not all at once).
 
 ## Model-aware routing

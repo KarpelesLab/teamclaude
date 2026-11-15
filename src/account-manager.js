@@ -358,6 +358,82 @@ export function accountSwitchThreshold(acct) {
   return value;
 }
 
+/** @typedef {{ enabled: boolean, startConc: number, stepConc: number, stepMs: number, windowMs: number, pollMs: number }} StormRamp */
+
+// Storm control's defaults (see the constructor, where the ramp is built).
+/** @type {Readonly<StormRamp>} */
+const RAMP_DEFAULTS = Object.freeze({
+  enabled: true,
+  startConc: 1,       // concurrent requests allowed at the instant of a switch
+  stepConc: 1,        // cap increase per stepMs
+  stepMs: 250,        // → +stepConc every 250ms (default ramps ~4 req/s)
+  windowMs: 30_000,   // after this, pacing stops entirely (cap = Infinity)
+  pollMs: 50,         // how often a waiting request re-checks the cap
+});
+
+// pollMs is a timer delay, so it is held to whole milliseconds a timer keeps,
+// from a chosen floor. Node waits no less than 1 ms, so a pollMs of 0 is a
+// 1 ms loop; above that a waiting request re-checks about as often as asked
+// (an awaited loop over 200 ms measured 161 re-checks at 1 ms, 81 at 2 and 32
+// at 5). The floor of 5 holds each waiting request to some 200 re-checks a
+// second, and is the shortest poll the test suite has always run with.
+// admit() waits `pollMs * 4` during a pause, and a delay past 2147483647 ms
+// overflows to 1 ms with a warning each time.
+const POLL_MS_MIN = 5;
+const POLL_MS_MAX = Math.floor(2_147_483_647 / 4);
+
+/**
+ * The storm-control settings admit() will pace by: the config's `stormRamp`
+ * over the defaults, with every value that cannot be used dropped back to its
+ * default and one line telling the operator what was dropped.
+ *
+ * Nothing downstream refuses a bad value, it misbehaves quietly instead: a
+ * quoted "1" makes the cap a string, which reads "10", "11", "12" where it
+ * should read 1, 2, 3, so a herd lands ten at a time; a startConc and
+ * stepConc of 0 hold every request off a just-switched account for the whole
+ * window; a pollMs of 0 makes each waiting request a 1 ms timer loop, and one
+ * too large for a timer does the same with a warning per loop; and a window
+ * of 1e999 (JSON for Infinity) with a cap that never grows holds them for
+ * good, which breaks admit()'s promise that a request is always admitted
+ * eventually. Each number therefore has to be finite and above 0, pollMs a
+ * whole number from the floor POLL_MS_MIN to POLL_MS_MAX, and a field that is
+ * not a setting at all (a typo) is named rather than ignored. `enabled` is
+ * read for its truth, as it always was, so a 0, null or "" keeps storm
+ * control off, but a value that is not true or false is named.
+ * @param {unknown} raw
+ * @returns {StormRamp}
+ */
+export function stormRampSettings(raw) {
+  /** @type {StormRamp} */
+  const ramp = { ...RAMP_DEFAULTS };
+  if (raw == null) return ramp;
+  // As read from the config: a string quoted, an array or object as JSON.
+  const shown = (/** @type {unknown} */ v) => (typeof v === 'string' || (v !== null && typeof v === 'object') ? JSON.stringify(v) : String(v));
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    console.log(`[TeamClaude] stormRamp: ignoring ${safeLine(shown(raw), 40)} — it must be an object, such as {"enabled": false}; storm control keeps its defaults`);
+    return ramp;
+  }
+  const rejected = [];
+  let notBoolean = null;
+  for (const [field, value] of Object.entries(raw)) {
+    if (!Object.hasOwn(RAMP_DEFAULTS, field)) {
+      rejected.push(`${field} (not a setting)`);
+    } else if (field === 'enabled') {
+      ramp.enabled = !!value;
+      if (typeof value !== 'boolean') notBoolean = `enabled ${shown(value)} is not true or false, so it is read as ${ramp.enabled}`;
+    } else if (field === 'pollMs' ? Number.isInteger(value) && value >= POLL_MS_MIN && value <= POLL_MS_MAX : Number.isFinite(value) && value > 0) {
+      /** @type {Record<string, any>} */ (ramp)[field] = value;
+    } else {
+      rejected.push(`${field} ${shown(value)}`);
+    }
+  }
+  const said = [];
+  if (rejected.length) said.push(`ignoring ${rejected.join(', ')} — numbers must be finite and above 0, and pollMs whole milliseconds from ${POLL_MS_MIN} to ${POLL_MS_MAX}; the defaults stand in`);
+  if (notBoolean) said.push(notBoolean);
+  if (said.length) console.log(`[TeamClaude] stormRamp: ${safeLine(said.join('; '), 300)}`);
+  return ramp;
+}
+
 /**
  * Whether a config entry opts its account into the extra-usage fallback: a
  * literal `true`, on an account the fallback can actually bill — an Anthropic
@@ -670,7 +746,7 @@ export class AccountManager {
    * @param {number} [opts.statusStaleMs]
    * @param {number} [opts.forcedRefreshFloorMs]
    * @param {Array<Object>} [opts.routes]
-   * @param {Object} [opts.ramp]
+   * @param {Object} [opts.ramp]  the config's `stormRamp`, checked by stormRampSettings
    * @param {boolean|string} [opts.distributeSessions]
    * @param {Object} [opts.adaptive]
    * @param {Object} [opts.sessionTracker]
@@ -798,16 +874,10 @@ export class AccountManager {
     // hit it at once and instantly throttle it — cascading down the fleet
     // (issue #84). admit() caps concurrent requests to a just-switched account
     // and ramps the cap up over a short window, so the first few reveal whether
-    // it's also near-exhausted before the whole herd commits.
-    this.ramp = {
-      enabled: true,
-      startConc: 1,       // concurrent requests allowed at the instant of a switch
-      stepConc: 1,        // cap increase per stepMs
-      stepMs: 250,        // → +stepConc every 250ms (default ramps ~4 req/s)
-      windowMs: 30_000,   // after this, pacing stops entirely (cap = Infinity)
-      pollMs: 50,         // how often a waiting request re-checks the cap
-      ...ramp,
-    };
+    // it's also near-exhausted before the whole herd commits. The settings are
+    // fixed here, and stormRampSettings is the one way in: a config reload does
+    // not re-read them.
+    this.ramp = stormRampSettings(ramp);
     // When every account reads as over-quota we would otherwise refuse locally
     // forever (a stale cached utilization is never re-validated because no
     // request is ever sent). Instead, allow one real upstream probe at most this
@@ -1171,9 +1241,10 @@ export class AccountManager {
    * Reserve a concurrency slot on `account` before sending upstream. Waits while
    * the account is in a rate-limit pause (a 429's retry-after window) and while
    * it is over its current ramp cap. Fail-open: returns true once a slot is taken
-   * (always eventually — the pause ends and the ramp cap grows), or false if
-   * `isAborted()` reports the client went away while waiting. Pair every `true`
-   * with a `release(index)`.
+   * (always eventually — the pause ends, and the ramp cap starts above 0, grows
+   * and lifts once the window is over; stormRampSettings keeps every number it
+   * is built from finite and above 0), or false if `isAborted()` reports the
+   * client went away while waiting. Pair every `true` with a `release(index)`.
    */
   async admit(index, isAborted) {
     const account = this.accounts[index];
