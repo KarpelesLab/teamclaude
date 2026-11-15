@@ -517,7 +517,7 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, leafH
     // Proxy-Authorization on EVERY CONNECT, including blind-tunneled third-party
     // hosts, where an account pin is meaningless — rejecting there would take
     // down unrelated traffic over a typo meant for Anthropic.
-    const { pin, error } = resolveConnectPin(req, accountManager, config.proxy);
+    const { pin, pins, error } = resolveConnectPin(req, accountManager, config.proxy);
     if (error) {
       log(`[TeamClaude] CONNECT ${host}: ${error}`);
       try {
@@ -552,20 +552,27 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, leafH
     // added, because the pool does not serve that pin on this host: another
     // provider's subscription, or a plain API key (no upstream of its own),
     // such as the one `teamclaude login --api` writes. TC_ACCT rides
-    // HTTPS_PROXY into whatever a session starts. Decided before a
-    // terminating server is built, so a refusal builds none.
+    // HTTPS_PROXY into whatever a session starts. Which pin is refused is
+    // decided now, on the accounts resolveConnectPin resolved it to, before
+    // ensureLeaf() is called: a reload while the leaf loads can remove or
+    // rename the pinned account, and the pin, resolved again after it, would
+    // name nothing and be tunnelled. A CONNECT already waiting keeps its 503
+    // even when that reload removes every account of the provider; the next
+    // one is tunnelled, since the host is no longer intercepted. Decided
+    // before a terminating server is built, too, so a refusal builds none.
     if (leafHosts && !leafHosts.includes(host)) {
+      const provider = providerForHost(host);
+      const pinWantsPool = pins.some((i) => {
+        const account = accountManager.accounts[i];
+        return providerOf(account) === provider || (!isSubscriptionAccount(account) && !!account?.upstream);
+      });
       ensureLeaf()
         .then(({ cert }) => ({ named: leafDnsNames(cert).includes(host), until: ', until the proxy restarts', why: 'the certificate this proxy presents does not name it' }))
         .catch((err) => ({ named: false, until: '', why: `this proxy's certificate could not be loaded (${safeLine(err?.message || err, 160)})` }))
         .then(({ named, until, why }) => {
           if (named) return intercept();
-          const provider = providerForHost(host);
-          if (pin && (resolvePinList(accountManager, pin) || []).some((i) => {
-            const account = accountManager.accounts[i];
-            return providerOf(account) === provider || (!isSubscriptionAccount(account) && !!account?.upstream);
-          })) {
-            log(`[TeamClaude] CONNECT ${host} refused for pin ${redactToken(pin)}: an account added since the proxy started needs that host, and ${why}; a tunnel would serve the pin outside the pool`);
+          if (pinWantsPool) {
+            log(`[TeamClaude] CONNECT ${host} refused for pin ${redactToken(pin)}: it arrived naming an account of that host's provider or an API key with an upstream of its own, and ${why}; a tunnel would serve the pin outside the pool`);
             refuseRaw(clientSocket, '503 Service Unavailable');
             return;
           }
@@ -575,7 +582,7 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, leafH
             const key = `${host}\u0000${why}`;
             if (unnamedReported.has(key)) return;
             unnamedReported.add(key);
-            log(`[TeamClaude] MITM: tunnelling ${host} untouched, on the client's own login${until}: an account added since the proxy started needs that host, and ${why}`);
+            log(`[TeamClaude] MITM: tunnelling ${host} untouched, on the client's own login${until}: it arrived while an account added since the proxy started needed that host, and ${why}`);
           });
         })
         .catch((err) => { log(`[TeamClaude] MITM ${host}: ${err?.message || err}`); reply502Raw(clientSocket); clientSocket.destroy(); });
@@ -612,7 +619,11 @@ export function connectPinToken(req) {
  * a pin that lists several accounts in order (`a,b`, see resolvePinList); the
  * pin is passed on as written and resolved again per request.
  *
- * @returns {{pin: string|null, error: string|null}}
+ * `pins` is what the pin resolved to here, the indices of the accounts it names
+ * in order (none without a pin), so that what the CONNECT itself decides rests
+ * on the same resolution as its 407.
+ *
+ * @returns {{pin: string|null, pins: number[], error: string|null}}
  */
 export function resolveConnectPin(req, accountManager, proxyConfig) {
   // Historically this took the bare apiKey string; accept both so existing
@@ -620,14 +631,15 @@ export function resolveConnectPin(req, accountManager, proxyConfig) {
   // (needed to recognize clientKeys entries in the username slot).
   const proxy = typeof proxyConfig === 'string' ? { apiKey: proxyConfig } : proxyConfig;
   const token = connectPinToken(req);
-  if (!token) return { pin: null, error: null };
+  if (!token) return { pin: null, pins: [], error: null };
   if (resolveClientAuth(proxy, token).ok && (proxy?.apiKey || proxy?.clientKeys?.length)) {
-    return { pin: null, error: null };
+    return { pin: null, pins: [], error: null };
   }
-  if (resolvePinList(accountManager, token) == null) {
-    return { pin: null, error: `Unknown account pin ${redactToken(token)}` };
+  const pins = resolvePinList(accountManager, token);
+  if (pins == null) {
+    return { pin: null, pins: [], error: `Unknown account pin ${redactToken(token)}` };
   }
-  return { pin: token, error: null };
+  return { pin: token, pins, error: null };
 }
 
 // An unrecognized CONNECT username reaches the log, and it is not necessarily a
