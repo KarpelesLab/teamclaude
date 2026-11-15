@@ -4263,7 +4263,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       ctx.resetRedeemTried = true;
       let redeemed = false;
       try {
-        redeemed = !!(await redeemHook?.(resettable))?.redeemed;
+        // The model tells the Claude redeemer which weekly bucket parked each
+        // account; the Codex one has no use for it.
+        redeemed = !!(await redeemHook?.(resettable, { model: ctx.model }))?.redeemed;
       } catch { /* a failed redemption must leave the refusal exactly as it was */ }
       if (redeemed) {
         // No upstream attempt was made, so this costs no retry from the budget:
