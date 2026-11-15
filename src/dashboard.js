@@ -2611,10 +2611,11 @@ export function runningTotals(values) {
   return (values || []).map(function (v) { acc += Number(v) || 0; return acc; });
 }
 
-// Each bucket's average over the `window` buckets ending at it, over buckets
-// from..to-1 only, and null outside them: before recording began there is
-// nothing to average, and the bucket still filling would drag the line down
-// every morning. Near `from` the window is only as long as the history.
+// Each bucket's average over the `window` buckets ending at it, and null
+// wherever a whole window of buckets from..to-1 does not end there: before
+// recording began there is nothing to average, the bucket still filling would
+// drag the line down every morning, and a shorter window labelled as the full
+// one would be a different number under the same name.
 /**
  * @param {(number|null|undefined)[]|null|undefined} values
  * @param {number} window
@@ -2628,21 +2629,22 @@ export function rollingAverage(values, window, from, to) {
   var start = Math.max(0, from || 0);
   var end = to == null ? v.length : Math.min(v.length, to);
   return v.map(function (_, i) {
-    if (i < start || i >= end) return null;
-    var first = Math.max(start, i - w + 1);
+    if (i - w + 1 < start || i >= end) return null;
     var sum = 0;
-    for (var j = first; j <= i; j++) sum += Number(v[j]) || 0;
-    return sum / (i - first + 1);
+    for (var j = i - w + 1; j <= i; j++) sum += Number(v[j]) || 0;
+    return sum / w;
   });
 }
 
 // The line the Per day / Per hour view draws over the bars, from full buckets
 // only (never the one still filling, never one before recording began).
-// Days get a rolling 7-day average, which follows a trend while smoothing
-// the weekends out. Hours get one flat average of the full hours instead: a
-// rolling window of hours would mostly trace the day-and-night cycle, which
-// the bars already show, and read as a trend that is not there. Null with no
-// full bucket to average.
+// With seven full days or more, days get a rolling 7-day average, drawn only
+// where a whole week of full days ends: it follows a trend while smoothing
+// the weekends out. With fewer (a 7-day range, a young history) they get one
+// flat average of the full days there are, named for how many. Hours always
+// get one flat average of the full hours: a rolling window of hours would
+// mostly trace the day-and-night cycle, which the bars already show, and read
+// as a trend that is not there. Null with no full bucket to average.
 /**
  * @param {number[]|null|undefined} values  the bars' totals, one per bucket
  * @param {string} unit  'hour' | 'day'
@@ -2652,21 +2654,47 @@ export function rollingAverage(values, window, from, to) {
 export function insightsTrend(values, unit, from) {
   var v = values || [];
   var n = v.length;
-  if (from >= n - 1) return null;
-  if (unit === 'hour') {
+  var full = n - 1 - from;
+  if (full < 1) return null;
+  if (unit === 'hour' || full < 7) {
     var sum = 0;
     for (var i = from; i < n - 1; i++) sum += Number(v[i]) || 0;
-    var avg = sum / (n - 1 - from);
-    return { values: v.map(function (_, k) { return k >= from && k < n - 1 ? avg : null; }), label: 'average full hour', last: avg };
+    var avg = sum / full;
+    var label = unit === 'hour' ? 'average full hour' : full === 1 ? 'the last full day' : 'average of ' + full + ' full days';
+    return { values: v.map(function (_, k) { return k >= from && k < n - 1 ? avg : null; }), label: label, last: avg };
   }
   var r = rollingAverage(v, 7, from, n - 1);
   return { values: r, label: '7-day average', last: /** @type {number} */ (r[n - 2]) };
+}
+
+// When the page leaves out the calendar and the months, the one line it shows
+// instead, or null when it draws them. They need four weeks of days: a week
+// is one column of calendar and part of a month, and hours have neither. On a
+// young history the line counts the days recorded rather than suggest a range
+// that would show no more, which may be the one already picked.
+/** @param {any} data  a GET /teamclaude/insights reply */
+export function calendarNote(data) {
+  var d = data || {};
+  var n = (d.buckets || []).length;
+  var min = 28;
+  if (d.unit === 'hour') return 'The calendar and the months are drawn by day: pick 30d, 90d or All.';
+  var recorded = n - recordedFrom(d);
+  if ((d.range === 'all' || recorded < n) && recorded < min) {
+    return 'The calendar and the months need four weeks of history (' + recorded + (recorded === 1 ? ' day' : ' days') + ' so far).';
+  }
+  if (n < min) return 'The calendar and the months need four weeks or more: pick 30d, 90d or All.';
+  return null;
 }
 
 // One of the hero's two headlines: the range's estimated API cost or its
 // tokens, against the period before. The cost one says what it left out
 // (tokens on models with no list price), since its figure does not include
 // them; the tokens one carries the request count the old tiles had.
+//
+// Whether there is an earlier period is the reply's `previous` alone, which
+// the server sends exactly when the history covers it, so the two headlines
+// can never disagree about it. A covered period that spent nothing (or
+// nothing priced) says so, rather than that it was not recorded.
 /**
  * @param {any} data  a GET /teamclaude/insights reply
  * @param {string} metric  'tokens' | 'cost'
@@ -2677,21 +2705,24 @@ export function insightsHeadline(data, metric) {
   var t = d.totals || {};
   var p = d.previous;
   var range = d.range || '30d';
+  var span = 'the previous ' + (range === '24h' ? '24 hours' : parseInt(range, 10) + ' days');
   var empty = d.since == null ? 'nothing recorded yet'
     : range === 'all' ? 'since ' + insightsBucketLabel(d.sinceDay || insightsDayKey(d.since), 'day', true)
       : 'no earlier period on record';
   if (metric === 'cost') {
     var c = d.cost;
     if (!c) return { label: 'Est. API cost', value: null, text: '—', change: null, vs: 'this proxy is too old to estimate it', note: '' };
-    var cc = insightsChange(c.total, c.previous, range);
-    return { label: 'Est. API cost', value: c.total, text: fmtUsd(c.total), change: cc ? cc.pill : null, vs: cc ? cc.vs : empty,
+    var cc = p == null ? null : insightsChange(c.total, c.previous, range);
+    return { label: 'Est. API cost', value: c.total, text: fmtUsd(c.total), change: cc ? cc.pill : null,
+      vs: cc ? cc.vs : p == null ? empty : c.previous == null ? 'no estimate for ' + span : 'no priced cost in ' + span,
       note: c.unpricedTokens > 0 ? fmtTokens(c.unpricedTokens) + ' tokens not priced' : 'at API list prices' };
   }
   var tokens = (t.input || 0) + (t.output || 0) + (t.cacheRead || 0) + (t.cacheWrite || 0);
   var prev = p ? (p.input || 0) + (p.output || 0) + (p.cacheRead || 0) + (p.cacheWrite || 0) : null;
   var tc = insightsChange(tokens, prev, range);
   var reqs = t.requests || 0;
-  return { label: 'Tokens', value: tokens, text: fmtTokens(tokens), change: tc ? tc.pill : null, vs: tc ? tc.vs : empty,
+  return { label: 'Tokens', value: tokens, text: fmtTokens(tokens), change: tc ? tc.pill : null,
+    vs: tc ? tc.vs : p == null ? empty : 'no tokens in ' + span,
     note: reqs.toLocaleString('en-US') + (reqs === 1 ? ' request' : ' requests') };
 }
 
@@ -2730,8 +2761,16 @@ export function insightsPace(data, metric, days) {
   var full = [];
   for (var i = Math.max(from, n - 1 - want); i < n - 1; i++) full.push(v[i]);
   if (!full.length) return null;
-  var rate = full.reduce(function (x, y) { return x + y; }, 0) / full.length;
   var span = full.length === 1 ? 'the last full day' : 'the last ' + full.length + ' full days';
+  // A projection is not good to the cent, so the figure is whole dollars (or
+  // fmtTokens' three figures), and the parts the sum shows are rounded first
+  // so the sum on screen adds up to the figure.
+  var cost = metric === 'cost';
+  /** @param {number} x */
+  var part = function (x) { return !cost ? x : x >= 1000 ? Math.round(x) : Math.round(x * 100) / 100; };
+  /** @param {number} x */
+  var whole = function (x) { return cost ? '$' + Math.round(x).toLocaleString('en-US') : fmtTokens(x); };
+  var rate = part(full.reduce(function (x, y) { return x + y; }, 0) / full.length);
   var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(b[n - 1]));
   if (m) {
     var first = m[1] + '-' + m[2] + '-01';
@@ -2745,44 +2784,51 @@ export function insightsPace(data, metric, days) {
     if (start >= 0) {
       var soFar = 0;
       for (var j = start; j < n; j++) soFar += v[j];
+      soFar = part(soFar);
       var dayOf = Number(m[3]);
       var left = new Date(Number(m[1]), Number(m[2]), 0).getDate() - dayOf;
       var month = new Date(Number(m[1]), Number(m[2]) - 1, 1).toLocaleDateString([], { month: 'long' });
-      // Last month by this same day, only when every one of its days is in
-      // the reply and on record: part of a month is not its total, and a
-      // shorter range is not asked again for it. A month with fewer days
-      // than today's date counts all of them.
+      // Against last month's same full days: this month up to yesterday,
+      // and last month's first that many days, only when every day of last
+      // month is in the reply and on record (part of a month is not its
+      // total, and a shorter range is not asked again for it). Today is
+      // still filling, so on the 1st there is nothing to compare yet.
       var prevStart = new Date(Number(m[1]), Number(m[2]) - 2, 1);
       var prevKey = insightsDayKey(prevStart.getTime()).slice(0, 7);
       var prevDays = new Date(Number(m[1]), Number(m[2]) - 1, 0).getDate();
-      var byDay = Math.min(dayOf, prevDays);
+      var byDay = Math.min(dayOf - 1, prevDays);
       var prevAt = b.indexOf(prevKey + '-01');
       /** @type {string|null} */
       var against = null;
-      if (began === false && prevAt >= from && prevAt >= 0 && prevAt + prevDays <= n) {
-        var sameDay = 0;
-        for (var k = prevAt; k < prevAt + byDay; k++) sameDay += v[k];
-        var ch = insightsChange(soFar, sameDay, '30d');
-        if (ch) against = ch.pill + ' against ' + prevStart.toLocaleDateString([], { month: 'long' }) + ' by its day ' + byDay + ' (' + fmt(sameDay) + ')';
+      if (began === false && byDay > 0 && prevAt >= from && prevAt >= 0 && prevAt + prevDays <= n) {
+        var thisFull = 0;
+        for (var t = start; t < n - 1; t++) thisFull += v[t];
+        var sameDays = 0;
+        for (var k = prevAt; k < prevAt + byDay; k++) sameDays += v[k];
+        var ch = insightsChange(thisFull, sameDays, '30d');
+        var prevName = prevStart.toLocaleDateString([], { month: 'long' });
+        if (ch) against = ch.pill + ' against ' + (byDay === 1 ? prevName + '’s first day' : prevName + '’s first ' + byDay + ' days') + ' (' + fmt(sameDays) + ')';
       }
-      return { kind: 'month', label: 'On pace for', value: soFar + rate * left, text: fmt(soFar + rate * left),
+      var value = soFar + rate * left;
+      return { kind: 'month', label: 'On pace for', value: value, text: whole(value),
         sub: month + ': ' + fmt(soFar) + ' so far' + (left > 0 ? ' + ' + fmt(rate) + '/day × ' + left + (left === 1 ? ' day' : ' days') : ', its last day'),
         how: 'Projected: ' + month + ' so far' + (began ? ' (recorded from ' + insightsBucketLabel(sinceDay, 'day', false) + ')' : '') + ', plus the average of ' + span + ' for each day after today.',
         rate: rate, soFar: soFar, left: left, month: month, against: against };
     }
   }
-  return { kind: 'run', label: '30-day pace', value: rate * 30, text: fmt(rate * 30), sub: fmt(rate) + '/day, the average of ' + span,
+  return { kind: 'run', label: '30-day pace', value: rate * 30, text: whole(rate * 30), sub: fmt(rate) + '/day, the average of ' + span,
     how: 'Projected: the average of ' + span + ', times 30.', rate: rate, soFar: null, left: null, month: null, against: null };
 }
 
 // The range's days summed by calendar month, oldest first, for the By month
 // card. A month the range (or recording) starts part-way through says the
 // day it is counted from, so a short bar does not read as a quiet month. The
-// month still running carries the pace's projection when there is one.
+// month still running carries the pace's projection when there is one, and
+// the pace's own text for it, so the bar and the headline print the same figure.
 /**
  * @param {any} data  a GET /teamclaude/insights reply
  * @param {string} metric  'tokens' | 'cost'
- * @returns {{ key: string, label: string, long: string, total: number, days: number, from: string|null, current: boolean, projected: number|null }[]}
+ * @returns {{ key: string, label: string, long: string, total: number, days: number, from: string|null, current: boolean, projected: number|null, projectedText: string|null }[]}
  */
 export function monthTotals(data, metric) {
   var d = data || {};
@@ -2790,7 +2836,7 @@ export function monthTotals(data, metric) {
   var v = insightsTotals(d, metric);
   if (!v) return [];
   var b = d.buckets || [];
-  /** @type {{ key: string, label: string, long: string, total: number, days: number, from: string|null, current: boolean, projected: number|null }[]} */
+  /** @type {{ key: string, label: string, long: string, total: number, days: number, from: string|null, current: boolean, projected: number|null, projectedText: string|null }[]} */
   var out = [];
   for (var i = recordedFrom(d); i < b.length; i++) {
     var day = String(b[i]);
@@ -2799,7 +2845,7 @@ export function monthTotals(data, metric) {
     if (!row || row.key !== key) {
       var start = new Date(Number(key.slice(0, 4)), Number(key.slice(5, 7)) - 1, 1);
       row = { key: key, label: start.toLocaleDateString([], { month: 'short' }), long: start.toLocaleDateString([], { month: 'long', year: 'numeric' }),
-        total: 0, days: 0, from: day.slice(8) === '01' ? null : day, current: false, projected: null };
+        total: 0, days: 0, from: day.slice(8) === '01' ? null : day, current: false, projected: null, projectedText: null };
       out.push(row);
     }
     row.total += v[i];
@@ -2809,7 +2855,7 @@ export function monthTotals(data, metric) {
     var last = out[out.length - 1];
     last.current = true;
     var pace = insightsPace(d, metric);
-    if (pace && pace.kind === 'month') last.projected = pace.value;
+    if (pace && pace.kind === 'month') { last.projected = pace.value; last.projectedText = pace.text; }
   }
   return out;
 }
@@ -2817,10 +2863,12 @@ export function monthTotals(data, metric) {
 // The range's days as a calendar, a column a week from Monday, the way GitHub
 // draws contributions. Each day is shaded by the quarter of the range's
 // active days it falls in rather than by its share of the biggest, so one
-// huge day does not wash the rest out. A day before recording began is
-// marked as not recorded (level -1), apart from an idle day (level 0). Beside
-// it, each weekday's average full day: today is still filling, and would pull
-// its weekday down.
+// huge day does not wash the rest out. The quarters are of full days: today
+// is still filling, and would pull the cuts down. With no spread to cut (one
+// active day, or all alike) every active day takes the top shade. A day
+// before recording began is marked as not recorded (level -1), apart from an
+// idle day (level 0). Beside it, each weekday's average full day, for the
+// same reason.
 /**
  * @param {any} data  a GET /teamclaude/insights reply
  * @param {number[]} values  one per bucket (insightsTotals)
@@ -2832,11 +2880,12 @@ export function calendarGrid(data, values) {
   var from = recordedFrom(d);
   /** @type {number[]} */
   var active = [];
-  for (var i = from; i < b.length; i++) if ((v[i] || 0) > 0) active.push(v[i]);
+  for (var i = from; i < b.length - 1; i++) if ((v[i] || 0) > 0) active.push(v[i]);
   active.sort(function (x, y) { return x - y; });
   var q = function (/** @type {number} */ f) { return active.length ? active[Math.floor(f * (active.length - 1))] : 0; };
   var cuts = [q(0.25), q(0.5), q(0.75)];
-  var level = function (/** @type {number} */ x) { return !(x > 0) ? 0 : x <= cuts[0] ? 1 : x <= cuts[1] ? 2 : x <= cuts[2] ? 3 : 4; };
+  var flat = cuts[0] === cuts[2];
+  var level = function (/** @type {number} */ x) { return !(x > 0) ? 0 : flat ? 4 : x <= cuts[0] ? 1 : x <= cuts[1] ? 2 : x <= cuts[2] ? 3 : 4; };
   /** @type {({ i: number, key: string, value: number, level: number, today: boolean }|null)[][]} */
   var weeks = [];
   /** @type {({ i: number, key: string, value: number, level: number, today: boolean }|null)[]|null} */
@@ -2973,7 +3022,7 @@ const SHARED_HELPERS = [
   peerLinkRequest, peerLinkOutcome, peerTestOutcome, linkSelfOptions, linkBackNotice, instanceLink, parseInstanceLink, linkAddMissing,
   accountSyncRequest, accountSyncUser, accountSyncOwnMode, accountSyncMembers, accountSyncLine, peerSyncCell, accountSyncApprovalHref, accountSyncSignInOutcome, accountSyncCancelOutcome, accountSyncOutcome,
   fmtTokens, fmtUsd, fmtUsdShort, niceCeil, insightsRangeText, insightsChange, insightsBucketLabel, insightsSeries, stackSeries, seriesStats, recordedFrom, insightsDayKey, bucketAt, labelStep, pricedRequests, cacheHitRate, peakBucket, providerRows, topModels, fleetMissingText,
-  insightsTotals, runningTotals, rollingAverage, insightsTrend, insightsHeadline, insightsPace, monthTotals, calendarGrid, breakdownRows,
+  insightsTotals, runningTotals, rollingAverage, insightsTrend, calendarNote, insightsHeadline, insightsPace, monthTotals, calendarGrid, breakdownRows,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -3365,6 +3414,12 @@ const PAGE = `<!doctype html>
   .inslegt tr.off .insl { background: var(--dim) !important; }
   /* The calendar: the grid, and each weekday's average full day beside it. */
   .inscal { display: flex; gap: 14px 22px; flex-wrap: wrap; align-items: flex-start; }
+  /* The calendar's three lower strengths of the metric's colour (the top is
+     solid). Dark is the default theme, and on its dark idle squares the
+     faintest needs more colour to stand apart from them. */
+  .inscal, .inskey { --ish1: .42; --ish2: .6; --ish3: .8; }
+  @media (prefers-color-scheme: light) { :root:not([data-theme="dark"]) .inscal, :root:not([data-theme="dark"]) .inskey { --ish1: .22; --ish2: .45; --ish3: .7; } }
+  :root[data-theme="light"] .inscal, :root[data-theme="light"] .inskey { --ish1: .22; --ish2: .45; --ish3: .7; }
   .inscal svg rect.day { cursor: default; }
   .inswk { display: grid; grid-template-columns: auto minmax(60px, 1fr) auto; gap: 3px 8px; align-items: center; font-size: 11.5px; flex: 1 1 180px; min-width: 0; max-width: 300px; }
   .inswk .k { color: var(--dim); }
@@ -5632,11 +5687,8 @@ ${SHARED_HELPERS}
   var INS_BY = [{ key: 'model', label: 'Models' }, { key: 'account', label: 'Accounts' }, { key: 'provider', label: 'Providers' }, { key: 'machine', label: 'Machines', fleet: true }];
   // Rows "Where it went" draws; the Table view has every one.
   var INS_BY_ROWS = 8;
-  // Days a reply needs before the calendar and the months are drawn: four
-  // weeks, so "All" on a young history is held to the same bar as 30d.
-  var INS_CALENDAR_MIN_DAYS = 28;
   var INSIGHTS_REFRESH_MS = 60 * 1000;
-  var ins = { charts: [], hidden: Object.create(null), range: '30d', split: 'provider', scope: localStorage.getItem(INS_SCOPE_KEY) === 'local' ? 'local' : 'all', metric: localStorage.getItem(INS_METRIC_KEY) === 'tokens' ? 'tokens' : 'cost', view: 'daily', by: 'model', linked: 0, asked: '', data: null, error: null, missing: false, pending: false, at: 0, inFlight: false, tables: Object.create(null), chips: [], drawn: '' };
+  var ins = { charts: [], hidden: Object.create(null), range: '30d', split: 'provider', scope: localStorage.getItem(INS_SCOPE_KEY) === 'local' ? 'local' : 'all', metric: localStorage.getItem(INS_METRIC_KEY) === 'tokens' ? 'tokens' : 'cost', view: 'daily', by: 'model', focus: null, focusables: Object.create(null), linked: 0, asked: '', data: null, error: null, missing: false, pending: false, at: 0, inFlight: false, tables: Object.create(null), chips: [], drawn: '' };
 
   // The scope the page draws: "all" needs this machine to have linked instances.
   function insightsScope() {
@@ -6039,27 +6091,35 @@ ${SHARED_HELPERS}
     tipOn(hit, function (e) {
       var i = at(e);
       insightsCursor(i);
+      var title = insightsBucketLabel(d.buckets[i], d.unit, true) + (i === n - 1 ? ' (so far)' : '');
+      if (i < (o.from || 0)) { showInsightsTip(e, title, [{ why: 'Before recording began: not idle, not recorded.' }]); return; }
+      var none = shown.every(function (sr) { return sr.unpriced; });
       var rows = shown.slice().reverse().map(function (sr) { return { label: sr.label, value: sr.unpriced ? 'not priced' : o.fmt(sr.values[i] || 0), color: sr.color }; });
       var sum = shown.reduce(function (x, sr) { return x + (sr.values[i] || 0); }, 0);
-      if (shown.length > 1) rows.push({ label: 'Total', value: o.fmt(sum), strong: true });
-      if (total) rows.push({ label: 'Running total', value: o.fmt(cols[i].length ? cols[i][cols[i].length - 1][1] : 0), strong: true });
+      if (shown.length > 1) rows.push({ label: 'Total', value: none ? 'not priced' : o.fmt(sum), strong: true });
+      if (total) rows.push({ label: 'Running total', value: none ? 'not priced' : o.fmt(cols[i].length ? cols[i][cols[i].length - 1][1] : 0), strong: true });
       if (o.other) rows.push({ label: o.otherName, value: o.otherFmt(o.other[i] || 0) });
-      showInsightsTip(e, insightsBucketLabel(d.buckets[i], d.unit, true) + (i === n - 1 ? ' (so far)' : ''), rows);
+      showInsightsTip(e, title, rows);
     }, function () { insightsCursor(null); });
   }
 
   // The range's days as a calendar (calendarGrid), each square in the
   // metric's colour at one of four strengths, with each weekday's average
-  // full day beside it. The squares are sized to the card, so a year fits a
-  // phone and a week does not sprawl across a monitor.
+  // full day beside it. The squares are sized to the card, so a week does not
+  // sprawl across a monitor; when even the smallest squares would not fit
+  // (a year on a phone), the latest weeks that do are drawn and a line says
+  // so, rather than the card scrolling sideways. The Table has every day.
   function drawCalendar(host, d, values, mt) {
     var cal = calendarGrid(d, values);
-    var weeks = Math.max(1, cal.weeks.length);
     var wrap = el('div', 'inscal');
     host.appendChild(wrap);
     var room = Math.max(160, host.clientWidth || 600);
     var side = room >= 560 ? 220 : 0;
     var lw = 30;
+    // The smallest square is 5px with a 2px gap.
+    var fit = Math.max(1, Math.floor((room - side - lw) / 7));
+    var shown = cal.weeks.length > fit ? cal.weeks.slice(cal.weeks.length - fit) : cal.weeks;
+    var weeks = Math.max(1, shown.length);
     var cell = Math.max(5, Math.min(18, Math.floor((room - side - lw) / weeks) - 3));
     var gap = cell >= 10 ? 3 : 2;
     var stepx = cell + gap;
@@ -6070,15 +6130,17 @@ ${SHARED_HELPERS}
     [0, 2, 4].forEach(function (r) {
       svgEl('text', { x: 0, y: mt0 + r * stepx + cell - 1 }, s).textContent = cal.weekdays[r].label;
     });
-    var shades = [0.22, 0.45, 0.7, 1];
+    // Each strength is a CSS variable, so the dark theme can lift the faintest
+    // clear of the idle squares' colour.
+    var shades = ['var(--ish1)', 'var(--ish2)', 'var(--ish3)', '1'];
     var pos = [];
     var lastLabel = -99;
-    cal.weeks.forEach(function (week, wi) {
+    shown.forEach(function (week, wi) {
       var x = lw + wi * stepx;
       // A month's name over the first week that holds its 1st, or over the
       // first week drawn when the next month's 1st is not about to take the room.
       var opens = function (w) { return !!w && w.some(function (c) { return c && c.key.slice(8) === '01'; }); };
-      var lead = wi === 0 && !cal.weeks.some(function (w, k) { return k > 0 && k * stepx < 30 && opens(w); });
+      var lead = wi === 0 && !shown.some(function (w, k) { return k > 0 && k * stepx < 30 && opens(w); });
       var firstOf = week.filter(function (c) { return c && (lead || c.key.slice(8) === '01'); })[0];
       if (firstOf && x - lastLabel >= 30 && x + 24 <= W) {
         svgEl('text', { x: x, y: 10 }, s).textContent = new Date(Number(firstOf.key.slice(0, 4)), Number(firstOf.key.slice(5, 7)) - 1, 1).toLocaleDateString([], { month: 'short' });
@@ -6095,9 +6157,10 @@ ${SHARED_HELPERS}
           paint(sq, 'var(--track)');
         } else {
           paint(sq, mt.color);
-          sq.style.fillOpacity = String(shades[c.level - 1]);
+          sq.style.fillOpacity = shades[c.level - 1];
         }
-        if (c.today) { sq.style.stroke = 'var(--text)'; sq.setAttribute('stroke-width', 1); sq.style.strokeDasharray = '2 1.5'; }
+        // Today is outlined solid: a dashed edge is what the key uses for not recorded.
+        if (c.today) { sq.style.stroke = 'var(--text)'; sq.setAttribute('stroke-width', 1.25); }
         pos[c.i] = { x: x, y: y };
         tipOn(sq, function (e) {
           insightsCursor(c.i);
@@ -6140,7 +6203,7 @@ ${SHARED_HELPERS}
     shades.forEach(function (op) {
       var sw = el('i');
       sw.style.background = mt.color;
-      sw.style.opacity = String(op);
+      sw.style.opacity = op;
       key.appendChild(sw);
     });
     key.appendChild(el('span', '', 'More'));
@@ -6148,6 +6211,7 @@ ${SHARED_HELPERS}
     key.appendChild(nr);
     key.appendChild(el('span', '', 'not recorded'));
     host.appendChild(key);
+    if (shown.length < cal.weeks.length) host.appendChild(el('p', 'hint insmore', 'The latest ' + shown.length + ' of ' + cal.weeks.length + ' weeks fit here; the Table has every day.'));
   }
 
   // Calendar months as bars (monthTotals): what each came to, and for the
@@ -6170,7 +6234,6 @@ ${SHARED_HELPERS}
     months.forEach(function (mo, i) {
       var cx = m.l + (i + 0.5) * band;
       var x = cx - bw / 2;
-      var hl = svgEl('rect', { x: m.l + i * band + 1, y: m.t - 18, width: Math.max(1, band - 2), height: ph + 18, rx: 4, fill: 'transparent' }, s);
       if (mo.projected != null && mo.projected > mo.total) {
         var pr = svgEl('rect', { x: x + 0.5, y: Y(mo.projected), width: bw - 1, height: Math.max(1, Y(mo.total) - Y(mo.projected)), rx: 3, 'stroke-width': 1.25, 'stroke-dasharray': '4 3' }, s);
         paint(pr, mt.color, mt.color);
@@ -6180,15 +6243,21 @@ ${SHARED_HELPERS}
       // Values over the bars where they fit; the tooltip has every one.
       if (band >= 40 || i === n - 1) {
         var lab = svgEl('text', { x: cx, y: Y(Math.max(mo.total, mo.projected || 0)) - 6, 'text-anchor': 'middle' }, s);
-        lab.textContent = (mo.projected != null ? '≈ ' : '') + mt.axis(mo.projected != null ? mo.projected : mo.total);
+        // The pace headline's own text, so the two never disagree.
+        lab.textContent = mo.projectedText != null ? '≈ ' + mo.projectedText : mt.axis(mo.total);
         if (mo.projected == null) lab.style.fill = 'var(--text)';
       }
       svgEl('text', { x: cx, y: H - 18, 'text-anchor': 'middle' }, s).textContent = mo.label;
       var note = mo.current ? (mo.projected != null ? 'so far' : 'to date') : mo.from ? 'from ' + Number(mo.from.slice(8)) : '';
       if (note && band >= 34) svgEl('text', { x: cx, y: H - 5, 'text-anchor': 'middle', class: 'insref' }, s).textContent = note;
+    });
+    // Each month's hover area goes on top of its bar, projection and labels,
+    // or the marks would take the pointer and the tooltip never open.
+    months.forEach(function (mo, i) {
+      var hl = svgEl('rect', { x: m.l + i * band + 1, y: m.t - 18, width: Math.max(1, band - 2), height: ph + 18, rx: 4, fill: 'transparent' }, s);
       tipOn(hl, function (e) {
         var rows = [{ label: mo.current ? 'So far' : 'Total', value: mt.fmt(mo.total), color: mt.color }, { label: 'Days counted', value: String(mo.days) }];
-        if (mo.projected != null) rows.push({ label: 'On pace for', value: mt.fmt(mo.projected), strong: true }, { why: 'Projected from the last full days; not a measurement.' });
+        if (mo.projectedText != null) rows.push({ label: 'On pace for', value: mo.projectedText, strong: true }, { why: 'Projected from the last full days; not a measurement.' });
         if (mo.from && !mo.current) rows.push({ why: 'Counted from ' + insightsBucketLabel(mo.from, 'day', false) + ': the range or the history starts there.' });
         showInsightsTip(e, mo.long, rows);
       });
@@ -6306,12 +6375,15 @@ ${SHARED_HELPERS}
     if (rows.length > INS_BY_ROWS) host.appendChild(el('p', 'hint insmore', (rows.length - INS_BY_ROWS) + ' more in the Table view.'));
   }
 
-  // A row of mutually exclusive buttons inside a card's header.
-  function segmented(host, options, current, pick) {
+  // A row of mutually exclusive buttons inside a card's header. Picking one
+  // redraws the page, so the button picked is focused again afterwards.
+  function segmented(host, group, options, current, pick) {
     var seg = el('div', 'inseg');
     options.forEach(function (o) {
-      var b = button(o.key === current ? 'sel' : '', o.label, function () { if (o.key !== current) pick(o.key); });
+      var key = 'seg:' + group + ':' + o.key;
+      var b = button(o.key === current ? 'sel' : '', o.label, function () { if (o.key === current) return; ins.focus = key; pick(o.key); });
       b.setAttribute('aria-pressed', o.key === current ? 'true' : 'false');
+      ins.focusables[key] = b;
       seg.appendChild(b);
     });
     host.appendChild(seg);
@@ -6332,7 +6404,11 @@ ${SHARED_HELPERS}
     head.appendChild(t);
     var tools = el('div', 'instools');
     if (o.tools) o.tools(tools);
-    if (table) tools.appendChild(button('btn', ins.tables[key] ? 'Chart' : 'Table', function () { ins.tables[key] = !ins.tables[key]; renderInsights(); }));
+    if (table) {
+      var tb = button('btn', ins.tables[key] ? 'Chart' : 'Table', function () { ins.tables[key] = !ins.tables[key]; ins.focus = 'table:' + key; renderInsights(); });
+      ins.focusables['table:' + key] = tb;
+      tools.appendChild(tb);
+    }
     head.appendChild(tools);
     card.appendChild(head);
     var body = el('div');
@@ -6373,8 +6449,10 @@ ${SHARED_HELPERS}
           if (ins.metric === k) return;
           ins.metric = k;
           localStorage.setItem(INS_METRIC_KEY, k);
+          ins.focus = 'metric:' + k;
           renderInsights();
         });
+        ins.focusables['metric:' + k] = b;
       }
       var l = el('span', 'l');
       l.appendChild(el('i'));
@@ -6413,7 +6491,18 @@ ${SHARED_HELPERS}
     return (body.clientWidth > 0 ? 'w' : '-') + '|' + accounts.map(function (a) { return accountGroup(a) + '/' + a.name; }).join('|');
   }
 
+  // Every redraw rebuilds the page's controls, so the one a keyboard user just
+  // pressed (ins.focus, a key in ins.focusables) is focused again afterwards,
+  // as the legend rows already are.
   function renderInsights() {
+    ins.focusables = Object.create(null);
+    drawInsights();
+    var again = ins.focus ? ins.focusables[ins.focus] : null;
+    ins.focus = null;
+    if (again && again.focus) again.focus();
+  }
+
+  function drawInsights() {
     hideInsightsTip();
     ins.charts = [];
     ins.drawn = insightsDrawnKey();
@@ -6469,6 +6558,8 @@ ${SHARED_HELPERS}
       insightsSeries(d, splitKey, accounts).forEach(function (sr) { tokenTotals[sr.key] = sr.total; });
       series.forEach(function (sr) { sr.unpriced = !(sr.total > 0) && tokenTotals[sr.key] > 0; });
     }
+    // One total of nothing priced, with tokens the estimate left out: not $0 either.
+    if (metric === 'cost' && oneTotal && !(series[0].total > 0) && d.cost && d.cost.unpricedTokens > 0) series[0].unpriced = true;
     var running = ins.view === 'total';
     var heroTitle = running ? 'Running total of the ' + (metric === 'cost' ? 'estimated API cost' : 'tokens')
       : (metric === 'cost' ? 'Estimated API cost ' : 'Tokens ') + perBucket;
@@ -6489,24 +6580,35 @@ ${SHARED_HELPERS}
       });
       legendTable(host, series, mt.fmt, from);
     }, function () {
+      // The numbers of the view picked: a running total reads as one, and a
+      // bucket from before recording began or a series with no price says so.
+      var view = function (vals) { return running ? runningTotals(vals) : vals; };
+      var many = series.length > 1;
+      var cells = series.map(function (sr) { return view(sr.values); });
+      var tot = view(values);
+      var oth = otherValues ? view(otherValues) : null;
+      var suffix = running ? ' (running total)' : '';
+      var allUnpriced = series.every(function (sr) { return sr.unpriced; });
       return {
-        cols: ['When'].concat(series.length > 1 ? series.map(function (sr) { return sr.label; }) : [], [mt.name], otherValues ? [ot.name] : []),
+        cols: ['When'].concat(many ? series.map(function (sr) { return sr.label + suffix; }) : [], [mt.name + suffix], oth ? [ot.name + suffix] : []),
         rows: d.buckets.map(function (b, i) {
-          return [when(b)].concat(series.length > 1 ? series.map(function (sr) { return mt.fmt(sr.values[i] || 0); }) : [], [mt.fmt(values[i])], otherValues ? [ot.fmt(otherValues[i])] : []);
+          if (i < from) return [when(b)].concat(many ? series.map(function () { return 'not recorded'; }) : [], ['not recorded'], oth ? ['not recorded'] : []);
+          return [when(b)].concat(many ? series.map(function (sr, k) { return sr.unpriced ? 'not priced' : mt.fmt(cells[k][i] || 0); }) : [],
+            [allUnpriced ? 'not priced' : mt.fmt(tot[i])], oth ? [ot.fmt(oth[i])] : []);
         }).reverse(),
       };
     }, { bare: true, tools: function (tools) {
-      segmented(tools, [{ key: 'daily', label: hourly ? 'Per hour' : 'Per day' }, { key: 'total', label: 'Running total' }], running ? 'total' : 'daily', function (k) { ins.view = k; renderInsights(); });
+      segmented(tools, 'view', [{ key: 'daily', label: hourly ? 'Per hour' : 'Per day' }, { key: 'total', label: 'Running total' }], running ? 'total' : 'daily', function (k) { ins.view = k; renderInsights(); });
     } });
 
     var missed = fleet ? fleetMissingText(d) : null;
     if (missed) body.appendChild(el('p', 'sub', missed));
 
-    // By day and by month: patterns over weeks and months. A week of days is
-    // one column of calendar and part of a month, and hours have neither, so
-    // a reply shorter than four weeks shows one line saying what they need.
-    if (hourly || d.buckets.length < INS_CALENDAR_MIN_DAYS) {
-      body.appendChild(el('p', 'hint insshort', 'The calendar and the months need a range of 30 days or more: pick 30d, 90d or All.'));
+    // By day and by month: patterns over weeks and months, or one line saying
+    // what they need (calendarNote).
+    var calNote = calendarNote(d);
+    if (calNote) {
+      body.appendChild(el('p', 'hint insshort', calNote));
     } else {
       var months = monthTotals(d, metric);
       var showMonths = months.length > 1 || (months.length === 1 && months[0].projected != null);
@@ -6524,7 +6626,7 @@ ${SHARED_HELPERS}
         }, function () {
           return { cols: ['Month', mt.name, 'Days counted', 'On pace for'],
             rows: months.slice().reverse().map(function (mo) {
-              return [mo.long + (mo.from && !mo.current ? ' (from ' + insightsBucketLabel(mo.from, 'day', false) + ')' : ''), mt.fmt(mo.total), String(mo.days), mo.projected == null ? '' : mt.fmt(mo.projected) + ' (projected)'];
+              return [mo.long + (mo.from && !mo.current ? ' (from ' + insightsBucketLabel(mo.from, 'day', false) + ')' : ''), mt.fmt(mo.total), String(mo.days), mo.projectedText == null ? '' : mo.projectedText + ' (projected)'];
             }) };
         });
       }
@@ -6544,7 +6646,7 @@ ${SHARED_HELPERS}
             r.perMillion == null ? '—' : fmtUsd(r.perMillion), r.hit == null ? '—' : (r.hit * 100).toFixed(1) + '%', r.share == null ? '—' : pctOf(r.share)];
         }) };
     }, { tools: function (tools) {
-      segmented(tools, byOpts, by, function (k) { ins.by = k; renderInsights(); });
+      segmented(tools, 'by', byOpts, by, function (k) { ins.by = k; renderInsights(); });
     } });
   }
 

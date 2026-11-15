@@ -1329,7 +1329,7 @@ test('the Insights headlines pick the metric and remember it; the views redraw w
   await page.answer(200, priced);
   assert.equal(page.byId('insNote').style.display, 'none');
   // Two days are too few for a calendar or months: one line says what they need.
-  assert.ok(page.built.some(e => /need a range of 30 days or more/.test(String(e.textContent))), 'the short-range line');
+  assert.ok(page.built.some(e => /need four weeks/.test(String(e.textContent))), 'the short-range line');
   const heads = () => page.built.filter(e => typeof e.className === 'string' && /^inshead( sel)?$/.test(e.className));
   assert.equal(heads().slice(-2)[0].className, 'inshead sel', 'the cost is drawn first');
   heads().slice(-1)[0].fire('click');
@@ -1348,6 +1348,53 @@ test('the Insights headlines pick the metric and remember it; the views redraw w
   assert.equal(old.byId('insNote').style.display, 'none');
   const oldHeads = old.built.filter(e => typeof e.className === 'string' && /^inshead( sel)?$/.test(e.className));
   assert.deepEqual(oldHeads.map(e => e.className), ['inshead', 'inshead sel'], 'no cost to draw: the tokens are');
+});
+
+// The hero's Table says what the chart shows: the view picked (a running
+// total adds up), "not recorded" before recording began, and "not priced"
+// for cost with no price, whether split by provider or drawn as one total.
+test('the Insights hero table follows the view, and says not recorded and not priced rather than $0', async () => {
+  const page = bootPage();
+  await page.answer(200, { accounts: [{ name: 'g', provider: 'grok' }] });
+  page.click('Insights');
+  const unpriced = {
+    ...INSIGHTS, since: 1, sinceDay: '2026-01-02',
+    totals: { requests: 1, input: 5, output: 0, cacheRead: 0, cacheWrite: 0 },
+    kinds: { cacheRead: [0, 0], cacheWrite: [0, 0], input: [0, 5], output: [0, 0] },
+    cost: { total: 0, values: [0, 0], previous: null, unpricedTokens: 5 },
+    providers: [{ provider: 'grok', tokens: 5, cost: 0, requests: 1, values: [0, 5], requestValues: [0, 1], costValues: [0, 0] }],
+    accounts: [{ provider: 'grok', account: 'g', tokens: 5, cost: 0, requests: 1, values: [0, 5], requestValues: [0, 1], costValues: [0, 0] }],
+    models: [{ provider: 'grok', model: 'grok-4', tokens: 5, requests: 1, cost: null }],
+  };
+  await page.answer(200, unpriced);
+  // Table and legend cells; the headline's own $0 is the priced total, with
+  // the tokens it could not price named under it.
+  const zeroCells = (/** @type {number} */ since) => page.built.slice(since).filter(e => e.className === 'num' && e.textContent === '$0').length;
+  let at = page.built.length;
+  page.click('Table');
+  assert.ok(page.labelled('not recorded') >= 1, 'the day before recording began');
+  assert.ok(page.labelled('not priced') >= 1, 'Grok by provider');
+  assert.equal(zeroCells(at), 0, 'no $0 for a cost with no price');
+  at = page.built.length;
+  page.click('Token type');
+  assert.ok(page.labelled('not priced') >= 1, 'one total of nothing priced');
+  assert.equal(zeroCells(at), 0);
+
+  const priced = bootPage();
+  await priced.answer(200, { accounts: [{ name: 'a', provider: 'anthropic' }] });
+  priced.click('Insights');
+  await priced.answer(200, {
+    ...INSIGHTS,
+    cost: { total: 3, values: [1, 2], previous: null, unpricedTokens: 0 },
+    providers: [{ provider: 'anthropic', tokens: 10, cost: 3, requests: 2, values: [5, 5], requestValues: [1, 1], costValues: [1, 2] }],
+    models: [{ provider: 'anthropic', model: 'claude-opus-5-5', tokens: 10, requests: 2, cost: 3 }],
+  });
+  priced.click('Table');
+  assert.ok(priced.labelled('$2.00') >= 1, 'per day: the second day alone');
+  priced.click('Running total');
+  assert.ok(priced.labelled('$3.00') >= 1, 'running total: both days');
+  assert.equal(priced.labelled('$2.00'), 0, 'no day-by-day figure under a running total');
+  assert.ok(priced.labelled('Est. API cost (running total)') >= 1, 'the column says which');
 });
 
 // A failed read is throttled like a successful one: a proxy answering 404 or

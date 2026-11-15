@@ -11,7 +11,7 @@ import {
   insightsSeries, stackSeries, topModels, fmtUsd, fmtUsdShort, fleetMissingText,
   seriesStats, cacheHitRate, peakBucket, providerRows,
   recordedFrom, insightsDayKey, bucketAt, labelStep, pricedRequests,
-  insightsTotals, runningTotals, rollingAverage, insightsTrend, insightsHeadline, insightsPace, monthTotals, calendarGrid, breakdownRows,
+  insightsTotals, runningTotals, rollingAverage, insightsTrend, calendarNote, insightsHeadline, insightsPace, monthTotals, calendarGrid, breakdownRows,
 } from '../src/dashboard.js';
 
 test('the page ships every Insights helper it is tested against', () => {
@@ -19,7 +19,7 @@ test('the page ships every Insights helper it is tested against', () => {
   for (const fn of [fmtTokens, niceCeil, insightsRangeText, insightsChange, insightsBucketLabel, insightsSeries, stackSeries, topModels, fmtUsd, fmtUsdShort, fleetMissingText,
     seriesStats, cacheHitRate, peakBucket, providerRows,
     recordedFrom, insightsDayKey, bucketAt, labelStep, pricedRequests,
-    insightsTotals, runningTotals, rollingAverage, insightsTrend, insightsHeadline, insightsPace, monthTotals, calendarGrid, breakdownRows]) {
+    insightsTotals, runningTotals, rollingAverage, insightsTrend, calendarNote, insightsHeadline, insightsPace, monthTotals, calendarGrid, breakdownRows]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
   assert.ok(html.includes('id="page-insights"'), 'the page section');
@@ -399,6 +399,31 @@ test('the headlines: cost and tokens against the period before, and what the cos
   assert.equal(insightsHeadline({ ...data, since: null, previous: null }, 'tokens').vs, 'nothing recorded yet');
 });
 
+test('the headlines: a covered earlier period that spent nothing says so, and both agree whether it exists', () => {
+  const zero = { requests: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+  const covered = { ...data, previous: zero, cost: { total: 30, values: [10, 20], previous: 0, unpricedTokens: 0 } };
+  assert.equal(insightsHeadline(covered, 'tokens').vs, 'no tokens in the previous 7 days');
+  assert.equal(insightsHeadline(covered, 'cost').vs, 'no priced cost in the previous 7 days');
+  assert.equal(insightsHeadline(covered, 'cost').change, null);
+  // Tokens then, but nothing priced: still a covered period.
+  assert.equal(insightsHeadline({ ...covered, previous: data.previous }, 'cost').vs, 'no priced cost in the previous 7 days');
+  assert.equal(insightsHeadline({ ...covered, cost: { ...covered.cost, previous: null } }, 'cost').vs, 'no estimate for the previous 7 days');
+  // No earlier period: both headlines say so, whatever the cost field carries.
+  const none = { ...data, previous: null, cost: { total: 30, values: [10, 20], previous: 5, unpricedTokens: 0 } };
+  assert.equal(insightsHeadline(none, 'cost').vs, 'no earlier period on record');
+  assert.equal(insightsHeadline(none, 'tokens').vs, 'no earlier period on record');
+});
+
+test('the calendar note: what the calendar and months need, never the range already picked', () => {
+  const reply = (/** @type {string} */ range, /** @type {number} */ n, /** @type {string} */ sinceDay) => ({ range, unit: 'day', buckets: dayRun('2026-10-17', n), since: 1, sinceDay });
+  assert.equal(calendarNote(reply('30d', 30, '2026-01-01')), null);
+  assert.equal(calendarNote(reply('7d', 7, '2026-01-01')), 'The calendar and the months need four weeks or more: pick 30d, 90d or All.');
+  // All on a 12-day history is all there is: the note counts the days.
+  assert.equal(calendarNote(reply('all', 12, '2026-10-17')), 'The calendar and the months need four weeks of history (12 days so far).');
+  assert.equal(calendarNote(reply('30d', 30, '2026-11-04')), 'The calendar and the months need four weeks of history (12 days so far).');
+  assert.equal(calendarNote({ ...reply('24h', 24, '2026-01-01'), unit: 'hour' }), 'The calendar and the months are drawn by day: pick 30d, 90d or All.');
+});
+
 test('the pace: the month so far plus the last seven full days\' average for each day after today', () => {
   // Oct 28 to Nov 10: $10 every full day, $4 so far today.
   const reply = costReply([10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 4]);
@@ -407,7 +432,8 @@ test('the pace: the month so far plus the last seven full days\' average for eac
   assert.equal(pace.label, 'On pace for');
   // Nov 1 to 10 is $94; 20 days of November follow the 10th.
   assert.deepEqual([pace.soFar, pace.rate, pace.left, pace.value], [94, 10, 20, 294]);
-  assert.equal(pace.text, '$294.00');
+  // A projection is whole dollars, and the sum shown adds up to it.
+  assert.equal(pace.text, '$294');
   assert.equal(pace.sub, monthName(10) + ': $94.00 so far + $10.00/day × 20 days');
   assert.match(pace.how, /^Projected: /);
   // Today is never a full day: a quiet morning does not drag the rate down.
@@ -440,7 +466,7 @@ test('the pace: a range that misses the 1st is a 30-day run rate, hours are the 
   const week = costReply([5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 1]);
   week.buckets = dayRun('2026-11-03', 14);
   const run = /** @type {any} */ (insightsPace(week, 'cost'));
-  assert.deepEqual([run.kind, run.label, run.value, run.text], ['run', '30-day pace', 150, '$150.00']);
+  assert.deepEqual([run.kind, run.label, run.value, run.text], ['run', '30-day pace', 150, '$150']);
   assert.equal(run.sub, '$5.00/day, the average of the last 7 full days');
   const hours = { ...week, unit: 'hour', buckets: week.buckets.map((_, i) => i * 3600000) };
   const peak = /** @type {any} */ (insightsPace(hours, 'cost'));
@@ -455,10 +481,12 @@ test('the pace: a range that misses the 1st is a 30-day run rate, hours are the 
 test('months: each calendar month in the range, the first counted from where it starts, the last with its projection', () => {
   const reply = costReply([10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 4]);
   const months = monthTotals(reply, 'cost');
-  assert.deepEqual(months.map(m => [m.key, m.total, m.days, m.from, m.current, m.projected]), [
-    ['2026-10', 40, 4, '2026-10-28', false, null],
-    ['2026-11', 94, 10, null, true, 294],
+  assert.deepEqual(months.map(m => [m.key, m.total, m.days, m.from, m.current, m.projected, m.projectedText]), [
+    ['2026-10', 40, 4, '2026-10-28', false, null, null],
+    ['2026-11', 94, 10, null, true, 294, '$294'],
   ]);
+  // The bar's label is the pace headline's own text.
+  assert.equal(months[1].projectedText, /** @type {any} */ (insightsPace(reply, 'cost')).text);
   assert.equal(months[1].long, new Date(2026, 10, 1).toLocaleDateString([], { month: 'long', year: 'numeric' }));
   // Days before recording began are not a quiet start to the month.
   const late = monthTotals(costReply([0, 0, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 4], { sinceDay: '2026-10-30' }), 'cost');
@@ -473,9 +501,10 @@ test('the calendar: weeks from Monday, shaded by quarter of active days, with ea
   const reply = { unit: 'day', buckets: dayRun('2026-11-02', 14), since: 1, sinceDay: '2026-01-01' };
   const cal = calendarGrid(reply, values);
   assert.equal(cal.weeks.length, 2);
-  assert.deepEqual(cal.cuts, [3, 5, 7]);
-  assert.deepEqual(cal.weeks[0].map(c => c && c.level), [1, 1, 1, 2, 0, 0, 0]);
-  assert.deepEqual(cal.weeks[1].map(c => c && c.level), [2, 3, 3, 4, 0, 0, 4]);
+  // The quarters are of full days: today's 9 is shaded but not in the cuts.
+  assert.deepEqual(cal.cuts, [2, 4, 6]);
+  assert.deepEqual(cal.weeks[0].map(c => c && c.level), [1, 1, 2, 2, 0, 0, 0]);
+  assert.deepEqual(cal.weeks[1].map(c => c && c.level), [3, 3, 4, 4, 0, 0, 4]);
   assert.equal(cal.weeks[1][6]?.today, true);
   // Mondays: 1 and 5. Sunday's only full day was idle; today is not one.
   assert.equal(cal.weekdays[0].avg, 3);
@@ -489,6 +518,9 @@ test('the calendar: weeks from Monday, shaded by quarter of active days, with ea
   // A range that starts mid-week leaves the days before it empty.
   const mid = calendarGrid({ ...reply, buckets: dayRun('2026-11-04', 3) }, [1, 1, 1]);
   assert.deepEqual(mid.weeks[0].map(c => (c ? c.key : null)), [null, null, '2026-11-04', '2026-11-05', '2026-11-06', null, null]);
+  // No spread to cut (alike days, or one active day): the top shade, not the faintest.
+  assert.deepEqual(mid.weeks[0].slice(2, 5).map(c => c && c.level), [4, 4, 4]);
+  assert.deepEqual(calendarGrid({ ...reply, buckets: dayRun('2026-11-04', 3) }, [0, 7, 2]).weeks[0].slice(2, 5).map(c => c && c.level), [0, 4, 4]);
   assert.deepEqual(calendarGrid({ ...reply, unit: 'hour' }, values).weeks, [], 'hours have no calendar');
 });
 
@@ -541,19 +573,26 @@ test('where it went: an account row carries its own values per bucket, in the me
   assert.equal(breakdownRows(detailed, 'model', 'cost')[0].values, null, 'only accounts have them');
 });
 
-test('a rolling average over full, recorded buckets only', () => {
-  assert.deepEqual(rollingAverage([2, 4, 6, 8], 2), [2, 3, 5, 7]);
-  // Before recording began and the bucket still filling are left out, and the
-  // window starts no earlier than the history does.
-  assert.deepEqual(rollingAverage([9, 9, 2, 4, 6, 1], 3, 2, 5), [null, null, 2, 3, 4, null]);
+test('a rolling average only where a whole window of full, recorded buckets ends', () => {
+  assert.deepEqual(rollingAverage([2, 4, 6, 8], 2), [null, 3, 5, 7]);
+  // Before recording began and the bucket still filling are left out, and no
+  // shorter window is passed off as the full one.
+  assert.deepEqual(rollingAverage([9, 9, 2, 4, 6, 1], 3, 2, 5), [null, null, null, null, 4, null]);
   assert.deepEqual(rollingAverage(null, 7), []);
 });
 
 test('the trend: a 7-day rolling average on days, one flat average of full hours on hours', () => {
-  const days = insightsTrend([7, 7, 7, 7, 7, 7, 14, 14, 1], 'day', 0);
-  assert.deepEqual(days?.values, [7, 7, 7, 7, 7, 7, 8, 9, null]);
+  // Eight full days and today: a point only where seven full days end.
+  const days = insightsTrend([3, 9, 4, 12, 5, 7, 14, 20, 2], 'day', 0);
+  assert.deepEqual(days?.values, [null, null, null, null, null, null, 54 / 7, 71 / 7, null]);
   assert.equal(days?.label, '7-day average');
-  assert.equal(days?.last, 9);
+  assert.equal(days?.last, 71 / 7);
+  // Fewer than seven full days (a 7-day range, a young history): one flat
+  // average of the full days there are, named for how many.
+  const few = insightsTrend([3, 9, 4, 1], 'day', 0);
+  assert.deepEqual(few?.values, [16 / 3, 16 / 3, 16 / 3, null]);
+  assert.equal(few?.label, 'average of 3 full days');
+  assert.equal(insightsTrend([0, 6, 1], 'day', 1)?.label, 'the last full day');
   const hours = insightsTrend([0, 0, 4, 8, 3], 'hour', 2);
   assert.deepEqual(hours?.values, [null, null, 6, 6, null], 'the hour still filling is not one of them');
   assert.equal(hours?.label, 'average full hour');
@@ -567,8 +606,16 @@ test('the pace: against last month by the same day, only when all of last month 
   const reply = costReply(values);
   reply.buckets = dayRun('2026-10-01', values.length);
   const pace = /** @type {any} */ (insightsPace(reply, 'cost'));
-  // November so far is $94; October by its day 10 was $50.
-  assert.equal(pace.against, '▲ 88% against ' + monthName(9) + ' by its day 10 ($50.00)');
+  // Full days only: November 1 to 9 is $90, October's first 9 days were $45.
+  assert.equal(pace.against, '▲ 100% against ' + monthName(9) + '\u2019s first 9 days ($45.00)');
+  // Flat usage early in the month is level with last month, whatever today has so far.
+  const flat = costReply([...Array(31).fill(10), 10, 3]);
+  flat.buckets = dayRun('2026-10-01', 33);
+  assert.equal(/** @type {any} */ (insightsPace(flat, 'cost')).against, '0% against ' + monthName(9) + '\u2019s first day ($10.00)');
+  // On the 1st there is no full day of this month to compare yet.
+  const first = costReply([...Array(31).fill(10), 3]);
+  first.buckets = dayRun('2026-10-01', 32);
+  assert.equal(/** @type {any} */ (insightsPace(first, 'cost')).against, null);
   // A range that starts on Oct 2 does not have all of October.
   const cut = (/** @type {number[]} */ a) => a.slice(1);
   const short = { ...reply, buckets: dayRun('2026-10-02', values.length - 1), cost: { ...reply.cost, values: cut(values) },
