@@ -5,7 +5,7 @@ import { once } from 'node:events';
 import { ReadableStream } from 'node:stream/web';
 import { Writable } from 'node:stream';
 import { TextEncoder, TextDecoder } from 'node:util';
-import { upstreamFetch, DEFAULT_HEADERS_TIMEOUT_MS } from '../src/upstream-fetch.js';
+import { upstreamFetch, resolveHeadersTimeout, DEFAULT_HEADERS_TIMEOUT_MS } from '../src/upstream-fetch.js';
 import { readWithIdleTimeout, streamResponse, createProxyServer } from '../src/server.js';
 import { AccountManager } from '../src/account-manager.js';
 import { withEnv } from '../test-helpers/env.js';
@@ -223,6 +223,29 @@ test('the env override beats the caller default', async () => {
     else process.env.TEAMCLAUDE_UPSTREAM_HEADERS_TIMEOUT_MS = prev;
     server.close();
   }
+});
+
+// setTimeout keeps its delay in a signed 32-bit integer and fires a larger one
+// after 1 ms, so a headers-timeout setting meant as "practically never" cut
+// the wait for every head at about 1 ms: a backend answering in 50 ms was a
+// "socket hang up" about 10 ms in. It is read as the longest delay a timer
+// holds instead, as the body-idle setting is. Asserted on the value, which is
+// what the head timer is armed with.
+test('a headers-timeout setting past the timer range is read as the longest timer, not as 1 ms', async () => {
+  const HEAD = 'TEAMCLAUDE_UPSTREAM_HEADERS_TIMEOUT_MS';
+  await withEnv({ [HEAD]: 99_999_999_999 }, () => {
+    assert.equal(resolveHeadersTimeout(null), 2 ** 31 - 1);
+    assert.equal(resolveHeadersTimeout(null, 300_000), 2 ** 31 - 1, "over a caller's default too");
+  });
+  await withEnv({ [HEAD]: 'Infinity' }, () => {
+    assert.equal(resolveHeadersTimeout(null), 2 ** 31 - 1);
+  });
+  await withEnv({ [HEAD]: 2 ** 31 }, () => {
+    assert.equal(resolveHeadersTimeout(null), 2 ** 31 - 1, 'one past it is read as it');
+  });
+  await withEnv({ [HEAD]: 2 ** 31 - 1 }, () => {
+    assert.equal(resolveHeadersTimeout(null), 2 ** 31 - 1, 'the longest timer itself is kept');
+  });
 });
 
 // ── the same deadline while an answer is held ───────────────────────────────
