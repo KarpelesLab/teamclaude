@@ -25,6 +25,7 @@ import { createEgressGuard } from './egress-guard.js';
 import { createDrainState, DRAIN_RETRY_AFTER_SECONDS } from './drain.js';
 import { isRoutingFailure, describeRouting } from './account-routing.js';
 import { safeLine } from './safe-text.js';
+import { upstreamErrorType } from './error-type.js';
 import { forwardRefusal, guardedLookup, FORBIDDEN_FORWARD } from './forward-target.js';
 import { renderDashboardHtml, dashboardCsp } from './dashboard.js';
 import { createUsageRecorder, resolveUsageDimensions, usageDimensionHeaderNames } from './client-usage.js';
@@ -2264,7 +2265,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // stripOverage, synthesizeQuota and poolQuota are sampled once here, at dispatch:
       // retries and holds of this request keep them, and a reload applies to
       // subsequent requests.
-      const ctx = { account: null, callerRequestId: callerId, status: null, attempt: 0, tried: new Set(), reauthed: new Set(), model, advisorModel, streamRequested: parseRequestStream(body), fleetMessageThreads: config?.messageThreads === true, pinnedIndex, pinChain, provider, holdBudgetMs: holdMs, pinKey, onMessage, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, stripOverage: shouldStripOverageHeaders(config), synthesizeQuota: shouldSynthesizeQuotaHeaders(config), poolQuota: shouldPoolQuotaHeaders(config), logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config), cacheUsage: /** @type {Record<string, any>|null} */ (null), usage };
+      const ctx = { account: null, callerRequestId: callerId, status: null, attempt: 0, tried: new Set(), reauthed: new Set(), model, advisorModel, streamRequested: parseRequestStream(body), fleetMessageThreads: config?.messageThreads === true, pinnedIndex, pinChain, provider, holdBudgetMs: holdMs, pinKey, onMessage, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, stripOverage: shouldStripOverageHeaders(config), synthesizeQuota: shouldSynthesizeQuotaHeaders(config), poolQuota: shouldPoolQuotaHeaders(config), logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config), cacheUsage: /** @type {Record<string, any>|null} */ (null), errorType: /** @type {string|null} */ (null), usage };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request.
@@ -2320,7 +2321,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         // marked open would send the outer catch to call that same throwing hook
         // a second time for one request.
         openEntry = null;
-        if (!hideActivity) hooks.onRequestEnd?.(reqId, { callerRequestId: callerId, method: req.method, path: req.url, account: ctx.account, status: ctx.status, model: ctx.model, effort, sessionId, pinned: ctx.pinnedIndex != null, client, attempts: ctx.attempt || 0, cacheUsage: ctx.cacheUsage });
+        if (!hideActivity) hooks.onRequestEnd?.(reqId, { callerRequestId: callerId, method: req.method, path: req.url, account: ctx.account, status: ctx.status, model: ctx.model, effort, sessionId, pinned: ctx.pinnedIndex != null, client, attempts: ctx.attempt || 0, cacheUsage: ctx.cacheUsage, errorType: ctx.errorType });
         // One SQLite row per request, written here because this is the one
         // place every terminal outcome of forwardRequest already funnels
         // through — success, a hop that exhausted retries, the pool-exhausted
@@ -4238,6 +4239,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // answered, so an earlier attempt's (a stream that died after
     // message_start, then a hop) do not stand in for a later one's (#642).
     ctx.cacheUsage = null;
+    // The same for the error type: the line names the answer it ends with.
+    ctx.errorType = null;
     let upstreamRes;
     let admittedLoad = 0;
     const entitlementEpoch = account.entitlementEpoch;
@@ -4930,6 +4933,12 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       l?.end();
     } else {
       const buf = await buffer(upstreamBody);
+      // The error body is already in hand here, so naming its type for the
+      // activity line costs one bounded parse and does not touch what the client
+      // gets. A JSON error only; past the inspection limit it is left unread.
+      if (upstreamRes.status >= 400 && buf.length <= ERROR_BODY_INSPECTION_LIMIT && isJsonContentType(contentType)) {
+        ctx.errorType = upstreamErrorType(buf);
+      }
       extractUsageFromBody(buf, account.index, accountManager, ctx.onUsage, ctx.pinKey, ctx.model, ctx.onMessage, (/** @type {Record<string, any>} */ u) => { ctx.cacheUsage = u; bookUsageTotals(ctx.usage, u); });
       const l = getLog();
       if (l) { l.body('RESPONSE BODY', buf, contentType); l.end(); }
