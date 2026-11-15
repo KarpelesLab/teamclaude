@@ -419,7 +419,7 @@ test('a removal the store could not take is not added back by the next pass, whi
   const [written] = await home.settled();
   assert.equal(written, false);
   assert.ok(home.logs.some((l) => /could not record the removal of "b" yet; it is tried again later/.test(l)), home.logs.join('\n'));
-  assert.deepEqual(home.sleeps, [60_000, 5 * 60_000, 15 * 60_000], 'tried again a minute, five and fifteen minutes later');
+  assert.deepEqual(home.sleeps, [60_000, 5 * 60_000, 15 * 60_000, 30 * 60_000], 'paused a minute, five, fifteen and thirty minutes between the tries');
   assert.equal(tombstoneOf(store.byKey(key).Data), null);
   down = false;
   const r = await home.sync.sync();
@@ -640,9 +640,11 @@ test('a removal gives up on a lock held throughout, says so, and stays pending',
     if (path === `User/Credential/${id}:lock`) { attempts++; throw Object.assign(new Error('Credential is locked'), { token: 'error_credential_locked' }); }
     return store.api(method, path, ...rest);
   };
+  const removedAt = store.now();
   home.am.removeAccount(1);
   assert.deepEqual(await home.settled(), [false]);
-  assert.equal(attempts, 4 * 8, 'eight attempts over 35s, then again after each of the three pauses');
+  assert.equal(attempts, 5 * 8, 'eight attempts over 35s, then again after each of the four pauses');
+  assert.ok(store.now() - removedAt < H, `every timed retry, its waits for the lock included, is made within the hour (${(store.now() - removedAt) / 1000}s)`);
   assert.ok(home.logs.some((l) => /could not record the removal of "b" yet: its lock is held; it is tried again later/.test(l)), home.logs.join('\n'));
   assert.equal(home.sync.pendingRemovals.size, 1);
   assert.equal(tombstoneOf(store.byKey(key).Data), null);
@@ -704,6 +706,30 @@ test('a removal the store could not take is tried again a minute later, and land
   assert.deepEqual(await home.settled(), [true]);
   assert.notEqual(tombstoneOf(store.byKey(key).Data), null);
   assert.equal(home.sync.pendingRemovals.size, 0);
+});
+
+test('a removal whose store is back half an hour later is recorded by the last timed retry, without a pass', async () => {
+  const store = makeStore();
+  const key = syncKeyFor(claude('b'));
+  const office = setup([claude('a'), claude('b')], { store });
+  await office.sync.sync();
+  const home = setup([claude('a'), claude('b')], { store });
+  await home.sync.sync();
+  let down = true;
+  home.sync.api = async (...args) => { if (down) throw new Error('fetch failed'); return store.api(...args); };
+  const removedAt = store.now();
+  const pauses = [];
+  home.sync.sleep = async (ms) => {
+    pauses.push(ms);
+    store.tick(ms);
+    if (store.now() - removedAt >= 30 * 60_000) down = false;
+  };
+  home.am.removeAccount(1);
+  assert.deepEqual(await home.settled(), [true], 'no pass ran: a timed retry wrote it');
+  assert.deepEqual(pauses, [60_000, 5 * 60_000, 15 * 60_000, 30 * 60_000]);
+  assert.notEqual(tombstoneOf(store.byKey(key).Data), null);
+  assert.equal(home.sync.pendingRemovals.size, 0);
+  assert.equal((await office.sync.sync()).evicted, 1);
 });
 
 test('a removal waiting for the lock writes nothing once the account is back here under another key', async () => {

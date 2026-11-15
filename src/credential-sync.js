@@ -49,21 +49,21 @@
 // still holds it and stores it later brings it back. A removal the store does
 // not take at once (out of reach, or the lock held throughout) stays pending on
 // the install that made it, in memory: no pass there adds the account back from
-// its row, and the tombstone is tried again a minute, five and fifteen minutes
-// later, then at each pass, until it lands. It stays pending for an hour at
-// most (REMOVAL_PENDING_MAX_MS), and ends at once when this install is found
-// signed out of callback.net (made while signed out, a removal records nothing
-// at all): past either, nothing is written, the removal is logged as not
-// recorded, and the account comes back from its row like any other, at the
-// next pass that reads it (the pass that gave the removal up, when one did).
-// While it is pending it also wins over a sign-in made on another install
-// meanwhile, which is why it does not stay pending longer: a row cannot tell a
-// sign-in from a renewal. A pass deletes a tombstone older than a week.
-// Nothing checks that every install has seen it by then: one that ran no pass
-// in that week and still holds the account, with a refresh token that still
-// renews, stores it again (at its first pass after signing back in to
-// callback.net if it renewed the token while signed out, at its next renewal
-// if it was switched off), and the others add it back.
+// its row, and the tombstone is tried again about 1, 6, 21 and 51 minutes
+// after the removal, then at each pass, until it lands. It stays pending for
+// an hour at most (REMOVAL_PENDING_MAX_MS), and ends at once when this install
+// is found signed out of callback.net (made while signed out, a removal
+// records nothing at all): past either, nothing is written, the removal is
+// logged as not recorded, and the account comes back from its row like any
+// other, at the next pass that reads it (the pass that gave the removal up,
+// when one did). While it is pending it also wins over a sign-in made on
+// another install meanwhile, which is why it does not stay pending longer: a
+// row cannot tell a sign-in from a renewal. A pass deletes a tombstone older
+// than a week. Nothing checks that every install has seen it by then: one that
+// ran no pass in that week and still holds the account, with a refresh token
+// that still renews, stores it again (at its first pass after signing back in
+// to callback.net if it renewed the token while signed out, at its next
+// renewal if it was switched off), and the others add it back.
 //
 // An account IN ERROR (upstream rejected its token; it needs a re-login) is
 // never written to the store: what it holds is dead, and stored it would
@@ -120,7 +120,7 @@ const LOCKED_WAIT_MS = 30_000;
 /** A removal waits this long for a held lock: one whole lease, and a re-check past it. */
 const REMOVAL_LOCK_WAIT_MS = LOCK_TIMEOUT_S * 1000 + LOCKED_RECHECK_MS;
 /** A removal the store did not take: tried again after each pause, then by each pass. */
-const REMOVAL_RETRY_MS = [60_000, 5 * 60_000, 15 * 60_000];
+const REMOVAL_RETRY_MS = [60_000, 5 * 60_000, 15 * 60_000, 30 * 60_000];
 /**
  * A removal still not recorded more than this long after it was made is given
  * up on. A pending removal is written over whatever its row then holds, and a
@@ -129,8 +129,8 @@ const REMOVAL_RETRY_MS = [60_000, 5 * 60_000, 15 * 60_000];
  * another install and destroy a working token. Given up on, the account comes
  * back here from its row, enabled and without the settings it had here, and
  * the one line logged says to remove it again. An hour covers every timed
- * retry (REMOVAL_RETRY_MS and the waits for the lock, about 23 minutes in
- * all).
+ * retry (REMOVAL_RETRY_MS and the waits for the lock, about 54 minutes in all
+ * when the store answers at once); past the last, only a pass tries it.
  */
 export const REMOVAL_PENDING_MAX_MS = 3600_000;
 /** Rounds of lock-or-wait before this refresh gives up (the next request asks again). */
