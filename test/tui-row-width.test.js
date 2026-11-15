@@ -17,7 +17,7 @@ function oauth(name) {
 
 /** Render the dashboard at `width` and return the account rows, ANSI stripped,
  * exactly as _renderAcct produced them (before fitLine pads or truncates). */
-function renderRows(width, { fable = [], sonnet = [], accounts = 6, routes = [], apikey = [], switchThreshold = [], resetCredits = [] } = {}) {
+function renderRows(width, { fable = [], sonnet = [], accounts = 6, routes = [], apikey = [], switchThreshold = [], resetCredits = [], fableResets = [], weekly = [] } = {}) {
   const names = Array.from({ length: accounts }, (_, i) => `acct${i}@example.com`);
   const entries = names.map((name, i) => apikey.includes(i)
     ? { name, type: 'apikey', apiKey: `k-${i}` }
@@ -38,7 +38,7 @@ function renderRows(width, { fable = [], sonnet = [], accounts = 6, routes = [],
     }
     a.quota.unified5h = 0.4;
     a.quota.unified5hReset = Date.now() + 4 * h;
-    a.quota.unified7d = 0.3;
+    a.quota.unified7d = weekly[i] ?? 0.3;
     a.quota.unified7dReset = Date.now() + (i + 1) * 24 * h;
     if (fable[i] != null) {
       a.quota.unified7dFable = fable[i];
@@ -50,7 +50,7 @@ function renderRows(width, { fable = [], sonnet = [], accounts = 6, routes = [],
     }
     // Held reset credits (Codex free credits, Claude banked resets), fresh.
     if (resetCredits[i] != null) {
-      a.quota.resetCredits = { available: resetCredits[i], applicable: resetCredits[i], expiresAt: Date.now() + 19 * 24 * h, seenAt: Date.now() };
+      a.quota.resetCredits = { available: resetCredits[i], applicable: resetCredits[i], expiresAt: Date.now() + 19 * 24 * h, seenAt: Date.now(), fable: fableResets[i] ?? 0 };
     }
   });
 
@@ -116,13 +116,46 @@ test('the row fills the width instead of stopping short', () => {
   }
 });
 
-test('the ⊘ tag gets its own room rather than being cut off', () => {
-  // A blocked family adds a trailing tag. It must be budgeted for, not overrun.
+// A blocked family is marked on its bar (`⊘F` in place of `F7`) where the row
+// draws one, else by the trailing `⊘ Fable` tag.
+const markedBlocked = r => r.includes('⊘F') || r.includes('⊘ Fable');
+
+test('a blocked family is marked whole rather than cut off', () => {
   for (const w of [80, 86, 100, 120]) {
     const rows = renderRows(w, { fable: [0.99, 0.29, 0.02, 0.0, 0.99, 0.0] });
     assert.ok(widest(rows) <= w, `W=${w}: widest row is ${widest(rows)} columns`);
-    const tagged = rows.filter(r => r.includes('⊘ Fable'));
-    assert.equal(tagged.length, 2, `W=${w}: both blocked accounts keep a whole tag`);
+    assert.equal(rows.filter(markedBlocked).length, 2, `W=${w}: both blocked accounts keep a whole mark`);
+  }
+});
+
+test('a drawn bar carries the blocked mark, and the trailing tag goes', () => {
+  const rows = renderRows(120, { fable: [0.99, 0.29, 0.02, 0.0, 0.99, 0.0] });
+  assert.ok(rows[0].includes('⊘F') && !rows[0].includes('F7'), rows[0]);
+  assert.ok(!rows.some(r => r.includes('⊘ Fable')), 'no tag beside a bar that already says it');
+  assert.ok(rows[1].includes('F7') && !rows[1].includes('⊘'), rows[1]);
+  // A spent shared weekly is marked on the Wk bar the same way.
+  const wk = renderRows(120, { fable: [0.1, 0.29, 0.02, 0.0, 0.1, 0.0], weekly: [0.99] });
+  assert.ok(wk[0].includes('⊘Wk') && !wk[0].includes('⊘ Wk'), wk[0]);
+  assert.ok(wk[0].includes('F7'), `the family bar is not blamed for the shared weekly: ${wk[0]}`);
+});
+
+test('a blocked bucket whose bar is not drawn still gets the tag', () => {
+  // Below LIST_MIN the row draws one bar, Ses: the weekly bar that would carry
+  // `⊘Wk` is gone, so the tag says it.
+  const rows = renderRows(60, { weekly: [0.99] });
+  assert.ok(widest(rows) <= 60, `widest row is ${widest(rows)} columns`);
+  assert.ok(rows[0].includes('⊘ Wk'), rows[0]);
+});
+
+// The accounts a Fable reset would put back are the ones that carry the mark;
+// their reset tag must survive beside it.
+test('a blocked row keeps its reset tag, Fable resets named as such', () => {
+  const resetCredits = [1, 2, 3, 4, 5, 6];
+  for (const w of [80, 86, 96, 100, 120, 160]) {
+    const rows = renderRows(w, { fable: [0.99, 0.29, 0.99, 0.0, 0.99, 0.0], resetCredits, fableResets: resetCredits });
+    assert.ok(widest(rows) <= w, `W=${w}: widest row is ${widest(rows)} columns`);
+    rows.forEach((r, i) => assert.ok(r.includes(`FR${i + 1}`), `W=${w}: row ${i} lost its reset tag: ${r}`));
+    assert.equal(rows.filter(markedBlocked).length, 3, `W=${w}: the three blocked accounts stay marked`);
   }
 });
 
@@ -132,7 +165,7 @@ test('family bars are dropped, not truncated, when they cannot fit', () => {
   const rows = renderRows(70, { fable: [0.99, 0.99, 0.99, 0.99, 0.99, 0.99] });
   assert.ok(widest(rows) <= 70, `widest row is ${widest(rows)} columns`);
   assert.ok(!rows.some(r => r.includes('F7')), 'the F7 bar is omitted rather than cut');
-  assert.ok(rows.every(r => r.includes('⊘ Fable')), 'the blocked tag still explains the state');
+  assert.ok(rows.every(markedBlocked), 'the blocked mark still explains the state');
 });
 
 test('blockedFamilies reports the families barred by their own weekly bucket', () => {
@@ -300,7 +333,7 @@ test('rows line up within their category, not across categories', () => {
 test('a blocked family on a subscription row does not shorten the API-key rows', () => {
   for (const w of UNCAPPED) {
     const rows = renderRows(w, { fable: [null, 0.99, 0.02, null, 0.11, 0.0], apikey: [0, 3] });
-    assert.ok(rows.some(r => r.includes('⊘ Fable')), 'the fixture blocks a family');
+    assert.ok(rows.some(markedBlocked), 'the fixture blocks a family');
     assert.ok(widest(rows) <= w, `W=${w}: widest row is ${widest(rows)} columns`);
     const metered = rows.filter(isMetered);
     assert.ok(w - widest(metered) <= 3, `W=${w}: the tag cost the API-key rows ${w - widest(metered)} columns`);

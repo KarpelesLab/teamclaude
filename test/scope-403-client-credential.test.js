@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
+import { withEnv } from '../test-helpers/env.js';
 
 function listen(server) {
   return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
@@ -104,6 +105,63 @@ test('the client-credential retry drops usage-dimension headers too', async () =
   }
 });
 
+// The client-credential answer is held whole to be relayed in one write, and
+// its upstream is the configurable top-level one. Past the hold limit (64 MiB
+// unless TEAMCLAUDE_UPSTREAM_MAX_HELD_BYTES says otherwise; 4 KiB here) it is a
+// 502 and the rest is not waited for: on the client's login this upstream
+// sends twice the limit and never ends its answer, so the only thing that
+// closes its connection is the proxy dropping it.
+test('a client-credential answer too large to hold is a 502, and the rest is dropped', async (t) => {
+  const LIMIT = 4096;
+  /** @type {(ended: boolean) => void} */
+  let dropped = () => {};
+  const upstreamDropped = new Promise((resolve) => { dropped = resolve; });
+  const tokens = [];
+  const upstream = http.createServer((req, res) => {
+    const token = (req.headers.authorization || '').replace(/^Bearer /, '');
+    tokens.push(token);
+    if (token !== 'client-token') {
+      res.writeHead(403, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'permission_error', message: 'scope', details: { error_code: 'oauth_scope_insufficient' } } }));
+      return;
+    }
+    res.on('close', () => dropped(res.writableEnded));
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.write(Buffer.alloc(2 * LIMIT, 0x61));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = inferenceOnlyPool();
+  /** @type {(info: Record<string, any>) => void} */
+  let ended = () => {};
+  const requestEnded = new Promise((resolve) => { ended = resolve; });
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` },
+    { onRequestEnd: (_id, info) => ended(info) });
+  const proxyPort = await listen(proxy);
+  // In an after hook, which a timed-out test still runs: the upstream's answer
+  // never ends, so a proxy that held on to it would hold these open.
+  t.after(() => {
+    proxy.closeAllConnections(); upstream.closeAllConnections();
+    proxy.close(); upstream.close();
+  });
+  const lines = [];
+  const error = console.error;
+  console.error = (...args) => { lines.push(args.join(' ')); };
+  try {
+    await withEnv({ TEAMCLAUDE_UPSTREAM_MAX_HELD_BYTES: LIMIT }, async () => {
+      const { status, body } = await send(proxyPort);
+      assert.equal(status, 502);
+      assert.match(body, /Upstream response too large/);
+      assert.deepEqual(tokens, ['a-token', 'client-token']);
+      assert.equal(await upstreamDropped, false, 'the upstream connection was dropped with its answer unfinished');
+      assert.ok(lines.some(l => /Client-credential relay: upstream answer larger than 4096 bytes, not relayed/.test(l)),
+        `the operator is told which path it was, and the limit: ${lines.join(' | ')}`);
+      assert.equal((await requestEnded).status, 502, 'the activity row reports the 502');
+    });
+  } finally {
+    console.error = error;
+  }
+});
+
 test('a completion that draws a scope 403 is never sent on the client credential', async () => {
   const { server: upstream, seen } = scopeUpstream();
   const upstreamPort = await listen(upstream);
@@ -173,6 +231,25 @@ test('a Codex account that draws a scope 403 never sends the client bearer', asy
     const { status } = await send(proxyPort, { path: '/backend-api/codex/models' });
     assert.equal(status, 502);
     assert.deepEqual(seen.map(s => s.token), ['a-token']);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+// With proxy.controlPlane "pool" bootstrap goes through the pool again, so a
+// setup-token account's scope 403 on it takes the same retry as any other GET.
+test('with proxy.controlPlane "pool", a scope 403 on bootstrap goes out on the client credential', async () => {
+  const { server: upstream, seen } = scopeUpstream();
+  const upstreamPort = await listen(upstream);
+  const am = inferenceOnlyPool();
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k', controlPlane: 'pool' }, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const { status } = await send(proxyPort, { path: '/api/claude_cli/bootstrap?entrypoint=cli' });
+    assert.equal(status, 200);
+    assert.deepEqual(seen.map(s => s.token), ['a-token', 'client-token']);
   } finally {
     proxy.close();
     upstream.close();

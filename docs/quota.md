@@ -260,7 +260,7 @@ At the cap, that account receives **nothing**:
 
 A family reading (Fable, Sonnet) at or past the cap is kept until its window resets, or for a week when no reset time is known. An uncapped spent family reading is revalidated after 30 minutes instead, because only a request of that family can refresh it; for a capped one that request would go past the cap.
 
-With [expiry-pressure routing](routing.md#expiry-pressure-routing) on, a capped account's pressure is the room left under its cap, not under 100%: an account at 0.6 with a 0.7 cap has 0.1 to spend before its reset. For a family window the shared weekly cap also bounds that room, since family spend counts against both.
+With [expiry-pressure routing](routing.md#expiry-pressure-routing) on, a capped account's pressure is the room left under its cap, not under 100%: an account at 0.6 with a 0.7 cap has 0.1 to spend before its reset. For a family window the shared weekly cap also bounds that room, since family spend counts against both (by [how much](routing.md#model-aware-routing) was measured on one pool).
 
 Caps are model-scoped exactly like thresholds. `unified5h` and `unified7d` stop every model; `unified7dFable` stops only Fable, so the example above keeps serving Opus and Sonnet from the same account after Fable is done. The cap binds at the level you set (`>=`), and a window that has reset is never capped on the old reading.
 

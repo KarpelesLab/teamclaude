@@ -46,6 +46,21 @@ test('on: a 5h-limited soonest account is skipped, then reclaimed', () => {
   assert.equal(am.getActiveAccount(null, OPUS).name, 'soon');
 });
 
+test('on: a manual switch holds against a sooner reset until rotation leaves it', () => {
+  const am = fleet(true);
+  assert.equal(am.getActiveAccount(null, OPUS).name, 'soon');
+  am.setCurrentAccount(0);
+  assert.deepEqual(am.eligibility(0), { eligible: true });
+  for (let turn = 0; turn < 3; turn++) assert.equal(am.getActiveAccount(null, OPUS).name, 'late');
+  // Spent, it is left like any other account, and the choice goes with it:
+  // with room again it is one of three, and the soonest reset wins.
+  am.accounts[0].quota.unified7d = 0.99;
+  assert.equal(am.getActiveAccount(null, OPUS).name, 'soon');
+  am.accounts[0].quota.unified7d = 0.1;
+  am._setCurrent(am.accounts[0]);
+  assert.equal(am.getActiveAccount(null, OPUS).name, 'soon');
+});
+
 test('on: priority still wins over reset time', () => {
   const am = fleet(true);
   am.accounts[1].priority = 5;

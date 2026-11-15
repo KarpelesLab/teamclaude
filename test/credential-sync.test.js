@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AccountManager } from '../src/account-manager.js';
-import { CredentialSync, refreshOutsideProxy, syncKeyFor, isSyncable, encodeBlob, decodeBlob, entryFromBlob, needsSignIn, tombstoneOf, tombstone, KEY_PREFIX, TOMBSTONE_TTL_MS } from '../src/credential-sync.js';
+import { CredentialSync, refreshOutsideProxy, syncKeyFor, isSyncable, encodeBlob, decodeBlob, entryFromBlob, needsSignIn, tombstoneOf, tombstone, KEY_PREFIX, TOMBSTONE_TTL_MS, REMOVAL_PENDING_MAX_MS } from '../src/credential-sync.js';
 
 // Credential sync through callback.net: every signed-in install keeps its OAuth
 // account tokens in the user's credential store and follows it. The store here
@@ -348,6 +348,581 @@ test('a refresh never brings a removed account back; a sign-in does', async () =
   assert.equal(await home.sync.storeSignIn(entry), false);
 });
 
+test('a removal made while another install renews waits for its lock, so the renewal does not write over the tombstone', async () => {
+  const store = makeStore();
+  const key = syncKeyFor(claude('a'));
+  const home = setup([claude('a')], { store });
+  let homeWaiting = false;
+  let renewed;
+  const renewedDone = new Promise((r) => { renewed = r; });
+  const office = setup([claude('a')], {
+    store,
+    refresh: async (rt) => {
+      // The account is removed at home while office's grant is out, under the lock.
+      home.am.removeAccount(0);
+      // Let home go as far as it can: write its tombstone, or wait for the lock.
+      for (let i = 0; i < 100 && !homeWaiting && tombstoneOf(store.byKey(key).Data) == null; i++) await new Promise((r) => setImmediate(r));
+      return { accessToken: `${rt}-renewed-at`, refreshToken: `${rt}-renewed-rt`, expiresAt: store.now() + 8 * H };
+    },
+  });
+  await home.sync.sync();
+  await office.sync.sync();
+  // Home's waits end only once office's renewal is stored and its lock released.
+  const homeSleeps = [];
+  home.sync.sleep = async (ms) => { homeWaiting = true; homeSleeps.push(ms); await renewedDone; store.tick(ms); };
+  await office.am.ensureTokenFresh(0, true);
+  assert.deepEqual(office.refreshed, ['rt-a-1']);
+  assert.equal(store.blob(key).accessToken, 'rt-a-1-renewed-at', 'the renewal was stored first');
+  renewed();
+  const [written] = await home.settled();
+  assert.equal(homeWaiting, true, 'home waited for the lock');
+  assert.deepEqual(homeSleeps, [5000], 'a re-check of the lock 5s on, not a later retry');
+  assert.equal(written, true);
+  assert.notEqual(tombstoneOf(store.byKey(key).Data), null, 'the tombstone stands');
+  assert.equal(store.byKey(key).Locked, null, 'and the lock is released');
+  assert.equal((await office.sync.sync()).evicted, 1);
+  assert.deepEqual(office.am.accounts, []);
+});
+
+test('a renewal that outlasts its lease reads the row again, and does not write over a tombstone stored meanwhile', async () => {
+  const store = makeStore();
+  const key = syncKeyFor(claude('a'));
+  const home = setup([claude('a')], { store });
+  const office = setup([claude('a')], {
+    store,
+    refresh: async (rt) => {
+      // The lease runs out while the grant is out, and the removal at home takes the lock.
+      store.tick(31_000);
+      home.am.removeAccount(0);
+      await home.settled();
+      return { accessToken: `${rt}-renewed-at`, refreshToken: `${rt}-renewed-rt`, expiresAt: store.now() + 8 * H };
+    },
+  });
+  await home.sync.sync();
+  await office.sync.sync();
+  await office.am.ensureTokenFresh(0, true);
+  assert.deepEqual(office.refreshed, ['rt-a-1']);
+  assert.deepEqual(office.persisted.map(([, t]) => t.accessToken), ['rt-a-1-renewed-at'], 'the request still gets its renewed token');
+  const [written] = await home.settled();
+  assert.equal(written, true);
+  assert.notEqual(tombstoneOf(store.byKey(key).Data), null, 'the late renewal did not write over the tombstone');
+  assert.ok(office.logs.some((l) => /outlasted the callback\.net lock/.test(l)), office.logs.join('\n'));
+  await office.sync.sync();
+  assert.deepEqual(office.am.accounts, []);
+});
+
+test('a removal finds a row another install stored after the last pass, and records it', async () => {
+  const store = makeStore();
+  const office = setup([claude('a')], { store });
+  await office.sync.sync(); // the store holds a, not b
+  // Home stores nothing of its own, so all it has seen is a's row.
+  const home = setup([claude('a'), claude('b')], { store, minted: false });
+  await home.sync.sync();
+  const later = setup([claude('b')], { store });
+  await later.sync.sync(); // b's row, made after home's pass
+  home.am.removeAccount(1);
+  const [written] = await home.settled();
+  assert.equal(written, true);
+  assert.notEqual(tombstoneOf(store.byKey(syncKeyFor(claude('b'))).Data), null);
+  assert.equal((await home.sync.sync()).added, 0, 'home does not add it back');
+  assert.deepEqual(home.am.accounts.map((a) => a.name), ['a']);
+  assert.equal((await later.sync.sync()).evicted, 1);
+});
+
+test('a removal the store could not take is not added back by the next pass, which records it', async () => {
+  const store = makeStore();
+  const key = syncKeyFor(claude('b'));
+  const office = setup([claude('a'), claude('b')], { store });
+  await office.sync.sync();
+  const home = setup([claude('a'), claude('b')], { store });
+  await home.sync.sync();
+  let down = true;
+  home.sync.api = async (...args) => { if (down) throw new Error('fetch failed'); return store.api(...args); };
+  home.am.removeAccount(1);
+  const [written] = await home.settled();
+  assert.equal(written, false);
+  assert.ok(home.logs.some((l) => /could not record the removal of "b" yet; it is tried again later/.test(l)), home.logs.join('\n'));
+  assert.deepEqual(home.sleeps, [60_000, 5 * 60_000, 15 * 60_000], 'tried again a minute, five and fifteen minutes later');
+  assert.equal(tombstoneOf(store.byKey(key).Data), null);
+  down = false;
+  const r = await home.sync.sync();
+  assert.equal(r.added, 0, 'not added back from its row');
+  assert.deepEqual(home.am.accounts.map((a) => a.name), ['a']);
+  assert.notEqual(tombstoneOf(store.byKey(key).Data), null, 'the pass wrote the tombstone');
+  assert.equal(home.sync.pendingRemovals.size, 0);
+  assert.ok(home.logs.some((l) => /"b": its removal here is now recorded on callback\.net/.test(l)), home.logs.join('\n'));
+  assert.equal((await office.sync.sync()).evicted, 1);
+});
+
+test('a sign-in here replaces a removal still pending, and the next pass leaves the row as signed in', async () => {
+  const store = makeStore();
+  const key = syncKeyFor(claude('b'));
+  const home = setup([claude('a'), claude('b')], { store });
+  await home.sync.sync();
+  let down = true;
+  home.sync.api = async (...args) => { if (down) throw new Error('fetch failed'); return store.api(...args); };
+  home.am.removeAccount(1);
+  assert.deepEqual(await home.settled(), [false]);
+  down = false;
+  store.tick(H);
+  const entry = claude('b', { accessToken: 'at-b-new', refreshToken: 'rt-b-new', expiresAt: store.now() + 8 * H });
+  assert.equal(await home.sync.storeSignIn(entry), true);
+  assert.equal(home.sync.pendingRemovals.size, 0);
+  await home.sync.sync();
+  assert.equal(tombstoneOf(store.byKey(key).Data), null);
+  assert.equal(store.blob(key).accessToken, 'at-b-new');
+});
+
+test('an account that goes into error finds a row another install stored after the last pass', async () => {
+  const store = makeStore();
+  const office = setup([claude('a')], { store });
+  await office.sync.sync(); // the store holds a, not b
+  const home = setup([claude('a'), claude('b')], { store, minted: false });
+  await home.sync.sync();
+  // b is signed in on another install after home's pass.
+  const elsewhere = claude('b', { accessToken: 'at-b-new', refreshToken: 'rt-b-new', expiresAt: store.now() + 9 * H });
+  assert.equal(await office.sync.storeSignIn(elsewhere), true);
+  home.am.markCredentialRejected(1, '401');
+  assert.equal(await home.recoveries[0], true);
+  assert.equal(home.am.accounts[1].status, 'active');
+  assert.equal(home.am.accounts[1].credential, 'at-b-new');
+});
+
+/**
+ * Home removes b while another install holds b's lock: home's removal waits,
+ * its sleeps held until `release()` frees the lock and lets it go on.
+ */
+async function removalWaitingOnLock() {
+  const store = makeStore();
+  const key = syncKeyFor(claude('b'));
+  const home = setup([claude('a'), claude('b')], { store });
+  await home.sync.sync();
+  store.byKey(key).Locked = { unixms: String(store.now()), unix: Math.floor(store.now() / 1000) };
+  let waiting = false;
+  let open;
+  const gate = new Promise((r) => { open = r; });
+  home.sync.sleep = async (ms) => { waiting = true; await gate; store.tick(ms); };
+  home.am.removeAccount(1);
+  for (let i = 0; i < 100 && !waiting; i++) await new Promise((r) => setImmediate(r));
+  assert.equal(waiting, true, 'the removal is waiting for the lock');
+  const release = () => { store.byKey(key).Locked = null; open(); };
+  return { store, key, home, release };
+}
+
+test('a pass that runs while a removal waits for the lock does not add the account back', async () => {
+  const { store, key, home, release } = await removalWaitingOnLock();
+  // The pass tries the tombstone once and does not wait on the held lock.
+  // A wait would go through the sync's sleep: for this pass, one that counts
+  // the call and fails it (the removal already waiting is parked in the gated
+  // sleep it called before the swap).
+  const gated = home.sync.sleep;
+  let slept = 0;
+  home.sync.sleep = async () => { slept++; throw new Error('the pass waited on the held lock'); };
+  const r = await home.sync.sync();
+  home.sync.sleep = gated;
+  assert.equal(slept, 0, 'the pass did not wait on the held lock');
+  assert.equal(r.added, 0);
+  assert.deepEqual(home.am.accounts.map((a) => a.name), ['a']);
+  assert.equal(home.sync.pendingRemovals.size, 1, 'still pending');
+  release();
+  assert.deepEqual(await home.settled(), [true]);
+  assert.notEqual(tombstoneOf(store.byKey(key).Data), null);
+});
+
+test('a removal waiting for the lock writes nothing once a sign-in here replaced it', async () => {
+  const { store, key, home, release } = await removalWaitingOnLock();
+  const entry = claude('b', { accessToken: 'at-b-new', refreshToken: 'rt-b-new', expiresAt: store.now() + 8 * H });
+  assert.equal(await home.sync.storeSignIn(entry), true);
+  const after = store.calls.length;
+  release();
+  assert.deepEqual(await home.settled(), [false]);
+  assert.equal(tombstoneOf(store.byKey(key).Data), null);
+  assert.equal(store.blob(key).accessToken, 'at-b-new', 'the sign-in stands');
+  assert.deepEqual(store.calls.slice(after).filter((c) => c.path.endsWith(':lock')), [], 'the wait stopped: no lock taken after the sign-in');
+  assert.ok(!home.logs.some((l) => /could not record the removal/.test(l)), home.logs.join('\n'));
+});
+
+test('a removal waiting for the lock writes nothing once the account is back on this install', async () => {
+  const { store, key, home, release } = await removalWaitingOnLock();
+  home.am.addAccount(claude('b')); // a reload brought it back from the config, say
+  release();
+  assert.deepEqual(await home.settled(), [false]);
+  assert.equal(tombstoneOf(store.byKey(key).Data), null);
+  assert.equal(home.sync.pendingRemovals.size, 0);
+});
+
+test('a pending removal is matched to its row by identity, where the row names the organization differently', async () => {
+  const store = makeStore();
+  // Written by an install whose entry has no orgUuid: keyed by the organization's name.
+  const bare = claude('b', { orgUuid: undefined });
+  store.put(syncKeyFor(bare), encodeBlob({ ...bare, credential: bare.accessToken }, tokensOf({ credential: bare.accessToken, refreshToken: bare.refreshToken, expiresAt: bare.expiresAt }), { now: T0, by: 'office' }));
+  const home = setup([claude('a'), claude('b')], { store });
+  await home.sync.sync();
+  assert.notEqual(syncKeyFor(claude('b')), syncKeyFor(bare));
+  let down = true;
+  home.sync.api = async (...args) => { if (down) throw new Error('fetch failed'); return store.api(...args); };
+  home.am.removeAccount(1);
+  assert.deepEqual(await home.settled(), [false]);
+  down = false;
+  assert.equal((await home.sync.sync()).added, 0, 'not added back from the row under the other key');
+  assert.notEqual(tombstoneOf(store.byKey(syncKeyFor(bare)).Data), null);
+});
+
+test('a sign-in under another key replaces a pending removal of the same identity', async () => {
+  const store = makeStore();
+  const key = syncKeyFor(claude('b'));
+  const home = setup([claude('a'), claude('b')], { store });
+  await home.sync.sync();
+  let down = true;
+  home.sync.api = async (...args) => { if (down) throw new Error('fetch failed'); return store.api(...args); };
+  home.am.removeAccount(1);
+  assert.deepEqual(await home.settled(), [false]);
+  down = false;
+  // Signed in again from an entry with no orgUuid, so its key names the organization by name.
+  const entry = claude('b', { orgUuid: undefined, accessToken: 'at-b-new', refreshToken: 'rt-b-new', expiresAt: store.now() + 8 * H });
+  assert.notEqual(syncKeyFor(entry), key);
+  assert.equal(await home.sync.storeSignIn(entry), true);
+  assert.equal(home.sync.pendingRemovals.size, 0);
+  await home.sync.sync();
+  assert.equal(tombstoneOf(store.byKey(key).Data), null, 'the sign-in is not written over');
+  assert.equal(store.blob(key).accessToken, 'at-b-new');
+});
+
+test('a removal with no row settles at once, so a sign-in elsewhere later is added, not removed', async () => {
+  const store = makeStore();
+  const key = syncKeyFor(claude('b'));
+  const home = setup([claude('a'), claude('b')], { store, minted: false }); // stores nothing
+  await home.sync.sync();
+  home.am.removeAccount(1);
+  assert.deepEqual(await home.settled(), [false]);
+  assert.equal(home.sync.pendingRemovals.size, 0);
+  assert.deepEqual(home.sleeps, [], 'settled: no retry pauses');
+  const office = setup([], { store });
+  const entry = claude('b', { accessToken: 'at-b-new', refreshToken: 'rt-b-new', expiresAt: store.now() + 8 * H });
+  assert.equal(await office.sync.storeSignIn(entry), true);
+  assert.equal((await home.sync.sync()).added, 1);
+  assert.equal(tombstoneOf(store.byKey(key).Data), null);
+});
+
+test('a removal whose row is gone since it was read settles, and writes nothing', async () => {
+  const store = makeStore();
+  const key = syncKeyFor(claude('b'));
+  const home = setup([claude('a'), claude('b')], { store });
+  await home.sync.sync();
+  store.rows.delete(store.byKey(key).User_Credential__); // deleted on the store's side; still in home's cache
+  home.am.removeAccount(1);
+  assert.deepEqual(await home.settled(), [false]);
+  assert.equal(home.sync.pendingRemovals.size, 0);
+  assert.equal(store.byKey(key), null, 'not made again');
+});
+
+test('a second removal of the same account, made while the first takes the lock, writes the tombstone', async () => {
+  const store = makeStore();
+  const key = syncKeyFor(claude('b'));
+  const home = setup([claude('a'), claude('b')], { store });
+  await home.sync.sync();
+  const id = store.byKey(key).User_Credential__;
+  let first = true;
+  home.sync.api = async (method, path, ...rest) => {
+    const r = await store.api(method, path, ...rest);
+    if (first && path === `User/Credential/${id}:lock`) {
+      // While the first removal's lock call is out: back, then removed again.
+      first = false;
+      home.am.addAccount(claude('b'));
+      home.am.removeAccount(1);
+    }
+    return r;
+  };
+  home.am.removeAccount(1);
+  await home.settled(); // the second removal is registered during the first
+  assert.deepEqual(await home.settled(), [false, true], 'the first lets go, the second writes');
+  assert.notEqual(tombstoneOf(store.byKey(key).Data), null);
+  assert.equal(home.sync.pendingRemovals.size, 0);
+});
+
+test('a removal waits out a lock held for a whole lease, then writes', async () => {
+  const store = makeStore();
+  const key = syncKeyFor(claude('b'));
+  const home = setup([claude('a'), claude('b')], { store });
+  await home.sync.sync();
+  store.byKey(key).Locked = { unixms: String(store.now()), unix: Math.floor(store.now() / 1000) }; // never released
+  home.am.removeAccount(1);
+  assert.deepEqual(await home.settled(), [true]);
+  assert.deepEqual(home.sleeps, [5000, 5000, 5000, 5000, 5000, 5000], 'every 5s, until the lease lapsed at 30s');
+  assert.notEqual(tombstoneOf(store.byKey(key).Data), null);
+});
+
+test('a removal gives up on a lock held throughout, says so, and stays pending', async () => {
+  const store = makeStore();
+  const key = syncKeyFor(claude('b'));
+  const home = setup([claude('a'), claude('b')], { store });
+  await home.sync.sync();
+  const id = store.byKey(key).User_Credential__;
+  let attempts = 0;
+  home.sync.api = async (method, path, ...rest) => {
+    if (path === `User/Credential/${id}:lock`) { attempts++; throw Object.assign(new Error('Credential is locked'), { token: 'error_credential_locked' }); }
+    return store.api(method, path, ...rest);
+  };
+  home.am.removeAccount(1);
+  assert.deepEqual(await home.settled(), [false]);
+  assert.equal(attempts, 4 * 8, 'eight attempts over 35s, then again after each of the three pauses');
+  assert.ok(home.logs.some((l) => /could not record the removal of "b" yet: its lock is held; it is tried again later/.test(l)), home.logs.join('\n'));
+  assert.equal(home.sync.pendingRemovals.size, 1);
+  assert.equal(tombstoneOf(store.byKey(key).Data), null);
+});
+
+test('a removal from a CLI command makes one attempt, with no wait for the lock', async () => {
+  const store = makeStore();
+  const key = syncKeyFor(claude('b'));
+  const home = setup([claude('a'), claude('b')], { store });
+  await home.sync.sync();
+  store.byKey(key).Locked = { unixms: String(store.now()), unix: Math.floor(store.now() / 1000) };
+  // As index.js builds it for `teamclaude remove`: no fleet of its own.
+  const sleeps = [];
+  const cli = new CredentialSync({ accountManager: /** @type {any} */ ({ accounts: [] }), addAccount: () => null, api: store.api, isSignedIn: async () => true, now: store.now, log: () => {}, sleep: async (ms) => { sleeps.push(ms); store.tick(ms); } });
+  const entry = claude('b');
+  assert.equal(await cli.onAccountRemoved({ ...entry, credential: entry.accessToken }, { wait: false }), false);
+  assert.deepEqual(sleeps, [], 'no wait');
+  store.byKey(key).Locked = null;
+  assert.equal(await cli.onAccountRemoved({ ...entry, credential: entry.accessToken }, { wait: false }), true);
+  assert.notEqual(tombstoneOf(store.byKey(key).Data), null);
+});
+
+test('an eviction is not a pending removal, even when its row cannot be reached just then', async () => {
+  const store = makeStore();
+  const key = syncKeyFor(claude('b'));
+  const office = setup([claude('a'), claude('b')], { store });
+  const home = setup([claude('a'), claude('b')], { store });
+  await office.sync.sync();
+  await home.sync.sync();
+  office.am.removeAccount(1);
+  await office.settled();
+  // Home's pass evicts b; every call on a single row (read, lock, write) fails from then on.
+  let failRow = false;
+  home.sync.api = async (method, path, ...rest) => {
+    if (failRow && path.startsWith('User/Credential/')) throw new Error('fetch failed');
+    return store.api(method, path, ...rest);
+  };
+  failRow = true;
+  assert.equal((await home.sync.sync()).evicted, 1);
+  assert.deepEqual(await home.settled(), [false]);
+  assert.equal(home.sync.pendingRemovals.size, 0);
+  failRow = false;
+  // Signed in again on office: home adds it back, and writes no tombstone over it.
+  const entry = claude('b', { accessToken: 'at-b-new', refreshToken: 'rt-b-new', expiresAt: store.now() + 8 * H });
+  assert.equal(await office.sync.storeSignIn(entry), true);
+  assert.equal((await home.sync.sync()).added, 1);
+  assert.equal(tombstoneOf(store.byKey(key).Data), null);
+});
+
+test('a removal the store could not take is tried again a minute later, and lands', async () => {
+  const store = makeStore();
+  const key = syncKeyFor(claude('b'));
+  const home = setup([claude('a'), claude('b')], { store });
+  await home.sync.sync();
+  let down = true;
+  home.sync.api = async (...args) => { if (down) throw new Error('fetch failed'); return store.api(...args); };
+  home.sync.sleep = async (ms) => { if (ms === 60_000) down = false; store.tick(ms); };
+  home.am.removeAccount(1);
+  assert.deepEqual(await home.settled(), [true]);
+  assert.notEqual(tombstoneOf(store.byKey(key).Data), null);
+  assert.equal(home.sync.pendingRemovals.size, 0);
+});
+
+test('a removal waiting for the lock writes nothing once the account is back here under another key', async () => {
+  const { store, key, home, release } = await removalWaitingOnLock();
+  // Back from an entry with no orgUuid, so its key names the organization by name.
+  home.am.addAccount(claude('b', { orgUuid: undefined }));
+  assert.notEqual(syncKeyFor(home.am.accounts[1]), key);
+  release();
+  assert.deepEqual(await home.settled(), [false]);
+  assert.equal(tombstoneOf(store.byKey(key).Data), null);
+});
+
+test('a removal settled during a retry pause takes no lock when it wakes', async () => {
+  const store = makeStore();
+  const key = syncKeyFor(claude('b'));
+  const home = setup([claude('a'), claude('b')], { store });
+  await home.sync.sync();
+  let down = true;
+  home.sync.api = async (...args) => { if (down) throw new Error('fetch failed'); return store.api(...args); };
+  let after = -1;
+  let checks = 0;
+  home.sync.isSignedIn = async () => { checks++; return true; };
+  home.sync.sleep = async (ms) => {
+    // During the first pause the store comes back and a pass writes the tombstone.
+    if (ms === 60_000) { down = false; await home.sync.sync(); after = store.calls.length; checks = 0; }
+    store.tick(ms);
+  };
+  home.am.removeAccount(1);
+  assert.deepEqual(await home.settled(), [false]);
+  assert.notEqual(tombstoneOf(store.byKey(key).Data), null);
+  assert.ok(after > 0);
+  assert.deepEqual(store.calls.slice(after).map((c) => `${c.method} ${c.path}`), [], 'nothing after it settled');
+  assert.equal(checks, 0, 'not even a sign-in check');
+});
+
+const NOT_RECORDED = (name, why) => new RegExp(`the removal of "${name}" was not recorded for your other installs \\(${why}\\); the account may reappear from them`);
+
+test('a sign-out while a removal is pending ends it: nothing is written, and the pass after signing back in adds the account back', async () => {
+  const store = makeStore();
+  const key = syncKeyFor(claude('b'));
+  const home = setup([claude('a'), claude('b')], { store });
+  await home.sync.sync();
+  let down = true;
+  home.sync.api = async (...args) => { if (down) throw new Error('fetch failed'); return store.api(...args); };
+  const pauses = [];
+  home.sync.sleep = async (ms) => { pauses.push(ms); home.signOut(); down = false; store.tick(ms); };
+  home.am.removeAccount(1);
+  assert.deepEqual(await home.settled(), [false]);
+  assert.deepEqual(pauses, [60_000], 'found signed out at the first retry, and not tried again');
+  assert.equal(home.sync.pendingRemovals.size, 0);
+  assert.equal(home.logs.filter((l) => NOT_RECORDED('b', 'this install is signed out of callback\\.net').test(l)).length, 1, home.logs.join('\n'));
+  home.signIn();
+  assert.equal((await home.sync.sync()).added, 1, 'its row is a row like any other again');
+  assert.deepEqual(home.am.accounts.map((a) => a.name), ['a', 'b']);
+  assert.equal(tombstoneOf(store.byKey(key).Data), null, 'no tombstone was written');
+});
+
+test('a pass that finds this install signed out ends a pending removal', async () => {
+  const store = makeStore();
+  const key = syncKeyFor(claude('b'));
+  const home = setup([claude('a'), claude('b')], { store });
+  await home.sync.sync();
+  let down = true;
+  home.sync.api = async (...args) => { if (down) throw new Error('fetch failed'); return store.api(...args); };
+  home.am.removeAccount(1);
+  assert.deepEqual(await home.settled(), [false]);
+  assert.equal(home.sync.pendingRemovals.size, 1, 'out of timed retries, left to the passes');
+  down = false;
+  home.signOut();
+  assert.equal((await home.sync.sync()).signedIn, false);
+  assert.equal(home.sync.pendingRemovals.size, 0);
+  assert.equal(home.logs.filter((l) => NOT_RECORDED('b', 'this install is signed out of callback\\.net').test(l)).length, 1, home.logs.join('\n'));
+  home.signIn();
+  assert.equal((await home.sync.sync()).added, 1);
+  assert.equal(tombstoneOf(store.byKey(key).Data), null);
+});
+
+test('a removal pending for more than an hour is dropped, and does not tombstone a sign-in made on another install since', async () => {
+  const store = makeStore();
+  const key = syncKeyFor(claude('b'));
+  const office = setup([claude('a'), claude('b')], { store });
+  await office.sync.sync();
+  const home = setup([claude('a'), claude('b')], { store });
+  await home.sync.sync();
+  let down = true;
+  home.sync.api = async (...args) => { if (down) throw new Error('fetch failed'); return store.api(...args); };
+  const removedAt = store.now();
+  home.am.removeAccount(1);
+  assert.deepEqual(await home.settled(), [false]);
+  assert.equal(home.sync.pendingRemovals.size, 1);
+  // Past the bound, by the least the clock can tell.
+  store.tick(removedAt + REMOVAL_PENDING_MAX_MS + 1 - store.now());
+  // Signed in again on office meanwhile; then the store is back in reach of home.
+  const entry = claude('b', { accessToken: 'at-b-new', refreshToken: 'rt-b-new', expiresAt: store.now() + 8 * H });
+  assert.equal(await office.sync.storeSignIn(entry), true);
+  down = false;
+  const r = await home.sync.sync();
+  assert.equal(home.sync.pendingRemovals.size, 0);
+  assert.equal(home.logs.filter((l) => NOT_RECORDED('b', 'callback\\.net did not take it within an hour').test(l)).length, 1, home.logs.join('\n'));
+  assert.equal(tombstoneOf(store.byKey(key).Data), null, 'no tombstone over the sign-in');
+  assert.equal(store.blob(key).accessToken, 'at-b-new', 'the sign-in stands');
+  assert.equal(r.added, 1, 'the same pass adds the account back from its row');
+  assert.equal(home.am.accounts[1].credential, 'at-b-new');
+  assert.equal((await office.sync.sync()).evicted, 0, 'office keeps its fresh login');
+  assert.deepEqual(office.am.accounts.map((a) => a.name), ['a', 'b']);
+  assert.equal((await home.sync.sync()).added, 0);
+  assert.equal(tombstoneOf(store.byKey(key).Data), null, 'nor by a later pass');
+});
+
+test('a removal pending for exactly an hour is still written by the pass', async () => {
+  const store = makeStore();
+  const key = syncKeyFor(claude('b'));
+  const office = setup([claude('a'), claude('b')], { store });
+  await office.sync.sync();
+  const home = setup([claude('a'), claude('b')], { store });
+  await home.sync.sync();
+  let down = true;
+  home.sync.api = async (...args) => { if (down) throw new Error('fetch failed'); return store.api(...args); };
+  const removedAt = store.now();
+  home.am.removeAccount(1);
+  assert.deepEqual(await home.settled(), [false]);
+  store.tick(removedAt + REMOVAL_PENDING_MAX_MS - store.now());
+  down = false;
+  assert.equal((await home.sync.sync()).added, 0);
+  assert.notEqual(tombstoneOf(store.byKey(key).Data), null, 'within the bound: it lands');
+  assert.equal(home.sync.pendingRemovals.size, 0);
+  assert.ok(!home.logs.some((l) => /was not recorded for your other installs/.test(l)), home.logs.join('\n'));
+  assert.equal((await office.sync.sync()).evicted, 1);
+});
+
+test('a timed retry that comes round after the hour drops the removal, and makes no call', async () => {
+  const store = makeStore();
+  const key = syncKeyFor(claude('b'));
+  const home = setup([claude('a'), claude('b')], { store });
+  await home.sync.sync();
+  let down = true;
+  home.sync.api = async (...args) => { if (down) throw new Error('fetch failed'); return store.api(...args); };
+  let after = -1;
+  // The last pause runs long (the machine slept, say), and the store is back when it ends.
+  home.sync.sleep = async (ms) => {
+    store.tick(ms);
+    if (ms === 15 * 60_000) { store.tick(REMOVAL_PENDING_MAX_MS); down = false; after = store.calls.length; }
+  };
+  home.am.removeAccount(1);
+  assert.deepEqual(await home.settled(), [false]);
+  assert.ok(after >= 0);
+  assert.deepEqual(store.calls.slice(after).map((c) => `${c.method} ${c.path}`), [], 'no lock, no write');
+  assert.equal(tombstoneOf(store.byKey(key).Data), null);
+  assert.equal(home.sync.pendingRemovals.size, 0);
+  assert.equal(home.logs.filter((l) => NOT_RECORDED('b', 'callback\\.net did not take it within an hour').test(l)).length, 1, home.logs.join('\n'));
+  assert.equal((await home.sync.sync()).added, 1, 'the next pass adds it back from its row');
+});
+
+test('a removal that passes the hour while it waits for the lock writes nothing, and releases the lock', async () => {
+  const { store, key, home, release } = await removalWaitingOnLock();
+  store.tick(REMOVAL_PENDING_MAX_MS);
+  release();
+  assert.deepEqual(await home.settled(), [false]);
+  assert.equal(tombstoneOf(store.byKey(key).Data), null);
+  assert.equal(home.sync.pendingRemovals.size, 0);
+  assert.equal(store.byKey(key).Locked, null, 'the lock it took is released');
+  assert.equal(home.logs.filter((l) => NOT_RECORDED('b', 'callback\\.net did not take it within an hour').test(l)).length, 1, home.logs.join('\n'));
+});
+
+test('an API-key account of the same name does not count as the removed account being back', async () => {
+  const store = makeStore();
+  const key = syncKeyFor(claude('b'));
+  const home = setup([claude('a'), claude('b'), { name: 'b', type: 'apikey', apiKey: 'k-b' }], { store });
+  const office = setup([claude('a'), claude('b')], { store });
+  await home.sync.sync();
+  await office.sync.sync();
+  home.am.removeAccount(1); // the OAuth b; the API-key namesake stays
+  assert.deepEqual(await home.settled(), [true]);
+  assert.notEqual(tombstoneOf(store.byKey(key).Data), null);
+  assert.equal((await office.sync.sync()).evicted, 1);
+});
+
+test('a sign-in here made while the removal takes the lock is not written over', async () => {
+  const store = makeStore();
+  const key = syncKeyFor(claude('b'));
+  const home = setup([claude('a'), claude('b')], { store });
+  await home.sync.sync();
+  const id = store.byKey(key).User_Credential__;
+  const entry = claude('b', { accessToken: 'at-b-new', refreshToken: 'rt-b-new', expiresAt: store.now() + 8 * H });
+  let first = true;
+  home.sync.api = async (method, path, ...rest) => {
+    const r = await store.api(method, path, ...rest);
+    if (first && path === `User/Credential/${id}:lock`) { first = false; await home.sync.storeSignIn(entry); }
+    return r;
+  };
+  home.am.removeAccount(1);
+  assert.deepEqual(await home.settled(), [false]);
+  assert.equal(tombstoneOf(store.byKey(key).Data), null);
+  assert.equal(store.blob(key).accessToken, 'at-b-new', 'the sign-in stands');
+});
+
 test('a tombstone older than a week is deleted by whichever pass sees it', async () => {
   const store = makeStore();
   store.put(syncKeyFor(claude('old')), tombstone(store.now() - TOMBSTONE_TTL_MS - 1));
@@ -372,6 +947,7 @@ test('a removal with no row, or while signed out, records nothing and is not an 
   am.removeAccount(1);
   await settled();
   assert.equal(tombstoneOf(store.byKey(syncKeyFor(claude('b'))).Data), null);
+  assert.equal(sync.pendingRemovals.size, 0, 'nothing is left pending');
   assert.equal(await sync.onAccountRemoved({ name: 'k', type: 'apikey' }), false);
 });
 
@@ -703,6 +1279,47 @@ test('a removed account is renewed under the lock, then released', async () => {
   assert.ok(lockAt >= 0 && fns.slice(lockAt + 1).includes('POST unlock'), fns.join(', '));
 });
 
+test('a removal finds the tombstone another install wrote since its last read, and leaves it as written', async () => {
+  const store = makeStore();
+  const key = syncKeyFor(claude('a'));
+  const home = setup([claude('a')], { store });
+  const office = setup([claude('a')], { store });
+  await home.sync.sync();
+  await office.sync.sync();
+  home.am.removeAccount(0);
+  await home.settled();
+  const first = JSON.parse(store.byKey(key).Data)._deleted;
+  store.tick(60_000);
+  // Office still holds the row as its pass read it: live. Under the lock it finds the tombstone.
+  office.am.removeAccount(0);
+  assert.deepEqual(await office.settled(), [false]);
+  assert.equal(JSON.parse(store.byKey(key).Data)._deleted, first, 'the first tombstone stands, not rewritten');
+  assert.equal(store.byKey(key).Locked, null);
+});
+
+test('a renewal past its lease whose re-read fails stores its token as before', async () => {
+  const store = makeStore();
+  const key = syncKeyFor(claude('a'));
+  let failRead = false;
+  const office = setup([claude('a')], {
+    store,
+    refresh: async (rt) => {
+      store.tick(31_000);
+      failRead = true;
+      return { accessToken: `${rt}-renewed-at`, refreshToken: `${rt}-renewed-rt`, expiresAt: store.now() + 8 * H };
+    },
+  });
+  await office.sync.sync();
+  office.sync.api = async (method, path, ...rest) => {
+    if (failRead && method === 'GET' && path.startsWith('User/Credential/')) { failRead = false; throw new Error('fetch failed'); }
+    return store.api(method, path, ...rest);
+  };
+  await office.am.ensureTokenFresh(0, true);
+  assert.equal(failRead, false, 'the re-read was made, and failed');
+  assert.equal(store.blob(key).accessToken, 'rt-a-1-renewed-at');
+  assert.deepEqual(office.persisted.map(([, t]) => t.accessToken), ['rt-a-1-renewed-at']);
+});
+
 test('a row gone between its read and its lock is found again, and locked', async () => {
   const { sync, am, store, refreshed, sent } = setup([claude('a')]);
   await sync.sync();
@@ -728,6 +1345,146 @@ test('an account the store does not carry by identity is still renewed under the
   const lone = setup([{ ...claude('n'), accountUuid: undefined }], { store });
   await lone.am.ensureTokenFresh(0, true);
   assert.deepEqual(lone.refreshed, ['rt-n-1']);
+});
+
+// A renewal writes the row from the account that renewed it. One matched to
+// the row by its refresh token alone carries no identity of its own.
+test('a renewal by an account held without its identity keeps the row\'s identity and name, and another install adds it whole', async () => {
+  const store = makeStore();
+  const a = claude('a', { hasClaudeMax: true, rateLimitTier: 'tier-a' });
+  const key = syncKeyFor(a);
+  store.put(key, encodeBlob(a, { accessToken: a.accessToken, refreshToken: a.refreshToken, expiresAt: T0 - H }, { now: T0, by: 'office' }));
+  // `teamclaude import` of that expired token renews it before reading the profile.
+  const imported = { name: 'imported account', type: 'oauth', accessToken: a.accessToken, refreshToken: a.refreshToken, expiresAt: T0 - H };
+  const tokens = await refreshOutsideProxy(imported, async () => ({ accessToken: 'at-a-2', refreshToken: 'rt-a-2', expiresAt: T0 + 8 * H }),
+    { force: true, api: store.api, isSignedIn: async () => true, log: () => {}, now: store.now, by: 'laptop' });
+  assert.equal(tokens?.refreshToken, 'rt-a-2');
+  const blob = store.blob(key);
+  assert.equal(blob.refreshToken, 'rt-a-2', 'the renewal is stored');
+  for (const f of ['accountUuid', 'orgUuid', 'orgName', 'hasClaudeMax', 'rateLimitTier']) assert.equal(blob[f], a[f], f);
+  assert.equal(blob.name, 'a');
+  // An install without the account adds it as the row describes it, and syncs it.
+  const other = setup([], { store });
+  await other.sync.sync();
+  assert.equal(other.admitted.length, 1);
+  assert.equal(other.admitted[0].name, 'a');
+  assert.equal(isSyncable(other.admitted[0]), true);
+});
+
+test('a renewal by an account missing part of its identity keeps the rest from the row; what it has decides', async () => {
+  const store = makeStore();
+  const a = claude('a', { hasClaudeMax: true, rateLimitTier: 'tier-a' });
+  store.put(syncKeyFor(a), encodeBlob(a, { accessToken: a.accessToken, refreshToken: a.refreshToken, expiresAt: a.expiresAt }, { now: T0, by: 'office' }));
+  const { am } = setup([claude('a', { orgName: undefined, hasClaudeMax: false })], { store });
+  await am.ensureTokenFresh(0, true);
+  const blob = store.blob(syncKeyFor(a));
+  assert.equal(blob.refreshToken, 'rt-a-1-renewed-rt');
+  assert.equal(blob.orgName, 'Org a');
+  assert.equal(blob.rateLimitTier, 'tier-a');
+  assert.equal(blob.hasClaudeMax, false, 'the account\'s own reading');
+});
+
+test('an account renewing under the lock of a row of another identity takes nothing from that row', async () => {
+  const store = makeStore();
+  const a = claude('a', { hasClaudeMax: true, rateLimitTier: 'tier-a' });
+  // The row names a, yet holds the refresh token b has.
+  store.put(syncKeyFor(a), encodeBlob(a, { accessToken: 'at-b-1', refreshToken: 'rt-b-1', expiresAt: T0 + 8 * H }, { now: T0, by: 'office' }));
+  const { am, refreshed } = setup([claude('b')], { store });
+  await am.ensureTokenFresh(0, true);
+  assert.deepEqual(refreshed, ['rt-b-1']);
+  const blob = store.blob(syncKeyFor(a));
+  assert.equal(blob.accountUuid, 'uuid-b');
+  assert.equal(blob.hasClaudeMax, undefined);
+  assert.equal(blob.rateLimitTier, undefined);
+});
+
+test('a Codex account renewing keeps its row\'s other fields, and takes nothing from a row of another Codex account', async () => {
+  const store = makeStore();
+  const c = codex('c', { rateLimitTier: 'tier-c' });
+  store.put(syncKeyFor(c), encodeBlob({ ...c, name: 'c at the office' }, { accessToken: c.accessToken, refreshToken: c.refreshToken, expiresAt: c.expiresAt }, { now: T0, by: 'office' }));
+  const own = setup([codex('c')], { store });
+  await own.am.ensureTokenFresh(0, true);
+  let blob = store.blob(syncKeyFor(c));
+  assert.equal(blob.refreshToken, 'rt-c-1-renewed-rt');
+  assert.equal(blob.rateLimitTier, 'tier-c');
+  assert.equal(blob.name, 'c', 'an account with its identity names the row, as before');
+  // The row names c, yet holds the refresh token d has.
+  store.put(`${KEY_PREFIX}codex.acct-c2`, encodeBlob({ ...c, accountId: 'acct-c2', name: 'c2' }, { accessToken: 'at-d-1', refreshToken: 'rt-d-1', expiresAt: T0 + 8 * H }, { now: T0, by: 'office' }));
+  const other = setup([codex('d')], { store });
+  await other.am.ensureTokenFresh(0, true);
+  blob = store.blob(`${KEY_PREFIX}codex.acct-c2`);
+  assert.equal(blob.refreshToken, 'rt-d-1-renewed-rt');
+  assert.equal(blob.accountId, 'acct-d');
+  assert.equal(blob.rateLimitTier, undefined);
+});
+
+// Every write over a row other than a sign-in keeps the row's fields the
+// account lacks: the pass storing a renewal, the token listener, an emptying.
+const rowWithMore = (store, tokens) => store.put(syncKeyFor(claude('a')), encodeBlob(claude('a', { rateLimitTier: 'tier-a' }), tokens, { now: T0, by: 'office' }));
+const keptFromRow = (store) => {
+  const blob = store.blob(syncKeyFor(claude('a')));
+  assert.equal(blob.orgName, 'Org a');
+  assert.equal(blob.rateLimitTier, 'tier-a');
+  return blob;
+};
+
+test('the pass storing a renewal keeps the row\'s fields the account lacks', async () => {
+  const store = makeStore();
+  rowWithMore(store, { accessToken: 'at-a-0', refreshToken: 'rt-a-0', expiresAt: T0 + H });
+  const { sync } = setup([claude('a', { orgName: undefined })], { store });
+  assert.equal((await sync.sync()).pushed, 1);
+  assert.equal(keptFromRow(store).refreshToken, 'rt-a-1');
+});
+
+test('a renewal stored from the token listener keeps the row\'s fields the account lacks', async () => {
+  const store = makeStore();
+  rowWithMore(store, { accessToken: 'at-a-1', refreshToken: 'rt-a-1', expiresAt: T0 + 8 * H });
+  const { sync, am } = setup([claude('a', { orgName: undefined })], { store, minted: false });
+  await sync.sync();
+  am.accounts[0]._minted = true;
+  await sync.onLocalTokens(0, { accessToken: 'at-a-2', refreshToken: 'rt-a-2', expiresAt: T0 + 9 * H });
+  assert.equal(keptFromRow(store).refreshToken, 'rt-a-2');
+});
+
+test('emptying a row that holds the rejected token keeps the row\'s fields the account lacks', async () => {
+  const store = makeStore();
+  rowWithMore(store, { accessToken: 'at-a-1', refreshToken: 'rt-a-1', expiresAt: T0 + 8 * H });
+  const { sync, am } = setup([claude('a', { orgName: undefined })], { store });
+  am.accounts[0].status = 'error';
+  am.accounts[0]._deadRefreshToken = 'rt-a-1';
+  assert.equal((await sync.sync()).emptied, 1);
+  assert.equal(keptFromRow(store).refreshToken, '');
+});
+
+// Rewritten by another version between the read and the lock, the row holds
+// nothing to keep: the renewal is stored as the account describes it.
+test('a renewal by an account held without its identity is still stored over a row that no longer reads once locked', async () => {
+  const store = makeStore();
+  const a = claude('a');
+  const row = store.put(syncKeyFor(a), encodeBlob(a, { accessToken: a.accessToken, refreshToken: a.refreshToken, expiresAt: T0 - H }, { now: T0, by: 'office' }));
+  const api = async (method, path, params, opts) => {
+    if (path.endsWith(':lock')) row.Data = JSON.stringify({ v: 2, by: 'newer' });
+    return store.api(method, path, params, opts);
+  };
+  const imported = { name: 'imported account', type: 'oauth', accessToken: a.accessToken, refreshToken: a.refreshToken, expiresAt: T0 - H };
+  const tokens = await refreshOutsideProxy(imported, async () => ({ accessToken: 'at-a-2', refreshToken: 'rt-a-2', expiresAt: T0 + 8 * H }),
+    { force: true, api, isSignedIn: async () => true, log: () => {}, now: store.now, by: 'laptop' });
+  assert.equal(tokens?.refreshToken, 'rt-a-2');
+  assert.equal(store.blob(syncKeyFor(a)).refreshToken, 'rt-a-2', 'the renewal is stored');
+});
+
+// A sign-in's entry is what the sign-in read: a plan field the sign-in no
+// longer reads is not kept from the row.
+test('a sign-in is stored as its entry stands, without what the row said before', async () => {
+  const store = makeStore();
+  const a = claude('a', { seatTier: 'team-premium', organizationType: 'claude_team' });
+  store.put(syncKeyFor(a), encodeBlob(a, { accessToken: a.accessToken, refreshToken: a.refreshToken, expiresAt: a.expiresAt }, { now: T0, by: 'office' }));
+  const { sync } = setup([], { store });
+  assert.equal(await sync.storeSignIn({ ...claude('a'), seatTier: null, organizationType: null, accessToken: 'at-a-login', refreshToken: 'rt-a-login', expiresAt: T0 + 8 * H }), true);
+  const blob = store.blob(syncKeyFor(a));
+  assert.equal(blob.refreshToken, 'rt-a-login');
+  assert.equal(blob.seatTier, undefined);
+  assert.equal(blob.organizationType, undefined);
 });
 
 test('a forced refresh waits for the lock holder even while the clock calls the token good', async () => {
@@ -1056,6 +1813,22 @@ test('an account that goes into error takes a token another install stored since
   am.markCredentialRejected(0, '401');
   assert.equal(await recoveries[1], false);
   assert.equal(am.accounts[0].status, 'error');
+});
+
+// The remedy for a refusal is a sign-in, and one made on another install
+// reaches this one through the store.
+test('a sign-in on another install brings an account upstream refused here back at the next pass', async () => {
+  const store = makeStore();
+  const home = setup([claude('a')], { store });
+  await home.sync.sync();
+  home.am.markRefused(home.am.accounts[0], { code: 'account_on_hold', message: 'on hold', link: null });
+  await home.sync.sync();
+  assert.equal(home.am.accounts[0].status, 'error', 'nothing new in the store');
+  const office = setup([], { store });
+  await office.sync.storeSignIn({ ...claude('a'), accessToken: 'at-a-login', refreshToken: 'rt-a-login', expiresAt: T0 + 8 * H });
+  await home.sync.sync();
+  assert.equal(home.am.accounts[0].status, 'active');
+  assert.equal(home.am.accounts[0].credential, 'at-a-login');
 });
 
 test('two installs renewing one account at once: one renews, the other adopts', async () => {

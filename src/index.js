@@ -5,12 +5,13 @@ import { createInterface } from 'node:readline';
 import { createWriteStream, existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import net from 'node:net';
-import { loadOrCreateConfig, loadConfig, loadConfigPersistingIds, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, getQuotaSeriesPath, loadState, saveState } from './config.js';
+import { loadOrCreateConfig, loadConfig, loadConfigPersistingIds, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, getQuotaSeriesPath, getUsageDbPath, loadState, saveState } from './config.js';
 import { loadQuotaSeries, saveQuotaSeries } from './quota-series.js';
 import { installCrashHandlers } from './crash-log.js';
 import { AccountManager, distributionMode, accountRouting, isLongLived } from './account-manager.js';
 import { validateAdaptiveConfig } from './adaptive-distribution.js';
-import { createProxyServer, reloadedHeaderFlags, resolveAccountPin } from './server.js';
+import { createProxyServer, NO_USAGE_STORE, reloadedHeaderFlags, resolveAccountPin } from './server.js';
+import { openUsageStore, startTicks, closeUsageStore } from './usage/db.js';
 import { createDrainState, resolveDrainTimeoutSeconds } from './drain.js';
 import { importCredentials, loginOAuth, loginOAuthWithPastedCode, startOAuthLogin, fetchProfile, profileForCredentials, refreshAccessToken, isTokenExpired, isTokenExpiringSoon } from './oauth.js';
 import {
@@ -36,6 +37,7 @@ import { Prober, probeApplicable } from './prober.js';
 import { CreditMonitor } from './api-credit.js';
 import { ResetCreditRedeemer } from './codex-reset-credits.js';
 import { ClaudeResetRedeemer } from './claude-resets.js';
+import { createResetActions } from './reset-actions.js';
 import { Warmer, warmApplicable } from './warmer.js';
 import { formatWarmupScheduleConfirmation, resolveWarmupConfig } from './warmup-schedule.js';
 import { TUI, ACCOUNT_SORTS } from './tui.js';
@@ -46,8 +48,10 @@ import { SxManager } from './sx.js';
 import { autoUpdate, checkForUpdate, currentVersion, resolveVersionLabel, runUpdate, installKind, updateAvailableFromCache, updateCommandFor, PKG_NAME } from './updater.js';
 import { renderStatus, formatPercent } from './status-renderer.js';
 import { sanitizeText, safeLine } from './safe-text.js';
+import { parseEndsAt, describeEndsAt } from './ends-at.js';
 import { modelLabel } from './model.js';
 import { cacheUsageLabel } from './usage-label.js';
+import { statusLabel } from './error-type.js';
 import { ClientUsageTracker, UsageDimensionTracker } from './client-usage.js';
 import { buildClaudeEnvLines, bypassesAllHosts, clearSelfProxyEnvLines, encodePinComponent, LOCAL_LOGIN_HINT_WINDOW_MS, localLoginHint, mergeNoProxy, resolveClientMode } from './claude-env.js';
 import { serviceKind, installService, uninstallService, serviceStatus, renderService, logPath } from './service.js';
@@ -60,6 +64,7 @@ import { startEventLoopMonitor } from './event-loop-monitor.js';
 import { envVar } from './brand.js';
 import { loginCallback, loadCallbackToken, saveCallbackToken, callbackWhoami, logoutCallback, callbackClientId, getCallbackAuthPath } from './callback-auth.js';
 import { CredentialSync, refreshOutsideProxy } from './credential-sync.js';
+import { setRefreshTokenExpiry, createRefreshTokenExpiryWarner } from './refresh-token-expiry.js';
 
 // The server's credential sync, once it runs; a CLI command that changes an
 // account on disk talks to the store through a sync of its own instead.
@@ -87,12 +92,17 @@ async function recordSignInWithCallback(entry) {
 
 /**
  * An account removed by hand (`remove`): leave the tombstone the other
- * installs act on, when this install is signed in to callback.net.
+ * installs act on, when this install is signed in to callback.net. One
+ * attempt, with no wait for a held lock, so the command does not hang: a
+ * running proxy, told to reload next, drops the account too and records the
+ * removal with its own wait and retries.
  * @param {Record<string, any>} entry
  */
 async function recordRemovalWithCallback(entry) {
   try {
-    if (await standaloneCredentialSync().onAccountRemoved({ ...entry, credential: entry.accessToken })) console.log('Recorded on callback.net: your other installs will remove it too.');
+    const sync = standaloneCredentialSync();
+    if (await sync.onAccountRemoved({ ...entry, credential: entry.accessToken }, { wait: false })) console.log('Recorded on callback.net: your other installs will remove it too.');
+    else if (sync.pendingRemovals.size) console.log('Not recorded on callback.net yet (its lock is held, or it could not be reached). A running proxy records it once told of the removal; with none running, the next start adds the account back, so remove it again then.');
   } catch (/** @type {any} */ err) {
     console.error(`Could not record the removal on callback.net: ${err?.message || err}`);
   }
@@ -122,6 +132,7 @@ import {
   upsertRoute,
   setAccountDisabled,
   setAccountCordoned,
+  setAccountEndsAt,
   setAccountPriority,
   renameAccount,
 } from './config-ops.js';
@@ -247,6 +258,10 @@ switch (command) {
     await setCordonedCommand(false);
     process.exit(0);
     break;
+  case 'ends':
+    await endsCommand();
+    process.exit(0);
+    break;
   case 'release':
     await releaseCommand();
     process.exit(0);
@@ -319,6 +334,7 @@ switch (command) {
 }
 
 // ── server ──────────────────────────────────────────────────
+
 
 async function serverCommand() {
   // Installed first: the server is the long-lived process, it runs under a TUI
@@ -399,7 +415,7 @@ async function serverCommand() {
     console.error(`[TeamClaude] Bad adaptiveDistribution setting in ${getConfigPath()}: ${err.message}`);
     process.exit(1);
   }
-  const accountManager = new AccountManager(accounts, threshold, { routes: config.routes, ramp: config.stormRamp, distributeSessions: config.distributeSessions, expiryRouting: config.expiryRouting, preferSoonestWeeklyReset: config.preferSoonestWeeklyReset, advisorEligibility: config.advisorEligibility, adaptive, listener: localListener(config) });
+  const accountManager = new AccountManager(accounts, threshold, { routes: config.routes, ramp: config.stormRamp, distributeSessions: config.distributeSessions, expiryRouting: config.expiryRouting, preferSoonestWeeklyReset: config.preferSoonestWeeklyReset, switchOnSessionReset: config.switchOnSessionReset, advisorEligibility: config.advisorEligibility, adaptive, listener: localListener(config) });
   // Names the activity log's session column from Claude Code's own on-disk
   // session titles. Built whether or not the TUI runs, so a reload has one
   // object to reconfigure.
@@ -421,6 +437,18 @@ async function serverCommand() {
   const dimensionUsage = new UsageDimensionTracker();
   if (savedState?.usageDimensions) dimensionUsage.restore(savedState.usageDimensions);
 
+  // SQLite usage history (src/usage/db.js), served at /teamclaude/usage. Off
+  // unless proxy.usageHistory is true, and read at start. A store that fails to
+  // open is not fatal — it serves `disabled` rather than taking the proxy down
+  // over a full disk or a corrupt file it could not recreate — so this only
+  // ever logs, never throws.
+  const usageStore = config.proxy?.usageHistory === true
+    ? openUsageStore({
+      path: getUsageDbPath(),
+      onError: (label, err) => console.error(`[TeamClaude] usage ${label}: ${err.message}`),
+    })
+    : NO_USAGE_STORE;
+  if (config.proxy?.usageHistory === true && usageStore.disabled) console.error(`[TeamClaude] usage history disabled: ${usageStore.reason}`);
   // The quota series behind the fleet forecast (#550), in its own file beside
   // the state file. Missing or corrupt reads as empty history.
   accountManager.quotaSeries = await loadQuotaSeries(getQuotaSeriesPath());
@@ -443,6 +471,9 @@ async function serverCommand() {
   };
   /** @type {ReturnType<typeof setInterval>|null} */
   let quotaSeriesInterval = null;
+  // On that minute tick too: one line a day for an account whose refresh token
+  // is known to lapse within days, so the re-login is planned, not discovered.
+  const warnRefreshTokenExpiry = createRefreshTokenExpiryWarner();
 
   // An account admitted from somewhere other than this install's config: the
   // callback.net credential store (credential-sync.js). Same three lists the
@@ -523,6 +554,9 @@ async function serverCommand() {
         diskConfig.accounts[cfgIdx].accessToken = newTokens.accessToken;
         diskConfig.accounts[cfgIdx].refreshToken = newTokens.refreshToken;
         diskConfig.accounts[cfgIdx].expiresAt = newTokens.expiresAt;
+        // With the token it describes: the date the manager settled on for this
+        // refresh token, or no key when it knows none.
+        setRefreshTokenExpiry(diskConfig.accounts[cfgIdx], newTokens.refreshTokenExpiresAt);
       } else {
         // Said out loud: the account keeps serving on the new token, so nothing
         // else shows that the file still holds the old one until a restart
@@ -617,6 +651,8 @@ async function serverCommand() {
     if (config.proxy) config.proxy.mcp = diskConfig.proxy?.mcp;
     // The CLIProxyAPI-compatible usage API, the same way and for the same reason.
     if (config.proxy) config.proxy.cliproxyApi = diskConfig.proxy?.cliproxyApi;
+    // Where Claude Code's bootstrap and feature calls go, the same way.
+    if (config.proxy) config.proxy.controlPlane = diskConfig.proxy?.controlPlane;
     // Pick up route table edits (teamclaude route …, TUI editor, or a hand edit).
     config.routes = diskConfig.routes || [];
     accountManager.setRoutes(config.routes);
@@ -639,6 +675,8 @@ async function serverCommand() {
     accountManager.setExpiryRouting(config.expiryRouting);
     config.preferSoonestWeeklyReset = diskConfig.preferSoonestWeeklyReset;
     accountManager.setPreferSoonestWeeklyReset(config.preferSoonestWeeklyReset);
+    config.switchOnSessionReset = diskConfig.switchOnSessionReset;
+    accountManager.setSwitchOnSessionReset(config.switchOnSessionReset);
     // And the advisor mode: read off the manager on every selection, so the
     // setter is the whole application. Absent on disk means 'strict' again.
     config.advisorEligibility = diskConfig.advisorEligibility;
@@ -739,13 +777,17 @@ async function serverCommand() {
     clearAddedAccountIds(config);
   };
 
+  const redeemer = new ResetCreditRedeemer(accountManager, { config });
+  const claudeRedeemer = new ClaudeResetRedeemer(accountManager, { config });
+  const resetActions = createResetActions({ accountManager, claudeRedeemer, codexRedeemer: redeemer });
+
   let tui = null;
   /** @type {Record<string, any>} */
   let hooks = {};
 
   if (useTUI) {
     tui = new TUI({
-      accountManager, config, sx, activityLogPath, sessionTitles, versionLabel, updateAvailable,
+      accountManager, config, sx, activityLogPath, sessionTitles, versionLabel, updateAvailable, resetActions,
       saveConfig: () => atomicConfigUpdate(async diskConfig => {
         mergeAccountsOnto(diskConfig);
         // Persist sx.org settings (set/cleared from the TUI settings screen).
@@ -854,7 +896,7 @@ async function serverCommand() {
       const client = (info.client || r?.client) ? `[${info.client || r.client}] ` : '';
       const pin = (info.pinned || r?.pinned) ? ' [pin]' : '';
       const cache = cacheUsageLabel(info.cacheUsage);
-      writeActivity(`${client}${sid}${info.method} ${info.path}${model} → ${acct}${pin} (${info.status}, ${dur}s)${cache ? ` ${cache}` : ''}`);
+      writeActivity(`${client}${sid}${info.method} ${info.path}${model} → ${acct}${pin} (${statusLabel(info.status, info.errorType)}, ${dur}s)${cache ? ` ${cache}` : ''}`);
     };
     // Tee console output to the activity log as well
     const origLog = console.log;
@@ -902,10 +944,8 @@ async function serverCommand() {
   // is not about redemption) simply refuses as before. The shared config, so the
   // fleet switch (`autoRedeemResets`) is read live — a TUI toggle or a reload
   // binds on the next refusal, not the next restart.
-  const redeemer = new ResetCreditRedeemer(accountManager, { config });
-  // Banked Claude usage-limit resets, armed by the same switch (autoRedeemResets).
-  const claudeRedeemer = new ClaudeResetRedeemer(accountManager, { config });
-  hooks.redeemClaudeResetForPool = (/** @type {Record<string, any>[]} */ accounts) => claudeRedeemer.maybeRedeemForPool(accounts);
+  // Banked Claude usage-limit resets are armed by the same switch.
+  hooks.redeemClaudeResetForPool = (/** @type {Record<string, any>[]} */ accounts, /** @type {{ model?: string|null }} */ opts) => claudeRedeemer.maybeRedeemForPool(accounts, opts);
   hooks.redeemCodexResetForPool = (/** @type {Record<string, any>[]} */ accounts) => redeemer.maybeRedeemForPool(accounts);
   hooks.getStatusExtra = () => ({
     // Read live from the shared config (not a startup snapshot) so the TUI's
@@ -975,7 +1015,7 @@ async function serverCommand() {
   // Shared with the listener (drain.js): POST /teamclaude/drain flips it, and a graceful
   // shutdown waits on the same in-flight count.
   const drain = createDrainState();
-  const server = createProxyServer(accountManager, config, hooks, sx, clientUsage, dimensionUsage, { bindHost, drain });
+  const server = createProxyServer(accountManager, config, hooks, sx, clientUsage, dimensionUsage, { bindHost, drain, usageStore });
   // Said once, at start: a value that is set but cannot turn the drain on would otherwise
   // leave SIGTERM stopping at once with nothing to say why.
   const rawDrain = config.proxy?.drainTimeoutSeconds;
@@ -1043,8 +1083,14 @@ async function serverCommand() {
   // Persist quota every minute; unref so it never keeps the process alive.
   quotaSaveInterval = setInterval(persistQuotaState, 60_000);
   quotaSaveInterval.unref?.();
-  quotaSeriesInterval = setInterval(sampleQuotaSeries, 60_000);
+  warnRefreshTokenExpiry(accountManager.accounts);
+  quotaSeriesInterval = setInterval(() => {
+    sampleQuotaSeries();
+    warnRefreshTokenExpiry(accountManager.accounts);
+  }, 60_000);
   quotaSeriesInterval.unref?.();
+  // WAL checkpoint + retention sweep; a no-op timer when the store is disabled.
+  startTicks(usageStore);
 
   // Start the opt-in quota probe (no-op when quotaProbeSeconds is 0).
   prober = new Prober(accountManager, {
@@ -1133,8 +1179,10 @@ async function serverCommand() {
       // The requests that finished while draining moved quota and usage
       // counters after the save above, and the periodic save is already off.
       await persistQuotaState();
+      closeUsageStore(usageStore);
       process.exit(0);
     }
+    closeUsageStore(usageStore);
     // Don't linger waiting on keep-alive / streaming connections: actively
     // destroy them so server.close() can complete promptly, and hard-exit after a
     // short grace period in case anything still hangs.
@@ -1180,6 +1228,8 @@ async function importCommand() {
         accessToken: data.accessToken,
         refreshToken: data.refreshToken,
         expiresAt: data.expiresAt,
+        // As importCredentials does for a file: only when the source states it.
+        ...(data.refreshTokenExpiresAt != null && { refreshTokenExpiresAt: data.refreshTokenExpiresAt }),
       };
     } catch (err) {
       console.error(`Failed to parse --json: ${err.message}`);
@@ -1392,6 +1442,8 @@ async function upsertCodexAccount(requestedName, creds, routing = null, storeRou
       // had, instead of silently clearing it.
       ...(routing && storeRouting ? { routing: routingToUrl(routing) } : {}),
     };
+    // When the refresh token lapses, if these credentials came with it.
+    setRefreshTokenExpiry(account, creds.refreshTokenExpiresAt);
 
     // Identity for a Codex account is its ChatGPT account id and user id; fall
     // back to the display name when upstream did not supply one.
@@ -1401,6 +1453,9 @@ async function upsertCodexAccount(requestedName, creds, routing = null, storeRou
     if (idx >= 0) {
       const prev = config.accounts[idx];
       config.accounts[idx] = { ...prev, ...account, name: prev.name };
+      // A new sign-in is a new refresh token: the date the row held was about
+      // the old one, so it is replaced by what this response stated, or dropped.
+      setRefreshTokenExpiry(config.accounts[idx], creds.refreshTokenExpiresAt);
       outcome = { action: 'updated', name: prev.name };
       if (storeRouting && !routing) delete config.accounts[idx].routing; // --routing none
       console.log(`Updated account "${prev.name}"`);
@@ -2088,6 +2143,9 @@ async function accountsCommand() {
       a.accessToken = newTokens.accessToken;
       a.refreshToken = newTokens.refreshToken;
       a.expiresAt = newTokens.expiresAt;
+      // refreshOutsideProxy hands back the date this token now goes by (the
+      // earlier one after a rotation; another install's own after an adoption).
+      setRefreshTokenExpiry(a, newTokens.refreshTokenExpiresAt);
       refreshed.push(a);
     } catch {
       // refresh failed — fetchProfile will report the specific error
@@ -2105,6 +2163,7 @@ async function accountsCommand() {
         disk.accounts[i].accessToken = a.accessToken;
         disk.accounts[i].refreshToken = a.refreshToken;
         disk.accounts[i].expiresAt = a.expiresAt;
+        setRefreshTokenExpiry(disk.accounts[i], a.refreshTokenExpiresAt);
       }
     });
   }
@@ -2362,12 +2421,11 @@ async function probeCommand() {
     }
   }
 
-  applyOrExit(() => setProbeSeconds(config, seconds));
-  await saveConfig(config);
+  const { config: saved } = await updateConfigOrExit(disk => setProbeSeconds(disk, seconds));
   console.log(seconds > 0
     ? `Quota probe set to every ${seconds}s (reads /api/oauth/usage; does not spend quota).`
     : 'Quota probe disabled (passive only).');
-  await notifyRunningServer(config);
+  await notifyRunningServer(saved);
 }
 
 // ── warmup ──────────────────────────────────────────────────
@@ -2399,10 +2457,9 @@ async function warmupCommand() {
       console.error(`Usage: teamclaude warmup ${arg} HH:MM --timezone Area/City`);
       process.exit(1);
     }
-    applyOrExit(() => setWarmupSchedule(config, arg, { resetTime, timezone }));
-    await saveConfig(config);
-    console.log(formatWarmupScheduleConfirmation(config.warmupSchedule));
-    await notifyRunningServer(config);
+    const { config: saved } = await updateConfigOrExit(disk => setWarmupSchedule(disk, arg, { resetTime, timezone }));
+    console.log(formatWarmupScheduleConfirmation(saved.warmupSchedule));
+    await notifyRunningServer(saved);
     return;
   }
 
@@ -2417,12 +2474,11 @@ async function warmupCommand() {
     }
   }
 
-  applyOrExit(() => setWarmupSeconds(config, seconds));
-  await saveConfig(config);
+  const { config: saved } = await updateConfigOrExit(disk => setWarmupSeconds(disk, seconds));
   console.log(seconds > 0
     ? `Keep-warm set to every ${seconds}s (spawns a minimal \`claude\` per idle account; spends a little quota).`
     : 'Keep-warm disabled.');
-  await notifyRunningServer(config);
+  await notifyRunningServer(saved);
 }
 
 // ── threshold ───────────────────────────────────────────────
@@ -2465,13 +2521,14 @@ async function thresholdCommand() {
       console.error(THRESHOLD_USAGE);
       process.exit(1);
     }
-    const { dropped } = applyOrExit(() => setThreshold(config, rest[0]));
-    await saveConfig(config);
+    // What it dropped is read off the file as it is now, not off the copy
+    // loaded above: a table set since then is dropped too, and named.
+    const { config: saved, result: { dropped } } = await updateConfigOrExit(disk => setThreshold(disk, rest[0]));
     if (dropped.length) {
       console.log(`Dropped the per-bucket thresholds (${dropped.join(', ')}) — one number governs every bucket.`);
     }
-    console.log(`Switch threshold set to ${formatPercent(config.switchThreshold)}.`);
-    await notifyRunningServer(config);
+    console.log(`Switch threshold set to ${formatPercent(saved.switchThreshold)}.`);
+    await notifyRunningServer(saved);
     return;
   }
 
@@ -2487,10 +2544,9 @@ async function thresholdCommand() {
     console.error(THRESHOLD_USAGE);
     process.exit(1);
   }
-  applyOrExit(() => setBucketThresholds(config, pairs));
-  await saveConfig(config);
-  printThresholds(config.switchThreshold);
-  await notifyRunningServer(config);
+  const { config: saved } = await updateConfigOrExit(disk => setBucketThresholds(disk, pairs));
+  printThresholds(saved.switchThreshold);
+  await notifyRunningServer(saved);
 }
 
 // ── distribute ──────────────────────────────────────────────
@@ -2526,9 +2582,21 @@ async function distributeCommand() {
   // An unchanged setting is not rewritten — the config file is a
   // read-modify-write shared with the running server — but the server is still
   // notified, so a config that already says `on` can be made to take effect.
-  if (setDistribution(config, next)) await saveConfig(config);
+  // Whether it is unchanged is judged on the file as it is under the lock, and
+  // the updater throwing is what leaves that file alone.
+  const unchanged = new Error('unchanged');
+  /** @type {any} */
+  let saved = config;
+  try {
+    await atomicConfigUpdate((/** @type {any} */ disk) => {
+      saved = disk;
+      if (!setDistribution(disk, next)) throw unchanged;
+    });
+  } catch (err) {
+    if (err !== unchanged) throw err;
+  }
   console.log(DISTRIBUTE_MODES[next].said);
-  await notifyRunningServer(config);
+  await notifyRunningServer(saved);
 }
 
 // ── update ──────────────────────────────────────────────────
@@ -2705,8 +2773,27 @@ function resolveAccount(accounts, query, orgFilter) {
   process.exit(1);
 }
 
+/**
+ * resolveAccount for use inside a config update: the same two refusals, in the
+ * same words, thrown rather than printed. Exiting there would leave the config
+ * lock behind for the next writer to wait out; thrown, the update is abandoned
+ * with the file untouched and updateConfigOrExit prints the message.
+ * @param {any[]} accounts
+ * @param {string} query
+ * @param {string|null} orgFilter
+ */
+function requireAccount(accounts, query, orgFilter) {
+  const matches = matchAccounts(accounts, query, orgFilter);
+  if (matches.length === 1) return matches[0];
+  if (matches.length === 0) throw new ConfigOpError(`Account "${query}" not found`);
+  throw new ConfigOpError([
+    `"${query}" matches ${matches.length} accounts — disambiguate with --org <name|uuid>:`,
+    ...matches.map((/** @type {any} */ a) => `  - ${a.name}${a.orgName ? `  (org: ${a.orgName})` : ''}`),
+  ].join('\n'));
+}
+
 async function removeCommand() {
-  const config = await loadOrCreateConfig();
+  await loadOrCreateConfig();
   const name = args[1];
 
   if (!name) {
@@ -2714,17 +2801,19 @@ async function removeCommand() {
     process.exit(1);
   }
 
-  const account = resolveAccount(config.accounts, name, argValue('--org'));
-  if (!account) {
-    console.error(`Account "${name}" not found`);
-    process.exit(1);
-  }
-
-  config.accounts.splice(config.accounts.indexOf(account), 1);
-  await saveConfig(config);
+  // The row is found in, and taken out of, the file as it is under the lock.
+  // Saving the copy loaded at the start of the command would also put back
+  // every other row as it was then, undoing a refresh token the running server
+  // rotated in between (#675).
+  const { config, result: account } = await updateConfigOrExit(disk => {
+    const found = requireAccount(disk.accounts, name, argValue('--org'));
+    disk.accounts.splice(disk.accounts.indexOf(found), 1);
+    return found;
+  });
   console.log(`Removed account "${account.name}"`);
   // The tombstone first, then the server: told of the removal, it finds the
-  // tombstone already there and leaves it alone.
+  // tombstone already there and leaves it alone, or, when that one attempt
+  // did not land, records it with its own wait and retries.
   await recordRemovalWithCallback(account);
   await notifyRunningServer(config);
 }
@@ -2762,19 +2851,17 @@ async function routeCommand() {
       console.error(ROUTE_USAGE);
       process.exit(1);
     }
-    const { route, updated, unknownAccounts } = applyOrExit(() => upsertRoute(config, { name, match, accounts, bucket, color }));
+    const { config: saved, result: { route, updated, unknownAccounts } } = await updateConfigOrExit(disk => upsertRoute(disk, { name, match, accounts, bucket, color }));
     for (const a of unknownAccounts) console.error(`Warning: no account named "${a}" (yet)`);
     console.log(`${updated ? 'Updated' : 'Added'} route "${route.name}"`);
-    await saveConfig(config);
-    await notifyRunningServer(config);
+    await notifyRunningServer(saved);
     return;
   }
 
   if (sub === 'rm' || sub === 'remove' || sub === 'delete') {
     const name = args[2];
-    applyOrExit(() => removeRoute(config, name));
-    await saveConfig(config);
-    await notifyRunningServer(config);
+    const { config: saved } = await updateConfigOrExit(disk => removeRoute(disk, name));
+    await notifyRunningServer(saved);
     console.log(`Removed route "${name}"`);
     return;
   }
@@ -2786,7 +2873,7 @@ async function routeCommand() {
 // ── priority ────────────────────────────────────────────────
 
 async function priorityCommand() {
-  const config = await loadOrCreateConfig();
+  await loadOrCreateConfig();
   const name = args[1];
 
   if (!name) {
@@ -2796,38 +2883,40 @@ async function priorityCommand() {
     process.exit(1);
   }
 
-  const account = resolveAccount(config.accounts, name, argValue('--org'));
-  if (!account) {
-    console.error(`Account "${name}" not found`);
-    process.exit(1);
-  }
-
-  const priorities = config.accounts.map(a => a.priority || 0);
-  let priority;
+  const orgFilter = argValue('--org');
+  /** @type {{ priority?: number, place?: 'first'|'last', orgFilter?: string }} */
+  const spec = { orgFilter: orgFilter ?? undefined };
   if (args.includes('--first')) {
-    priority = Math.min(0, ...priorities) - 1;
+    spec.place = 'first';
   } else if (args.includes('--last')) {
-    priority = Math.max(0, ...priorities) + 1;
+    spec.place = 'last';
   } else {
     // Accept the integer in any position (e.g. after --org) — first int-looking token.
     const numTok = args.slice(2).find(t => /^-?\d+$/.test(t));
-    priority = numTok != null ? parseInt(numTok, 10) : NaN;
-    if (Number.isNaN(priority)) {
-      console.error('Provide an integer priority, or --first / --last.');
-      process.exit(1);
-    }
+    if (numTok != null) spec.priority = parseInt(numTok, 10);
   }
 
-  account.priority = priority;
-  await saveConfig(config);
-  console.log(`Set priority of "${account.name}" to ${priority} (lower = preferred)`);
+  // Applied to the file as it is under the config lock, the way the dashboard's
+  // POST /teamclaude/priority does it. Saving the copy loaded at the start of
+  // the command put every other field back as it was then, and a refresh token
+  // the running server rotated in between was lost with them (#691). --first
+  // and --last are worked out from that same fresh read.
+  const { config, result } = await updateConfigOrExit(disk => {
+    // An unknown account is reported before a missing number, as it always was.
+    requireAccount(disk.accounts, name, orgFilter);
+    if (!spec.place && spec.priority === undefined) {
+      throw new ConfigOpError('Provide an integer priority, or --first / --last.');
+    }
+    return setAccountPriority(disk, name, spec);
+  });
+  console.log(`Set priority of "${result.name}" to ${result.priority} (lower = preferred)`);
   await notifyRunningServer(config);
 }
 
 // ── rename ──────────────────────────────────────────────────
 
 async function renameCommand() {
-  const config = await loadOrCreateConfig();
+  await loadOrCreateConfig();
   const name = args[1];
   const newName = args[2];
 
@@ -2836,8 +2925,7 @@ async function renameCommand() {
     process.exit(1);
   }
 
-  const renamed = applyOrExit(() => renameAccount(config, name, newName, { orgFilter: argValue('--org') ?? undefined }));
-  await saveConfig(config);
+  const { config, result: renamed } = await updateConfigOrExit(disk => renameAccount(disk, name, newName, { orgFilter: argValue('--org') ?? undefined }));
   const routes = renamed.routes.length ? ` (updated route${renamed.routes.length > 1 ? 's' : ''}: ${renamed.routes.join(', ')})` : '';
   console.log(`Renamed "${renamed.from}" to "${renamed.name}"${routes}`);
   await notifyRunningServer(config);
@@ -2846,7 +2934,7 @@ async function renameCommand() {
 // ── enable / disable ────────────────────────────────────────
 
 async function setDisabledCommand(disabled) {
-  const config = await loadOrCreateConfig();
+  await loadOrCreateConfig();
   const name = args[1];
   const verb = disabled ? 'disable' : 'enable';
 
@@ -2855,18 +2943,11 @@ async function setDisabledCommand(disabled) {
     process.exit(1);
   }
 
-  const account = resolveAccount(config.accounts, name, argValue('--org'));
-  if (!account) {
-    console.error(`Account "${name}" not found`);
-    process.exit(1);
-  }
-
-  if (disabled) {
-    account.disabled = true;
-  } else {
-    delete account.disabled;
-  }
-  await saveConfig(config);
+  const orgFilter = argValue('--org');
+  const { config, result: account } = await updateConfigOrExit(disk => {
+    requireAccount(disk.accounts, name, orgFilter);
+    return setAccountDisabled(disk, name, disabled, { orgFilter: orgFilter ?? undefined });
+  });
   console.log(`${disabled ? 'Disabled' : 'Enabled'} account "${account.name}"`);
   await notifyRunningServer(config);
 }
@@ -2881,7 +2962,7 @@ async function setDisabledCommand(disabled) {
  * @param {boolean} cordoned
  */
 async function setCordonedCommand(cordoned) {
-  const config = await loadOrCreateConfig();
+  await loadOrCreateConfig();
   const name = args[1];
   const verb = cordoned ? 'cordon' : 'uncordon';
 
@@ -2890,18 +2971,14 @@ async function setCordonedCommand(cordoned) {
     process.exit(1);
   }
 
-  const account = resolveAccount(config.accounts, name, argValue('--org'));
-  if (!account) {
-    console.error(`Account "${name}" not found`);
-    process.exit(1);
-  }
-
-  if (cordoned) {
-    account.cordoned = true;
-  } else {
-    delete account.cordoned;
-  }
-  await saveConfig(config);
+  const orgFilter = argValue('--org');
+  // The row itself is handed back, not just its name: the check below asks
+  // which of the accounts that were written could still take its traffic.
+  const { config, result: account } = await updateConfigOrExit(disk => {
+    const found = requireAccount(disk.accounts, name, orgFilter);
+    setAccountCordoned(disk, name, cordoned, { orgFilter: orgFilter ?? undefined });
+    return found;
+  });
   console.log(cordoned
     ? `Cordoned account "${account.name}": no new conversations go to it; the ones already on it stay until they finish (teamclaude status shows how many are left)`
     : `Uncordoned account "${account.name}": it takes new conversations again`);
@@ -2912,6 +2989,56 @@ async function setCordonedCommand(cordoned) {
   if (cordoned && !(config.accounts || []).some((/** @type {any} */ a) => a !== account && !a.disabled && !a.cordoned && canServeProvider(a, provider))) {
     console.log(`No other account takes new ${provider} conversations now: they are refused until one is uncordoned, enabled or added.`);
   }
+}
+
+// ── ends ────────────────────────────────────────────────────
+
+/**
+ * `teamclaude ends <name> <time>` / `ends <name> --clear`: record when an
+ * account stops being usable (a cancelled subscription's last paid day, the
+ * end of a trial), so selection spends it before then. Written the way
+ * priority is, then picked up by a running server's reload.
+ */
+async function endsCommand() {
+  await loadOrCreateConfig();
+  const usage = () => {
+    console.error('Usage: teamclaude ends <account-name|email> <time> [--org <name|uuid>]');
+    console.error('       teamclaude ends <account-name|email> --clear');
+    console.error('<time> is an ISO 8601 date or date-time (2026-12-01, 2026-12-01T09:00:00Z) or epoch');
+    console.error('milliseconds. A date alone is the start of that day in local time.');
+  };
+  const name = args[1] && !args[1].startsWith('--') ? args[1] : null;
+  const orgFilter = argValue('--org');
+  const clear = args.includes('--clear');
+  // The time in any position after the name (e.g. after --org): the first
+  // token that is neither a flag nor --org's own value.
+  const orgAt = args.indexOf('--org');
+  const time = args.slice(2).find((t, i) => !t.startsWith('--') && i + 2 !== orgAt + 1);
+  if (!name || (clear ? time != null : time == null)) {
+    usage();
+    process.exit(1);
+  }
+  // Refused before the file is opened, with the usage: a time that does not
+  // parse is a mistyped command, not a fact about the config.
+  if (!clear && parseEndsAt(time) == null) {
+    console.error(`"${safeLine(time, 80)}" is not a time.`);
+    usage();
+    process.exit(1);
+  }
+
+  const { config, result } = await updateConfigOrExit(disk => {
+    requireAccount(disk.accounts, name, orgFilter);
+    return setAccountEndsAt(disk, name, clear ? null : /** @type {string} */ (time), { orgFilter: orgFilter ?? undefined });
+  });
+  if (result.endsAt == null) {
+    console.log(`Cleared the end time of "${result.name}"`);
+  } else {
+    const now = Date.now();
+    console.log(`Account "${result.name}" ends ${describeEndsAt(result.endsAt, now)}`);
+    // Accepted, since it is what the operator said, but it will do nothing.
+    if (result.endsAt <= now) console.log('That time has already passed, so it has no effect on which account is chosen.');
+  }
+  await notifyRunningServer(config);
 }
 
 // ── release ─────────────────────────────────────────────────
@@ -3001,10 +3128,13 @@ async function routingCommand() {
   }
 
   if (/^(none|off|-)$/i.test(value)) {
-    delete account.routing;
-    await saveConfig(config);
-    console.log(`Cleared routing for "${account.name}" — it now uses the fleet egress`);
-    await notifyRunningServer(config);
+    const { config: saved, result: cleared } = await updateConfigOrExit(disk => {
+      const found = requireAccount(disk.accounts, name, argValue('--org'));
+      delete found.routing;
+      return found;
+    });
+    console.log(`Cleared routing for "${cleared.name}" — it now uses the fleet egress`);
+    await notifyRunningServer(saved);
     return;
   }
 
@@ -3022,11 +3152,17 @@ async function routingCommand() {
   // Before the save, not after: on a running server the change is live at
   // once, and a mistyped password would take a working account out of rotation.
   await requireWorkingRouting(routing, upstreamUrl);
-  // Canonical form on disk: defaults spelled out, credentials percent-encoded.
-  account.routing = routingToUrl(routing);
-  await saveConfig(config);
-  console.log(`Routing "${account.name}" via ${describeRouting(routing)} — all of its traffic now tunnels through this proxy`);
-  await notifyRunningServer(config);
+  // The proxy check above can take seconds, and the running server may rotate a
+  // refresh token meanwhile, so the account is looked up again in a fresh read
+  // of the file and only its routing is set there.
+  const { config: saved, result: routed } = await updateConfigOrExit(disk => {
+    const found = requireAccount(disk.accounts, name, argValue('--org'));
+    // Canonical form on disk: defaults spelled out, credentials percent-encoded.
+    found.routing = routingToUrl(routing);
+    return found;
+  });
+  console.log(`Routing "${routed.name}" via ${describeRouting(routing)} — all of its traffic now tunnels through this proxy`);
+  await notifyRunningServer(saved);
 }
 
 // ── help ────────────────────────────────────────────────────
@@ -3083,6 +3219,9 @@ Commands:
   release <name>      Unpin the conversations on an account, leaving it in service;
                       each is placed again on its next request
   priority <name> <n> Set rotation priority (lower = preferred; --first/--last)
+  ends <name> <time>  Record when an account stops being usable, so it is spent
+                      before then: an ISO date or date-time, or epoch ms; a date
+                      alone is the start of that day, local time (--clear to unset)
   rename <name> <new> Rename an account, updating the routes that list it
   route [list|add|rm] Per-model routing: pin model globs to specific accounts
                       (add <name> --match "<glob>" [--accounts "<name>"] [--bucket <b>])
@@ -3263,7 +3402,7 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
   // signed in there: the token being imported may be one the store holds, and
   // so one other installs hold too.
   const identified = await profileForCredentials(creds, routing, {
-    renew: (c) => refreshOutsideProxy({ name: name || 'imported account', type: 'oauth', accessToken: c.accessToken, refreshToken: c.refreshToken, expiresAt: c.expiresAt }, (o) => refreshAccessToken(c.refreshToken, undefined, routing, o), { force: true })
+    renew: (c) => refreshOutsideProxy({ name: name || 'imported account', type: 'oauth', accessToken: c.accessToken, refreshToken: c.refreshToken, expiresAt: c.expiresAt, refreshTokenExpiresAt: c.refreshTokenExpiresAt }, (o) => refreshAccessToken(c.refreshToken, undefined, routing, o), { force: true })
       .then((t) => t ?? Promise.reject(new Error('token not renewed'))),
   });
   creds = identified.creds;
@@ -3331,6 +3470,8 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
       ...(routing && storeRouting ? { routing: routingToUrl(routing) } : {}),
       ...(creds.longLived === true && { longLived: true }),
     };
+    // When the refresh token lapses, if these credentials came with it.
+    setRefreshTokenExpiry(account, creds.refreshTokenExpiresAt);
 
     // Deduplicate by account+org identity (same email in a different org is a
     // distinct account), then by name — but only where the name is not standing in
@@ -3342,6 +3483,10 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
       // display name, entry id, and any disk-only fields (e.g. importFrom).
       const prev = config.accounts[idx];
       config.accounts[idx] = updateAccountEntry(prev, account);
+      // A sign-in or an import is a new refresh token: the date the row held
+      // was about the old one, so it is replaced by the one these credentials
+      // came with (the login response, the credential file), or dropped.
+      setRefreshTokenExpiry(config.accounts[idx], creds.refreshTokenExpiresAt);
       outcome = { action: 'updated', name: prev.name };
       if (storeRouting && !routing) delete config.accounts[idx].routing; // --routing none
       console.log(`Updated account "${prev.name}"`);
@@ -3443,14 +3588,27 @@ function argValue(flag) {
 }
 
 /**
- * Apply a settings change, exiting with its message when the change is refused.
+ * Apply a settings change to the config as it is on disk now, and save it.
+ *
+ * The change runs inside atomicConfigUpdate, on a fresh read taken under the
+ * config lock. A command that changed the copy it loaded at its start and saved
+ * that replaced the whole file with it, and a refresh token the running server
+ * had rotated in between went back to its old, dead value: the account failed
+ * with invalid_grant at the next restart (#675, #691).
+ *
+ * A refused change exits with its message. The updater throwing is what leaves
+ * the file unwritten, and the lock is released before the exit; so `change`
+ * must throw a ConfigOpError rather than exit itself.
  * @template T
- * @param {() => T} change
- * @returns {T}
+ * @param {(disk: any) => T} change
+ * @returns {Promise<{ config: any, result: T }>} the config as written, and what `change` returned
  */
-function applyOrExit(change) {
+async function updateConfigOrExit(change) {
+  /** @type {any} */
+  let result;
   try {
-    return change();
+    const config = await atomicConfigUpdate((/** @type {any} */ disk) => { result = change(disk); });
+    return { config, result };
   } catch (err) {
     if (!(err instanceof ConfigOpError)) throw err;
     console.error(err.message);

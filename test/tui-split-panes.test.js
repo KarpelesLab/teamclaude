@@ -110,7 +110,7 @@ test('the split costs no height: the titles sit in the spacer line', () => {
 
 test('it splits only when both panes draw every bar the one-column list draws', () => {
   const am = fleet([claude('a@x.com'), claude('b@x.com'), codex('k1@x.com'), codex('k2@x.com')]);
-  am.accounts[1].quota.unified7dFable = 0.995; // a blocked family: F7 bar plus a `⊘ Fable` tag
+  am.accounts[1].quota.unified7dFable = 0.995; // a blocked family: its bar reads `⊘F`
   let first = null;
   for (let w = 100; w <= 200; w++) {
     const { lines, drawn } = screen(am, w);
@@ -120,7 +120,7 @@ test('it splits only when both panes draw every bar the one-column list draws', 
     }
     first ??= w;
     for (const row of drawn.filter(r => am.accounts[r.idx].provider !== 'codex')) {
-      assert.match(row.text, /F7/, `W=${w}: the pane dropped a family bar the list draws: ${row.text}`);
+      assert.match(row.text, /F7|⊘F/, `W=${w}: the pane dropped a family bar the list draws: ${row.text}`);
     }
     // And never so narrow that a bar cuts its reset label (`10h23m` needs 6 plus a cell).
     for (const row of drawn) assert.ok(row.bw >= 8, `W=${w}: a pane bar is ${row.bw} wide: ${row.text}`);

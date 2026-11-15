@@ -15,6 +15,7 @@
 // credential, and it separates two entries that agree on everything else.
 
 import { sameIdentity, sameOrg } from './identity.js';
+import { setRefreshTokenExpiry } from './refresh-token-expiry.js';
 
 /**
  * The manager account built from config entry `acct`, or null if it has none.
@@ -219,12 +220,19 @@ export function mergeAccountsForSave(configAccounts, managerAccounts, diskAccoun
       expiresAt: am.expiresAt,
     } : a;
     const diskAcct = diskAccounts[rowFor.get(i)];
-    if (!diskAcct) return live;
-    const row = { ...diskAcct, ...live };
+    const row = diskAcct ? { ...diskAcct, ...live } : live;
     // The spread cannot delete a key, and an import clears the long-lived mark on
     // the running entry only; left on disk, it would stop the account refreshing.
-    if (live.longLived !== true) delete row.longLived;
-    return row;
+    if (diskAcct && live.longLived !== true) delete row.longLived;
+    // `endsAt` is the one account field nothing in this process edits: it is
+    // set by `teamclaude ends` or by hand, on disk, and reaches memory at the
+    // next reload. So the row is the authority, in both directions. Without
+    // this a token-refresh save landing between that write and the reload
+    // would put back the end time just cleared, or drop the one just set.
+    if (diskAcct) { if (diskAcct.endsAt != null) row.endsAt = diskAcct.endsAt; else delete row.endsAt; }
+    // The date belongs to the live refresh token: none known for it means none
+    // is saved, whatever the entry or the disk row said about an earlier token.
+    return live === a ? row : setRefreshTokenExpiry(row, am.refreshTokenExpiresAt);
   });
 
   // Carry over rows that exist on disk and not in memory. The list used to be
@@ -266,5 +274,6 @@ export function syncRefreshedTokens(configAccounts, managerAccounts, mgrIdx, new
   configAccounts[i].accessToken = newTokens.accessToken;
   configAccounts[i].refreshToken = newTokens.refreshToken;
   configAccounts[i].expiresAt = newTokens.expiresAt;
+  setRefreshTokenExpiry(configAccounts[i], newTokens.refreshTokenExpiresAt);
   return i;
 }

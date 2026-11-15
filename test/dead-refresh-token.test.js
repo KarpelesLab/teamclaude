@@ -1,12 +1,16 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
+import http from 'node:http';
 import { AccountManager } from '../src/account-manager.js';
+import { refreshAccessToken } from '../src/oauth.js';
+import { refreshCodexToken } from '../src/codex-auth.js';
+import { ROUTING_FAILED } from '../src/account-routing.js';
 
 // An account whose token is already expiring, so ensureTokenFresh always tries.
-function mgr(refreshFn) {
+function mgr(refreshFn, extra = {}) {
   return new AccountManager([{
     name: 'a', type: 'oauth',
-    accessToken: 'at-old', refreshToken: 'rt-dead', expiresAt: Date.now() - 1000,
+    accessToken: 'at-old', refreshToken: 'rt-dead', expiresAt: Date.now() - 1000, ...extra,
   }], 0.98, { refreshFn });
 }
 
@@ -162,6 +166,85 @@ test('a successful refresh of the OLD token does not overwrite tokens imported m
   assert.strictEqual(a._refreshPromise, null, 'the coalescing slot is released');
 });
 
+// The renewal's failure belongs to the token that was sent, as above: what a
+// client of the imported token is told must not be the old token's reason.
+for (const [label, error] of [['rejected', () => authError(400)], ['failing for now', () => Object.assign(new Error('socket hang up'), { status: 500 })]]) {
+  test(`a refresh of the OLD token ${label} leaves no failure on tokens imported mid-refresh`, async () => {
+    const d = deferred();
+    const m = mgr(async () => d.promise);
+    const inflight = m.ensureTokenFresh(0);
+    m.updateAccountTokens(0, { accessToken: 'at-imported', refreshToken: 'rt-imported', expiresAt: Date.now() + 3600_000 });
+    d.reject(error());
+    await inflight;
+    assert.strictEqual(m.accounts[0]._lastRefreshFailure, null, 'the reason a client of the imported token would be given');
+  });
+}
+
+// A failure that leaves a hold is the exception: the hold governs the imported
+// tokens too, so the reason for that is the failure's.
+test('a 429 on the OLD token\'s refresh is kept as the reason for tokens imported mid-refresh, which it holds too', async () => {
+  const d = deferred();
+  let calls = 0;
+  const m = mgr(async () => { calls++; return d.promise; });
+  const inflight = m.ensureTokenFresh(0);
+  m.updateAccountTokens(0, { accessToken: 'at-imported', refreshToken: 'rt-imported', expiresAt: Date.now() - 1000 });
+  d.reject(Object.assign(new Error('Token refresh failed (429)'), { status: 429, retryAfterMs: 60_000 }));
+  await inflight;
+  await m.ensureTokenFresh(0);
+  assert.strictEqual(calls, 1, 'the imported token waits out the hold');
+  assert.strictEqual(m.accounts[0]._lastRefreshFailure?.status, 429);
+});
+
+test('a routing failure of the OLD token\'s refresh is kept as the reason for tokens imported mid-refresh, which its cooldown holds too', async () => {
+  const d = deferred();
+  const m = mgr(async () => d.promise, { routing: 'http://127.0.0.1:9' });
+  const inflight = m.ensureTokenFresh(0);
+  m.updateAccountTokens(0, { accessToken: 'at-imported', refreshToken: 'rt-imported', expiresAt: Date.now() - 1000 });
+  d.reject(Object.assign(new Error('routing proxy down'), { code: ROUTING_FAILED }));
+  await inflight;
+  assert.strictEqual(m.isRoutingDown(0), true, 'the account sits out its cooldown');
+  assert.match(m.accounts[0]._lastRefreshFailure?.reason ?? '', /routing proxy down/);
+});
+
+test('new tokens clear the reason a renewal of the old ones failed', async () => {
+  const m = mgr(async () => { const e = new Error('socket hang up'); e.status = 500; throw e; });
+  await m.ensureTokenFresh(0);
+  assert.ok(m.accounts[0]._lastRefreshFailure);
+  m.updateAccountTokens(0, { accessToken: 'at-imported', refreshToken: 'rt-imported', expiresAt: Date.now() + 3600_000 });
+  assert.strictEqual(m.accounts[0]._lastRefreshFailure, null);
+});
+
+test('a refresh failure of the token the account still holds is kept as the reason', async () => {
+  const m = mgr(async () => { const e = new Error('socket hang up'); e.status = 500; throw e; });
+  await m.ensureTokenFresh(0);
+  assert.match(m.accounts[0]._lastRefreshFailure?.reason ?? '', /socket hang up/);
+});
+
+// No caller leaves out the access token today, but the signature allows it,
+// and the listener writes what it is handed onto the account's config row.
+test('a token update writes what it carries: a field left out keeps the account\'s own', () => {
+  const m = new AccountManager([{ name: 'a', type: 'oauth', accessToken: 'at-1', refreshToken: 'rt-1', expiresAt: 4_000_000_000_000 }], 0.98);
+  const written = [];
+  m.onTokenRefresh((_i, tokens) => written.push(tokens));
+  const a = m.accounts[0];
+  m.updateAccountTokens(0, { refreshToken: 'rt-2' });
+  assert.strictEqual(a.credential, 'at-1');
+  assert.strictEqual(a.refreshToken, 'rt-2');
+  assert.strictEqual(a.expiresAt, 4_000_000_000_000);
+  assert.deepStrictEqual(written.at(-1), { accessToken: 'at-1', refreshToken: 'rt-2', expiresAt: 4_000_000_000_000 });
+  m.updateAccountTokens(0, { expiresAt: 4_100_000_000_000 });
+  assert.strictEqual(a.credential, 'at-1');
+  assert.strictEqual(a.expiresAt, 4_100_000_000_000, 'an expiry alone moves the expiry');
+  m.updateAccountTokens(0, { expiresAt: 0 });
+  assert.strictEqual(a.expiresAt, 4_100_000_000_000, 'an expiry of 0 is none, as makeAccount reads it, and alone carries nothing');
+  // A new access token with no expiry has none known, never the one it replaces.
+  m.updateAccountTokens(0, { accessToken: 'at-3' });
+  assert.strictEqual(a.credential, 'at-3');
+  assert.ok(!a.expiresAt, `kept the replaced token's expiry: ${a.expiresAt}`);
+  assert.strictEqual(a.refreshToken, 'rt-2');
+  assert.deepStrictEqual(written.at(-1), { accessToken: 'at-3', refreshToken: 'rt-2', expiresAt: undefined });
+});
+
 test('an unchanged token is refreshed normally (the guard only fires on a swap)', async () => {
   const m = mgr(async () => ({ accessToken: 'at-new', refreshToken: 'rt-new', expiresAt: Date.now() + 3600_000 }));
   await m.ensureTokenFresh(0);
@@ -182,4 +265,117 @@ test('an account with a third-party upstream is never refreshed against Anthropi
   await m.ensureTokenFresh(0, true);
   assert.strictEqual(calls, 0, 'the refresh token was not sent anywhere');
   assert.strictEqual(m.accounts[0].credential, 'third-party-key', 'the credential is untouched');
+});
+
+// Whether a refresh token is dead is the token endpoint's answer, not the
+// status alone: whatever stands in front of the endpoint (a firewall, a proxy,
+// a CDN) can answer a 403 of its own, and a token taken for dead is not sent
+// again until a new one arrives, while credential sync, told through
+// onAccountError, empties the row holding it. These drive the real refresh
+// functions against a local token endpoint.
+
+/** A token endpoint answering every request with `status` and `body`, as `type`. */
+async function tokenEndpoint(status, body, type) {
+  const srv = http.createServer((req, res) => { req.resume(); res.writeHead(status, { 'content-type': type }); res.end(body); });
+  await new Promise((resolve) => srv.listen(0, '127.0.0.1', resolve));
+  return { url: `http://127.0.0.1:${srv.address().port}/token`, close: () => srv.close() };
+}
+
+/** Two refreshes of an expiring account against one answer: the account, the refreshes sent, the errors reported. */
+async function refreshAgainst([status, body, type = 'application/json'], { provider = undefined } = {}) {
+  const endpoint = await tokenEndpoint(status, body, type);
+  let calls = 0;
+  const via = (fn) => (rt, _endpoint, routing, opts) => { calls++; return fn(rt, endpoint.url, routing, opts); };
+  const m = new AccountManager([{
+    name: 'a', type: 'oauth', ...(provider ? { provider, accountId: 'acct-a' } : {}),
+    accessToken: 'at-old', refreshToken: 'rt-a', expiresAt: Date.now() - 1000,
+  }], 0.98, { refreshFn: via(refreshAccessToken), codexRefreshFn: via(refreshCodexToken) });
+  let errors = 0;
+  m.onAccountError(() => { errors++; });
+  let heldUntil = null;
+  try {
+    await m.ensureTokenFresh(0);
+    // A kept 4xx leaves a short hold (as a 429 does). It is noted and lapsed
+    // here, so the second call shows whether the token itself is sent again.
+    heldUntil = m.accounts[0]._refreshHeldUntil;
+    m.accounts[0]._refreshHeldUntil = null;
+    await m.ensureTokenFresh(0);
+  } finally {
+    endpoint.close();
+  }
+  return { account: m.accounts[0], calls, errors, heldUntil };
+}
+
+function assertKept({ account, calls, errors, heldUntil }, status, what) {
+  assert.strictEqual(account.status, 'active', what);
+  assert.strictEqual(account._deadRefreshToken, null, what);
+  assert.strictEqual(account.refreshToken, 'rt-a', what);
+  assert.strictEqual(errors, 0, `credential sync is not told the token is dead: ${what}`);
+  assert.ok(heldUntil > Date.now(), `the endpoint is not asked again at once: ${what}`);
+  assert.strictEqual(calls, 2, `the token is tried again once that hold has passed: ${what}`);
+  assert.strictEqual(account._lastRefreshFailure?.status, status, `the failure is kept as the reason: ${what}`);
+}
+
+test('a 400, 401 or 403 that is not an OAuth answer does not mark the refresh token dead', async () => {
+  for (const answer of [
+    [403, '<html><body>Access denied</body></html>', 'text/html'],
+    [401, '', 'text/plain'],
+    [400, 'Bad Request', 'text/plain'],
+    [403, '{"error":'],
+  ]) {
+    assertKept(await refreshAgainst(answer), answer[0], `${answer[0]} ${answer[1]}`);
+  }
+});
+
+// About the client or the request, which are the same for every account, so
+// marking each account's token dead would empty every row in the store at once;
+// or a code that proves nothing. A bare access_denied counts only as a hold
+// (account_on_hold, see refresh-account-on-hold.test.js). Flat, as RFC 6749
+// writes them, or nested as an Anthropic API error.
+test('an OAuth error other than invalid_grant does not mark the refresh token dead', async () => {
+  for (const [status, body] of [
+    [401, { error: 'invalid_client', error_description: 'not the token' }],
+    [400, { error: 'unauthorized_client' }], [400, { error: 'invalid_request' }],
+    [400, { error: 'unsupported_grant_type' }], [400, { error: 'some_new_code' }], [403, { error: 'access_denied' }],
+    [403, { type: 'error', error: { type: 'permission_error', message: 'Request not allowed' } }],
+    [401, { type: 'error', error: { type: 'invalid_client', message: 'not the token' } }],
+  ]) {
+    assertKept(await refreshAgainst([status, JSON.stringify(body)]), status, `${status} ${JSON.stringify(body)}`);
+  }
+});
+
+// The same code nested as an Anthropic API error, where Claude Code's own
+// refresh reads it (`error.type`). Which shape upstream sends is not verified.
+test('invalid_grant nested as an Anthropic API error marks the refresh token dead too, and it is sent once', async () => {
+  for (const status of [400, 401, 403]) {
+    const { account, calls, errors } = await refreshAgainst([status, JSON.stringify({ type: 'error', error: { type: 'invalid_grant', message: 'Refresh token not found or invalid' } })]);
+    assert.strictEqual(account.status, 'error', String(status));
+    assert.strictEqual(account.errorReason.code, 'refresh_rejected', String(status));
+    assert.strictEqual(account._deadRefreshToken, 'rt-a', String(status));
+    assert.strictEqual(errors, 1, String(status));
+    assert.strictEqual(calls, 1, String(status));
+  }
+});
+
+test('the token endpoint\'s invalid_grant still marks the refresh token dead, and it is sent once', async () => {
+  for (const status of [400, 401, 403]) {
+    const { account, calls, errors } = await refreshAgainst([status, JSON.stringify({ error: 'invalid_grant', error_description: 'Refresh token not found or invalid' })]);
+    assert.strictEqual(account.status, 'error', String(status));
+    assert.strictEqual(account.errorReason.code, 'refresh_rejected', String(status));
+    assert.strictEqual(account._deadRefreshToken, 'rt-a', String(status));
+    assert.strictEqual(errors, 1, String(status));
+    assert.strictEqual(calls, 1, String(status));
+  }
+});
+
+// The Codex refresh does not parse its answer's body, so its error says nothing
+// about the grant, and its status decides, as it did before.
+test('a Codex refresh rejected with a 400, 401 or 403 still marks the refresh token dead', async () => {
+  for (const status of [400, 401, 403]) {
+    const { account, calls, errors } = await refreshAgainst([status, JSON.stringify({ error: 'invalid_grant' })], { provider: 'codex' });
+    assert.strictEqual(account.status, 'error', String(status));
+    assert.strictEqual(account._deadRefreshToken, 'rt-a', String(status));
+    assert.strictEqual(errors, 1, String(status));
+    assert.strictEqual(calls, 1, String(status));
+  }
 });
