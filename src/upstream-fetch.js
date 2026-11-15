@@ -343,7 +343,7 @@ function sendNodeRequest(u, opts, timeoutMs, { transport, agent }, release) {
 // fires after 'end'), which crashes the process. The `closed` guard makes close
 // idempotent; backpressure via pause/resume so a slow consumer doesn't buffer the
 // whole (possibly minutes-long) stream in memory.
-function nodeToWeb(res) {
+export function nodeToWeb(res) {
   let closed = false;
   const close = (controller) => {
     if (closed) return;

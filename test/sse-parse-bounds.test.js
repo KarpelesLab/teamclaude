@@ -388,8 +388,10 @@ test('a client that leaves an answer past the hold limit has the upstream droppe
 // megabytes to fill the socket buffers, and "the upstream has stopped sending"
 // is only ever observed by waiting. The source is always ready, so a relay
 // that did not wait for the drain reads all of it without yielding once; one
-// turn of the event loop is enough to tell the two apart.
-test('a client that stops reading an answer past the hold limit stops the upstream too', async () => {
+// turn of the event loop is enough to tell the two apart. What it measures is
+// the relay's reads of the replay; that a body nobody reads pauses the
+// upstream socket is the transport's half (nodeToWeb, upstream-pool.test.js).
+test('a relay past the hold limit reads no further while its client has not drained, and cancels the replay when it leaves', async () => {
   const { holdBody } = await import('../src/server.js');
   let pulls = 0;
   let cancelled = false;
