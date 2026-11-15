@@ -24,6 +24,7 @@ import { createProxyRequestListener, resolveClientAuth, loopbackExempt, relayUpg
 import { interceptHostsFor, isNeverIntercepted, providerForPath, providerForHost, providerOf, DEFAULT_PROVIDER } from './provider.js';
 import { forwardRefusal, guardedLookup, FORBIDDEN_FORWARD } from './forward-target.js';
 import { safeLine } from './safe-text.js';
+import { usageDimensionHeaderNames } from './client-usage.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
 const CA_CERT = 'teamclaude-ca.pem';
@@ -361,7 +362,7 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, leafH
         }
         // The CONNECT's client identity is bound to this listener (see getServer),
         // so the channel is attributed the way the requests in the tunnel are.
-        relayUpgrade(req, socket, head, target, sx, { client, clientUsage, log, stripOverage: shouldStripOverageHeaders(config) });
+        relayUpgrade(req, socket, head, target, sx, { client, clientUsage, log, stripOverage: shouldStripOverageHeaders(config), strip: usageDimensionHeaderNames(/** @type {any} */ (config).proxy) });
       } catch (err) {
         log(`[TeamClaude] MITM: WebSocket upgrade handler failed for ${safeLine(req?.url)}: ${err?.message || err}`);
         try { socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n'); } catch { /* client already gone */ }
