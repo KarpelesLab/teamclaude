@@ -15,7 +15,7 @@ import { isTokenExpired } from './oauth.js';
 import { TopLevelFieldFinder, modelGlobMatches, parseRequestEffort, parseRequestStream } from './model.js';
 import { conversationDigest, pinKeyFor } from './conversation.js';
 import { BodyWriter, truncationNote } from './request-log.js';
-import { upstreamFetch, upstreamPoolStatus } from './upstream-fetch.js';
+import { upstreamFetch, upstreamPoolStatus, resolveHeadersTimeout } from './upstream-fetch.js';
 import { accountRefusal, isRefused } from './account-refusal.js';
 import { applyAuthHeaders, upstreamFor, rewritesBody, defaultHeadersTimeoutFor, providerForPath, providerForHost, interceptHostsFor, providerOf, isSubscriptionAccount, canServeProvider, DEFAULT_PROVIDER, PROVIDERS } from './provider.js';
 import { matchAccounts } from './identity.js';
@@ -293,6 +293,27 @@ async function readErrorBody(body, limit = ERROR_BODY_INSPECTION_LIMIT) {
 const BUFFERED_RESPONSE_LIMIT = 64 * 1024 * 1024;
 
 /**
+ * The limit in force. Read per call like the body idle timeout, so a test can
+ * shrink it through TEAMCLAUDE_UPSTREAM_MAX_HELD_BYTES without reloading the
+ * module (and without pushing 64 MiB through loopback to cross it). Unset,
+ * empty or non-positive means the default.
+ * @returns {number}
+ */
+export function resolveBufferedResponseLimit() {
+  const env = Number(envVar('UPSTREAM_MAX_HELD_BYTES'));
+  return env > 0 ? env : BUFFERED_RESPONSE_LIMIT;
+}
+
+/**
+ * The limit in force, for a log line: whole MiB when it is that, bytes otherwise.
+ * @returns {string}
+ */
+function bufferedResponseLimitLabel() {
+  const limit = resolveBufferedResponseLimit();
+  return limit % (1024 * 1024) === 0 ? `${limit / (1024 * 1024)} MiB` : `${limit} bytes`;
+}
+
+/**
  * Read a response body whole, up to `limit` bytes. `buf` is the body when it
  * ended within the limit. When it outgrew the limit `buf` is null and `body`
  * replays what was read ahead of the rest of the same stream, for a caller that
@@ -308,11 +329,11 @@ const BUFFERED_RESPONSE_LIMIT = 64 * 1024 * 1024;
  * has no such signal). The replay's reads are its relay's to time
  * (streamResponse's).
  * @param {ReadableStream<Uint8Array>|null} stream
- * @param {number} [limit]
+ * @param {number} [limit]  defaults to resolveBufferedResponseLimit()
  * @param {number} [idleMs]  defaults to TEAMCLAUDE_UPSTREAM_BODY_TIMEOUT_MS's reading
  * @returns {Promise<{ buf: Buffer|null, body: ReadableStream<Uint8Array>|null }>}
  */
-export async function holdBody(stream, limit = BUFFERED_RESPONSE_LIMIT, idleMs = resolveBodyIdleTimeout()) {
+export async function holdBody(stream, limit = resolveBufferedResponseLimit(), idleMs = resolveBodyIdleTimeout()) {
   if (!stream) return { buf: Buffer.alloc(0), body: null };
   const reader = stream.getReader();
   /** @type {Uint8Array[]} */
@@ -361,7 +382,7 @@ export async function holdBody(stream, limit = BUFFERED_RESPONSE_LIMIT, idleMs =
  */
 async function refuseOversizedResponse(res, body, where) {
   await body?.cancel().catch(() => {});
-  console.error(`[TeamClaude] ${where}: upstream answer larger than ${BUFFERED_RESPONSE_LIMIT / (1024 * 1024)} MiB, not relayed (502)`);
+  console.error(`[TeamClaude] ${where}: upstream answer larger than ${bufferedResponseLimitLabel()}, not relayed (502)`);
   if (res.headersSent || clientGone(res)) return;
   res.writeHead(502, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'Upstream response too large' } }));
@@ -5029,10 +5050,12 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // BUFFERED_RESPONSE_LIMIT. Past it the rest is relayed as it arrives, the way
     // an event stream is but unread: an answer that large is not a completion,
     // so there is no usage in it to lose, and lines in it that look like an
-    // event stream's (a saved transcript) are not one's to book.
-    const held = isStreaming ? null : await holdBody(upstreamBody);
+    // event stream's (a saved transcript) are not one's to book. The hold has
+    // its own silence budget (resolveHeldAnswerIdleTimeout), longer than a
+    // relay's: a non-streaming completion may be all silence after its head.
+    const held = isStreaming ? null : await holdBody(upstreamBody, undefined, resolveHeldAnswerIdleTimeout(account));
     if (held && !held.buf) {
-      console.log(`[TeamClaude] A ${upstreamRes.status} answer from "${safeLine(account.name, 64)}" is larger than ${BUFFERED_RESPONSE_LIMIT / (1024 * 1024)} MiB; relaying it as it arrives instead of holding it`);
+      console.log(`[TeamClaude] A ${upstreamRes.status} answer from "${safeLine(account.name, 64)}" is larger than ${bufferedResponseLimitLabel()}; relaying it as it arrives instead of holding it`);
     }
 
     if (held?.buf == null) {
@@ -5208,7 +5231,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
 // converting a mid-stream hang into a fast failure that evicts the dead socket
 // (reader.cancel destroys the underlying connection on both the direct-fetch and
 // the sx-tunnel path, since both hand back a web ReadableStream). It times the
-// reads of a body being relayed (streamResponse) or held whole (holdBody); the
+// reads of a body being relayed (streamResponse) or held whole (holdBody; the
+// forward path's hold may wait longer, see resolveHeldAnswerIdleTimeout); the
 // bounded diagnostic reads of an error body (readErrorBody, inspectBillingError)
 // are not timed. Override with TEAMCLAUDE_UPSTREAM_BODY_TIMEOUT_MS.
 const DEFAULT_BODY_IDLE_TIMEOUT_MS = 120_000;
@@ -5222,6 +5246,25 @@ const MAX_TIMER_MS = 2 ** 31 - 1;
 function resolveBodyIdleTimeout() {
   const env = Number(envVar('UPSTREAM_BODY_TIMEOUT_MS'));
   return env > 0 ? Math.min(env, MAX_TIMER_MS) : DEFAULT_BODY_IDLE_TIMEOUT_MS;
+}
+
+/**
+ * How long the forward path's held answer may stay silent: the longer of the
+ * body-idle deadline and the head deadline the same request was given (the
+ * operator's TEAMCLAUDE_UPSTREAM_HEADERS_TIMEOUT_MS, else the account
+ * provider's default). A `stream:false` completion is silent for as long as
+ * the model generates, and a backend may spend that silence after its head
+ * instead of before it; the head deadline is what the operator already allows
+ * a generation to take in silence, so the same wait is not cut for falling on
+ * the other side of the head, and the client left to resend and generate
+ * again. The two passthroughs keep the plain body-idle deadline: nothing
+ * generates behind a token answer or a settings document.
+ * @param {Record<string, any>} account
+ * @returns {number}
+ */
+export function resolveHeldAnswerIdleTimeout(account) {
+  const head = resolveHeadersTimeout(null, defaultHeadersTimeoutFor(account));
+  return Math.min(Math.max(resolveBodyIdleTimeout(), head), MAX_TIMER_MS);
 }
 
 // Race a single reader.read() against an inactivity deadline. Resolves to the

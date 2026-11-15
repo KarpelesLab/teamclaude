@@ -119,7 +119,7 @@ export const DEFAULT_HEADERS_TIMEOUT_MS = 120_000;
  * @param {number|null|undefined} [fallbackMs]
  * @returns {number}
  */
-function resolveHeadersTimeout(perCall, fallbackMs) {
+export function resolveHeadersTimeout(perCall, fallbackMs) {
   if (perCall != null) return perCall;
   const env = Number(envVar('UPSTREAM_HEADERS_TIMEOUT_MS'));
   return env > 0 ? env : positiveInt(fallbackMs, DEFAULT_HEADERS_TIMEOUT_MS);
