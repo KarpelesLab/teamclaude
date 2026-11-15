@@ -1,12 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { once } from 'node:events';
-import { setTimeout as delay } from 'node:timers/promises';
+import { EventEmitter } from 'node:events';
 import { TextEncoder } from 'node:util';
 import { ReadableStream } from 'node:stream/web';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer, createSseLineScanner, streamResponse, SSE_MAX_LINE_CHARS } from '../src/server.js';
+import { withEnv } from '../test-helpers/env.js';
 
 // The SSE usage parser used to accumulate the whole relayed body into one
 // string and drain it on the `\n\n` event boundary. An upstream that never
@@ -203,129 +203,123 @@ test('holdBody rejects on a failed read, as buffer() did', async () => {
   await assert.rejects(holdBody(failing, 1024), /socket reset/);
 });
 
-// End to end, through an account's own upstream: an answer past the limit (64
-// MiB, BUFFERED_RESPONSE_LIMIT) reaches the client before the upstream has
-// finished sending it. The upstream holds its last MiB back until the client
-// has seen a byte; a proxy holding the answer whole shows it nothing until the
-// end, so a deadline ends it anyway and the order gives that proxy away.
-test('an answer past the hold limit is relayed as it arrives, not held whole', { timeout: 60_000 }, async () => {
-  const MiB = 1 << 20;
-  const chunk = Buffer.alloc(MiB, 0x61);
-  const total = 64 * MiB + 2 * MiB;
-  /** @type {() => void} */
-  let clientHasBytes = () => {};
-  const firstByte = new Promise((resolve) => { clientHasBytes = () => resolve(undefined); });
-  let upstreamEnded = false;
+// ── end to end, through an account's own upstream ───────────────────────────
+
+// The limit is 64 MiB unless TEAMCLAUDE_UPSTREAM_MAX_HELD_BYTES says otherwise;
+// these tests set 4 KiB, so that an answer crosses it in two writes instead of
+// 66 MiB of loopback traffic. None of them is decided by a clock: each upstream
+// waits on what it is told about the client, and a proxy that never gets there
+// leaves the request open for the runner's timeout to report.
+const LIMIT = 4096;
+const HELD = { TEAMCLAUDE_UPSTREAM_MAX_HELD_BYTES: LIMIT };
+
+/**
+ * A proxy in front of one backend account whose upstream answers every request
+ * with `answer(res)`. The servers are closed in an after hook, which a
+ * timed-out test still runs: several of these upstreams leave their answer
+ * open on purpose.
+ * @param {import('node:test').TestContext} t
+ * @param {(res: import('node:http').ServerResponse) => void} answer
+ * @param {Record<string, any>} [hooks]
+ */
+async function throughBackend(t, answer, hooks = {}) {
   const upstream = http.createServer((req, res) => {
     req.resume();
-    req.on('end', async () => {
-      res.writeHead(200, { 'content-type': 'application/octet-stream' });
-      for (let sent = 0; sent < total - MiB; sent += MiB) {
-        if (!res.write(chunk)) await once(res, 'drain');
-      }
-      // Unref'd: once the client has a byte, this deadline must not hold the
-      // test process open for the rest of its three seconds.
-      await Promise.race([firstByte, delay(3000, undefined, { ref: false })]);
-      upstreamEnded = true;
-      res.end(chunk);
-    });
+    req.on('end', () => answer(res));
   });
   await new Promise((resolve) => upstream.listen(0, '127.0.0.1', () => resolve(undefined)));
   const upstreamPort = /** @type {import('node:net').AddressInfo} */ (upstream.address()).port;
   const am = new AccountManager([{ name: 'backend', type: 'apikey', apiKey: 'k1', upstream: `http://127.0.0.1:${upstreamPort}` }], 0.98);
-  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: 'http://127.0.0.1:9' });
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: 'http://127.0.0.1:9' }, hooks);
   await new Promise((resolve) => proxy.listen(0, '127.0.0.1', () => resolve(undefined)));
-  const port = /** @type {import('node:net').AddressInfo} */ (proxy.address()).port;
+  t.after(() => {
+    proxy.closeAllConnections(); upstream.closeAllConnections();
+    proxy.close(); upstream.close();
+  });
+  return { port: /** @type {import('node:net').AddressInfo} */ (proxy.address()).port, am };
+}
+
+/** Run `fn` with console.log collected instead of printed. */
+async function quietly(fn) {
+  /** @type {string[]} */
   const lines = [];
   const log = console.log;
   console.log = (...args) => { lines.push(args.join(' ')); };
   try {
+    return await fn(lines);
+  } finally {
+    console.log = log;
+  }
+}
+
+/** A promise and the function that settles it, for an upstream to wait on. */
+function signal() {
+  /** @type {(value?: any) => void} */
+  let fire = () => {};
+  const fired = new Promise((resolve) => { fire = resolve; });
+  return { fire, fired };
+}
+
+const postOpts = (port) => ({ host: '127.0.0.1', port, method: 'POST', path: '/v1/messages', headers: { 'x-api-key': 'k', 'content-type': 'application/json' } });
+
+// An answer past the limit reaches the client before the upstream has finished
+// sending it: the upstream keeps its last part back until the client has seen
+// a byte. A proxy holding the answer whole shows the client nothing until the
+// end, which then never comes.
+test('an answer past the hold limit is relayed as it arrives, not held whole', async (t) => {
+  const first = Buffer.alloc(2 * LIMIT, 0x61);
+  const last = Buffer.alloc(LIMIT, 0x62);
+  const clientHasBytes = signal();
+  const { port } = await throughBackend(t, async (res) => {
+    res.writeHead(200, { 'content-type': 'application/octet-stream' });
+    res.write(first);
+    await clientHasBytes.fired;
+    res.end(last);
+  });
+  await quietly((lines) => withEnv(HELD, async () => {
     const got = await new Promise((resolve, reject) => {
-      const req = http.request({ host: '127.0.0.1', port, method: 'POST', path: '/v1/messages', headers: { 'x-api-key': 'k', 'content-type': 'application/json' } }, (res) => {
-        let received = 0;
-        /** @type {boolean|null} */
-        let endedFirst = null;
-        res.on('data', (c) => {
-          if (endedFirst === null) { endedFirst = upstreamEnded; clientHasBytes(); }
-          received += c.length;
-        });
-        res.on('end', () => resolve({ status: res.statusCode, received, endedFirst }));
+      const req = http.request(postOpts(port), (res) => {
+        /** @type {Buffer[]} */
+        const chunks = [];
+        res.on('data', (c) => { chunks.push(c); clientHasBytes.fire(); });
+        res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(chunks) }));
         res.on('error', reject);
       });
       req.on('error', reject);
       req.end(JSON.stringify({ model: 'm', messages: [] }));
     });
     assert.equal(got.status, 200);
-    assert.equal(got.received, total, 'every byte reached the client');
-    assert.equal(got.endedFirst, false, 'the client saw bytes before the upstream finished sending');
-    assert.ok(lines.some(l => /"backend" is larger than 64 MiB; relaying it as it arrives/.test(l)), 'the operator is told which account sent it');
-  } finally {
-    console.log = log;
-    proxy.close();
-    upstream.close();
-  }
+    assert.ok(got.body.equals(Buffer.concat([first, last])), `the client got the answer byte for byte (${got.body.length} bytes)`);
+    assert.ok(lines.some(l => /"backend" is larger than 4096 bytes; relaying it as it arrives/.test(l)),
+      `the operator is told which account sent it, and the limit: ${lines.join(' | ')}`);
+  }));
 });
 
 // Past the limit the answer is relayed, and two things have to survive the
 // switch from holding to relaying: an upstream failure after it still reaches
 // the client as a broken answer, never a clean end of a truncated one, and a
-// client that stops reading still stops the upstream, so the proxy holds no more
-// than the limit plus what is in flight. Both use an account's own upstream
-// answering in 1 MiB chunks, with backpressure.
-async function withBigAnswer({ total, reset = false }, fn) {
-  const MiB = 1 << 20;
-  const chunk = Buffer.alloc(MiB, 0x61);
-  const state = { sent: 0, closed: false };
-  const upstream = http.createServer((req, res) => {
-    req.resume();
-    req.on('end', () => {
-      res.writeHead(200, { 'content-type': 'application/octet-stream' });
-      res.on('close', () => { state.closed = true; });
-      const pump = () => {
-        while (state.sent < total) {
-          if (state.closed) return;
-          state.sent += MiB;
-          if (!res.write(chunk)) { res.once('drain', pump); return; }
-        }
-        if (reset) setTimeout(() => res.socket?.destroy(), 200);
-        else res.end();
-      };
-      pump();
-    });
+// client that stops reading or leaves still stops the upstream.
+
+// The upstream resets its connection once the client has everything it sent,
+// so the relay has started by then and the failure can only arrive through it.
+// What this pins is the relay's error path: a replay that ended quietly on a
+// failed read would turn the upstream's failure into a clean end of a truncated
+// answer.
+test('an upstream that fails after the hold limit leaves the client with a broken answer, not a clean end', async (t) => {
+  const sent = 2 * LIMIT;
+  const clientHasAll = signal();
+  const { port } = await throughBackend(t, async (res) => {
+    res.writeHead(200, { 'content-type': 'application/octet-stream' });
+    res.write(Buffer.alloc(sent, 0x61));
+    await clientHasAll.fired;
+    res.destroy();
   });
-  await new Promise((resolve) => upstream.listen(0, '127.0.0.1', () => resolve(undefined)));
-  const upstreamPort = /** @type {import('node:net').AddressInfo} */ (upstream.address()).port;
-  const am = new AccountManager([{ name: 'backend', type: 'apikey', apiKey: 'k1', upstream: `http://127.0.0.1:${upstreamPort}` }], 0.98);
-  /** @type {Record<string, any>[]} */
-  const ended = [];
-  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: 'http://127.0.0.1:9' },
-    { onRequestEnd: (/** @type {any} */ _id, /** @type {Record<string, any>} */ info) => ended.push(info) });
-  await new Promise((resolve) => proxy.listen(0, '127.0.0.1', () => resolve(undefined)));
-  const port = /** @type {import('node:net').AddressInfo} */ (proxy.address()).port;
-  const log = console.log;
-  console.log = () => {};
-  try {
-    await fn({ port, state, MiB, ended });
-  } finally {
-    console.log = log;
-    proxy.close();
-    upstream.close();
-  }
-}
-
-const postOpts = (port) => ({ host: '127.0.0.1', port, method: 'POST', path: '/v1/messages', headers: { 'x-api-key': 'k', 'content-type': 'application/json' } });
-
-// On acaa750, which held the answer whole, the client saw no head and no bytes,
-// so this fails there on its first assertion. What it pins is the relay's error
-// path: a replay that ended quietly on a failed read would turn the upstream's
-// failure into a clean end of a truncated answer.
-test('an upstream that fails after the hold limit leaves the client with a broken answer, not a clean end', { timeout: 60_000 }, async () => {
-  await withBigAnswer({ total: 66 * (1 << 20), reset: true }, async ({ port, MiB }) => {
+  await quietly(() => withEnv(HELD, async () => {
     const got = await new Promise((resolve) => {
       const req = http.request(postOpts(port), (res) => {
         let received = 0;
         let ended = false;
-        res.on('data', (c) => { received += c.length; });
+        res.on('data', (c) => { received += c.length; if (received >= sent) clientHasAll.fire(); });
         res.on('end', () => { ended = true; });
         res.on('error', () => {});
         res.on('close', () => resolve({ status: res.statusCode, received, ended, complete: res.complete }));
@@ -334,34 +328,72 @@ test('an upstream that fails after the hold limit leaves the client with a broke
       req.end(JSON.stringify({ model: 'm', messages: [] }));
     });
     assert.equal(got.status, 200);
-    assert.ok(got.received > 64 * MiB, `the relay had started (${got.received} bytes)`);
+    assert.equal(got.received, sent, 'the relay had started: everything sent before the reset arrived');
     assert.equal(got.ended, false, 'no clean end');
     assert.equal(got.complete, false);
-  });
+  }));
 });
 
-// The relay is waiting for the client's socket to drain when the client leaves,
-// and a socket that closes never drains, so the request must end on the close:
-// within a second, recorded as a client that left (499).
-test('a client that stops reading an answer past the hold limit stops the upstream too', { timeout: 60_000 }, async () => {
-  await withBigAnswer({ total: 200 * (1 << 20) }, async ({ port, state, MiB, ended }) => {
-    const sentWhilePaused = await new Promise((resolve) => {
-      const req = http.request(postOpts(port), (res) => {
-        res.on('error', () => {});
-        res.once('data', () => {
-          res.pause();
-          setTimeout(() => { const sent = state.sent; req.destroy(); resolve(sent); }, 2000);
-        });
-      });
-      req.on('error', () => {});
-      req.end(JSON.stringify({ model: 'm', messages: [] }));
+// A client that leaves part-way through such an answer: the upstream here never
+// ends its answer, so its connection closes only if the proxy drops it, and the
+// request ends only if the proxy ends it, recorded as a client that left (499).
+test('a client that leaves an answer past the hold limit has the upstream dropped, and the request ended as a 499', async (t) => {
+  const upstreamDropped = signal();
+  const requestEnded = signal();
+  const { port } = await throughBackend(t, (res) => {
+    res.on('close', () => upstreamDropped.fire(res.writableEnded));
+    res.writeHead(200, { 'content-type': 'application/octet-stream' });
+    res.write(Buffer.alloc(2 * LIMIT, 0x61));
+  }, { onRequestEnd: (/** @type {any} */ _id, /** @type {Record<string, any>} */ info) => requestEnded.fire(info) });
+  await quietly(() => withEnv(HELD, async () => {
+    const req = http.request(postOpts(port), (res) => {
+      res.on('error', () => {});
+      res.once('data', () => req.destroy());
     });
-    assert.ok(sentWhilePaused < 100 * MiB, `the upstream sent ${sentWhilePaused / MiB} of 200 MiB to a client that read one chunk`);
-    for (let i = 0; i < 100 && !state.closed; i++) await delay(20);
-    assert.equal(state.closed, true, 'and its connection was dropped once the client left');
-    for (let i = 0; i < 50 && ended.length === 0; i++) await delay(20);
-    assert.equal(ended.at(-1)?.status, 499, 'and the request ended, as one whose client left');
+    req.on('error', () => {});
+    req.end(JSON.stringify({ model: 'm', messages: [] }));
+    assert.equal(await upstreamDropped.fired, false, 'the upstream connection was dropped with its answer unfinished');
+    assert.equal((await requestEnded.fired).status, 499, 'and the request ended, as one whose client left');
+  }));
+});
+
+// The same for a client that is still there but has stopped reading: the relay
+// waits for its socket to drain and reads nothing further meanwhile, so the
+// proxy holds no more than the limit plus one chunk; and since a socket that
+// closes never drains, the wait ends on the close. Driven on the relay itself,
+// where a write that does not drain is a return value: over loopback it takes
+// megabytes to fill the socket buffers, and "the upstream has stopped sending"
+// is only ever observed by waiting. The source is always ready, so a relay
+// that did not wait for the drain reads all of it without yielding once; one
+// turn of the event loop is enough to tell the two apart.
+test('a client that stops reading an answer past the hold limit stops the upstream too', async () => {
+  const { holdBody } = await import('../src/server.js');
+  let pulls = 0;
+  let cancelled = false;
+  const source = new ReadableStream({
+    pull(c) { if (pulls < 1000) { pulls++; c.enqueue(bytes('x')); } else c.close(); },
+    cancel() { cancelled = true; },
   });
+  const held = await holdBody(source, 5);
+  assert.equal(held.buf, null);
+  const heldPulls = pulls;
+  const parked = signal();
+  const res = new class extends EventEmitter {
+    destroyed = false; writableEnded = false; headersSent = true; writes = 0;
+    write() { this.writes++; parked.fire(); return false; }
+    end() { this.writableEnded = true; }
+  }();
+  const relay = streamResponse(/** @type {any} */ (held.body), res, 0, { recordTokenUsage() {} }, null, null, null, null, null, null, false);
+  await parked.fired;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(res.writes, 1, 'nothing more was written to a client that had not drained');
+  assert.ok(pulls <= heldPulls + 2, `the upstream was read no further (${pulls} chunks, ${heldPulls} of them for the hold)`);
+  // The client leaves without ever draining.
+  res.destroyed = true;
+  res.emit('close');
+  await relay;
+  assert.equal(cancelled, true, 'the upstream body was cancelled once the client left');
+  assert.equal(res.writes, 1);
 });
 
 // An answer past the limit is relayed the way a stream is, but not read as one:
@@ -369,71 +401,46 @@ test('a client that stops reading an answer past the hold limit stops the upstre
 // transcript) is a download, and booking its lines would credit an account
 // with tokens nothing spent. Passes on acaa750 too, which held such a file and
 // failed to parse it as JSON: it guards the relay.
-test('an answer past the hold limit is relayed without reading its lines for usage', { timeout: 60_000 }, async () => {
+test('an answer past the hold limit is relayed without reading its lines for usage', async (t) => {
   const line = 'data: {"type":"message_delta","usage":{"output_tokens":1000}}\n';
-  const body = Buffer.from(line.repeat(Math.ceil((65 << 20) / line.length)));
-  const upstream = http.createServer((req, res) => {
-    req.resume();
-    req.on('end', () => { res.writeHead(200, { 'content-type': 'text/plain' }); res.end(body); });
+  const body = Buffer.from(line.repeat(Math.ceil((2 * LIMIT) / line.length)));
+  const { port, am } = await throughBackend(t, (res) => {
+    res.writeHead(200, { 'content-type': 'text/plain' });
+    res.end(body);
   });
-  await new Promise((resolve) => upstream.listen(0, '127.0.0.1', () => resolve(undefined)));
-  const upstreamPort = /** @type {import('node:net').AddressInfo} */ (upstream.address()).port;
-  const am = new AccountManager([{ name: 'backend', type: 'apikey', apiKey: 'k1', upstream: `http://127.0.0.1:${upstreamPort}` }], 0.98);
-  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: 'http://127.0.0.1:9' });
-  await new Promise((resolve) => proxy.listen(0, '127.0.0.1', () => resolve(undefined)));
-  const port = /** @type {import('node:net').AddressInfo} */ (proxy.address()).port;
-  const log = console.log;
-  console.log = () => {};
-  try {
+  await quietly((lines) => withEnv(HELD, async () => {
     const received = await new Promise((resolve, reject) => {
       const req = http.request({ host: '127.0.0.1', port, method: 'GET', path: '/v1/files/file_1/content', headers: { 'x-api-key': 'k' } }, (res) => {
-        let n = 0;
-        res.on('data', (c) => { n += c.length; });
-        res.on('end', () => resolve(n));
+        /** @type {Buffer[]} */
+        const chunks = [];
+        res.on('data', (c) => { chunks.push(c); });
+        res.on('end', () => resolve(Buffer.concat(chunks)));
         res.on('error', reject);
       });
       req.on('error', reject);
       req.end();
     });
-    assert.equal(received, body.length, 'the file reached the client whole');
+    assert.ok(received.equals(body), 'the file reached the client whole');
+    assert.ok(lines.some(l => /is larger than 4096 bytes; relaying it as it arrives/.test(l)), 'it was relayed past the limit, not held');
     assert.equal(am.accounts[0].usage.totalOutputTokens, 0, 'and nothing was booked from its lines');
-  } finally {
-    console.log = log;
-    proxy.close();
-    upstream.close();
-  }
+  }));
 });
 
 // The line saying an answer was too large to hold names only such an answer:
-// an event stream is never held, and is not one.
-test('an event stream relayed through the forward path is not reported as too large to hold', { timeout: 30_000 }, async () => {
-  const upstream = http.createServer((req, res) => {
-    req.resume();
-    req.on('end', () => {
-      res.writeHead(200, { 'content-type': 'text/event-stream' });
-      res.end('event: message_stop\ndata: {"type":"message_stop"}\n\n');
-    });
+// an event stream is never held, and is not one, however long (here it is
+// longer than a limit of 16 bytes).
+test('an event stream relayed through the forward path is not reported as too large to hold', async (t) => {
+  const { port } = await throughBackend(t, (res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end('event: message_stop\ndata: {"type":"message_stop"}\n\n');
   });
-  await new Promise((resolve) => upstream.listen(0, '127.0.0.1', () => resolve(undefined)));
-  const upstreamPort = /** @type {import('node:net').AddressInfo} */ (upstream.address()).port;
-  const am = new AccountManager([{ name: 'backend', type: 'apikey', apiKey: 'k1', upstream: `http://127.0.0.1:${upstreamPort}` }], 0.98);
-  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: 'http://127.0.0.1:9' });
-  await new Promise((resolve) => proxy.listen(0, '127.0.0.1', () => resolve(undefined)));
-  const port = /** @type {import('node:net').AddressInfo} */ (proxy.address()).port;
-  const lines = [];
-  const log = console.log;
-  console.log = (...args) => { lines.push(args.join(' ')); };
-  try {
+  await quietly((lines) => withEnv({ TEAMCLAUDE_UPSTREAM_MAX_HELD_BYTES: 16 }, async () => {
     const status = await new Promise((resolve, reject) => {
       const req = http.request(postOpts(port), (res) => { res.resume(); res.on('end', () => resolve(res.statusCode)); res.on('error', reject); });
       req.on('error', reject);
       req.end(JSON.stringify({ model: 'm', messages: [], stream: true }));
     });
     assert.equal(status, 200);
-    assert.ok(!lines.some(l => /is larger than .* MiB; relaying it as it arrives/.test(l)), `no such line: ${lines.join(' | ')}`);
-  } finally {
-    console.log = log;
-    proxy.close();
-    upstream.close();
-  }
+    assert.ok(!lines.some(l => /is larger than .*; relaying it as it arrives/.test(l)), `no such line: ${lines.join(' | ')}`);
+  }));
 });

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer, resolveMaxBodyBytes, DEFAULT_MAX_BODY_BYTES } from '../src/server.js';
+import { withEnv } from '../test-helpers/env.js';
 
 // The forward path buffers the whole request body (to resend it on another
 // account after a 429), and so does the token-refresh passthrough. Neither had
@@ -88,51 +89,49 @@ test('the token-refresh passthrough is capped too', async () => {
 });
 
 // The passthrough's answer is held whole too, to be relayed in one write, and
-// its upstream (the top-level `upstream`) is configurable. Past 64 MiB
-// (BUFFERED_RESPONSE_LIMIT) it is a 502, and the rest is not read: this
-// upstream would send 96 MiB, and its connection is dropped before it can.
-test('the token-refresh passthrough answers 502 for an answer too large to hold, and drops the rest', { timeout: 60_000 }, async () => {
-  const MiB = 1 << 20;
-  const chunk = Buffer.alloc(MiB, 0x61);
-  const total = 96 * MiB;
-  let sent = 0;
-  let finished = false;
-  let closed = false;
+// its upstream (the top-level `upstream`) is configurable. Past the hold limit
+// (64 MiB unless TEAMCLAUDE_UPSTREAM_MAX_HELD_BYTES says otherwise; 4 KiB here)
+// it is a 502, and the rest is not waited for: this upstream sends twice the
+// limit and never ends its answer, so the only thing that closes its
+// connection is the proxy dropping it. A proxy that kept reading would leave
+// the request open, and the runner's timeout would say so.
+test('the token-refresh passthrough answers 502 for an answer too large to hold, and drops the rest', async (t) => {
+  const LIMIT = 4096;
+  /** @type {(ended: boolean) => void} */
+  let dropped = () => {};
+  const upstreamDropped = new Promise((resolve) => { dropped = resolve; });
   const upstream = http.createServer((req, res) => {
     req.resume();
     req.on('end', () => {
+      res.on('close', () => dropped(res.writableEnded));
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.on('close', () => { closed = true; });
-      const pump = () => {
-        while (sent < total) {
-          sent += MiB;
-          if (!res.write(chunk)) { res.once('drain', pump); return; }
-        }
-        finished = true;
-        res.end();
-      };
-      pump();
+      res.write(Buffer.alloc(2 * LIMIT, 0x61));
     });
   });
   const upstreamPort = await listen(upstream);
   const am = new AccountManager([{ name: 'a', type: 'apikey', apiKey: 'k1' }], 0.98);
   const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` });
   const port = await listen(proxy);
+  // In an after hook, which a timed-out test still runs: the upstream's answer
+  // never ends, so a proxy that held on to it would hold these open.
+  t.after(() => {
+    proxy.closeAllConnections(); upstream.closeAllConnections();
+    proxy.close(); upstream.close();
+  });
   const lines = [];
   const error = console.error;
   console.error = (...args) => { lines.push(args.join(' ')); };
   try {
-    const res = await post(port, '/v1/oauth/token', '{}');
-    assert.equal(res.status, 502);
-    assert.match(res.text, /Upstream response too large/);
-    for (let i = 0; i < 100 && !closed; i++) await new Promise(r => setTimeout(r, 20));
-    assert.equal(closed, true, 'the upstream connection was dropped');
-    assert.equal(finished, false, `the rest was not read (the upstream sent ${sent / MiB} of ${total / MiB} MiB)`);
-    assert.ok(lines.some(l => /Token refresh passthrough: upstream answer larger than 64 MiB/.test(l)), 'the operator is told which path it was');
+    await withEnv({ TEAMCLAUDE_UPSTREAM_MAX_HELD_BYTES: LIMIT }, async () => {
+      const res = await post(port, '/v1/oauth/token', '{}');
+      assert.equal(res.status, 502);
+      assert.match(res.text, /Upstream response too large/);
+      assert.equal(await upstreamDropped, false, 'the upstream connection was dropped with its answer unfinished');
+      assert.ok(lines.some(l => /Token refresh passthrough: upstream answer larger than 4096 bytes, not relayed/.test(l)),
+        `the operator is told which path it was, and the limit: ${lines.join(' | ')}`);
+    });
   } finally {
     console.error = error;
-    proxy.close();
-    upstream.close();
   }
 });
 
