@@ -276,12 +276,23 @@ async function readErrorBody(body, limit = ERROR_BODY_INSPECTION_LIMIT) {
   }
 }
 
-// Response header names that are connection-specific and thus illegal on an
-// HTTP/2 response (Node's Http2ServerResponse.writeHead rejects them). Also
-// hop-by-hop on h1, so stripping them is correct on both paths.
+// Response header names that are connection-specific, dropped from the
+// upstream's response on every path that copies its headers to the client
+// (relayUpgrade's 101 head aside, where connection and upgrade are the
+// answer). They describe the hop to the upstream, not the one to the client,
+// and most of them also make the client response's writeHead throw.
+// Measured on Node 24: Http2ServerResponse.writeHead (the MITM's h2 server)
+// throws on keep-alive, transfer-encoding, upgrade, proxy-connection and
+// http2-settings, on te with any value but "trailers", and on connection:
+// trailers; any other connection value it drops itself, with a warning. The
+// h1 writeHead throws on trailer for any answer it does not send chunked (one
+// with no body: a 204, a 304, an answer to HEAD; one with a Content-Length;
+// any answer to an HTTP/1.0 client), so trailer is load-bearing on h1 too.
+// Only te: trailers is dropped for hygiene alone, as HOP_BY_HOP_HEADERS drops
+// te on the request side.
 const CONNECTION_SPECIFIC_HEADERS = new Set([
   'connection', 'keep-alive', 'transfer-encoding', 'upgrade',
-  'proxy-connection', 'te', 'trailer',
+  'proxy-connection', 'te', 'trailer', 'http2-settings',
 ]);
 
 // Response headers describing the SERVING organization's billing state:
@@ -433,7 +444,11 @@ export function reloadedHeaderFlags(diskConfig) {
 }
 
 // Constant-time proxy-API-key comparison (both the HTTP gate and the CONNECT
-// gate use it). Returns false on any type/length mismatch without leaking timing.
+// gate use it). Returns false on any type or length mismatch. Two keys of equal
+// length are compared in constant time; a length mismatch returns at once, so
+// the timing can reveal a key's length, never its content. A generated key
+// (`tc-` and 32 characters, config.js) has a fixed, published length anyway;
+// a key written by hand (an apiKey set by hand, a clientKeys entry) does not.
 export function safeKeyEqual(a, b) {
   if (typeof a !== 'string' || typeof b !== 'string') return false;
   const ba = Buffer.from(a);
@@ -1381,8 +1396,9 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // The CLIProxyAPI prefix is ours, and no route under it is a WebSocket.
       // requestHandler answers every request there itself; a handshake would
       // otherwise be relayed with the client's management key in its headers
-      // (relayUpgrade strips only x-api-key). Refused before the key gate, as
-      // the request path's answer does not depend on the key either.
+      // (of the credentials, relayUpgrade strips only x-api-key). Refused
+      // before the key gate, as the request path's answer does not depend on
+      // the key either.
       if (isCliproxyPath(classificationPath(req.url || ''))) {
         try { socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n'); } catch { /* already gone */ }
         socket.destroy();
@@ -1410,7 +1426,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // path (req.tcClient): a handshake authenticated with a client key is
       // attributed to that client, or it is a channel the operator cannot see
       // under `clients` at all (#325).
-      relayUpgrade(req, socket, head, upstream, sx, { client: auth.client, clientUsage, stripOverage: shouldStripOverageHeaders(config) });
+      relayUpgrade(req, socket, head, upstream, sx, { client: auth.client, clientUsage, stripOverage: shouldStripOverageHeaders(config), strip: usageDimensionHeaderNames(config.proxy) });
     } catch (err) {
       console.error(`[TeamClaude] WebSocket upgrade handler failed for ${safeLine(req?.url)}: ${err?.message || err}`);
       try { socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n'); } catch { /* already gone */ }
@@ -1493,8 +1509,9 @@ export function isLocalHostHeader(host, bindHost = null) {
   return bound != null && !WILDCARD_BINDS.has(bound) && bound === name;
 }
 
-// Read a control-endpoint body as text. Capped, unlike the proxied request path:
-// these endpoints carry a couple of fields, so anything larger is a mistake or an
+// Read a control-endpoint body as text. Capped far below the proxied request
+// path (64 KiB here; 64 MiB there by default, see resolveMaxBodyBytes): these
+// endpoints carry a couple of fields, so anything larger is a mistake or an
 // attack and buffering it whole would be the wrong answer either way.
 async function readControlBody(req, limit = 64 * 1024) {
   const chunks = [];
@@ -2026,7 +2043,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       }
       // Client token refresh: pass through untouched (the proxy manages its own
       // tokens via ensureTokenFresh; rewriting client refreshes would conflict).
-      if (req.method === 'POST' && req.url === '/v1/oauth/token') { await relayRaw(req, res, upstream, sx, resolveMaxBodyBytes(config), shouldStripOverageHeaders(config)); return; }
+      if (req.method === 'POST' && req.url === '/v1/oauth/token') { await relayRaw(req, res, upstream, sx, resolveMaxBodyBytes(config), shouldStripOverageHeaders(config), usageDimensionHeaderNames(/** @type {any} */ (config).proxy)); return; }
       // Account pin: a request to `/tc-acct/<name-or-index>/...` (e.g. via
       // ANTHROPIC_BASE_URL=http://host:port/tc-acct/deepseek) is forced onto that
       // one account, bypassing rotation. Used by the keep-warm scheduler and for
@@ -2102,10 +2119,14 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // either pool, and goes to that host as sent (#492). Before the identity
       // plane below, which is Anthropic's.
       const passthrough = clientPassthroughOrigin({ authority: requestAuthority(req), url: req.url, config, accounts: /** @type {any} */ (accountManager).accounts });
-      if (passthrough) { await relayStream(req, res, passthrough, sx, shouldStripOverageHeaders(config)); return; }
+      // Both relays drop the usage-dimension headers, as relayRaw above and the
+      // forward path below do: on those paths the operator's labels stay here.
+      // relayHttpForward, which in practice sees only third-party hosts (it
+      // does not check for an http:// configured upstream), keeps them.
+      if (passthrough) { await relayStream(req, res, passthrough, sx, shouldStripOverageHeaders(config), usageDimensionHeaderNames(/** @type {any} */ (config).proxy)); return; }
 
       const classifiedPath = classificationPath(req.url);
-      if (isClientCredentialPath(classifiedPath, config)) { await relayStream(req, res, upstream, sx, shouldStripOverageHeaders(config)); return; }
+      if (isClientCredentialPath(classifiedPath, config)) { await relayStream(req, res, upstream, sx, shouldStripOverageHeaders(config), usageDimensionHeaderNames(/** @type {any} */ (config).proxy)); return; }
 
       // MITM-mode pin. A CONNECT carrying `Proxy-Authorization: Basic <acct>:…`
       // has no URL to hang a `/tc-acct/` prefix on — the path inside the tunnel
@@ -2633,10 +2654,16 @@ function clientCredentialHeaders(reqHeaders, strip = null) {
  * the upstream may withhold response headers for minutes between events. No
  * buffering, no timeout, no reconstruction — just pipe bytes both ways as they
  * arrive, exactly like a transparent proxy would.
+ * @param {any} req
+ * @param {any} res
+ * @param {string} upstream
+ * @param {any} sx
+ * @param {boolean} [stripOverage]
+ * @param {Set<string>|null} [strip] request headers to drop (usage dimensions)
  */
-function relayStream(req, res, upstream, sx, stripOverage = false) {
+function relayStream(req, res, upstream, sx, stripOverage = false, strip = null) {
   const target = new URL(`${upstream}${req.url}`);
-  const headers = clientCredentialHeaders(req.headers);
+  const headers = clientCredentialHeaders(req.headers, strip);
 
   const useProxy = !!(sx?.useByDefault() && sx.isProvisioned());
   const agent = useProxy ? sxAgent(sx, target.hostname) : undefined;
@@ -2765,7 +2792,7 @@ export function upgradeTarget(upstream, url) {
   return target;
 }
 
-export function relayUpgrade(req, socket, head, upstream, sx, { client = null, clientUsage = null, log = console.log, stripOverage = false } = {}) {
+export function relayUpgrade(req, socket, head, upstream, sx, { client = null, clientUsage = null, log = console.log, stripOverage = false, strip = /** @type {Set<string>|null} */ (null) } = {}) {
   const target = upgradeTarget(upstream, req.url);
   if (!target) {
     log(`[TeamClaude] WebSocket upgrade refused: request target ${JSON.stringify(safeLine(req.url, 128))} is not a path on the upstream`);
@@ -2785,9 +2812,16 @@ export function relayUpgrade(req, socket, head, upstream, sx, { client = null, c
     const lk = key.toLowerCase();
     // Unlike relayStream, do NOT strip 'upgrade'/'connection' here — they ARE
     // the handshake. Only 'host' (the client transport reconstructs it from
-    // `target`), h2 pseudo-headers and the proxy's own x-api-key (the client's
-    // credential to us, not to upstream) are dropped.
+    // `target`), h2 pseudo-headers, the proxy's own x-api-key (the client's
+    // credential to us, not to upstream) and the usage-dimension headers in
+    // `strip` (the operator's labels, as on the request paths) are dropped.
     if (lk.startsWith(':') || lk === 'host' || lk === 'x-api-key') continue;
+    // The handshake's own names are exempt even when configured as a
+    // dimension, so the handshake reaches upstream as the client sent it:
+    // without connection or upgrade a Node upstream sees a plain request, not
+    // an upgrade, and the sec-websocket-* headers are the handshake's own key,
+    // version and offers.
+    if (strip?.has(lk) && lk !== 'connection' && lk !== 'upgrade' && !lk.startsWith('sec-websocket-')) continue;
     headers[key] = value;
   }
 
@@ -2886,12 +2920,14 @@ async function refuseOversizedBody(req, res) {
 /**
  * Relay a request to upstream on the client's own terms: no pooled account
  * credentials are injected and the body goes through unchanged, with only
- * content-type, accept and user-agent forwarded. On the way back the
- * connection-specific and stale framing headers (transfer-encoding,
- * connection, content-encoding, content-length) are dropped, and so is the
- * per-org billing family when `stripOverage` is set (see isOverageHeader).
+ * content-type, accept and user-agent forwarded (one of them configured as a
+ * usage dimension in `strip` counts as not sent). On the way back the
+ * connection-specific headers (CONNECTION_SPECIFIC_HEADERS), the stale
+ * framing ones (content-encoding, content-length) and an upstream copy of
+ * CORRELATION_HEADER (the proxy's own) are dropped, and so is the per-org
+ * billing family when `stripOverage` is set (see isOverageHeader).
  */
-async function relayRaw(req, res, upstream, sx, maxBodyBytes = DEFAULT_MAX_BODY_BYTES, stripOverage = false) {
+async function relayRaw(req, res, upstream, sx, maxBodyBytes = DEFAULT_MAX_BODY_BYTES, stripOverage = false, strip = /** @type {Set<string>|null} */ (null)) {
   const bodyChunks = [];
   let bodyBytes = 0;
   for await (const chunk of req) {
@@ -2903,13 +2939,17 @@ async function relayRaw(req, res, upstream, sx, maxBodyBytes = DEFAULT_MAX_BODY_
   }
   const body = Buffer.concat(bodyChunks);
 
+  // A usage-dimension header is the operator's label, consumed here: one
+  // configured on any of the three names below is read as not sent, so the
+  // default goes upstream in its place.
+  const sent = (/** @type {string} */ name) => (strip?.has(name) ? undefined : req.headers[name]);
   try {
     const upstreamRes = await upstreamFetch(`${upstream}${req.url}`, {
       method: req.method,
       headers: {
-        'content-type': req.headers['content-type'] || 'application/json',
-        'accept': req.headers['accept'] || 'application/json',
-        'user-agent': req.headers['user-agent'] || 'node',
+        'content-type': sent('content-type') || 'application/json',
+        'accept': sent('accept') || 'application/json',
+        'user-agent': sent('user-agent') || 'node',
       },
       body: body.length > 0 ? body : undefined,
     }, sx, sx?.useByDefault());
@@ -2920,8 +2960,14 @@ async function relayRaw(req, res, upstream, sx, maxBodyBytes = DEFAULT_MAX_BODY_
       // `.text()` already decompressed the body, so drop content-encoding and
       // the now-stale content-length (both refer to the compressed bytes) — else
       // a gzip'd upstream response reaches the client mis-framed / truncated.
-      if (key === 'transfer-encoding' || key === 'connection' ||
-          key === 'content-encoding' || key === 'content-length') continue;
+      // All of the connection-specific set, not just transfer-encoding and
+      // connection: this path serves /v1/oauth/token on the MITM's h2 server
+      // too, where writeHead throws on most of them (and an upstream that is
+      // itself a Node server sends `Keep-Alive` by default), and over h1
+      // writeHead throws on trailer for any answer it does not send chunked:
+      // one with no body (a 204, a 304, an answer to HEAD), one with a
+      // Content-Length, any answer to an HTTP/1.0 client.
+      if (CONNECTION_SPECIFIC_HEADERS.has(key) || key === 'content-encoding' || key === 'content-length') continue;
       if (key === CORRELATION_HEADER) continue;
       if (stripOverage && isOverageHeader(key)) continue;
       responseHeaders[key] = value;
@@ -4726,28 +4772,16 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       return;
     }
 
-    // A 401 means the credential we injected was rejected. For an OAuth account
-    // that usually means the access token was revoked BEFORE its clock expiry —
-    // something else refreshed the same token family, so upstream reports it
-    // revoked while it still looks fresh locally. ensureTokenFresh's expiry
-    // check cannot see that (it only compares the clock), so the account would
-    // otherwise keep serving a dead token until the token aged out, and every
-    // request in between would surface a 401 to the client with no recovery.
-    // Force one refresh and retry. If the refresh is itself rejected the refresh
-    // token is dead too: ensureTokenFresh marks the account errored, and the
-    // retry's status check rotates to another account. Bounded to one re-auth
-    // per account per request, so a genuinely dead credential surfaces the 401
-    // instead of looping.
     // Upstream 5xx — 529 "Overloaded" above all (#156). This is the provider
-    // saying it cannot serve right now, not anything about this account'"'"'s quota,
+    // saying it cannot serve right now, not anything about this account's quota,
     // so surfacing it to the client turns a provider-side transient into a
-    // client-visible failure — and Claude Code'"'"'s own retry loop then re-piles the
+    // client-visible failure — and Claude Code's own retry loop then re-piles the
     // same load onto the same account.
     //
     // One hop, on the same budget and for the same reason as the 429 path above:
     // if a second account is overloaded too, it is the provider that is
     // overloaded, not the account, and walking the fleet would just spend every
-    // account'"'"'s cache discovering that. After the hop the response goes to the
+    // account's cache discovering that. After the hop the response goes to the
     // client as it does today, with its own retry-after intact.
     // Never for a pinned request, as for the 429 hop above.
     if (ctx.pinnedIndex == null && upstreamRes.status >= 500 && !res.headersSent && !ctx.serverErrorHopped && retryCount < maxRetries) {
@@ -4861,6 +4895,18 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
     }
 
+    // A 401 means the credential we injected was rejected. For an OAuth account
+    // that usually means the access token was revoked BEFORE its clock expiry —
+    // something else refreshed the same token family, so upstream reports it
+    // revoked while it still looks fresh locally. ensureTokenFresh's expiry
+    // check cannot see that (it only compares the clock), so the account would
+    // otherwise keep its dead token until the token aged out, and every request
+    // in between would only fail over (the branch below), never repairing it.
+    // Force one refresh and retry. If the refresh is itself rejected the refresh
+    // token is dead too: ensureTokenFresh marks the account errored, and the
+    // retry's status check rotates to another account. Bounded to one re-auth
+    // per account per request, so a genuinely dead credential does not loop: a
+    // 401 that comes back goes to the branch below.
     if (upstreamRes.status === 401 && account.type === 'oauth' && account.refreshToken
         && retryCount < maxRetries && !ctx.reauthed.has(account.index)) {
       ctx.reauthed.add(account.index);
@@ -4956,9 +5002,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // A request-specific refusal is an answer, not a starving session.
     const deliveredStatus = nonRetryable429 || answeredStatus(upstreamRes.status);
 
-    // Build response headers (skip hop-by-hop and encoding headers). The
-    // connection-specific names are also illegal on an HTTP/2 response — when
-    // this runs behind the MITM's h2 server, writeHead would otherwise throw.
+    // Build response headers (skip the connection-specific and encoding
+    // headers). Most connection-specific names would make writeHead throw,
+    // behind the MITM's h2 server above all (see CONNECTION_SPECIFIC_HEADERS).
     /** @type {Record<string, string>} */
     const responseHeaders = {};
     for (const [key, value] of upstreamRes.headers.entries()) {
@@ -5849,9 +5895,9 @@ const UNTIMED_RETRY_AFTER_SECONDS = 60;
  * account spent for three days beside a healthy one that just dropped a
  * connection told the client to come back in three days, where it used to say a
  * minute. Only accounts that will not come back on their own are left out: the
- * disabled, and those in an error state waiting on a re-login. (An entitlement
- * quarantine always has a clock, so it answers with that.) With nobody left to
- * ask, the answer is still 60s.
+ * disabled, the cordoned, and those in an error state waiting on a re-login.
+ * (An entitlement quarantine always has a clock, so it answers with that.) With
+ * nobody left to ask, the answer is still 60s.
  *
  * Deliberately uncapped: the truthful value is the whole point, and a ceiling
  * would rebuild the silent loop at whatever interval the ceiling was. Nothing
