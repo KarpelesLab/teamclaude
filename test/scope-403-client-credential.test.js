@@ -104,6 +104,64 @@ test('the client-credential retry drops usage-dimension headers too', async () =
   }
 });
 
+// The client-credential answer is held whole to be relayed in one write, and
+// its upstream is the configurable top-level one. Past 64 MiB
+// (BUFFERED_RESPONSE_LIMIT) it is a 502 and the rest is not read: this upstream
+// would send 96 MiB on the client's login, and its connection is dropped first.
+test('a client-credential answer too large to hold is a 502, and the rest is dropped', { timeout: 60_000 }, async () => {
+  const MiB = 1 << 20;
+  const chunk = Buffer.alloc(MiB, 0x61);
+  const total = 96 * MiB;
+  let sent = 0;
+  let finished = false;
+  let closed = false;
+  const tokens = [];
+  const upstream = http.createServer((req, res) => {
+    const token = (req.headers.authorization || '').replace(/^Bearer /, '');
+    tokens.push(token);
+    if (token !== 'client-token') {
+      res.writeHead(403, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'permission_error', message: 'scope', details: { error_code: 'oauth_scope_insufficient' } } }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.on('close', () => { closed = true; });
+    const pump = () => {
+      while (sent < total) {
+        sent += MiB;
+        if (!res.write(chunk)) { res.once('drain', pump); return; }
+      }
+      finished = true;
+      res.end();
+    };
+    pump();
+  });
+  const upstreamPort = await listen(upstream);
+  const am = inferenceOnlyPool();
+  const ended = [];
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` },
+    { onRequestEnd: (_id, info) => ended.push(info) });
+  const proxyPort = await listen(proxy);
+  const lines = [];
+  const error = console.error;
+  console.error = (...args) => { lines.push(args.join(' ')); };
+  try {
+    const { status, body } = await send(proxyPort);
+    assert.equal(status, 502);
+    assert.match(body, /Upstream response too large/);
+    assert.deepEqual(tokens, ['a-token', 'client-token']);
+    for (let i = 0; i < 100 && !closed; i++) await new Promise(r => setTimeout(r, 20));
+    assert.equal(closed, true, 'the upstream connection was dropped');
+    assert.equal(finished, false, `the rest was not read (the upstream sent ${sent / MiB} of ${total / MiB} MiB)`);
+    assert.ok(lines.some(l => /Client-credential relay: upstream answer larger than 64 MiB/.test(l)), 'the operator is told which path it was');
+    assert.equal(ended.at(-1)?.status, 502, 'the activity row reports the 502');
+  } finally {
+    console.error = error;
+    proxy.close();
+    upstream.close();
+  }
+});
+
 test('a completion that draws a scope 403 is never sent on the client credential', async () => {
   const { server: upstream, seen } = scopeUpstream();
   const upstreamPort = await listen(upstream);

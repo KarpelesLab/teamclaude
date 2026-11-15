@@ -428,3 +428,16 @@ test('an event stream relayed with a request log on reaches the client whole', {
   assert.notEqual(got, 'still waiting after 10 s', 'the relay did not stop');
   assert.equal(got.received, total, 'every byte reached the client');
 });
+
+// The same, for an answer past the forward path's hold limit (64 MiB,
+// BUFFERED_RESPONSE_LIMIT), which is relayed the way a stream is: with a log on
+// it must still arrive whole, and as it arrives (the upstream holds its last
+// chunk back until the client has a byte, so a proxy holding it whole would
+// show the client nothing first).
+test('an answer past the hold limit relayed with a request log on reaches the client whole, as it arrives', { timeout: 60000 }, async () => {
+  const total = 66 * 1024 * 1024;
+  const got = await relayWithLog('application/octet-stream', total, { holdLastUntilFirstByte: true });
+  assert.notEqual(got, 'still waiting after 10 s', 'the relay did not stop');
+  assert.equal(got.received, total, 'every byte reached the client');
+  assert.equal(got.endedFirst, false, 'the client saw bytes before the upstream finished');
+});

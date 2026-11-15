@@ -87,6 +87,90 @@ test('the token-refresh passthrough is capped too', async () => {
   });
 });
 
+// The passthrough's answer is held whole too, to be relayed in one write, and
+// its upstream (the top-level `upstream`) is configurable. Past 64 MiB
+// (BUFFERED_RESPONSE_LIMIT) it is a 502, and the rest is not read: this
+// upstream would send 96 MiB, and its connection is dropped before it can.
+test('the token-refresh passthrough answers 502 for an answer too large to hold, and drops the rest', { timeout: 60_000 }, async () => {
+  const MiB = 1 << 20;
+  const chunk = Buffer.alloc(MiB, 0x61);
+  const total = 96 * MiB;
+  let sent = 0;
+  let finished = false;
+  let closed = false;
+  const upstream = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.on('close', () => { closed = true; });
+      const pump = () => {
+        while (sent < total) {
+          sent += MiB;
+          if (!res.write(chunk)) { res.once('drain', pump); return; }
+        }
+        finished = true;
+        res.end();
+      };
+      pump();
+    });
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager([{ name: 'a', type: 'apikey', apiKey: 'k1' }], 0.98);
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const port = await listen(proxy);
+  const lines = [];
+  const error = console.error;
+  console.error = (...args) => { lines.push(args.join(' ')); };
+  try {
+    const res = await post(port, '/v1/oauth/token', '{}');
+    assert.equal(res.status, 502);
+    assert.match(res.text, /Upstream response too large/);
+    for (let i = 0; i < 100 && !closed; i++) await new Promise(r => setTimeout(r, 20));
+    assert.equal(closed, true, 'the upstream connection was dropped');
+    assert.equal(finished, false, `the rest was not read (the upstream sent ${sent / MiB} of ${total / MiB} MiB)`);
+    assert.ok(lines.some(l => /Token refresh passthrough: upstream answer larger than 64 MiB/.test(l)), 'the operator is told which path it was');
+  } finally {
+    console.error = error;
+    proxy.close();
+    upstream.close();
+  }
+});
+
+// Under the limit the passthrough relays the bytes it read, as they came: a
+// token endpoint that answers in another charset (or with bytes that are not
+// UTF-8 at all) reaches the client unchanged, not decoded and re-encoded.
+test('the token-refresh passthrough relays its answer byte for byte', async () => {
+  const answer = Buffer.from('{"error":"invalid_grant","error_description":"caf\xe9 \xff"}', 'latin1');
+  const upstream = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      res.writeHead(400, { 'content-type': 'application/json; charset=iso-8859-1' });
+      res.end(answer);
+    });
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager([{ name: 'a', type: 'apikey', apiKey: 'k1' }], 0.98);
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const port = await listen(proxy);
+  try {
+    const got = await new Promise((resolve, reject) => {
+      const req = http.request({ host: '127.0.0.1', port, method: 'POST', path: '/v1/oauth/token', headers: { 'content-type': 'application/json', 'x-api-key': 'k' } }, (res) => {
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(chunks) }));
+        res.on('error', reject);
+      });
+      req.on('error', reject);
+      req.end('{}');
+    });
+    assert.equal(got.status, 400);
+    assert.equal(got.body.toString('hex'), answer.toString('hex'));
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
 test('resolveMaxBodyBytes: default, override, quoted number, opt-out', () => {
   assert.equal(resolveMaxBodyBytes({}), DEFAULT_MAX_BODY_BYTES);
   assert.equal(resolveMaxBodyBytes(undefined), DEFAULT_MAX_BODY_BYTES);

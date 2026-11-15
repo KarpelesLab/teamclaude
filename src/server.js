@@ -3,7 +3,6 @@ import https from 'node:https';
 import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { createWriteStream, mkdirSync, writeSync } from 'node:fs';
 import { readdir, stat, unlink } from 'node:fs/promises';
-import { buffer } from 'node:stream/consumers';
 import { join } from 'node:path';
 import { ensureCerts, createConnectHandler, mitmHosts } from './mitm.js';
 import { inspectBillingError } from './billing-error.js';
@@ -273,6 +272,82 @@ async function readErrorBody(body, limit = ERROR_BODY_INSPECTION_LIMIT) {
   } finally {
     reader.releaseLock();
   }
+}
+
+// The largest upstream answer the proxy holds whole. Three paths read a body to
+// its end before relaying it: the forward path's answer that is not an event
+// stream (for its usage figures and the log), the token-refresh passthrough and
+// the client-credential retry (each relayed in one write). Their upstreams are
+// the configurable ones — the top-level `upstream`, or an account's own, which
+// is a third-party backend or a local translating proxy — so the size is theirs
+// to choose, and without a bound one answer held as much of the proxy's memory
+// as its upstream cared to send. 64 MiB is the request cap's figure (see
+// DEFAULT_MAX_BODY_BYTES): a completion's answer is its output plus any
+// server-tool results, far below that, and a token answer or a settings
+// document is a few KiB. Past it, the forward path relays the rest as it
+// arrives rather than holding it, since an answer that is not a completion (a
+// file download, a batch's results) can be larger and is still an answer; the
+// two passthroughs, which have no use for one, answer 502. Like the request
+// cap, the limit is per answer: the answers held at once hold up to this much
+// each, and nothing bounds the sum.
+const BUFFERED_RESPONSE_LIMIT = 64 * 1024 * 1024;
+
+/**
+ * Read a response body whole, up to `limit` bytes. `buf` is the body when it
+ * ended within the limit. When it outgrew the limit `buf` is null and `body`
+ * replays what was read ahead of the rest of the same stream, for a caller that
+ * relays it instead; one that does not cancels it, which drops the upstream
+ * connection. A failed read rejects, as buffer() and text() did, so each
+ * caller's error handling is unchanged.
+ * @param {ReadableStream<Uint8Array>|null} stream
+ * @param {number} [limit]
+ * @returns {Promise<{ buf: Buffer|null, body: ReadableStream<Uint8Array>|null }>}
+ */
+export async function holdBody(stream, limit = BUFFERED_RESPONSE_LIMIT) {
+  if (!stream) return { buf: Buffer.alloc(0), body: null };
+  const reader = stream.getReader();
+  /** @type {Uint8Array[]} */
+  let chunks = [];
+  let length = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) return { buf: Buffer.concat(chunks, length), body: null };
+    chunks.push(value);
+    length += value.byteLength;
+    if (length > limit) break;
+  }
+  return {
+    buf: null,
+    body: new ReadableStream({
+      start(controller) {
+        for (const chunk of chunks) controller.enqueue(chunk);
+        // The queue holds them now; held once, not twice, while they drain.
+        chunks = [];
+      },
+      async pull(controller) {
+        const { done, value } = await reader.read();
+        if (done) controller.close();
+        else controller.enqueue(value);
+      },
+      cancel(reason) { return reader.cancel(reason); },
+    }),
+  };
+}
+
+/**
+ * Answer a passthrough whose upstream answer outgrew BUFFERED_RESPONSE_LIMIT:
+ * the rest is dropped unread (which closes the upstream connection), the
+ * operator is told which path it was, and the client gets a 502 that says why.
+ * @param {any} res
+ * @param {ReadableStream<Uint8Array>|null} body  holdBody's replay
+ * @param {string} where  the path, for the log line
+ */
+async function refuseOversizedResponse(res, body, where) {
+  await body?.cancel().catch(() => {});
+  console.error(`[TeamClaude] ${where}: upstream answer larger than ${BUFFERED_RESPONSE_LIMIT / (1024 * 1024)} MiB, not relayed (502)`);
+  if (res.headersSent || clientGone(res)) return;
+  res.writeHead(502, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'Upstream response too large' } }));
 }
 
 // Response header names that are connection-specific and thus illegal on an
@@ -2852,6 +2927,8 @@ async function refuseOversizedBody(req, res) {
  * connection-specific and stale framing headers (transfer-encoding,
  * connection, content-encoding, content-length) are dropped, and so is the
  * per-org billing family when `stripOverage` is set (see isOverageHeader).
+ * The answer is held whole and relayed in one write, so one larger than
+ * BUFFERED_RESPONSE_LIMIT is a 502 instead (a token answer is a few hundred bytes).
  */
 async function relayRaw(req, res, upstream, sx, maxBodyBytes = DEFAULT_MAX_BODY_BYTES, stripOverage = false) {
   const bodyChunks = [];
@@ -2876,12 +2953,15 @@ async function relayRaw(req, res, upstream, sx, maxBodyBytes = DEFAULT_MAX_BODY_
       body: body.length > 0 ? body : undefined,
     }, sx, sx?.useByDefault());
 
-    const responseBody = await upstreamRes.text();
+    const held = await holdBody(upstreamRes.body);
+    if (!held.buf) { await refuseOversizedResponse(res, held.body, 'Token refresh passthrough'); return; }
     const responseHeaders = {};
     for (const [key, value] of upstreamRes.headers.entries()) {
-      // `.text()` already decompressed the body, so drop content-encoding and
-      // the now-stale content-length (both refer to the compressed bytes) — else
-      // a gzip'd upstream response reaches the client mis-framed / truncated.
+      // The body is plain: relayRaw sends no accept-encoding, so the default
+      // transport is answered unencoded, and under TEAMCLAUDE_UPSTREAM_GLOBAL_FETCH
+      // fetch decompresses the encoding it asked for. So drop content-encoding and
+      // the stale content-length (both would describe compressed bytes) — else a
+      // gzip'd upstream response reaches the client mis-framed / truncated.
       if (key === 'transfer-encoding' || key === 'connection' ||
           key === 'content-encoding' || key === 'content-length') continue;
       if (key === CORRELATION_HEADER) continue;
@@ -2889,7 +2969,7 @@ async function relayRaw(req, res, upstream, sx, maxBodyBytes = DEFAULT_MAX_BODY_
       responseHeaders[key] = value;
     }
     res.writeHead(upstreamRes.status, responseHeaders);
-    res.end(responseBody);
+    res.end(held.buf);
   } catch (err) {
     console.error('[TeamClaude] Raw relay error:', describeConnectError(err));
     if (!res.headersSent) {
@@ -3728,7 +3808,10 @@ function respondModelUnsupported(res, ctx, denied) {
  * transport, not relayStream's: the admission gate, the fleet upstream proxy,
  * this attempt's sx route and the default headers deadline all apply, since
  * this is an ordinary request and not a Remote Control long-poll. The body is
- * buffered the way the forward path buffers a non-streaming answer.
+ * buffered the way the forward path buffers a non-streaming answer, up to
+ * BUFFERED_RESPONSE_LIMIT; past it this answers 502 rather than relaying it, as
+ * the calls that come here are Claude Code's bootstrap, settings and
+ * connector-registry reads (see the scope branch of forwardRequest).
  * @param {any} req
  * @param {any} res
  * @param {string} upstream
@@ -3751,10 +3834,15 @@ async function relayOnClientCredential(req, res, upstream, sx, route, ctx) {
       if (ctx.stripOverage === true && isOverageHeader(key)) continue;
       responseHeaders[key] = value;
     }
-    const buf = Buffer.from(await upstreamRes.arrayBuffer());
+    const held = await holdBody(upstreamRes.body);
+    if (!held.buf) {
+      ctx.status = 502;
+      await refuseOversizedResponse(res, held.body, 'Client-credential relay');
+      return;
+    }
     ctx.status = upstreamRes.status;
     res.writeHead(upstreamRes.status, responseHeaders);
-    res.end(buf);
+    res.end(held.buf);
   } catch (err) {
     const code = /** @type {{ code?: string }|null} */ (err)?.code;
     if (code === 'TEAMCLAUDE_CLIENT_GONE') { ctx.abandoned = true; ctx.status = 499; return; }
@@ -4909,13 +4997,24 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       return;
     }
 
-    if (isStreaming) {
+    // Any other body is held whole, for its usage figures and the log, up to
+    // BUFFERED_RESPONSE_LIMIT. Past it the rest is relayed as it arrives, the way
+    // an event stream is but unread: an answer that large is not a completion,
+    // so there is no usage in it to lose, and lines in it that look like an
+    // event stream's (a saved transcript) are not one's to book.
+    const held = isStreaming ? null : await holdBody(upstreamBody);
+    if (held && !held.buf) {
+      console.log(`[TeamClaude] A ${upstreamRes.status} answer from "${safeLine(account.name, 64)}" is larger than ${BUFFERED_RESPONSE_LIMIT / (1024 * 1024)} MiB; relaying it as it arrives instead of holding it`);
+    }
+
+    if (held?.buf == null) {
       // Stream each chunk straight to the log as it is relayed — never hold the
-      // whole (potentially ~1M-token) SSE body in memory.
+      // whole body in memory: an SSE body (potentially ~1M tokens), or an answer
+      // past BUFFERED_RESPONSE_LIMIT.
       const l = getLog();
       const bw = l ? l.bodyWriter('RESPONSE BODY (streamed)', contentType) : null;
       try {
-        await streamResponse(upstreamBody, res, account.index, accountManager, bw, ctx.onUsage, ctx.pinKey, ctx.model, ctx.onMessage, (/** @type {Record<string, any>} */ u) => { ctx.cacheUsage = u; bookUsageTotals(ctx.usage, u); });
+        await streamResponse(held?.body ?? upstreamBody, res, account.index, accountManager, bw, ctx.onUsage, ctx.pinKey, ctx.model, ctx.onMessage, (/** @type {Record<string, any>} */ u) => { ctx.cacheUsage = u; bookUsageTotals(ctx.usage, u); }, isStreaming);
         // Reached only when the stream completed. A stream that dies upstream
         // throws out of streamResponse, so it never marks itself delivered —
         // which is the failure the token counters cannot see, since a stream
@@ -4929,7 +5028,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       }
       l?.end();
     } else {
-      const buf = await buffer(upstreamBody);
+      const buf = held.buf;
       extractUsageFromBody(buf, account.index, accountManager, ctx.onUsage, ctx.pinKey, ctx.model, ctx.onMessage, (/** @type {Record<string, any>} */ u) => { ctx.cacheUsage = u; bookUsageTotals(ctx.usage, u); });
       const l = getLog();
       if (l) { l.body('RESPONSE BODY', buf, contentType); l.end(); }
@@ -5126,10 +5225,14 @@ export function bookUsageTotals(totals, usage) {
 }
 
 /**
- * Stream an SSE response to the client, parsing usage data along the way.
+ * Relay a response body to the client as it arrives: an event stream, whose
+ * usage is parsed from its SSE event lines along the way, or, with `scanUsage`
+ * false, an answer the forward path would not hold (see
+ * BUFFERED_RESPONSE_LIMIT), relayed unread, since a body that is not an event
+ * stream can still carry lines shaped like one's (a saved transcript, a file).
  * `onTotals` is told the usage that was booked, once the stream ends.
  */
-export async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter, onUsage = null, pinKey = null, model = null, onMessage = null, /** @type {((usage: Record<string, any>) => void)|null} */ onTotals = null) {
+export async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter, onUsage = null, pinKey = null, model = null, onMessage = null, /** @type {((usage: Record<string, any>) => void)|null} */ onTotals = null, scanUsage = true) {
   const reader = webStream.getReader();
   // A client that leaves while upstream is silent must not hold the pending
   // read — and with it the upstream socket and its admission permit — until
@@ -5150,7 +5253,7 @@ export async function streamResponse(webStream, res, accountIndex, accountManage
   // remembers that it did — the incremental counters would book the turn again
   // if a second terminal event arrived. See parseSSEDataLine.
   const responsesTurn = { settled: false };
-  const usage = createSseLineScanner(line => parseSSEDataLine(line, accountIndex, accountManager, onUsage, merged, responsesTurn, onMessage));
+  const usage = scanUsage ? createSseLineScanner(line => parseSSEDataLine(line, accountIndex, accountManager, onUsage, merged, responsesTurn, onMessage)) : null;
 
   try {
     while (true) {
@@ -5183,10 +5286,11 @@ export async function streamResponse(webStream, res, accountIndex, accountManage
       const logPending = bodyWriter?.drain?.();
       if (logPending) await logPending;
 
-      // Parse the SSE data lines for usage tracking, as they arrive. The relay
-      // above is done with the chunk by now; this reads it and retains at most
-      // one bounded partial line, never the response.
-      usage.push(decoder.decode(value, { stream: true }));
+      // Parse the SSE data lines for usage tracking, as they arrive (an event
+      // stream's only; see scanUsage). The relay above is done with the chunk by
+      // now; this reads it and retains at most one bounded partial line, never
+      // the response.
+      usage?.push(decoder.decode(value, { stream: true }));
 
       // Handle backpressure — also bail out if client disconnects,
       // because 'drain' will never fire on a destroyed socket
@@ -5197,8 +5301,8 @@ export async function streamResponse(webStream, res, accountIndex, accountManage
     }
 
     // A final data line without a trailing newline.
-    usage.push(decoder.decode());
-    usage.flush();
+    usage?.push(decoder.decode());
+    usage?.flush();
   } catch (err) {
     // A mid-stream idle timeout (or any read error) means the upstream went
     // silent after headers. Rethrow to the caller's transient handler, which
