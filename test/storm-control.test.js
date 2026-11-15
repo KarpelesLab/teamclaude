@@ -275,7 +275,7 @@ test('a stormRamp value that is an array or an object is named as written', () =
 // A timer waits whole milliseconds, never less than 1, and holds no more than
 // 2147483647 (admit() waits pollMs * 4 during a pause).
 test('a pollMs a timer cannot keep falls back to its default, with a line naming it', () => {
-  for (const pollMs of [0.001, 1, 4, 2.5, 7.5, 536_870_912, 3e9]) {
+  for (const pollMs of [0, 0.001, 1, 4, 2.5, 7.5, 536_870_912, 3e9]) {
     const { am, lines } = withRamp({ pollMs });
     assert.equal(am.ramp.pollMs, 50, String(pollMs));
     assert.equal(lines.length, 1, String(pollMs));
@@ -285,6 +285,40 @@ test('a pollMs a timer cannot keep falls back to its default, with a line naming
     const { am, lines } = withRamp({ pollMs });
     assert.equal(am.ramp.pollMs, pollMs);
     assert.deepEqual(lines, []);
+  }
+});
+
+// What pollMs is for: how often a waiting admit re-checks the cap. Each
+// re-check asks isAborted first, so counting those calls on a mocked clock
+// reads the delays admit() schedules rather than how fast the machine is: over
+// two waits, none before pollMs and one at it. A 0 or a 1 fell back to 50
+// above, and were either kept, a timer would re-check every 1 ms; the kept 5
+// shows the wait is read from pollMs, not fixed at the default.
+test('a waiting admit waits pollMs between re-checks of the cap, and the default for a pollMs that fell back', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.now() });
+  for (const [pollMs, every] of [[0, 50], [1, 50], [5, 5]]) {
+    const { am } = withRamp({ pollMs, stepMs: 10_000 });
+    am._beginRamp(am.accounts[0]); // cap 1: the mocked clock never reaches a step
+    assert.equal(await am.admit(0), true, 'the free slot is taken at once');
+    let checks = 0;
+    let gone = false;
+    const waiting = am.admit(0, () => { checks++; return gone; });
+    assert.equal(checks, 1, 'the first check is made at once');
+    t.mock.timers.tick(every - 1);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(checks, 1, `pollMs ${pollMs}: re-checked before ${every} ms`);
+    t.mock.timers.tick(1);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(checks, 2, `pollMs ${pollMs}: not re-checked at ${every} ms`);
+    t.mock.timers.tick(every - 1);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(checks, 2, `pollMs ${pollMs}: re-checked again before another ${every} ms`);
+    t.mock.timers.tick(1);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(checks, 3, `pollMs ${pollMs}: not re-checked again after another ${every} ms`);
+    gone = true;
+    t.mock.timers.tick(every);
+    assert.equal(await waiting, false, 'a waiting admit gives up once the client is gone');
   }
 });
 

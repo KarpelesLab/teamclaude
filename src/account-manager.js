@@ -386,8 +386,10 @@ const RAMP_DEFAULTS = Object.freeze({
   pollMs: 50,         // how often a waiting request re-checks the cap
 });
 
-// pollMs is a timer delay, so it is held to whole milliseconds a timer keeps,
-// from a chosen floor. Node waits no less than 1 ms, so a pollMs of 0 is a
+// pollMs is a timer delay, so it has to be whole milliseconds a timer keeps,
+// from a chosen floor: a smaller value is not raised to it but falls back to
+// the default, as any value the ramp cannot use does (so does one past the
+// ceiling below). Node waits no less than 1 ms, so a pollMs of 0 would be a
 // 1 ms loop; above that a waiting request re-checks about as often as asked
 // (an awaited loop over 200 ms measured 161 re-checks at 1 ms, 81 at 2 and 32
 // at 5). The floor of 5 holds each waiting request to some 200 re-checks a
