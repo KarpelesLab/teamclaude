@@ -608,7 +608,26 @@ export function unavailableLine(account, paint) {
   // any other, yet is taking traffic and billing for it. Say so on the line
   // that would otherwise tell the operator it is idle.
   if (account.onExtraUsage) {
+    // With `preferExtraUsage` the account is past its threshold by the
+    // operator's own choice, so while it can still serve that way the line
+    // says what it is doing and not that it is blocked. Without the key the
+    // line is the one it always was.
+    if (account.preferExtraUsage === true && account.fallbackTier) {
+      return `${paint.dim('Usage'.padEnd(8))} ${paint.red('serving on extra usage (paid overage), billing')}`;
+    }
     return `${paint.dim('Blocked'.padEnd(8))} ${paint.yellow(text)} ${paint.red('\u2014 serving on extra usage (paid overage), billing')}`;
+  }
+  // Past its switch threshold, yet the fallback could still serve from it
+  // (AccountManager.fallbackTier). Included quota is known from the buckets.
+  // Paid credits are not: the tier is 'paid' whenever nothing says overage is
+  // off, which includes an account whose usage was never probed, so the line
+  // claims credits only when the spend reading says overage is on upstream.
+  const capacity = account.fallbackTier === 'free' ? 'included quota available past switch threshold'
+    : account.fallbackTier === 'paid' && account.quota?.spend?.enabled === true ? 'subscription usage credits available'
+    : null;
+  if (capacity) {
+    const policy = account.preferExtraUsage === true ? 'extra-usage preference enabled' : 'fallback after normal rotation';
+    return `${paint.dim('Fallback'.padEnd(8))} ${paint.yellow(capacity)} (${policy})`;
   }
   return `${paint.dim('Blocked'.padEnd(8))} ${paint.yellow(text)}`;
 }
