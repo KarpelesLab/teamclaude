@@ -49,6 +49,7 @@ import { renderStatus, formatPercent } from './status-renderer.js';
 import { sanitizeText, safeLine } from './safe-text.js';
 import { modelLabel } from './model.js';
 import { cacheUsageLabel } from './usage-label.js';
+import { statusLabel } from './error-type.js';
 import { ClientUsageTracker, UsageDimensionTracker } from './client-usage.js';
 import { buildClaudeEnvLines, bypassesAllHosts, clearSelfProxyEnvLines, encodePinComponent, LOCAL_LOGIN_HINT_WINDOW_MS, localLoginHint, mergeNoProxy, resolveClientMode } from './claude-env.js';
 import { serviceKind, installService, uninstallService, serviceStatus, renderService, logPath } from './service.js';
@@ -401,7 +402,7 @@ async function serverCommand() {
     console.error(`[TeamClaude] Bad adaptiveDistribution setting in ${getConfigPath()}: ${err.message}`);
     process.exit(1);
   }
-  const accountManager = new AccountManager(accounts, threshold, { routes: config.routes, ramp: config.stormRamp, distributeSessions: config.distributeSessions, expiryRouting: config.expiryRouting, preferSoonestWeeklyReset: config.preferSoonestWeeklyReset, advisorEligibility: config.advisorEligibility, adaptive, listener: localListener(config) });
+  const accountManager = new AccountManager(accounts, threshold, { routes: config.routes, ramp: config.stormRamp, distributeSessions: config.distributeSessions, expiryRouting: config.expiryRouting, preferSoonestWeeklyReset: config.preferSoonestWeeklyReset, switchOnSessionReset: config.switchOnSessionReset, advisorEligibility: config.advisorEligibility, adaptive, listener: localListener(config) });
   // Names the activity log's session column from Claude Code's own on-disk
   // session titles. Built whether or not the TUI runs, so a reload has one
   // object to reconfigure.
@@ -655,6 +656,8 @@ async function serverCommand() {
     accountManager.setExpiryRouting(config.expiryRouting);
     config.preferSoonestWeeklyReset = diskConfig.preferSoonestWeeklyReset;
     accountManager.setPreferSoonestWeeklyReset(config.preferSoonestWeeklyReset);
+    config.switchOnSessionReset = diskConfig.switchOnSessionReset;
+    accountManager.setSwitchOnSessionReset(config.switchOnSessionReset);
     // And the advisor mode: read off the manager on every selection, so the
     // setter is the whole application. Absent on disk means 'strict' again.
     config.advisorEligibility = diskConfig.advisorEligibility;
@@ -870,7 +873,7 @@ async function serverCommand() {
       const client = (info.client || r?.client) ? `[${info.client || r.client}] ` : '';
       const pin = (info.pinned || r?.pinned) ? ' [pin]' : '';
       const cache = cacheUsageLabel(info.cacheUsage);
-      writeActivity(`${client}${sid}${info.method} ${info.path}${model} → ${acct}${pin} (${info.status}, ${dur}s)${cache ? ` ${cache}` : ''}`);
+      writeActivity(`${client}${sid}${info.method} ${info.path}${model} → ${acct}${pin} (${statusLabel(info.status, info.errorType)}, ${dur}s)${cache ? ` ${cache}` : ''}`);
     };
     // Tee console output to the activity log as well
     const origLog = console.log;

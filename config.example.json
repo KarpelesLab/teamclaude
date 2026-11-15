@@ -24,6 +24,7 @@
   "synthesizeQuotaHeaders": false,
   "poolQuotaHeaders": false,
   "distributeSessions": false,
+  "switchOnSessionReset": true,
   "adaptiveDistribution": {
     "scoring": "burndown"
   },

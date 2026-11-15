@@ -263,7 +263,7 @@ const WRITE_TOOLS = [
     run: (args, ctx) => {
       const index = accountIndexFor(ctx, args);
       ctx.accountManager.setCurrentAccount(index);
-      return { account: ctx.accountManager.accounts[index].name, ...ctx.accountManager.eligibility(index) };
+      return { account: ctx.accountManager.accounts[index].name, ...ctx.accountManager.eligibility(index, { manualSwitch: true }) };
     },
   },
   {
