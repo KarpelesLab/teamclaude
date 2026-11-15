@@ -3718,6 +3718,32 @@ export async function peekStreamFailure(stream, bounds = {}) {
 }
 
 /**
+ * Whether a re-login is what brings an account back: it still holds the
+ * refresh token the token endpoint refused (the dead-token guard in
+ * AccountManager.ensureTokenFresh), and that refusal was not over the account
+ * itself. A hold arms the same guard, but a re-login does not lift it, and its
+ * own words say what to do (isRefused). A failed renewal's status alone does
+ * not say so either, since a 400, 401 or 403 that was not the endpoint's own
+ * refusal leaves the token in place (oauth.js isRefreshRejection).
+ * @param {Record<string, any>|undefined} account
+ */
+function fixedByReLogin(account) {
+  return !!account?._deadRefreshToken && account._deadRefreshToken === account.refreshToken && !isRefused(account);
+}
+
+/**
+ * The advice for an account a re-login brings back: its own login command, as
+ * status names it (errorReason.remedy, `teamclaude login --codex` for a Codex
+ * account). The `teamclaude login` fallback is not reached: an account at
+ * either site has been through ensureTokenFresh, whose refusal or guard check
+ * put it in error through _needsLogin, which always sets the remedy.
+ * @param {Record<string, any>} account
+ */
+function reLoginAdvice(account) {
+  return `Re-add it with: ${account.errorReason?.remedy || 'teamclaude login'}`;
+}
+
+/**
  * Why each refused account failed, for the client. An account whose last token
  * refresh failed (and none has succeeded since) was refused because its token
  * could not be renewed, and that reason is named — the coordinator's (the store's
@@ -3745,7 +3771,7 @@ function refusalMessage(refused, statuses, holds) {
     if (isRefused(account)) return `upstream refused account "${name}": ${account.errorReason.detail}`;
     const failure = account._lastRefreshFailure;
     // A refresh token the endpoint rejected IS fixed by a re-login; say so then.
-    if (failure) return `the token of "${name}" could not be renewed: ${failure.reason}${[400, 401, 403].includes(failure.status) ? '. Re-add it with: teamclaude login' : ''}`;
+    if (failure) return `the token of "${name}" could not be renewed: ${failure.reason}${fixedByReLogin(account) ? `. ${reLoginAdvice(account)}` : ''}`;
     return `upstream refused the credential for account "${name}" (${statuses?.get(account) ?? 403}). Check the account, then re-add it with: teamclaude login`;
   });
   // Two accounts of one name with the same story are told once.
@@ -3772,7 +3798,8 @@ function respondUnrenewed(res, ctx) {
   const failures = accounts.map(a => a._lastRefreshFailure).filter(Boolean);
   const reasons = failures.map(f => f.reason);
   // A refresh token the endpoint rejected IS fixed by a re-login; say so then.
-  const relogin = failures.some(f => [400, 401, 403].includes(f.status)) ? ' Re-add it with: teamclaude login' : '';
+  const dead = accounts.find(fixedByReLogin);
+  const relogin = dead ? ` ${reLoginAdvice(dead)}` : '';
   // Come back when a renewal may be tried again: the longest 429 hold among these
   // accounts (the token endpoint's Retry-After), or 30 s when none is held.
   const now = Date.now();

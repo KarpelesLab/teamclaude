@@ -172,32 +172,92 @@ export function parseRetryAfterMs(value, now = Date.now()) {
 const DEFAULT_APPEAL_URL = 'https://claude.ai/restricted';
 
 /**
+ * The OAuth error a token endpoint's answer carries, in either shape: the flat
+ * one RFC 6749 §5.2 defines (`{"error": "invalid_grant", "error_description":
+ * ...}`), or nested as an Anthropic API error (`{"type": "error", "error":
+ * {"type": "invalid_grant", ...}}`), where Claude Code's own refresh reads the
+ * code from `error.type`. Which one upstream sends is not verified; both are
+ * read. The description and the link are the OAuth `error_description` and
+ * `error_uri`, each taken from inside the nested object or else from beside
+ * it; `message` is the nested object's own text. Null when the body is
+ * neither.
+ * @param {string} text
+ * @returns {{ code: string, description: unknown, uri: unknown, message: unknown }|null}
+ */
+function oauthErrorOf(text) {
+  let body;
+  try { body = JSON.parse(text); } catch { return null; }
+  const e = body?.error;
+  if (typeof e === 'string') return { code: e, description: body.error_description, uri: body.error_uri, message: undefined };
+  if (e && typeof e === 'object' && typeof e.type === 'string') {
+    return { code: e.type, description: e.error_description ?? body.error_description, uri: e.error_uri ?? body.error_uri, message: e.message };
+  }
+  return null;
+}
+
+/**
  * The appeal link of a refusal for an account on hold, checked as Claude Code does:
  * it is shown to the operator, so anything but a plain https Anthropic link becomes the default.
+ * The hold itself is read in either shape (oauthErrorOf), where Claude Code
+ * reads it in the flat one only.
  * @param {string} text
  */
 function holdAppealUrl(text) {
-  let body;
-  try { body = JSON.parse(text); } catch { return undefined; }
-  if (!['invalid_grant', 'access_denied'].includes(body?.error) || body.error_description !== 'account_on_hold') return undefined;
-  return anthropicLink(body.error_uri) ?? DEFAULT_APPEAL_URL;
+  const oauth = oauthErrorOf(text);
+  if (!oauth || !['invalid_grant', 'access_denied'].includes(oauth.code) || oauth.description !== 'account_on_hold') return undefined;
+  return anthropicLink(oauth.uri) ?? DEFAULT_APPEAL_URL;
 }
 
 /**
  * The token endpoint's own reason for a refusal, as `invalid_grant: Refresh
- * token expired`, or undefined when the body is not an OAuth error. Status
- * carries it beside a `refresh_rejected` error (#629), so only the two OAuth
- * fields go there, each bounded: never the rest of the body.
+ * token expired`, or undefined when the body is not an OAuth error (in either
+ * shape, see oauthErrorOf). Status carries it beside a `refresh_rejected`
+ * error (#629), so only the code and the description (or, nested, the
+ * message) go there, each bounded: never the rest of the body.
  * @param {string} text
  * @returns {string|undefined}
  */
 export function oauthErrorSummary(text) {
-  let body;
-  try { body = JSON.parse(text); } catch { return undefined; }
-  const code = body?.error;
+  const oauth = oauthErrorOf(text);
+  const code = oauth?.code;
   if (typeof code !== 'string' || !/^[A-Za-z0-9_.-]{1,40}$/.test(code)) return undefined;
-  const desc = typeof body.error_description === 'string' ? safeLine(body.error_description, 100) : '';
+  const said = typeof oauth?.description === 'string' ? oauth.description : oauth?.message;
+  const desc = typeof said === 'string' ? safeLine(said, 100) : '';
   return desc ? `${code}: ${desc}` : code;
+}
+
+/**
+ * Whether the token endpoint refused the grant itself: `invalid_grant`, the
+ * OAuth error for a refresh token that is invalid, expired or revoked (RFC 6749
+ * §5.2), and what upstream answers a dead one, in either shape (oauthErrorOf).
+ * The other OAuth errors are about the client or the request
+ * (`invalid_client`, `unauthorized_client`, `invalid_request`, ...), which are
+ * the same for every account here, and a code this does not know proves
+ * nothing either.
+ * @param {string} text
+ */
+function refusesGrant(text) {
+  return oauthErrorOf(text)?.code === 'invalid_grant';
+}
+
+/**
+ * Whether a failed refresh says the refresh token itself is dead: it is not
+ * sent again, and the account needs a re-login (or, on hold, an appeal).
+ *
+ * A 400, 401 or 403 alone does not say so. Whatever stands between this
+ * process and the token endpoint (a firewall, a proxy, a CDN) can answer one
+ * with a page of its own, and a token taken for dead stays unused until a new
+ * one arrives, while credential sync empties the row holding it
+ * (credential-sync.js), so every install then waits for a sign-in. So
+ * refreshAccessToken, which parses the body, sets `grantRefused` on its error,
+ * true only for `invalid_grant` or a hold, and only an explicit false spares
+ * the token. An error without it, the Codex refresh's, which does not parse
+ * its body, is judged by its status alone, as before.
+ * @param {any} err
+ */
+export function isRefreshRejection(err) {
+  if (err?.status !== 400 && err?.status !== 401 && err?.status !== 403) return false;
+  return err.grantRefused !== false;
 }
 
 /**
@@ -275,7 +335,8 @@ export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_
         const err = /** @type {CodedError} */ (new Error(`Token refresh failed (${res.status}): ${text}`));
         // Surface the HTTP status so callers can distinguish a genuine auth
         // rejection (the refresh token is dead — re-login needed) from a
-        // transient server error. 5xx is retried above; reaching here with a 5xx
+        // transient server error, with `grantRefused` below (see
+        // isRefreshRejection). 5xx is retried above; reaching here with a 5xx
         // means retries were exhausted, which is still transient, not auth.
         err.status = res.status;
         // A 429 says how long to stay away; the account holds its refreshes
@@ -289,6 +350,8 @@ export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_
         if (appealUrl) /** @type {any} */ (err).appealUrl = appealUrl;
         const oauthError = oauthErrorSummary(text);
         if (oauthError) /** @type {any} */ (err).oauthError = oauthError;
+        // Whether this answer is the endpoint refusing the refresh token itself.
+        /** @type {any} */ (err).grantRefused = !!appealUrl || refusesGrant(text);
         throw err;
       }
 
@@ -352,9 +415,15 @@ export function normalizeExpiresAt(expiresAt) {
  * Check if an OAuth token is expiring within the given threshold.
  *
  * No expiry at all means unknown, and the token is used until upstream says
- * otherwise. An expiry that is present but not a number is treated as already
- * reached: it cannot be trusted to lie in the future, and refreshing replaces
- * it with one that can be compared.
+ * otherwise. That is any falsy value: absent, null, an empty string, and 0,
+ * which is how the callback.net store writes an expiry it was never given
+ * (credential-sync.js, whose rows need a number) and which makeAccount reads
+ * back as null; a token from a sign-in that carried no expiry reads the same
+ * on every install. Any other value that does not read as a positive finite
+ * number (`'0'`, `'soon'`, `-1`, `Infinity`) is present but unusable, and is
+ * treated as already reached: it cannot be trusted to lie in the future, and
+ * refreshing replaces it with one that can be compared. A numeric string is
+ * read as the time it spells.
  */
 export function isTokenExpiringSoon(expiresAt, thresholdMs = 5 * 60 * 1000) {
   if (!expiresAt) return false;
@@ -443,11 +512,14 @@ export async function fetchProfile(accessToken, routing = null) {
  * is what identity.js isTokenRejection keys on:
  *   - 401 when the credential is dead: the profile endpoint rejected the access
  *     token and there was no refresh token to renew it with, or the token
- *     endpoint rejected the refresh (400/401/403 — the same reading
- *     account-manager gives a refresh that needs a re-login);
+ *     endpoint refused the refresh token itself (isRefreshRejection, the same
+ *     reading account-manager gives a refresh that needs a re-login);
  *   - the token endpoint's status, or null, when the refresh failed for a
- *     reason that says nothing about the token (network, 5xx after retries):
- *     the credential is unreachable, not refused, and stays importable by name.
+ *     reason that says nothing about the token (network, 5xx after retries, a
+ *     400/401/403 that was not the endpoint's refusal, such as a page from a
+ *     firewall in front of it): the credential is unreachable, not refused,
+ *     and stays importable by name. A 401 among those is carried as null,
+ *     since isTokenRejection would read it as the upstream's verdict.
  * A 403 is neither refreshed nor a rejection: the upstream answers 403 to a
  * valid token from an unexpected region (see egress-guard.js) and under an org
  * policy, and a new token would meet the same answer.
@@ -485,14 +557,15 @@ export async function profileForCredentials(creds, routing = null, { renew = (c)
     profile ??= await fetchProfile(creds.accessToken, routing);
     if (profile.status !== 401) return { creds, profile };
     const e = /** @type {CodedError} */ (err);
-    const rejected = e.status === 400 || e.status === 401 || e.status === 403;
+    const rejected = isRefreshRejection(e);
     return {
       creds,
       profile: rejected
         ? { ...profile, error: `${profile.error}; token refresh rejected: ${e.message}` }
         // Not a verdict: the refresh token may well be good, so this is the
-        // unreachable shape, carrying the token endpoint's status if it gave one.
-        : { error: `${profile.error}; token refresh failed: ${e.message}`, status: e.status ?? null },
+        // unreachable shape, carrying the token endpoint's status if it gave
+        // one, but a 401 as none: that one isTokenRejection takes for a verdict.
+        : { error: `${profile.error}; token refresh failed: ${e.message}`, status: e.status === 401 ? null : e.status ?? null },
     };
   }
 

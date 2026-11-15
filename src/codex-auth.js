@@ -110,7 +110,9 @@ export async function refreshCodexToken(refreshToken, endpoint = TOKEN_ENDPOINT,
     const text = await res.text();
     const err = /** @type {CodedError} */ (new Error(`Codex token refresh failed (${res.status}): ${text}`));
     // Surfaced so callers can tell a dead refresh token (re-login needed) from
-    // a transient server error, exactly as the Anthropic path does.
+    // a transient server error, as the Anthropic path does, but by the status
+    // alone: the body goes into the message unparsed, so the error carries no
+    // `grantRefused` (see oauth.js isRefreshRejection).
     err.status = res.status;
     throw err;
   }
