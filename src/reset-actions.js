@@ -146,7 +146,7 @@ export function createResetActions({ accountManager, claudeRedeemer, codexRedeem
         details.weeklyResetsAt = status.weeklyResetsAt;
         details.grants = status.grants.map((/** @type {import('./claude-resets.js').ResetStatus['grants'][number]} */ grant) => {
           const warnings = [...held];
-          if (!status.atLimit && grant.useRequiresLimit !== false) warnings.push('not at a usage limit — upstream will probably decline; nothing is spent then');
+          if (!status.atLimit && grant.useRequiresLimit !== false) warnings.push('not at a usage limit — upstream may still accept, and the reset is then spent');
           if (!status.exhausted.some(limit => limit.startsWith('seven_day'))) warnings.push('no weekly limit is exhausted');
           const uncovered = status.exhausted.filter(limit => !grant.clears.includes(limit));
           if (uncovered.length) warnings.push(`does not clear ${safeLine(uncovered.join(', '), 120)}`);
@@ -202,11 +202,36 @@ export function createResetActions({ accountManager, claudeRedeemer, codexRedeem
     return detailsFor(account, read, read?.error ? null : resetReading(account)?.seenAt ?? null);
   }
 
+  /** Removal renumbers the accounts after it, so a removed account's index
+   * names a neighbour: nothing here may act through the index of an account
+   * that is no longer listed.
+   * @param {Record<string, any>} account
+   */
+  const listed = account => accountManager.accounts.includes(account);
+
+  /** One upstream read per account at a time: a panel reopened while its first
+   * read is pending shares that read instead of sending another.
+   * @type {WeakMap<object, Promise<ResetDetails>>} */
+  const pendingReads = new WeakMap();
+
+  /** @param {Record<string, any>} account
+   * @returns {Promise<ResetDetails>}
+   */
+  function read(account) {
+    let pending = pendingReads.get(account);
+    if (!pending) {
+      pending = readOnce(account).finally(() => pendingReads.delete(account));
+      pendingReads.set(account, pending);
+    }
+    return pending;
+  }
+
   /** A panel read is fresh, but a failure retains the last successful grants.
    * @param {Record<string, any>} account
    * @returns {Promise<ResetDetails>}
    */
-  async function read(account) {
+  async function readOnce(account) {
+    if (!listed(account)) return { ...detailsFor(account, null, null), error: 'account is no longer listed', grants: [] };
     if (oauthAccount(account)) {
       try { await accountManager.ensureTokenFresh(account.index); } catch (/** @type {any} */ err) {
         rememberResetReading(account, providerOf(account) === 'codex' ? 'codex' : 'claude', {
@@ -228,6 +253,7 @@ export function createResetActions({ accountManager, claudeRedeemer, codexRedeem
     const name = safeLine(account?.name || 'unknown account', 64);
     /** @param {string} reason @returns {ManualRedeemResult} */
     const decline = reason => ({ redeemed: false, uncertain: false, message: `Manual reset on "${name}": ${safeLine(reason, 240)}` });
+    if (!listed(account)) return decline('account is no longer listed');
     const blocked = accountBlock(account);
     if (blocked) return decline(blocked);
     const redeemer = redeemerFor(account);

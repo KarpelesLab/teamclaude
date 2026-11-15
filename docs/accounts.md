@@ -608,7 +608,7 @@ Manual spending is your decision. It ignores `autoRedeemResets`, the account's
 weekly limit is exhausted, when the grant does not clear an exhausted limit,
 when upstream reports a cooldown, or when a reset recently landed or may have
 landed. If the grant requires a limit and the account is not at one, it warns
-that upstream will probably decline without spending anything. A disabled or
+that upstream may still accept the claim, in which case the reset is spent. A disabled or
 non-OAuth account, missing organization id, ineligible status, or an empty,
 paused, unusable or expired grant is a hard block.
 

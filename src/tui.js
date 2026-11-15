@@ -2128,8 +2128,10 @@ export class TUI {
     // A claim cannot be cancelled. Keep its grant fixed until it settles;
     // closing the panel only stops displaying it, not the upstream request.
     if (panel.busy) return;
-    if (k === 'r') { void this._readResets(panel); return; }
+    // One read at a time: the read floor only arms once a read has landed, so
+    // a held `r` would otherwise send a usage request per key repeat.
     if (panel.loading) return;
+    if (k === 'r') { void this._readResets(panel); return; }
     const grants = panel.details?.grants || [];
     if (k === 'up' || k === 'k') panel.idx = Math.max(0, panel.idx - 1);
     else if (k === 'down' || k === 'j') panel.idx = Math.max(0, Math.min(grants.length - 1, panel.idx + 1));
