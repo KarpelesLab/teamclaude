@@ -1374,8 +1374,9 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // The CLIProxyAPI prefix is ours, and no route under it is a WebSocket.
       // requestHandler answers every request there itself; a handshake would
       // otherwise be relayed with the client's management key in its headers
-      // (relayUpgrade strips only x-api-key). Refused before the key gate, as
-      // the request path's answer does not depend on the key either.
+      // (of the credentials, relayUpgrade strips only x-api-key). Refused
+      // before the key gate, as the request path's answer does not depend on
+      // the key either.
       if (isCliproxyPath(classificationPath(req.url || ''))) {
         try { socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n'); } catch { /* already gone */ }
         socket.destroy();
@@ -1403,7 +1404,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // path (req.tcClient): a handshake authenticated with a client key is
       // attributed to that client, or it is a channel the operator cannot see
       // under `clients` at all (#325).
-      relayUpgrade(req, socket, head, upstream, sx, { client: auth.client, clientUsage, stripOverage: shouldStripOverageHeaders(config) });
+      relayUpgrade(req, socket, head, upstream, sx, { client: auth.client, clientUsage, stripOverage: shouldStripOverageHeaders(config), strip: usageDimensionHeaderNames(config.proxy) });
     } catch (err) {
       console.error(`[TeamClaude] WebSocket upgrade handler failed for ${safeLine(req?.url)}: ${err?.message || err}`);
       try { socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n'); } catch { /* already gone */ }
@@ -2015,7 +2016,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       }
       // Client token refresh: pass through untouched (the proxy manages its own
       // tokens via ensureTokenFresh; rewriting client refreshes would conflict).
-      if (req.method === 'POST' && req.url === '/v1/oauth/token') { await relayRaw(req, res, upstream, sx, resolveMaxBodyBytes(config), shouldStripOverageHeaders(config)); return; }
+      if (req.method === 'POST' && req.url === '/v1/oauth/token') { await relayRaw(req, res, upstream, sx, resolveMaxBodyBytes(config), shouldStripOverageHeaders(config), usageDimensionHeaderNames(/** @type {any} */ (config).proxy)); return; }
       // Account pin: a request to `/tc-acct/<name-or-index>/...` (e.g. via
       // ANTHROPIC_BASE_URL=http://host:port/tc-acct/deepseek) is forced onto that
       // one account, bypassing rotation. Used by the keep-warm scheduler and for
@@ -2091,10 +2092,14 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // either pool, and goes to that host as sent (#492). Before the identity
       // plane below, which is Anthropic's.
       const passthrough = clientPassthroughOrigin({ authority: requestAuthority(req), url: req.url, config, accounts: /** @type {any} */ (accountManager).accounts });
-      if (passthrough) { await relayStream(req, res, passthrough, sx, shouldStripOverageHeaders(config)); return; }
+      // Both relays drop the usage-dimension headers, as relayRaw above and the
+      // forward path below do: on those paths the operator's labels stay here.
+      // relayHttpForward, which in practice sees only third-party hosts (it
+      // does not check for an http:// configured upstream), keeps them.
+      if (passthrough) { await relayStream(req, res, passthrough, sx, shouldStripOverageHeaders(config), usageDimensionHeaderNames(/** @type {any} */ (config).proxy)); return; }
 
       const classifiedPath = classificationPath(req.url);
-      if (isClientCredentialPath(classifiedPath, config)) { await relayStream(req, res, upstream, sx, shouldStripOverageHeaders(config)); return; }
+      if (isClientCredentialPath(classifiedPath, config)) { await relayStream(req, res, upstream, sx, shouldStripOverageHeaders(config), usageDimensionHeaderNames(/** @type {any} */ (config).proxy)); return; }
 
       // MITM-mode pin. A CONNECT carrying `Proxy-Authorization: Basic <acct>:…`
       // has no URL to hang a `/tc-acct/` prefix on — the path inside the tunnel
@@ -2595,10 +2600,16 @@ function clientCredentialHeaders(reqHeaders, strip = null) {
  * the upstream may withhold response headers for minutes between events. No
  * buffering, no timeout, no reconstruction — just pipe bytes both ways as they
  * arrive, exactly like a transparent proxy would.
+ * @param {any} req
+ * @param {any} res
+ * @param {string} upstream
+ * @param {any} sx
+ * @param {boolean} [stripOverage]
+ * @param {Set<string>|null} [strip] request headers to drop (usage dimensions)
  */
-function relayStream(req, res, upstream, sx, stripOverage = false) {
+function relayStream(req, res, upstream, sx, stripOverage = false, strip = null) {
   const target = new URL(`${upstream}${req.url}`);
-  const headers = clientCredentialHeaders(req.headers);
+  const headers = clientCredentialHeaders(req.headers, strip);
 
   const useProxy = !!(sx?.useByDefault() && sx.isProvisioned());
   const agent = useProxy ? sxAgent(sx, target.hostname) : undefined;
@@ -2727,7 +2738,7 @@ export function upgradeTarget(upstream, url) {
   return target;
 }
 
-export function relayUpgrade(req, socket, head, upstream, sx, { client = null, clientUsage = null, log = console.log, stripOverage = false } = {}) {
+export function relayUpgrade(req, socket, head, upstream, sx, { client = null, clientUsage = null, log = console.log, stripOverage = false, strip = /** @type {Set<string>|null} */ (null) } = {}) {
   const target = upgradeTarget(upstream, req.url);
   if (!target) {
     log(`[TeamClaude] WebSocket upgrade refused: request target ${JSON.stringify(safeLine(req.url, 128))} is not a path on the upstream`);
@@ -2747,9 +2758,16 @@ export function relayUpgrade(req, socket, head, upstream, sx, { client = null, c
     const lk = key.toLowerCase();
     // Unlike relayStream, do NOT strip 'upgrade'/'connection' here — they ARE
     // the handshake. Only 'host' (the client transport reconstructs it from
-    // `target`), h2 pseudo-headers and the proxy's own x-api-key (the client's
-    // credential to us, not to upstream) are dropped.
+    // `target`), h2 pseudo-headers, the proxy's own x-api-key (the client's
+    // credential to us, not to upstream) and the usage-dimension headers in
+    // `strip` (the operator's labels, as on the request paths) are dropped.
     if (lk.startsWith(':') || lk === 'host' || lk === 'x-api-key') continue;
+    // The handshake's own names are exempt even when configured as a
+    // dimension, so the handshake reaches upstream as the client sent it:
+    // without connection or upgrade a Node upstream sees a plain request, not
+    // an upgrade, and the sec-websocket-* headers are the handshake's own key,
+    // version and offers.
+    if (strip?.has(lk) && lk !== 'connection' && lk !== 'upgrade' && !lk.startsWith('sec-websocket-')) continue;
     headers[key] = value;
   }
 
@@ -2848,12 +2866,13 @@ async function refuseOversizedBody(req, res) {
 /**
  * Relay a request to upstream on the client's own terms: no pooled account
  * credentials are injected and the body goes through unchanged, with only
- * content-type, accept and user-agent forwarded. On the way back the
+ * content-type, accept and user-agent forwarded (one of them configured as a
+ * usage dimension in `strip` counts as not sent). On the way back the
  * connection-specific and stale framing headers (transfer-encoding,
  * connection, content-encoding, content-length) are dropped, and so is the
  * per-org billing family when `stripOverage` is set (see isOverageHeader).
  */
-async function relayRaw(req, res, upstream, sx, maxBodyBytes = DEFAULT_MAX_BODY_BYTES, stripOverage = false) {
+async function relayRaw(req, res, upstream, sx, maxBodyBytes = DEFAULT_MAX_BODY_BYTES, stripOverage = false, strip = /** @type {Set<string>|null} */ (null)) {
   const bodyChunks = [];
   let bodyBytes = 0;
   for await (const chunk of req) {
@@ -2865,13 +2884,17 @@ async function relayRaw(req, res, upstream, sx, maxBodyBytes = DEFAULT_MAX_BODY_
   }
   const body = Buffer.concat(bodyChunks);
 
+  // A usage-dimension header is the operator's label, consumed here: one
+  // configured on any of the three names below is read as not sent, so the
+  // default goes upstream in its place.
+  const sent = (/** @type {string} */ name) => (strip?.has(name) ? undefined : req.headers[name]);
   try {
     const upstreamRes = await upstreamFetch(`${upstream}${req.url}`, {
       method: req.method,
       headers: {
-        'content-type': req.headers['content-type'] || 'application/json',
-        'accept': req.headers['accept'] || 'application/json',
-        'user-agent': req.headers['user-agent'] || 'node',
+        'content-type': sent('content-type') || 'application/json',
+        'accept': sent('accept') || 'application/json',
+        'user-agent': sent('user-agent') || 'node',
       },
       body: body.length > 0 ? body : undefined,
     }, sx, sx?.useByDefault());
