@@ -3455,7 +3455,13 @@ export class AccountManager {
     const reason = this.unavailableReason(account, model);
     if (reason !== 'quota' && reason !== 'upstream-rejected') return null;
     if (model && !this._routeAllows(account, model)) return null;
-    if (advisorModel && !this._routeAllows(account, advisorModel)) return null;
+    // The advisor model's route binds as its family cap does in capBars: a
+    // requirement under 'strict', and set aside under `advisorEligibility:
+    // "prefer"`, where the advisor describes the request and does not filter
+    // the fleet. A 429 hop keeps the advisor when no account can serve the
+    // request at all (_advisorReach answers 0 of 0), so without this a spent
+    // fleet under 'prefer' refused the hop its fallback account could serve.
+    if (advisorModel && this.advisorEligibility !== 'prefer' && !this._routeAllows(account, advisorModel)) return null;
     // The executor's caps were read above; the advisor's family is its own.
     if (this.capBars(account, model, advisorModel)) return null;
     // `quota` is reported ahead of `upstream-rejected`, so a rejected account
