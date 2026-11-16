@@ -90,9 +90,8 @@ the test, on the error that escaped or on its timeout, but does not unwind it,
 and the `finally` never runs. On Node 24 and later the servers the test opened
 then keep the file from ever exiting. Node 20 and 22 also apply the runner's
 timeout (see above) to each file as a whole and kill the file at it instead: a
-test that fails sooner, on an escaped error or a shorter timeout of its own, is
-named and the tests after it run, but nothing after a test stuck until the
-runner's timeout reports. Ending the wait is what lets the `finally` run:
+test that fails sooner, on an escaped error, is named and the tests after it
+run, but nothing after a test stuck until the runner's timeout reports. Ending the wait is what lets the `finally` run:
 listen on `t.signal`, which node:test aborts once the test has ended however it
 ended, and destroy the socket the wait is on or pass the signal to `fetch`, as
 the relayRaw tests in `overage-headers.test.js` do. A cleanup with no wait of
