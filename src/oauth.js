@@ -922,7 +922,7 @@ const OAUTH_AUTHORIZE = 'https://claude.ai/oauth/authorize';
 const OAUTH_SCOPES = 'org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload';
 const MANUAL_LOGIN_REDIRECT_URI = 'https://console.anthropic.com/oauth/code/callback';
 // What `claude setup-token` asks for, and nothing else: the same flow on the
-// same client id and URLs, with the scope `user:inference` alone and
+// same client id and token endpoint, with the scope `user:inference` alone and
 // `expires_in` of one year (in seconds) on the code exchange. A token on that
 // scope serves inference only; see long-lived.js for what that leaves out.
 const LONG_LIVED_SCOPES = 'user:inference';

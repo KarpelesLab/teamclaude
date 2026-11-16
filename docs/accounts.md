@@ -33,7 +33,7 @@ rename that account first.
 teamclaude login --long-lived --name work
 ```
 
-Signs an account in with a token that lasts a year and is never refreshed. It makes the request `claude setup-token` makes: the usual sign-in flow, on the same client id and addresses, asking for the scope `user:inference` alone, with `expires_in` set to one year when the code is exchanged. The flow is the copy/paste one of `login --token`. The entry is saved with `"longLived": true` and no refresh token.
+Signs an account in with a token that lasts a year and is never refreshed. It makes the request `claude setup-token` makes: the usual sign-in flow, on the same client id and token endpoint, asking for the scope `user:inference` alone, with `expires_in` set to one year when the code is exchanged. The flow is the copy/paste one of `login --token`. The entry is saved with `"longLived": true` and no refresh token.
 
 Use it for an account that only has to serve completions through the proxy, where you would rather renew one login a year than depend on every refresh succeeding. For everything else, the ordinary `teamclaude login` is the better choice, because an inference-only token leaves out the following.
 
