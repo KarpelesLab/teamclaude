@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import { mkdtemp, readFile, readdir, rm, stat, symlink, writeFile, mkdir, chmod } from 'node:fs/promises';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { renderStatusLine, stopHookOutput, moveCommand, EMPTY_NOTICE_STATE } from '../src/claude-code-surface.js';
 import { stopHookTurn } from '../src/advice-notice-state.js';
 import { sanitizeText } from '../src/safe-text.js';
@@ -179,4 +180,21 @@ test('the state file lives in a 0700 directory, one file per session, written be
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test('the /switch skill carries its shell command, argument and choice markers (AC9)', async () => {
+  const path = join(dirname(fileURLToPath(import.meta.url)), '..', 'claude-code', 'skills', 'switch', 'SKILL.md');
+  const skill = await readFile(path, 'utf8');
+  assert.match(skill, /^!`teamclaude switch --session`$/m, 'inline command that injects the session state');
+  assert.match(skill, /\$ARGUMENTS/);
+  assert.match(skill, /AskUserQuestion/);
+  assert.match(skill, /teamclaude switch --session --stay/);
+  assert.match(skill, /^allowed-tools: Bash\(teamclaude switch --session \*\)$/m, 'one prefix rule, no mid-rule wildcard');
+  assert.match(skill, /`teamclaude switch --session --to '\$ARGUMENTS'`/, 'the arguments as one quoted word');
+  assert.match(skill, /verbatim/);
+  assert.match(skill, /`move command:`.*exactly as printed, character for character\. Never rebuild it from the account name/s,
+    'the recommended move runs the server-quoted command');
+  const commands = [...skill.matchAll(/`(teamclaude [^`]*)`/g)].map(m => m[1]);
+  assert.ok(commands.length >= 4);
+  for (const command of commands) assert.match(command, /^teamclaude switch --session(?: |$)/, command);
 });
