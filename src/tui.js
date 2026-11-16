@@ -1992,6 +1992,12 @@ export class TUI {
     // ignored on the next reload and the account would land back in `error`.
     const entry = acct.id ? this.config?.accounts?.find((/** @type {any} */ c) => c.id === acct.id) : null;
     if (entry?.importFrom) { this._addLog(`"${acct.name}" reads its tokens from ${entry.importFrom} — sign in there instead`); return; }
+    // A long-lived account (long-lived.js) is renewed by its own login, which
+    // asks for a year-long, inference-only token. The sign-in here is the
+    // ordinary one: onto an entry that carries the account's ids it would turn
+    // it into a refreshing account, and onto one known by its name only it
+    // would add the account it signed in as and leave this one waiting.
+    if (acct.longLived === true) { this._addLog(`"${acct.name}" holds a long-lived token; renew it from a shell: teamclaude login --long-lived --name "${acct.name}"`); return; }
     // One at a time: a second flow would race the first for the browser, and
     // for Codex for the fixed callback port as well.
     if (this._loggingIn) { this._addLog(`Still waiting on the sign-in for "${this._loggingIn}"`); return; }
