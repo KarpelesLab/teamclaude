@@ -64,14 +64,21 @@ async function inertBin(dir) {
 // Runs `program` with stdin held open until the authorize URL is printed, then
 // types `code`. Resolves with the URL, the exit code and everything printed.
 // The child ends on its own in every case here: the paste flow when its input
-// ends, a refused command when it exits. The proxy variables are taken out of
-// its environment, so its token exchange reaches the stub and not a proxy the
-// developer has exported.
-function runPasteFlow(args, { code = 'code-1', env = {} } = {}) {
+// ends, a refused command when it exits. And with its test: `signal` is the
+// test's own, so a child left waiting for input it is never given (a change
+// that keeps the URL from being printed, say) is killed when the test times
+// out, rather than holding the test file open for good. The proxy variables
+// are taken out of its environment, so its token exchange reaches the stub and
+// not a proxy the developer has exported.
+function runPasteFlow(args, { code = 'code-1', env = {}, signal } = {}) {
   const child = spawn(process.execPath, args, {
     env: childEnvWithoutProxy({ TEAMCLAUDE_DISABLE_AUTOUPDATE: '1', ...env }),
     stdio: ['pipe', 'pipe', 'pipe'],
+    signal,
   });
+  // The kill an abort makes is also reported as an 'error'; the close that
+  // follows it settles the run.
+  child.on('error', () => {});
   let stdout = '';
   let stderr = '';
   let typed = false;
@@ -105,7 +112,7 @@ const result = (stdout) => JSON.parse(stdout.match(/^RESULT (.*)$/m)[1]);
 test('a long-lived login asks for inference only, for a year, and keeps no refresh token', async (t) => {
   const { endpoint, seen } = await stubTokenEndpoint(t);
   const before = Date.now();
-  const run = await runPasteFlow(loginProgram({ longLived: true, tokenEndpoint: endpoint }));
+  const run = await runPasteFlow(loginProgram({ longLived: true, tokenEndpoint: endpoint }), { signal: t.signal });
   assert.equal(run.status, 0, run.stderr);
 
   // Exactly the scope `claude setup-token` asks for, and no other.
@@ -130,7 +137,7 @@ test('a long-lived login asks for inference only, for a year, and keeps no refre
 // what an ordinary grant returns.
 test('the ordinary paste login keeps full scopes, the default lifetime and its refresh token', async (t) => {
   const { endpoint, seen } = await stubTokenEndpoint(t);
-  const run = await runPasteFlow(loginProgram({ tokenEndpoint: endpoint }));
+  const run = await runPasteFlow(loginProgram({ tokenEndpoint: endpoint }), { signal: t.signal });
   assert.equal(run.status, 0, run.stderr);
 
   assert.match(run.authorizeUrl.searchParams.get('scope'), /user:sessions:claude_code/);
@@ -139,6 +146,47 @@ test('the ordinary paste login keeps full scopes, the default lifetime and its r
   const creds = result(run.stdout);
   assert.equal(creds.refreshToken, 'rt-granted');
   assert.equal('longLived' in creds, false);
+});
+
+const DAY_MS = 86_400_000;
+
+// A sign-in's refresh token is dated even when the response states no lifetime:
+// 30 days out, the fallback Claude Code uses (#710). One it states stands.
+test('an ordinary sign-in is dated 30 days out when its response states no refresh-token lifetime, and keeps one it states', async (t) => {
+  for (const grant of [{ expires_in: 28_800 }, { expires_in: 28_800, refresh_token_expires_in: null }, { expires_in: 28_800, refresh_token_expires_at: null }]) {
+    const { endpoint } = await stubTokenEndpoint(t, { grant });
+    const before = Date.now();
+    const run = await runPasteFlow(loginProgram({ tokenEndpoint: endpoint }), { signal: t.signal });
+    const after = Date.now();
+    assert.equal(run.status, 0, run.stderr);
+    const { refreshTokenExpiresAt } = result(run.stdout);
+    assert.ok(refreshTokenExpiresAt >= before + 30 * DAY_MS && refreshTokenExpiresAt <= after + 30 * DAY_MS,
+      `${JSON.stringify(grant)}: dated ${refreshTokenExpiresAt}, not 30 days out`);
+  }
+  const { endpoint } = await stubTokenEndpoint(t, { grant: { expires_in: 28_800, refresh_token_expires_in: 7 * 86_400 } });
+  const before = Date.now();
+  const run = await runPasteFlow(loginProgram({ tokenEndpoint: endpoint }), { signal: t.signal });
+  assert.equal(run.status, 0, run.stderr);
+  const { refreshTokenExpiresAt } = result(run.stdout);
+  assert.ok(refreshTokenExpiresAt >= before + 7 * DAY_MS && refreshTokenExpiresAt < before + 8 * DAY_MS, `dated ${refreshTokenExpiresAt}`);
+});
+
+// A response that states a lifetime that cannot be believed - further out than
+// any refresh token lives, 0, or long past - said something, and it was not 30
+// days: the sign-in is given no date, rather than the assumed one.
+test('an ordinary sign-in whose response states a refresh-token lifetime that cannot be believed is given no date', async (t) => {
+  for (const grant of [
+    { expires_in: 28_800, refresh_token_expires_in: 20 * 365 * 86_400 },
+    { expires_in: 28_800, refresh_token_expires_in: 0 },
+    { expires_in: 28_800, refresh_token_expires_at: Math.floor(Date.now() / 1000) - 2 * 86_400 },
+  ]) {
+    const { endpoint } = await stubTokenEndpoint(t, { grant });
+    const run = await runPasteFlow(loginProgram({ tokenEndpoint: endpoint }), { signal: t.signal });
+    assert.equal(run.status, 0, run.stderr);
+    const creds = result(run.stdout);
+    assert.equal(creds.refreshToken, 'rt-granted');
+    assert.equal('refreshTokenExpiresAt' in creds, false, `${JSON.stringify(grant)}: dated ${creds.refreshTokenExpiresAt}`);
+  }
 });
 
 // Dropping the refresh token is only safe when the year was actually granted:
@@ -152,7 +200,7 @@ test('a long-lived login fails when the server grants more than a day short of a
     [{ expires_at: 'not-a-time' }, /granted no usable expiry/],
   ]) {
     const { endpoint } = await stubTokenEndpoint(t, { grant });
-    const run = await runPasteFlow(loginProgram({ longLived: true, tokenEndpoint: endpoint }));
+    const run = await runPasteFlow(loginProgram({ longLived: true, tokenEndpoint: endpoint }), { signal: t.signal });
     assert.notEqual(run.status, 0, JSON.stringify(grant));
     assert.doesNotMatch(run.stdout, /^RESULT /m);
     assert.match(run.stderr, said);
@@ -168,7 +216,7 @@ test('a long-lived login accepts a year given as expires_at, or a little short',
     { expires_in: YEAR - 3600 },
   ]) {
     const { endpoint } = await stubTokenEndpoint(t, { grant });
-    const run = await runPasteFlow(loginProgram({ longLived: true, tokenEndpoint: endpoint }));
+    const run = await runPasteFlow(loginProgram({ longLived: true, tokenEndpoint: endpoint }), { signal: t.signal });
     assert.equal(run.status, 0, `${JSON.stringify(grant)}: ${run.stderr}`);
     assert.equal('refreshToken' in result(run.stdout), false);
   }
@@ -200,7 +248,7 @@ test('`teamclaude login --long-lived` refuses another login kind beside it', asy
   await writeFile(configPath, JSON.stringify({ proxy: { port: 1, apiKey: 'tc-test' }, accounts: [] }));
   for (const other of ['--api', '--codex', '--oauth']) {
     const run = await runPasteFlow([cliPath, 'login', other, '--long-lived'], {
-      code: '', env: { TEAMCLAUDE_CONFIG: configPath, PATH: await inertBin(dir) },
+      code: '', env: { TEAMCLAUDE_CONFIG: configPath, PATH: await inertBin(dir) }, signal: t.signal,
     });
     assert.equal(run.status, 1, other);
     assert.match(run.stderr, /cannot be combined with --api, --codex or --oauth/, other);
@@ -214,7 +262,7 @@ test('`teamclaude login --long-lived` runs the long-lived paste flow', async (t)
   await writeFile(configPath, JSON.stringify({ proxy: { port: 1, apiKey: 'tc-test' }, accounts: [] }));
   // An empty answer stops the login before any network call.
   const run = await runPasteFlow([cliPath, 'login', '--long-lived', '--name', 'year'], {
-    code: '', env: { TEAMCLAUDE_CONFIG: configPath, PATH: await inertBin(dir) },
+    code: '', env: { TEAMCLAUDE_CONFIG: configPath, PATH: await inertBin(dir) }, signal: t.signal,
   });
   assert.equal(existsSync(join(dir, 'opened')), false, 'the long-lived login opened a browser');
   assert.ok(run.authorizeUrl, `no authorize URL printed:\n${run.stdout}\n${run.stderr}`);
@@ -231,7 +279,7 @@ test('`teamclaude login --long-lived` without --name stops before the sign-in li
   const configPath = join(dir, 'config.json');
   await writeFile(configPath, JSON.stringify({ proxy: { port: 1, apiKey: 'tc-test' }, accounts: [] }));
   const run = await runPasteFlow([cliPath, 'login', '--long-lived'], {
-    code: '', env: { TEAMCLAUDE_CONFIG: configPath, PATH: await inertBin(dir) },
+    code: '', env: { TEAMCLAUDE_CONFIG: configPath, PATH: await inertBin(dir) }, signal: t.signal,
   });
   assert.equal(run.status, 1);
   assert.equal(run.authorizeUrl, null, `a sign-in link was printed:\n${run.stdout}`);

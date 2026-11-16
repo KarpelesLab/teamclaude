@@ -11,7 +11,7 @@ import { LOGIN_TIMEOUT_MS, codeRace, openBrowser, pasteFromTerminal } from './lo
 import { safeLine } from './safe-text.js';
 import { resetRetryAt } from './reset-readings.js';
 import { anthropicLink } from './account-refusal.js';
-import { refreshTokenExpiryFromResponse, withFamilyExpiry, signInRefreshTokenExpiry } from './refresh-token-expiry.js';
+import { refreshTokenExpiryFromResponse, withFamilyExpiry, signInRefreshTokenExpiry, statesRefreshTokenExpiry } from './refresh-token-expiry.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
 const execFileAsync = promisify(execFile);
@@ -390,7 +390,8 @@ export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_
  * for the two spellings read and why. It is what THIS response said: a caller
  * refreshing a token it already has a date for keeps the earlier of the two
  * (withFamilyExpiry), and a new Claude sign-in takes it as it is, or assumes
- * one when none was stated (signInRefreshTokenExpiry, in exchangeCodeForTokens).
+ * one when the response stated none at all (signInRefreshTokenExpiry and
+ * statesRefreshTokenExpiry, in exchangeCodeForTokens).
  */
 export function tokenPairFromResponse(data, { previousRefreshToken = undefined, now = Date.now() } = {}) {
   const accessToken = data?.access_token;
@@ -974,9 +975,11 @@ async function exchangeCodeForTokens(code, state, codeVerifier, redirectUri, tok
       : 'no usable expiry';
     throw new Error(`Token exchange granted ${granted}, short of the ${expiresIn}s requested`);
   }
-  // A sign-in dates its refresh token even when the response does not, as
-  // Claude Code does; see signInRefreshTokenExpiry.
-  return signInRefreshTokenExpiry(tokens);
+  // A sign-in dates its refresh token even when the response does not, with
+  // the 30-day fallback Claude Code uses; see signInRefreshTokenExpiry. One
+  // whose response states a lifetime keeps what it states, which is no date
+  // when that could not be believed.
+  return statesRefreshTokenExpiry(data) ? tokens : signInRefreshTokenExpiry(tokens);
 }
 
 /**
