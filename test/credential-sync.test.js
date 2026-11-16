@@ -232,6 +232,19 @@ test('a long-lived account near its end takes no refreshing login from the store
   assert.equal(am.accounts[0].status, 'error');
 });
 
+// The date travels with the token it describes: a token adopted from the
+// store brings the row's date, not the one the account held for its own.
+test('a token adopted from the store brings the date its row carries', async () => {
+  const store = makeStore();
+  const a = claude('a', { refreshTokenExpiresAt: T0 + 2 * 24 * H });
+  const fresher = { ...a, credential: 'at-a-9', refreshToken: 'rt-a-9', expiresAt: T0 + 20 * H };
+  store.put(syncKeyFor(a), encodeBlob(fresher, { ...tokensOf(fresher), refreshTokenExpiresAt: T0 + 29 * 24 * H }, { now: T0 + 12 * H, by: 'office' }));
+  const { sync, am } = setup([a], { store });
+  assert.equal((await sync.sync('start')).adopted, 1);
+  assert.equal(am.accounts[0].refreshToken, 'rt-a-9');
+  assert.equal(am.accounts[0].refreshTokenExpiresAt, T0 + 29 * 24 * H);
+});
+
 // A long-lived login named onto an entry keeps the ids an earlier full login
 // recorded, and the row that login stored stays. The account is not carried,
 // but removing it must still remove that identity: without the tombstone the

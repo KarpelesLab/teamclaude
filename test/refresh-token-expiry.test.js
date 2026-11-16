@@ -484,6 +484,22 @@ test('the server logs one line per account per day while a known date is close',
   ]);
 });
 
+// The once-a-day memory is per account, and an account removed takes its entry
+// with it: one added back (removed and signed in again) is warned at once.
+test('the log line forgets an account once it is gone, and warns an account added back at once', () => {
+  let clock = NOW;
+  /** @type {string[]} */
+  const logged = [];
+  const warn = createRefreshTokenExpiryWarner({ log: (l) => logged.push(l), now: () => clock });
+  const account = { id: 'a', name: 'soon@x.com', type: 'oauth', status: 'active', refreshTokenExpiresAt: NOW + 3 * DAY };
+  assert.equal(warn([account]).length, 1);
+  clock += H;
+  assert.deepEqual(warn([]), []);
+  clock += H;
+  assert.equal(warn([account]).length, 1, 'the day since its last line restarts with the account');
+  assert.equal(logged.length, 2);
+});
+
 test('the log line follows the account: a new sign-in ends it, a name cannot break it', () => {
   let clock = NOW;
   const warn = createRefreshTokenExpiryWarner({ log: () => {}, now: () => clock });
