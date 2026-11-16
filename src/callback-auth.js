@@ -60,6 +60,7 @@ const RENEW_AHEAD_MS = 120_000;
  * @property {number} [expires_in]
  * @property {string} client_id     the app the token was issued to; a refresh has to name it
  * @property {number} obtained_at   when this access token was issued, epoch ms
+ * @property {number} [signed_in_at] when the sign-in was made, epoch ms; a renewal keeps it (see callbackSessionOf)
  */
 
 /**
@@ -134,6 +135,18 @@ export async function loadCallbackToken() {
   } catch {
     return null;
   }
+}
+
+/**
+ * Which sign-in a stored token belongs to, to tell one session from the next:
+ * its `signed_in_at`, which a renewal keeps (refreshCallbackToken keeps what
+ * the reply does not restate) and each sign-in sets anew, whoever it signs in
+ * as. "" for a token saved before sign-ins carried one, null for no token.
+ * @param {CallbackToken|null} token
+ * @returns {string|null}
+ */
+export function callbackSessionOf(token) {
+  return token ? String(token.signed_in_at ?? '') : null;
 }
 
 /** @param {CallbackToken} token */
@@ -320,7 +333,8 @@ export async function loginCallback({
     }
     if (code) {
       const token = await tokenRequest({ client_id: clientId, grant_type: 'authorization_code', code }, call);
-      return /** @type {CallbackToken} */ ({ ...token, client_id: clientId, obtained_at: now() });
+      const at = now();
+      return /** @type {CallbackToken} */ ({ ...token, client_id: clientId, obtained_at: at, signed_in_at: at });
     }
     if (now() >= deadline) throw new Error(`the sign-in was not approved within ${Math.round(lifetimeSeconds / 60)} minutes`);
     await sleep(POLL_PAUSE_MS);

@@ -49,20 +49,25 @@
 // still holds it and stores it later brings it back. A removal the store does
 // not take at once (out of reach, or the lock held throughout) stays pending on
 // the install that made it, in memory: no pass there adds the account back from
-// its row, and the tombstone is tried again a minute, five and fifteen minutes
-// later, then at each pass, until it lands. It stays pending for an hour at
-// most (REMOVAL_PENDING_MAX_MS), and ends at once when this install is found
-// signed out of callback.net (made while signed out, a removal records nothing
-// at all): past either, nothing is written, the removal is logged as not
-// recorded, and the next pass adds the account back from its row like any
-// other. While it is pending it also wins over a sign-in made on another
-// install meanwhile, which is why it does not stay pending longer: a row
-// cannot tell a sign-in from a renewal. A pass deletes a
-// tombstone older than a week. Nothing checks that every install has seen it by
-// then: one that ran no pass in that week and still holds the account, with a
-// refresh token that still renews, stores it again (at its first pass after
-// signing back in to callback.net if it renewed the token while signed out, at
-// its next renewal if it was switched off), and the others add it back.
+// its row, and the tombstone is tried again about 1, 6, 21 and 51 minutes
+// after the removal, then at each pass, until it lands. It stays pending for
+// an hour at most (REMOVAL_PENDING_MAX_MS), and ends at once when this install
+// is found signed out of callback.net (made while signed out, a removal
+// records nothing at all), or signed in to it again: a session since
+// (`callback login`, as anyone) may name another user's store, whose row for
+// the same account is not the one removed. Past any of these, nothing is
+// written, the removal is logged as not recorded (a sign-in between its read
+// of the session and the lock can instead end it unlogged, as a row gone),
+// and the account comes back from its row like any other, at the next pass
+// that reads it (the pass that gave the removal up, when one did). While it
+// is pending it also wins over a sign-in made on another install meanwhile,
+// which is why it does not stay pending longer: a row cannot tell a sign-in
+// from a renewal. A pass deletes a tombstone older than a week. Nothing checks
+// that every install has seen it by then: one that ran no pass in that week
+// and still holds the account, with a refresh token that still renews, stores
+// it again (at its first pass after signing back in to callback.net if it
+// renewed the token while signed out, at its next renewal if it was switched
+// off), and the others add it back.
 //
 // An account IN ERROR (upstream rejected its token; it needs a re-login) is
 // never written to the store: what it holds is dead, and stored it would
@@ -91,7 +96,7 @@
 // would kill one another.
 
 import { hostname } from 'node:os';
-import { callbackCall, loadCallbackToken } from './callback-auth.js';
+import { callbackCall, callbackSessionOf, loadCallbackToken } from './callback-auth.js';
 import { isTokenExpired } from './oauth.js';
 import { providerOf } from './provider.js';
 import { sameIdentity } from './identity.js';
@@ -120,15 +125,17 @@ const LOCKED_WAIT_MS = 30_000;
 /** A removal waits this long for a held lock: one whole lease, and a re-check past it. */
 const REMOVAL_LOCK_WAIT_MS = LOCK_TIMEOUT_S * 1000 + LOCKED_RECHECK_MS;
 /** A removal the store did not take: tried again after each pause, then by each pass. */
-const REMOVAL_RETRY_MS = [60_000, 5 * 60_000, 15 * 60_000];
+const REMOVAL_RETRY_MS = [60_000, 5 * 60_000, 15 * 60_000, 30 * 60_000];
 /**
- * A removal still not recorded this long after it was made is given up on. A
- * pending removal is written over whatever its row then holds, and a row cannot
- * tell a sign-in from a renewal: one that lived as long as the process would,
- * days later, write its tombstone over a sign-in made on another install and
- * destroy a working token. Given up on, the account reappears here from its
- * row, which shows and loses nothing. An hour covers every timed retry
- * (REMOVAL_RETRY_MS and the waits for the lock, about 23 minutes in all).
+ * A removal still not recorded more than this long after it was made is given
+ * up on. A pending removal is written over whatever its row then holds, and a
+ * row cannot tell a sign-in from a renewal: one that lived as long as the
+ * process would, days later, write its tombstone over a sign-in made on
+ * another install and destroy a working token. Given up on, the account comes
+ * back here from its row, enabled and without the settings it had here, and
+ * the one line logged says to remove it again. An hour covers every timed
+ * retry (REMOVAL_RETRY_MS and the waits for the lock, about 54 minutes in all
+ * when the store answers at once); past the last, only a pass tries it.
  */
 export const REMOVAL_PENDING_MAX_MS = 3600_000;
 /** Rounds of lock-or-wait before this refresh gives up (the next request asks again). */
@@ -396,17 +403,19 @@ export class CredentialSync {
    * @param {(account: Record<string, any>) => void} [opts.evictAccount]  remove an account the store says is gone (config, disk, manager)
    * @param {Api} [opts.api]
    * @param {() => Promise<boolean>} [opts.isSignedIn]
+   * @param {() => Promise<string|null>} [opts.session]  which callback.net sign-in this install is under (callbackSessionOf)
    * @param {(line: string) => void} [opts.log]
    * @param {() => number} [opts.now]
    * @param {(ms: number) => Promise<void>} [opts.sleep]
    * @param {string} [opts.by]
    */
-  constructor({ accountManager, addAccount, evictAccount = () => {}, api = callbackCall, isSignedIn = async () => !!(await loadCallbackToken()), log = (l) => console.log(l), now = Date.now, sleep = (ms) => new Promise((r) => { setTimeout(r, ms); }), by = hostname() }) {
+  constructor({ accountManager, addAccount, evictAccount = () => {}, api = callbackCall, isSignedIn = async () => !!(await loadCallbackToken()), session = async () => callbackSessionOf(await loadCallbackToken()), log = (l) => console.log(l), now = Date.now, sleep = (ms) => new Promise((r) => { setTimeout(r, ms); }), by = hostname() }) {
     this.am = accountManager;
     this.addAccount = addAccount;
     this.evictAccount = evictAccount;
     this.api = api;
     this.isSignedIn = isSignedIn;
+    this.session = session;
     this.log = log;
     this.now = now;
     this.sleep = sleep;
@@ -418,7 +427,8 @@ export class CredentialSync {
      * Marked before anything is awaited, so a pass running meanwhile does not
      * add the account back from its row, and each pass tries to write it
      * again, for REMOVAL_PENDING_MAX_MS at most. In memory only: a restart
-     * forgets it, and the next start's pass adds the account back from its row.
+     * forgets it, with no line to say so, and the next start's pass adds the
+     * account back from its row.
      * @type {Map<string, Record<string, any>>}
      */
     this.pendingRemovals = new Map();
@@ -428,6 +438,20 @@ export class CredentialSync {
      * @type {WeakMap<Record<string, any>, number>}
      */
     this._removedAt = new WeakMap();
+    /**
+     * The callback.net session each pending removal is tied to (see
+     * _dropIfSessionChanged): the one last seen when it was made, else the
+     * one the first check after it read.
+     * @type {WeakMap<Record<string, any>, string|null>}
+     */
+    this._removedUnder = new WeakMap();
+    /**
+     * The callback.net session the last check read (_readSession), or null
+     * when the last pass found this install signed out; undefined until a
+     * check has run.
+     * @type {string|null|undefined}
+     */
+    this._lastSession = undefined;
     /**
      * Accounts a pass is evicting for a tombstone (evictAccount): their removal
      * is in the store already, so it is neither written nor pending.
@@ -504,14 +528,20 @@ export class CredentialSync {
     const result = { signedIn: false, adopted: 0, pushed: 0, created: 0, added: 0, evicted: 0, expired: 0, emptied: 0, rows: 0 };
     if (!await this.isSignedIn()) {
       this.rows.clear();
+      // Signed out is a session too: the first sign-in after it is a change.
+      this._lastSession = null;
       // Nothing can be recorded, and nothing says when it could be.
       for (const [key, account] of [...this.pendingRemovals]) this._abandonRemoval(key, account, 'this install is signed out of callback.net');
       return result;
     }
     result.signedIn = true;
-    // A removal pending too long is given up on before the rows are read, so
-    // this pass already treats its row like any other.
-    for (const [key, account] of [...this.pendingRemovals]) this._dropIfLapsed(key, account);
+    // A removal pending too long, or made under another callback.net session,
+    // is given up on before the rows are read, so this pass already treats its
+    // row like any other.
+    const session = await this._readSession();
+    for (const [key, account] of [...this.pendingRemovals]) {
+      if (!this._dropIfSessionChanged(key, account, session)) this._dropIfLapsed(key, account);
+    }
     try {
       this.rows = await this._list();
       const matched = new Set();
@@ -816,9 +846,9 @@ export class CredentialSync {
    * REMOVAL_PENDING_MAX_MS old. `wait: false`, for a CLI command that must
    * not hang, makes one attempt: no wait for the lock and no retry here.
    * Signed out of callback.net at the removal, nothing is recorded; found
-   * signed out after it, the removal is given up on. An account a pass
-   * evicts for a tombstone is removed in the store already, and nothing is
-   * written.
+   * signed out after it, or signed in to it again, the removal is given up
+   * on. An account a pass evicts for a tombstone is removed in the store
+   * already, and nothing is written.
    * Resolves with whether a tombstone was written.
    * @param {Record<string, any>} account
    * @param {{ wait?: boolean }} [opts]
@@ -831,6 +861,10 @@ export class CredentialSync {
     // account back from its row.
     this.pendingRemovals.set(key, account);
     this._removedAt.set(account, this.now());
+    // Tied to the session last seen (signed out counts). A sign-in since
+    // then, made before the removal or after it, ends it at the first check:
+    // the store a new session names may be another user's.
+    if (this._lastSession !== undefined) this._removedUnder.set(account, this._lastSession);
     if (!await this.isSignedIn()) {
       this._settleRemoval(key, account);
       return false;
@@ -866,9 +900,10 @@ export class CredentialSync {
 
   /**
    * Give up on a pending removal: nothing is written, it is settled, and its
-   * row is from then on a row like any other, which the next pass adds the
-   * account back from. Said once, since the account was removed here and the
-   * other installs were never told.
+   * row is from then on a row like any other, which the next pass to read it
+   * adds the account back from (a pass giving it up reads the rows after).
+   * Said once, since the account was removed here, comes back, and the other
+   * installs were never told.
    * @param {string} key
    * @param {Record<string, any>} account
    * @param {string} why
@@ -876,7 +911,44 @@ export class CredentialSync {
   _abandonRemoval(key, account, why) {
     if (this.pendingRemovals.get(key) !== account) return;
     this.pendingRemovals.delete(key);
-    this.log(`[TeamClaude] callback.net: the removal of "${safeLine(account.name, 64)}" was not recorded for your other installs (${why}); the account may reappear from them`);
+    this.log(`[TeamClaude] callback.net: the removal of "${safeLine(account.name, 64)}" was not recorded for your other installs (${why}); the account comes back here from its row, if the store holds one, at the next pass: remove it again then`);
+  }
+
+  /** The callback.net session the token file names now, kept as the last one seen. */
+  async _readSession() {
+    const session = await this.session();
+    this._lastSession = session;
+    return session;
+  }
+
+  /**
+   * Give up on a pending removal made under another callback.net session than
+   * `session`, the one this install is under now. A removal is meant for the
+   * store it was made against, and a session since (`callback login --force`,
+   * a login over a session that had lapsed, a logout and a login) may be
+   * another user's: their row for the same account is a login of theirs, which
+   * a tombstone would destroy. A removal is tied when it is made to the session
+   * the last check read, or to none when the last pass found this install
+   * signed out, so a sign-in after that ends it, even one made before the
+   * removal (the safe side: which session it was meant for is not known). Made
+   * by a sync that has run no check yet (the one `teamclaude remove` builds for
+   * its single attempt, or a server's before its start pass has looked), it is
+   * tied by the first check after it, and a sign-in in between goes unseen. A
+   * session read as null (signed out since) gives it up as signed out.
+   * @param {string} key
+   * @param {Record<string, any>} account
+   * @param {string|null} session
+   * @returns {boolean} whether it was given up on
+   */
+  _dropIfSessionChanged(key, account, session) {
+    if (this.pendingRemovals.get(key) !== account) return false;
+    if (!this._removedUnder.has(account)) {
+      this._removedUnder.set(account, session);
+      return false;
+    }
+    if (this._removedUnder.get(account) === session) return false;
+    this._abandonRemoval(key, account, session === null ? 'this install is signed out of callback.net' : 'this install was signed in to callback.net again since');
+    return true;
   }
 
   /**
@@ -888,8 +960,10 @@ export class CredentialSync {
    */
   _dropIfLapsed(key, account) {
     if (this.pendingRemovals.get(key) !== account) return false;
-    const since = this._removedAt.get(account);
-    if (since == null || this.now() - since <= REMOVAL_PENDING_MAX_MS) return false;
+    // Set with the mark in onAccountRemoved, so every pending removal has one
+    // (one missing would read as lapsed: NaN is never within the bound).
+    const since = /** @type {number} */ (this._removedAt.get(account));
+    if (this.now() - since <= REMOVAL_PENDING_MAX_MS) return false;
     this._abandonRemoval(key, account, 'callback.net did not take it within an hour');
     return true;
   }
@@ -899,8 +973,9 @@ export class CredentialSync {
    * there is nothing to write: no row (or the row gone since it was read), a
    * tombstone there already, a sign-in here since (storeSignIn), or the
    * account back on this install. Given up on, and settled, when it is older
-   * than REMOVAL_PENDING_MAX_MS (checked on entry, and again with the lock
-   * held, just before the write) or when this install is signed out of
+   * than REMOVAL_PENDING_MAX_MS or under another callback.net session than the
+   * removal is tied to (each checked on entry, and again with the lock held,
+   * just before the write), and when this install is signed out of
    * callback.net. Left pending, to be tried again, when the store cannot be
    * reached or when the lock is not had within `waitMs`.
    * @param {Record<string, any>} account
@@ -922,6 +997,8 @@ export class CredentialSync {
         this._abandonRemoval(key, account, 'this install is signed out of callback.net');
         return false;
       }
+      // Signed in again since: the store may be another user's.
+      if (this._dropIfSessionChanged(key, account, await this._readSession())) return false;
       const row = await this._findRow(account);
       if (!row) return settle();
       const lease = await this._lockWaiting(row, waitMs, () => this.pendingRemovals.get(key) === account);
@@ -931,11 +1008,18 @@ export class CredentialSync {
         return false;
       }
       try {
+        // Read before the checks below, so that nothing is awaited between
+        // them and the write: a pass that gives the removal up meanwhile (the
+        // reload a sign-in sends, say) is seen by them.
+        const session = await this._readSession();
         const current = rowOf({ ...lease.locked, Data: lease.locked?.Data ?? '' });
         this.rows.set(current.key, current);
         if (current.deletedAt != null || this.pendingRemovals.get(key) !== account || this._backHere(key, account)) return settle();
-        // The wait for the lock may have taken it past the bound.
+        // The wait for the lock may have taken it past the bound, or past a
+        // sign-in or a sign-out: the lock and the write go out under the
+        // session the token file names when each is sent.
         if (this._dropIfLapsed(key, account)) return false;
+        if (this._dropIfSessionChanged(key, account, session)) return false;
         const stone = tombstone(this.now());
         const r = await this.api('PATCH', `User/Credential/${row.id}`, { Data: JSON.stringify(stone) });
         const fresh = rowOf({ ...r, Data: JSON.stringify(stone) });
