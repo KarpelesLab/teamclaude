@@ -888,6 +888,35 @@ test('a refusal that waited on another model\'s walk sees what that walk re-read
   assert.equal(calls.status, 1, 'the Opus walk read x; the Fable refusal needs no read of its own');
 });
 
+// Selection routes an advisor request by its own model when no account can
+// serve the advisor too, so a pool is dry only for the request's model: a
+// reset judged on that model serves the request, though the advisor's family
+// bucket stays spent.
+test('an advisor request on a dry pool is served by a reset judged on its own model', async () => {
+  let hits = 0;
+  const upstream = http.createServer((_req, res) => { hits++; res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"ok":true}'); });
+  const port = await new Promise(r => upstream.listen(0, '127.0.0.1', () => r(upstream.address().port)));
+  const sharedOnly = { ...weeklyGrant, clears: ['five_hour', 'seven_day'] };
+  const { am, redeemer, calls } = parkedHarness({ accounts: [oauth('a'), oauth('b')], quota: { unified7d: 0.99, unified7dFable: 0.99 }, grants: [sharedOnly] });
+  // After the claim upstream reports the shared weekly cleared and the Fable
+  // weekly as it was.
+  redeemer.statusFn = async () => ({ reset: parseResetStatus(grantBlock([sharedOnly], NOT_WALLED)),
+    usage: { fiveHour: { utilization: 0.1 }, sevenDay: { utilization: calls.claim.length ? 0 : 0.99 }, sevenDayFable: { utilization: 0.99 } } });
+  redeemer.claimFn = async account => { calls.claim.push(account.name); return { result: 'reset', resetsLeft: 0, cleared: ['five_hour', 'seven_day'] }; };
+  am._nextProbeAt = Date.now() + H;
+  const hooks = { redeemClaudeResetForPool: (cands, opts) => redeemer.maybeRedeemForPool(cands, opts) };
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${port}` }, hooks);
+  try {
+    const pport = await new Promise(r => proxy.listen(0, '127.0.0.1', () => r(proxy.address().port)));
+    const body = { model: OPUS, max_tokens: 1, tools: [{ type: 'advisor_20260301', name: 'advisor', model: FABLE }], messages: [] };
+    const res = await fetch(`http://127.0.0.1:${pport}/v1/messages`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+    await res.text();
+    assert.equal(calls.claim.length, 1);
+    assert.equal(res.status, 200);
+    assert.equal(hits, 1);
+  } finally { proxy.close(); upstream.close(); }
+});
+
 // unavailableReason names `quota` ahead of `route`, so an account the model's
 // route excludes reads as resettable unless the offer asks the route itself.
 test('a dry pool offers only the accounts the request model\'s route allows, parked or at the upstream limit', async () => {
