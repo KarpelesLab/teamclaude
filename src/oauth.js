@@ -929,7 +929,28 @@ const LONG_LIVED_SCOPES = 'user:inference';
 const LONG_LIVED_EXPIRES_IN = 365 * 24 * 3600;
 
 /**
- * Exchange an OAuth authorization code for access/refresh tokens.
+ * The account a code exchange's response says its token was issued to, in the
+ * fields a profile fills (accountUuid, orgUuid, orgName): `account.uuid` and
+ * `organization.uuid`, with `organization.name`. A long-lived token cannot
+ * read its profile (long-lived.js), so this is the only identity its sign-in
+ * has. Empty unless the answer names both the account and its organization:
+ * findUpsertTarget takes an organization it is not told for a match, so an
+ * account alone would land on whichever of that person's organizations'
+ * entries came first. Such an answer is taken as naming no account.
+ * @param {any} data  the parsed response body
+ * @returns {{ accountUuid?: string, orgUuid?: string, orgName?: string }}
+ */
+function tokenResponseIdentity(data) {
+  const accountUuid = data?.account?.uuid;
+  const orgUuid = data?.organization?.uuid;
+  if (typeof accountUuid !== 'string' || !accountUuid || typeof orgUuid !== 'string' || !orgUuid) return {};
+  const orgName = data.organization.name;
+  return { accountUuid, orgUuid, ...(typeof orgName === 'string' && orgName && { orgName }) };
+}
+
+/**
+ * Exchange an OAuth authorization code for access/refresh tokens, with the
+ * account the response names as `issuedTo` (see tokenResponseIdentity).
  * Shared by both browser-callback and manual/paste login paths. With
  * `expiresIn`, asks for that lifetime and fails unless the expiry granted is
  * within a day of it, which absorbs rounding and clock skew on `expires_at`.
@@ -979,7 +1000,8 @@ async function exchangeCodeForTokens(code, state, codeVerifier, redirectUri, tok
   // the 30-day fallback Claude Code uses; see signInRefreshTokenExpiry. One
   // whose response states a lifetime keeps what it states, which is no date
   // when that could not be believed.
-  return statesRefreshTokenExpiry(data) ? tokens : signInRefreshTokenExpiry(tokens);
+  const dated = statesRefreshTokenExpiry(data) ? tokens : signInRefreshTokenExpiry(tokens);
+  return { ...dated, issuedTo: tokenResponseIdentity(data) };
 }
 
 /**
@@ -1113,7 +1135,10 @@ function isLoopbackAddress(text, port) {
  * @param {boolean} [opts.longLived]  the `claude setup-token` request: a one-year
  *   token on LONG_LIVED_SCOPES, returned marked `longLived` and without any
  *   refresh token the response carries. Such a token is not refreshed, and a
- *   refresh would replace the year-long access token with a short one
+ *   refresh would replace the year-long access token with a short one. It
+ *   carries the account the response names, if it names it with its
+ *   organization (tokenResponseIdentity: accountUuid, orgUuid, orgName): its
+ *   sign-in has no other way to know which it is
  * @param {string} [opts.tokenEndpoint]
  */
 export async function startOAuthLogin({ loopback = true, routing = null, signal = null, timeoutMs = LOGIN_TIMEOUT_MS, exchange = exchangeCodeForTokens, longLived = false, tokenEndpoint = DEFAULT_TOKEN_ENDPOINT } = {}) {
@@ -1150,7 +1175,7 @@ export async function startOAuthLogin({ loopback = true, routing = null, signal 
   const tokens = race.result.then(answer => {
     console.log('Exchanging authorization code for tokens...');
     return exchange(answer.code, answer.state, codeVerifier, answer.redirectUri, tokenEndpoint, routing, longLived ? LONG_LIVED_EXPIRES_IN : undefined);
-  }).then(creds => (longLived ? { accessToken: creds.accessToken, expiresAt: creds.expiresAt, longLived: true } : creds));
+  }).then(creds => (longLived ? { accessToken: creds.accessToken, expiresAt: creds.expiresAt, ...creds.issuedTo, longLived: true } : creds));
   // Awaited by every caller; this only stops one that failed before awaiting
   // from leaving a later rejection unhandled, which would end the process.
   tokens.catch(() => {});

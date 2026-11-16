@@ -1504,10 +1504,11 @@ async function loginCommand() {
     }
     // Before anything is opened or asked: the token this login returns carries
     // `user:inference` alone, so the profile that names every other login
-    // cannot be read with it, and the name is all the account is known by.
+    // cannot be read with it. The name is what the account is known by, with
+    // the account its token answer names, when it names one (upsertOAuthAccount).
     if (!argValue('--name')) {
       console.error('--long-lived needs --name: its token serves inference only, so the account cannot be named from its profile.');
-      console.error('Usage: teamclaude login --long-lived --name <name>   (the name of an existing account renews that one)');
+      console.error('Usage: teamclaude login --long-lived --name <name>   (an existing account\'s name renews it, unless the token was signed in as another account)');
       process.exit(1);
     }
     await loginOAuthCommand({ pasteOnly: true, longLived: true });
@@ -3438,7 +3439,8 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
   // A long-lived token (long-lived.js) is not asked: the profile endpoint
   // needs a scope it does not carry and would answer 403. What stands in is
   // the shape of a profile that could not be read, so the account goes by the
-  // name given, which loginCommand has already required.
+  // name given, which loginCommand has already required, and by the account
+  // its sign-in's token response named, when it named one (startOAuthLogin).
   const longLived = creds.longLived === true;
   // The refresh goes through the callback.net lock when this install is
   // signed in there: the token being imported may be one the store holds, and
@@ -3468,9 +3470,7 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
     process.exit(1);
   }
 
-  if (longLived) {
-    console.log('A long-lived token serves inference only: the account is saved under the name given, with no profile lookup.');
-  } else if (!profileOk) {
+  if (!longLived && !profileOk) {
     console.error(`Warning: importing named account without profile detection — ${profile?.error ? sanitizeText(profile.error) : 'profile unavailable'}`);
   }
   if (!name && profile?.email) {
@@ -3500,7 +3500,10 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
       name,
       type: 'oauth',
       source,
-      ...oauthIdentityFields(profile),
+      // A long-lived login's is what its token response named: as a profile
+      // does for any other login, it decides which entry this is, so a token
+      // signed in as another account is not saved under this one's ids.
+      ...oauthIdentityFields(longLived ? creds : profile),
       organizationType: profile?.organizationType || null,
       rateLimitTier: profile?.rateLimitTier || creds.rateLimitTier || null,
       seatTier: profile?.seatTier || null,
@@ -3516,8 +3519,8 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
       ...(longLived && { longLived: true }),
     };
     // No profile was read for a long-lived login, so it states no plan. The
-    // keys are left off rather than written as null: onto an entry of the
-    // same name, what an earlier full login learned about the account stays.
+    // keys are left off rather than written as null: onto the entry it
+    // updates, what an earlier full login learned about the account stays.
     if (longLived) {
       for (const field of ['organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro']) delete (/** @type {Record<string, any>} */ (account))[field];
     }
@@ -3562,6 +3565,9 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
     }
     signedIn = config.accounts[idx >= 0 ? idx : config.accounts.length - 1];
   });
+  // Said once the entry is known: one that already holds the account the
+  // token answer named is renewed under its own name, not the one given.
+  if (longLived) console.log(`A long-lived token serves inference only: saved as "${outcome.name}", with no profile lookup.`);
   console.log(`Saved to ${getConfigPath()}`);
   // Before the server is told: its reload pass would otherwise read a tombstone
   // for an account that was just signed in again and remove it.

@@ -898,12 +898,13 @@ export class CredentialSync {
    * on. An account a pass evicts for a tombstone is removed in the store
    * already, and nothing is written.
    * A long-lived account is not carried (isSyncable), but its identity can
-   * be: a long-lived login named onto an entry keeps the ids an earlier full
-   * login recorded, and the row that login stored would add the account back
-   * here, as a refreshing one, at the next pass. So its removal is recorded
-   * for that identity (removalKeyFor), as any account's is, and removes that
-   * account from every install. It is written only into the row stored under
-   * that key (_rowByKey); one with no identity has no row to write it into.
+   * be: the account its sign-in's token answer named, or the ids an earlier
+   * full login recorded on the entry it was named onto. A row stored for that
+   * account would add it back here, as a refreshing one, at the next pass.
+   * So its removal is recorded for that identity (removalKeyFor), as any
+   * account's is, and removes that account from every install. It is written
+   * only into the row stored under that key (_rowByKey); one with no identity
+   * has no row to write it into.
    * Resolves with whether a tombstone was written.
    * @param {Record<string, any>} account
    * @param {{ wait?: boolean }} [opts]

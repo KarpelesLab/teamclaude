@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -19,6 +19,8 @@ import { childEnvWithoutProxy } from '../test-helpers/env.js';
 
 const oauthUrl = new URL('../src/oauth.js', import.meta.url).href;
 const cliPath = fileURLToPath(new URL('../src/index.js', import.meta.url));
+// Answers the token endpoint inside a CLI child (see the file).
+const tokenEndpointPreload = new URL('../test-helpers/token-endpoint.js', import.meta.url).href;
 const YEAR = 31_536_000;
 const MANUAL_REDIRECT = 'https://console.anthropic.com/oauth/code/callback';
 
@@ -285,4 +287,131 @@ test('`teamclaude login --long-lived` without --name stops before the sign-in li
   assert.equal(run.authorizeUrl, null, `a sign-in link was printed:\n${run.stdout}`);
   assert.match(run.stderr, /--long-lived needs --name/);
   assert.equal(existsSync(join(dir, 'opened')), false);
+});
+
+// The whole `teamclaude login --long-lived --name <name>`, through the code
+// exchange (answered by test-helpers/token-endpoint.js with `response`) to the
+// saved config. Resolves with the exit status, what was printed and the
+// accounts saved.
+async function longLivedLoginAs(t, accounts, response, name = 'A') {
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-long-lived-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const configPath = join(dir, 'config.json');
+  await writeFile(configPath, JSON.stringify({ proxy: { port: 1, apiKey: 'tc-test' }, upstreamProxy: false, accounts }));
+  const run = await runPasteFlow(['--import', tokenEndpointPreload, cliPath, 'login', '--long-lived', '--name', name], {
+    env: { TEAMCLAUDE_CONFIG: configPath, TEAMCLAUDE_TEST_TOKEN_RESPONSE: JSON.stringify(response), PATH: await inertBin(dir) },
+    signal: t.signal,
+  });
+  return { status: run.status, stdout: run.stdout, stderr: run.stderr, saved: JSON.parse(await readFile(configPath, 'utf8')).accounts };
+}
+
+const accountA = () => ({
+  id: 'a-id', name: 'A', type: 'oauth', accountUuid: 'uuid-A', orgUuid: 'org-A', orgName: 'Org A',
+  hasClaudeMax: true, rateLimitTier: 'max_20x', accessToken: 'at-A', refreshToken: 'rt-A', expiresAt: Date.now() + 3_600_000,
+});
+const yearGrant = (extra = {}) => ({ access_token: 'at-year', refresh_token: 'rt-not-kept', expires_in: YEAR, ...extra });
+
+// The token cannot read its profile, so the code exchange's answer is the only
+// thing that says which account signed in. Where it names one, that decides,
+// as the profile does for `teamclaude login`: a sign-in as another account
+// does not take this entry's ids, it is added under the name given.
+test('a long-lived login named onto an entry, signed in as another account, is added beside it and leaves the entry as it was', async (t) => {
+  const before = accountA();
+  const { status, stdout, stderr, saved } = await longLivedLoginAs(t, [before], yearGrant({
+    account: { uuid: 'uuid-B', email_address: 'b@example.com' }, organization: { uuid: 'org-B', name: 'Org B' },
+  }));
+  assert.equal(status, 0, `${stdout}\n${stderr}`);
+  assert.match(stdout, /Added account "A"/);
+  assert.match(stdout, /A long-lived token serves inference only: saved as "A"/);
+  assert.equal(saved.length, 2);
+  assert.deepEqual(saved[0], before, 'the existing entry is untouched');
+  assert.equal(saved[1].name, 'A');
+  assert.equal(saved[1].accountUuid, 'uuid-B');
+  assert.equal(saved[1].orgUuid, 'org-B');
+  assert.equal(saved[1].orgName, 'Org B');
+  assert.equal(saved[1].accessToken, 'at-year');
+  assert.equal(saved[1].longLived, true);
+  assert.equal('refreshToken' in saved[1], false);
+  assert.equal('hasClaudeMax' in saved[1], false, 'no plan: nothing read one');
+});
+
+// The same account, or an answer that names none: the entry's token is
+// replaced, it is marked long-lived, and what an earlier full login recorded
+// (ids, organization, plan) stays. An organization without an account is not
+// an identity, and neither is an account id that is not a string: neither
+// replaces the entry's.
+test('a long-lived login onto its own entry replaces the token, marks it, and keeps its ids and plan', async (t) => {
+  for (const response of [
+    yearGrant({ account: { uuid: 'uuid-A' }, organization: { uuid: 'org-A', name: 'Org A' } }),
+    yearGrant(),
+    yearGrant({ organization: { uuid: 'org-B', name: 'Org B' } }),
+    yearGrant({ account: { uuid: 123 }, organization: { uuid: 'org-B', name: 'Org B' } }),
+  ]) {
+    const { status, stdout, stderr, saved } = await longLivedLoginAs(t, [accountA()], response);
+    assert.equal(status, 0, `${stdout}\n${stderr}`);
+    assert.match(stdout, /Updated account "A"/, JSON.stringify(response));
+    assert.equal(saved.length, 1);
+    const [a] = saved;
+    assert.equal(a.id, 'a-id');
+    assert.equal(a.accessToken, 'at-year');
+    assert.equal(a.longLived, true);
+    assert.equal('refreshToken' in a, false);
+    assert.equal('refreshTokenExpiresAt' in a, false);
+    assert.deepEqual([a.accountUuid, a.orgUuid, a.orgName], ['uuid-A', 'org-A', 'Org A']);
+    assert.deepEqual([a.hasClaudeMax, a.rateLimitTier], [true, 'max_20x']);
+  }
+});
+
+// The answer decides which entry this is, as the profile does for `teamclaude
+// login`: when an entry already holds the account it names, that entry is the
+// one renewed, under its own name, and it becomes long-lived (an ordinary one
+// stops syncing here). The name given does not rename it, and is not added.
+test('a long-lived login whose answer names an account an entry holds renews that entry, under its own name', async (t) => {
+  const b = { id: 'b-id', name: 'b@example.com', type: 'oauth', accountUuid: 'uuid-B', orgUuid: 'org-B', orgName: 'Org B', accessToken: 'at-B', refreshToken: 'rt-B', expiresAt: Date.now() + 3_600_000 };
+  const { status, stdout, stderr, saved } = await longLivedLoginAs(t, [b], yearGrant({
+    account: { uuid: 'uuid-B', email_address: 'b@example.com' }, organization: { uuid: 'org-B', name: 'Org B' },
+  }), 'ci');
+  assert.equal(status, 0, `${stdout}\n${stderr}`);
+  assert.match(stdout, /Updated account "b@example.com"/);
+  assert.match(stdout, /A long-lived token serves inference only: saved as "b@example.com"/);
+  assert.doesNotMatch(stdout, /"ci"/);
+  assert.deepEqual(saved.map(a => a.name), ['b@example.com']);
+  assert.equal(saved[0].accessToken, 'at-year');
+  assert.equal(saved[0].longLived, true);
+  assert.equal('refreshToken' in saved[0], false);
+});
+
+// One person in two organizations: two entries with one account UUID. An answer
+// that names the account and not its organization cannot tell them apart, and
+// would land on whichever came first; it is taken as naming no account, so the
+// name decides. So is one whose organization id is not a string.
+const twoOrganizations = () => [
+  { id: 'p1', name: 'p@example.com (Org 1)', type: 'oauth', accountUuid: 'uuid-P', orgUuid: 'org-1', orgName: 'Org 1', accessToken: 'at-1', refreshToken: 'rt-1', expiresAt: Date.now() + 3_600_000 },
+  { id: 'p2', name: 'p@example.com (Org 2)', type: 'oauth', accountUuid: 'uuid-P', orgUuid: 'org-2', orgName: 'Org 2', accessToken: 'at-2', refreshToken: 'rt-2', expiresAt: Date.now() + 3_600_000 },
+];
+
+test('a long-lived login whose answer names the account but not its organization goes by the name', async (t) => {
+  for (const response of [
+    yearGrant({ account: { uuid: 'uuid-P' } }),
+    yearGrant({ account: { uuid: 'uuid-P' }, organization: { uuid: 1, name: 'Org 1' } }),
+  ]) {
+    const before = twoOrganizations();
+    const { status, stdout, stderr, saved } = await longLivedLoginAs(t, before, response, 'ci');
+    assert.equal(status, 0, `${stdout}\n${stderr}`);
+    assert.match(stdout, /Added account "ci"/, JSON.stringify(response));
+    assert.deepEqual(saved.slice(0, 2), before, 'both organizations\' entries are untouched');
+    assert.deepEqual([saved[2].name, saved[2].accountUuid, saved[2].orgUuid, saved[2].longLived], ['ci', undefined, undefined, true]);
+  }
+});
+
+test('a long-lived login whose answer names the account and its organization renews that organization\'s entry', async (t) => {
+  const before = twoOrganizations();
+  const { status, stdout, stderr, saved } = await longLivedLoginAs(t, before, yearGrant({
+    account: { uuid: 'uuid-P' }, organization: { uuid: 'org-2', name: 'Org 2' },
+  }), 'ci');
+  assert.equal(status, 0, `${stdout}\n${stderr}`);
+  assert.match(stdout, /Updated account "p@example.com \(Org 2\)"/);
+  assert.equal(saved.length, 2);
+  assert.deepEqual(saved[0], before[0]);
+  assert.deepEqual([saved[1].accessToken, saved[1].longLived, 'refreshToken' in saved[1]], ['at-year', true, false]);
 });
