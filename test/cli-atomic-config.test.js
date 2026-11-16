@@ -58,14 +58,17 @@ function rotatedConfig(port) {
 
 /**
  * A config on disk, and beside it the newer one the "server" saves while the
- * command runs. `serverEdit` adds what else the server changed in that save.
+ * command runs. `serverEdit` adds what else the server changed in that save,
+ * and `diskEdit` what the file held differently before it.
  */
-async function stageRace(serverEdit = () => {}) {
+async function stageRace(serverEdit = () => {}, diskEdit = () => {}) {
   const port = await closedPort();
   const dir = await mkdtemp(join(tmpdir(), 'teamclaude-cli-atomic-'));
   const configPath = join(dir, 'config.json');
   const racePath = join(dir, 'server-save.json');
-  await writeFile(configPath, JSON.stringify(baseConfig(port)));
+  const disk = baseConfig(port);
+  diskEdit(disk);
+  await writeFile(configPath, JSON.stringify(disk));
   const rotated = rotatedConfig(port);
   serverEdit(rotated);
   await writeFile(racePath, JSON.stringify(rotated));
@@ -102,8 +105,8 @@ function runCli({ configPath, racePath }, cliArgs) {
  * Run a command across the staged race and return what it left on disk, having
  * checked that the race ran and that no account lost its rotated tokens.
  */
-async function runAcrossRace(cliArgs, serverEdit) {
-  const staged = await stageRace(serverEdit);
+async function runAcrossRace(cliArgs, serverEdit, diskEdit) {
+  const staged = await stageRace(serverEdit, diskEdit);
   const res = await runCli(staged, cliArgs);
   assert.equal(res.code, 0, res.stderr);
   assert.equal(existsSync(staged.racePath), false, 'the server save was staged between the read and the write');
@@ -201,6 +204,80 @@ test('probe, warmup and distribute keep a token rotated meanwhile', async () => 
 
   const distribute = await runAcrossRace(['distribute', 'on']);
   assert.equal(distribute.saved.distributeSessions, true);
+});
+
+// `accounts` writes the entry ids a file lacks before it pairs any row by id.
+// It saved the copy it had loaded, read outside the lock, over the whole file,
+// so a write landing after that read was lost: here the "server" has rotated
+// the tokens and a login has added an account, in a save that carries ids, as
+// every locked write does (so this run has no id left to write). Each row
+// sends its profile lookup through its own proxy, a closed local port, so the
+// command reaches no network.
+const routeNowhere = (/** @type {number} */ port) => (/** @type {any} */ config) => {
+  for (const account of config.accounts) account.routing = `http://127.0.0.1:${port}`;
+};
+
+test('accounts on a file without ids keeps what another writer saved before its locked read', async () => {
+  const nowhere = routeNowhere(await closedPort());
+  const { saved, res } = await runAcrossRace(['accounts'], config => {
+    config.accounts.push({
+      id: 'c-id', name: 'c@example.com', type: 'oauth', accountUuid: 'uc', orgUuid: 'oc',
+      accessToken: 'c-at-rotated', refreshToken: 'c-rt-rotated', expiresAt: Date.now() + 3_600_000,
+    });
+    nowhere(config);
+  }, config => {
+    nowhere(config);
+    for (const account of config.accounts) delete account.id;
+  });
+  assert.deepEqual(saved.accounts.map(a => a.id), ['a-id', 'b-id', 'c-id'], 'the ids on disk are the ones the server wrote');
+  // What it lists is that same read, so the ids it pairs by are those ids.
+  assert.match(res.stdout, /^ {2}\[3\] c@example\.com /m);
+});
+
+// The id write itself, with no race: a file whose rows carry no ids has them
+// on disk after one run, each row its own, and a second run finds nothing to
+// write and leaves the file byte for byte.
+test('accounts writes the ids a file lacks, once', async () => {
+  const nowhere = routeNowhere(await closedPort());
+  const { configPath } = await stageRace(undefined, config => {
+    nowhere(config);
+    for (const account of config.accounts) delete account.id;
+  });
+  const first = await runCli({ configPath }, ['accounts']);
+  assert.equal(first.code, 0, first.stderr);
+  const written = await readFile(configPath, 'utf8');
+  const ids = JSON.parse(written).accounts.map((/** @type {any} */ a) => a.id);
+  assert.ok(ids.every((/** @type {unknown} */ id) => typeof id === 'string' && id !== ''), `every row has an id: ${JSON.stringify(ids)}`);
+  assert.equal(new Set(ids).size, ids.length, 'and no two rows share one');
+  const second = await runCli({ configPath }, ['accounts']);
+  assert.equal(second.code, 0, second.stderr);
+  assert.equal(await readFile(configPath, 'utf8'), written, 'a file that carries every id is not rewritten');
+});
+
+// A first run has no file to read: the config is created then, with no
+// accounts and so no id to write, and the command carries on from it.
+test('accounts on a first run creates the config, with no accounts', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-cli-atomic-'));
+  const configPath = join(dir, 'config.json');
+  const res = await runCli({ configPath }, ['accounts']);
+  assert.equal(res.code, 0, res.stderr);
+  assert.match(res.stdout, /^Created config at /m);
+  assert.deepEqual(JSON.parse(await readFile(configPath, 'utf8')).accounts, []);
+});
+
+// A run with nothing to write takes no lock. The staged save is renamed in at
+// the first attempt to take it, so finding it still in place says none was
+// made. Locking on every run would make `accounts` wait out another process's
+// hold on the lock (2 s) and print the warning, for a read.
+test('accounts on a file that carries every id takes no config lock', async () => {
+  const nowhere = routeNowhere(await closedPort());
+  const staged = await stageRace(nowhere, nowhere);
+  const before = await readFile(staged.configPath, 'utf8');
+  const res = await runCli(staged, ['accounts']);
+  assert.equal(res.code, 0, res.stderr);
+  assert.match(res.stdout, /a@example\.com/, 'it listed the accounts');
+  assert.equal(existsSync(staged.racePath), true, 'the command attempted to take the config lock');
+  assert.equal(await readFile(staged.configPath, 'utf8'), before);
 });
 
 test('routing none clears the routing on a fresh read', async () => {

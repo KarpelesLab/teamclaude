@@ -3,9 +3,8 @@
 import { spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { createWriteStream, existsSync } from 'node:fs';
-import { readFile } from 'node:fs/promises';
 import net from 'node:net';
-import { loadOrCreateConfig, loadConfig, loadConfigPersistingIds, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, getQuotaSeriesPath, getUsageDbPath, loadState, createStatePersister } from './config.js';
+import { loadOrCreateConfig, loadConfig, loadConfigPersistingIds, loadConfigEnsuringIds, atomicConfigUpdate, getConfigPath, getCrashLogPath, getQuotaSeriesPath, getUsageDbPath, loadState, createStatePersister } from './config.js';
 import { loadQuotaSeries, saveQuotaSeries } from './quota-series.js';
 import { installCrashHandlers } from './crash-log.js';
 import { AccountManager, distributionMode, accountRouting, isLongLived } from './account-manager.js';
@@ -31,7 +30,7 @@ import { isRemoteSession, openBrowser, PANEL_LOGIN_TIMEOUT_MS } from './login-fl
 import { providerOf, canServeProvider } from './provider.js';
 import { syncAccountsFromDisk } from './sync-accounts.js';
 import { mergeAccountsForSave, syncRefreshedTokens, removedAccountIds, clearRemovedAccountIds, clearAddedAccountIds, markAccountRemoved, configIndexFor } from './account-pairing.js';
-import { ensureAccountIds, accountIdsComplete } from './account-id.js';
+import { ensureAccountIds } from './account-id.js';
 import * as alias from './alias.js';
 import { ensureCerts, mitmHosts, caCertPath } from './mitm.js';
 import { Prober, probeApplicable } from './prober.js';
@@ -357,11 +356,10 @@ async function serverCommand() {
     && process.stdout.isTTY && process.stdin.isTTY;
   const earlyConsole = tuiExpected ? captureEarlyConsole() : null;
 
-  const config = await loadOrCreateConfig();
-  const persistSessionAffinity = config.persistSessionAffinity === true;
   // Token writes below pair rows by entry id against a re-read of the file, so
   // the ids have to be on disk before the first refresh, not just in memory.
-  await persistMintedAccountIds(config);
+  const config = await loadConfigWithIdsOnDisk();
+  const persistSessionAffinity = config.persistSessionAffinity === true;
 
   // --log-to <dir>
   const logTo = argValue('--log-to');
@@ -2146,7 +2144,9 @@ async function switchSessionCommand(port, headers, name) {
 // ── accounts ────────────────────────────────────────────────
 
 async function accountsCommand() {
-  const config = await loadOrCreateConfig();
+  // Both writes below pair rows by entry id against a fresh read of the file,
+  // so a file written before ids existed needs its ids on disk first.
+  const config = await loadConfigWithIdsOnDisk();
   const verbose = args.includes('-v') || args.includes('--verbose');
 
   if (config.accounts.length === 0) {
@@ -2154,10 +2154,6 @@ async function accountsCommand() {
     console.log('Add one with: teamclaude import, teamclaude login, or teamclaude login --api');
     return;
   }
-
-  // Both writes below pair rows by entry id against a fresh read of the file,
-  // so a file written before ids existed needs its ids on disk first.
-  await persistMintedAccountIds(config);
 
   // Refresh expired tokens before fetching profiles. Each call goes by the
   // account's own routing when it has one — this is that account's traffic.
@@ -3589,7 +3585,7 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
  *
  * The id is exact and survives the refresh that rewrites the credential. A file
  * written before the field existed gets its ids persisted at startup
- * (persistMintedAccountIds), so the in-memory ids are the on-disk ids.
+ * (loadConfigWithIdsOnDisk), so the in-memory ids are the on-disk ids.
  */
 function findConfigAccount(diskConfig, account) {
   if (!account?.id) return -1;
@@ -3597,23 +3593,25 @@ function findConfigAccount(diskConfig, account) {
 }
 
 /**
- * Persist the entry ids loadConfig just minted, if the file did not carry them.
+ * The config, with any entry id the file lacked written to it first, so the ids
+ * in the copy handed out are the ids on disk; a first run creates the file.
  *
  * Every later token write pairs its row by id and re-reads the file to do it. A
  * config written before the field existed has ids in memory only, and the
  * re-read would mint a second, different set — nothing would pair until the
- * next start, and refreshed tokens would never reach disk. One save up front
- * makes the in-memory ids the on-disk ids. A file that already carries a
- * complete, unique set is left alone.
+ * next start, and refreshed tokens would never reach disk. A file that already
+ * carries a complete, unique set is not written, and its read takes no lock.
+ *
+ * Through loadConfigEnsuringIds, which writes missing ids under the config lock
+ * and hands out the read it wrote. This used to save the copy loaded first,
+ * read outside the lock, over the whole file, and whatever another writer had
+ * saved since that read was lost: a refresh token the running server had
+ * rotated went back to its old, dead value.
  */
-async function persistMintedAccountIds(config) {
-  let raw;
-  try {
-    raw = JSON.parse(await readFile(getConfigPath(), 'utf-8'));
-  } catch {
-    return; // nothing on disk to reconcile with (or unreadable — the next save will tell)
-  }
-  if (!accountIdsComplete(raw?.accounts)) await saveConfig(config);
+async function loadConfigWithIdsOnDisk() {
+  // null when there is no file: the one created then has no accounts, so no
+  // id to write.
+  return (await loadConfigEnsuringIds()) ?? await loadOrCreateConfig();
 }
 
 // ── helpers ─────────────────────────────────────────────────
