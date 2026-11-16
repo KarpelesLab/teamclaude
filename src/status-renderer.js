@@ -94,6 +94,8 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
     if (unserved) lines.push(`  ${unserved}`);
     const login = loginExpiryLine(account, paint, now);
     if (login) lines.push(`  ${login}`);
+    const token = longLivedLine(account, paint);
+    if (token) lines.push(`  ${token}`);
     const plan = subscriptionLostLine(account, paint, now);
     if (plan) lines.push(`  ${plan}`);
     const spend = spendLine(account, paint);
@@ -105,6 +107,8 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
     }
     const resetCredits = resetCreditLine(account, paint, now);
     if (resetCredits) lines.push(`  ${resetCredits}`);
+    const redeem = autoRedeemLine(account, paint);
+    if (redeem) lines.push(`  ${redeem}`);
     const outside = outsideSpendText(account.quota?.outsideSpend);
     if (outside) lines.push(`  ${paint.dim('Outside'.padEnd(8))} ${outside}`);
     const forecast = forecastText(account.quota?.forecast, now);
@@ -496,6 +500,30 @@ export function resetCreditLine(account, paint, now = Date.now()) {
   return `${paint.dim('Reset'.padEnd(8))} ${paint.cyan(held.join(', '))}${paint.gray(note)}`;
 }
 
+/**
+ * The auto-redeem policy's standing on this account: whether the automatic
+ * policy may spend one of its reset credits, why not when it may not, and what
+ * a credit spent now would buy (a Codex reset restarts the 7-day timer, so a
+ * credit is worth the days left to the natural reset over seven).
+ *
+ * Drawn only where the payload carries the block — Codex rows from a server
+ * that computes it — so an older server, or a Claude row, prints nothing.
+ *
+ * @param {Record<string, any>|null|undefined} account  a row of the status payload
+ * @param {ReturnType<typeof colors>} paint
+ */
+export function autoRedeemLine(account, paint) {
+  const view = account?.autoRedeem;
+  if (!view || typeof view !== 'object') return null;
+  const value = Number.isFinite(view.creditValueWeeks)
+    ? `credit worth ${view.creditValueWeeks.toFixed(2)} of a week (${(view.creditValueWeeks * 7).toFixed(1)}d to reset)`
+    : 'credit value unknown (no reset time)';
+  const state = view.armed
+    ? paint.green('armed')
+    : `${paint.yellow('exempt')}${view.exemptReason ? paint.gray(` — ${safeLine(view.exemptReason, 160)}`) : ''}`;
+  return `${paint.dim('Redeem'.padEnd(8))} ${state}${paint.gray(`, ${value}`)}`;
+}
+
 // How long a reset-credit reading is worth showing. Nothing refreshes the count
 // but the usage probe, and the probe is off by default, so a credit that was
 // redeemed or expired would otherwise stay on screen indefinitely. A week is the
@@ -580,7 +608,26 @@ export function unavailableLine(account, paint) {
   // any other, yet is taking traffic and billing for it. Say so on the line
   // that would otherwise tell the operator it is idle.
   if (account.onExtraUsage) {
+    // With `preferExtraUsage` the account is past its threshold by the
+    // operator's own choice, so while it can still serve that way the line
+    // says what it is doing and not that it is blocked. Without the key the
+    // line is the one it always was.
+    if (account.preferExtraUsage === true && account.fallbackTier) {
+      return `${paint.dim('Usage'.padEnd(8))} ${paint.red('serving on extra usage (paid overage), billing')}`;
+    }
     return `${paint.dim('Blocked'.padEnd(8))} ${paint.yellow(text)} ${paint.red('\u2014 serving on extra usage (paid overage), billing')}`;
+  }
+  // Past its switch threshold, yet the fallback could still serve from it
+  // (AccountManager.fallbackTier). Included quota is known from the buckets.
+  // Paid credits are not: the tier is 'paid' whenever nothing says overage is
+  // off, which includes an account whose usage was never probed, so the line
+  // claims credits only when the spend reading says overage is on upstream.
+  const capacity = account.fallbackTier === 'free' ? 'included quota available past switch threshold'
+    : account.fallbackTier === 'paid' && account.quota?.spend?.enabled === true ? 'subscription usage credits available'
+    : null;
+  if (capacity) {
+    const policy = account.preferExtraUsage === true ? 'extra-usage preference enabled' : 'fallback after normal rotation';
+    return `${paint.dim('Fallback'.padEnd(8))} ${paint.yellow(capacity)} (${policy})`;
   }
   return `${paint.dim('Blocked'.padEnd(8))} ${paint.yellow(text)}`;
 }
@@ -589,7 +636,8 @@ export function unavailableLine(account, paint) {
  * When the account's refresh token lapses and a new sign-in is due — only for
  * an account whose provider or imported credential file stated the date
  * (#674); most rows have none and get no line. Yellow, with the command, once
- * it is within the warning window or past.
+ * it is within the warning window or past. A long-lived account gets the same
+ * row for the token itself, which lapses a year after its login.
  * @param {any} account
  * @param {ReturnType<typeof colors>} paint
  * @param {number} [now]
@@ -600,6 +648,18 @@ export function loginExpiryLine(account, paint, now = Date.now()) {
   const label = paint.dim('Login'.padEnd(8));
   if (!view.warn) return `${label} ${view.text}`;
   return `${label} ${paint.yellow(view.text)} ${paint.gray(`\u2014 run: ${loginCommandFor(account)}`)}`;
+}
+
+/**
+ * Why a `login --long-lived` account shows less than its neighbours: its token
+ * serves inference only, so no plan, usage read or probe stands behind the
+ * row, and its quota bars stay empty until a response of its own states them.
+ * @param {any} account
+ * @param {ReturnType<typeof colors>} paint
+ */
+export function longLivedLine(account, paint) {
+  if (account?.longLived !== true) return null;
+  return `${paint.dim('Token'.padEnd(8))} long-lived, inference only: plan and usage are not read, quota is taken from response headers`;
 }
 
 // Upstream's refusal outlives its cooldown, so the account reads as denied

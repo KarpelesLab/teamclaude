@@ -203,6 +203,29 @@ test('holdBody rejects on a failed read, as buffer() did', async () => {
   await assert.rejects(holdBody(failing, 1024), /socket reset/);
 });
 
+// The hold limit is a whole number of bytes, parsed as upstream-fetch.js
+// parses TEAMCLAUDE_UPSTREAM_MAX_SOCKETS and ..._QUEUE_TIMEOUT_MS. Read as any
+// positive number, a fraction was taken as given (0.5 made every answer with a
+// byte in it too large to hold: each relayed token refresh was a 502 "larger
+// than 0.5 bytes"), and so were Infinity, 1e400 and integers past
+// Number.MAX_SAFE_INTEGER. Anything but a safe positive integer is the default
+// now; what Number() reads as one (hexadecimal, an exponent, surrounding
+// spaces) is used, as documented.
+test('the hold limit is a whole number of bytes, and any other setting is the default', async () => {
+  const { resolveBufferedResponseLimit } = await import('../src/server.js');
+  const DEFAULT = 64 * 1024 * 1024;
+  for (const value of [null, '', '0', '-1', 'abc', '64MiB', '0.5', '1.5', '4096.7', 'Infinity', '-Infinity', '1e400', '1e20', '9007199254740993']) {
+    await withEnv({ TEAMCLAUDE_UPSTREAM_MAX_HELD_BYTES: value }, () => {
+      assert.equal(resolveBufferedResponseLimit(), DEFAULT, `${JSON.stringify(value)} is read as the default`);
+    });
+  }
+  for (const [value, limit] of [['1', 1], ['4096', 4096], ['0x1000', 4096], ['1e3', 1000], [' 4096 ', 4096], ['9007199254740991', Number.MAX_SAFE_INTEGER]]) {
+    await withEnv({ TEAMCLAUDE_UPSTREAM_MAX_HELD_BYTES: value }, () => {
+      assert.equal(resolveBufferedResponseLimit(), limit, `${value} is used as given`);
+    });
+  }
+});
+
 // ── end to end, through an account's own upstream ───────────────────────────
 
 // The limit is 64 MiB unless TEAMCLAUDE_UPSTREAM_MAX_HELD_BYTES says otherwise;
@@ -265,7 +288,9 @@ const postOpts = (port) => ({ host: '127.0.0.1', port, method: 'POST', path: '/v
 // An answer past the limit reaches the client before the upstream has finished
 // sending it: the upstream keeps its last part back until the client has seen
 // a byte. A proxy holding the answer whole shows the client nothing until the
-// end, which then never comes.
+// end, which does not come: the hold is cut at its idle deadline instead (120 s
+// at the defaults, as long as npm test's runner timeout), and the test fails
+// on whichever of the two comes first.
 test('an answer past the hold limit is relayed as it arrives, not held whole', async (t) => {
   const first = Buffer.alloc(2 * LIMIT, 0x61);
   const last = Buffer.alloc(LIMIT, 0x62);
@@ -341,7 +366,7 @@ test('a client that leaves an answer past the hold limit has the upstream droppe
   const upstreamDropped = signal();
   const requestEnded = signal();
   const { port } = await throughBackend(t, (res) => {
-    res.on('close', () => upstreamDropped.fire(res.writableEnded));
+    res.on('close', () => upstreamDropped.fire());
     res.writeHead(200, { 'content-type': 'application/octet-stream' });
     res.write(Buffer.alloc(2 * LIMIT, 0x61));
   }, { onRequestEnd: (/** @type {any} */ _id, /** @type {Record<string, any>} */ info) => requestEnded.fire(info) });
@@ -352,7 +377,9 @@ test('a client that leaves an answer past the hold limit has the upstream droppe
     });
     req.on('error', () => {});
     req.end(JSON.stringify({ model: 'm', messages: [] }));
-    assert.equal(await upstreamDropped.fired, false, 'the upstream connection was dropped with its answer unfinished');
+    // The await is the check, as the comment above says: only the proxy
+    // dropping the upstream's connection settles it.
+    await upstreamDropped.fired;
     assert.equal((await requestEnded.fired).status, 499, 'and the request ended, as one whose client left');
   }));
 });
@@ -365,8 +392,10 @@ test('a client that leaves an answer past the hold limit has the upstream droppe
 // megabytes to fill the socket buffers, and "the upstream has stopped sending"
 // is only ever observed by waiting. The source is always ready, so a relay
 // that did not wait for the drain reads all of it without yielding once; one
-// turn of the event loop is enough to tell the two apart.
-test('a client that stops reading an answer past the hold limit stops the upstream too', async () => {
+// turn of the event loop is enough to tell the two apart. What it measures is
+// the relay's reads of the replay; that a body nobody reads pauses the
+// upstream socket is the transport's half (nodeToWeb, upstream-pool.test.js).
+test('a relay past the hold limit reads no further while its client has not drained, and cancels the replay when it leaves', async () => {
   const { holdBody } = await import('../src/server.js');
   let pulls = 0;
   let cancelled = false;

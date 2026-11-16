@@ -200,6 +200,29 @@ test('a row with no local account becomes one, with its tokens and identity but 
   assert.ok(logs.some((l) => /"b" added from callback.net \(signed in on office\)/.test(l)), logs.join('\n'));
 });
 
+test('a long-lived account near its end takes no refreshing login from the store, healthy or rejected', async () => {
+  const store = makeStore();
+  const a = claude('a', { refreshToken: undefined, longLived: true, expiresAt: T0 + H });
+  const ordinary = { ...a, credential: 'at-a-9', refreshToken: 'rt-a-9', expiresAt: T0 + 20 * H };
+  store.put(syncKeyFor(claude('a')), encodeBlob(ordinary, tokensOf(ordinary), { now: T0 + 12 * H, by: 'office' }));
+  const { sync, am, admitted } = setup([a], { store });
+
+  const r = await sync.sync('start');
+  assert.equal(r.adopted, 0);
+  assert.equal(r.added, 0);
+  assert.deepEqual(admitted, []);
+  assert.equal(am.accounts.length, 1);
+  assert.equal(am.accounts[0].credential, 'at-a-1');
+  assert.equal(am.accounts[0].refreshToken, null);
+  assert.equal(am.accounts[0].longLived, true);
+
+  // A 401 on it does not pull the store's refreshing login in either.
+  am.accounts[0].status = 'error';
+  assert.equal(await sync.onAccountError(am.accounts[0]), false);
+  assert.equal(am.accounts[0].credential, 'at-a-1');
+  assert.equal(am.accounts[0].status, 'error');
+});
+
 test('the newer token wins each way: the store\'s is adopted, this install\'s is stored', async () => {
   const store = makeStore();
   const a = claude('a');
@@ -1147,6 +1170,33 @@ test('a lock refused every round: the refresh gives up rather than renewing with
   assert.deepEqual(refreshed, [], 'never renewed without the lock');
   assert.equal(am.accounts[0].status, 'active');
   assert.ok(logs.some((l) => /not renewing, the callback\.net lock was not to be had in 3 rounds/.test(l)), logs.join('\n'));
+});
+
+// A page in front of this install's token endpoint (a 403 that is not its
+// refusal) keeps the token and holds its renewal for a short while. The hold
+// is that refresh token's: a renewal another install stored, adopted by a
+// pass meanwhile, is renewed under the lock when it needs renewing in turn.
+test('a token adopted from the store inside a kept 403\'s hold is renewed under the lock, not held', async () => {
+  const { sync, am, store, refreshed } = setup([claude('a', { expiresAt: Date.now() - 60_000 })], {
+    refresh: (rt) => {
+      if (rt === 'rt-a-1') throw Object.assign(new Error('Token refresh failed (403): <html>Access denied</html>'), { status: 403, grantRefused: false });
+      return { accessToken: `${rt}-renewed-at`, refreshToken: `${rt}-renewed-rt`, expiresAt: Date.now() + 8 * H };
+    },
+  });
+  await sync.sync();
+  await am.ensureTokenFresh(0);
+  assert.deepEqual(refreshed, ['rt-a-1']);
+  assert.equal(am.accounts[0].status, 'active', 'kept');
+  // Another install renewed and stored; its access token expires within the renewal window.
+  const row = store.byKey(syncKeyFor(am.accounts[0]));
+  const renewed = { ...am.accounts[0], credential: 'at-a-office', refreshToken: 'rt-a-office', expiresAt: Date.now() + 60_000 };
+  row.Data = JSON.stringify(encodeBlob(renewed, tokensOf(renewed), { now: store.now(), by: 'office' }));
+  await sync.sync();
+  assert.equal(am.accounts[0].refreshToken, 'rt-a-office', 'adopted');
+  await am.ensureTokenFresh(0);
+  assert.deepEqual(refreshed, ['rt-a-1', 'rt-a-office']);
+  assert.equal(am.accounts[0].credential, 'rt-a-office-renewed-at');
+  assert.equal(store.blob(syncKeyFor(am.accounts[0])).refreshToken, 'rt-a-office-renewed-rt');
 });
 
 test('an account the store has never seen gets its row first, and is renewed under that row\'s lock', async () => {

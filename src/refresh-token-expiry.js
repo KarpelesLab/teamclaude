@@ -1,11 +1,13 @@
-// When an account's refresh token stops working, where the provider says.
+// When an account's refresh token stops working.
 //
-// A Claude refresh token seems to live a fixed time from the sign-in that
-// issued it, and a rotation does not extend it (issue #674): the account then
-// fails with `invalid_grant` / "Refresh token expired" and needs a new login.
-// Nothing here assumes how long that is. The date is kept only when it was
-// STATED — by the token endpoint, or by the credential file an account was
-// imported from — and an account without one simply shows none.
+// A Claude refresh token lives a fixed time from the sign-in that issued it,
+// and a rotation does not extend it (issue #674): the account then fails with
+// `invalid_grant` / "Refresh token expired" and needs a new login. The date is
+// the one that was STATED — by the token endpoint, or by the credential file an
+// account was imported from. One case is assumed, exactly as Claude Code does
+// it: a Claude sign-in whose response states no lifetime is given 30 days
+// (signInRefreshTokenExpiry). A refresh assumes nothing, and neither does any
+// other provider; an account without a date simply shows none.
 //
 // The date describes one refresh-token family. It follows a rotation (the same
 // sign-in, a new token), is replaced by a new sign-in, and is never carried
@@ -13,6 +15,7 @@
 
 import { providerOf } from './provider.js';
 import { safeLine } from './safe-text.js';
+import { isLongLived, LONG_LIVED_WARN_DAYS } from './long-lived.js';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -49,11 +52,11 @@ function numberOf(v) {
  * The refresh-token expiry a token-endpoint response states, as epoch ms, or
  * null when it states none that can be believed.
  *
- * The name of the field is UNCONFIRMED: nobody has captured a response that
- * carries one. `refresh_token_expires_in` (seconds from now) is the guess from
- * the Claude Code side and `refresh_token_expires_at` the other common
- * spelling (epoch seconds, epoch milliseconds, or an ISO date), so both are
- * read. A response with neither yields null, and no lifetime is assumed.
+ * `refresh_token_expires_in` (seconds from now) is the field Claude Code reads
+ * from this endpoint, at sign-in and at refresh. `refresh_token_expires_at`,
+ * the other common spelling (epoch seconds, epoch milliseconds, or an ISO
+ * date), is read too, for a provider that uses it. A response with neither
+ * yields null; what a sign-in does then is signInRefreshTokenExpiry's.
  *
  * @param {any} data  the parsed response body
  * @param {number} [now]
@@ -81,6 +84,31 @@ export function refreshTokenExpiryFromResponse(data, now = Date.now()) {
   const plausible = stated.filter((ms) => ms > now - MAX_PAST_MS && ms <= now + MAX_AHEAD_MS);
   // Both spellings in one response: the sooner one is the safe reading.
   return plausible.length ? Math.round(Math.min(...plausible)) : null;
+}
+
+/**
+ * How long a Claude refresh token is taken to live when the sign-in that issued
+ * it stated no lifetime: 30 days, the figure Claude Code itself falls back to
+ * for `refreshTokenExpiresAt` at login (and only at login). The accounts
+ * measured in #674 lapsed 28.0 to 30.1 days after their sign-in.
+ */
+export const ASSUMED_SIGN_IN_LIFETIME_MS = 30 * DAY_MS;
+
+/**
+ * The tokens a Claude SIGN-IN returned, with the date its refresh token lapses:
+ * the one the response stated, else 30 days from now, as Claude Code records
+ * it. Tokens with no refresh token have nothing to lapse and get no date.
+ *
+ * An assumed date that turns out wrong corrects itself: a refresh that succeeds
+ * after it drops it (withFamilyExpiry).
+ * @template {Record<string, any>} T
+ * @param {T} tokens  what tokenPairFromResponse made of the sign-in response
+ * @param {number} [now]
+ * @returns {T}
+ */
+export function signInRefreshTokenExpiry(tokens, now = Date.now()) {
+  if (!tokens?.refreshToken) return tokens;
+  return setRefreshTokenExpiry({ ...tokens }, knownRefreshTokenExpiry(tokens.refreshTokenExpiresAt) ?? now + ASSUMED_SIGN_IN_LIFETIME_MS);
 }
 
 /**
@@ -152,9 +180,15 @@ export function expiryAfterReplacement(held, next) {
   return earlierRefreshTokenExpiry(held.refreshTokenExpiresAt, next.refreshTokenExpiresAt);
 }
 
-/** The sign-in command for an account's provider. @param {Record<string, any>|null|undefined} account */
+/**
+ * The sign-in command for an account's provider. A long-lived account names
+ * the long-lived login: a plain `teamclaude login` would turn it back into a
+ * refreshing one.
+ * @param {Record<string, any>|null|undefined} account
+ */
 export function loginCommandFor(account) {
-  return providerOf(account) === 'codex' ? 'teamclaude login --codex' : 'teamclaude login';
+  if (providerOf(account) === 'codex') return 'teamclaude login --codex';
+  return isLongLived(account) ? 'teamclaude login --long-lived' : 'teamclaude login';
 }
 
 /** @param {number} ms @returns {string} the local calendar day, as YYYY-MM-DD */
@@ -176,9 +210,11 @@ export function localDate(ms) {
  * date it says "expired" rather than a negative count.
  * @param {unknown} expiresAt
  * @param {number} [now]
+ * @param {{ noun?: string, warnDays?: number }} [opts]  what lapses, and how
+ *   far ahead it warns; the defaults are the refresh token's
  * @returns {RefreshTokenExpiryView|null}
  */
-export function refreshTokenExpiryView(expiresAt, now = Date.now()) {
+export function refreshTokenExpiryView(expiresAt, now = Date.now(), { noun = 'refresh token', warnDays = REFRESH_TOKEN_WARN_DAYS } = {}) {
   const at = knownRefreshTokenExpiry(expiresAt);
   if (at == null) return null;
   const left = at - now;
@@ -190,22 +226,35 @@ export function refreshTokenExpiryView(expiresAt, now = Date.now()) {
   return {
     expiresAt: at,
     expired,
-    warn: left <= REFRESH_TOKEN_WARN_DAYS * DAY_MS,
+    warn: left <= warnDays * DAY_MS,
     phrase,
-    text: `refresh token ${phrase} (${localDate(at)})`,
+    text: `${noun} ${phrase} (${localDate(at)})`,
   };
+}
+
+/** What lapses on an account: its refresh token, or the long-lived token itself. @param {Record<string, any>|null|undefined} account */
+function expiringTokenNoun(account) {
+  return isLongLived(account) ? 'long-lived token' : 'refresh token';
 }
 
 /**
  * The view for an account as status and the TUI show it, or null when there is
  * nothing to show: no known date, or an account already out as `error`, whose
  * own line says what happened and what to run.
+ *
+ * A long-lived account (long-lived.js) has no refresh token. What lapses there
+ * is the token itself, a year after its login, and nothing renews it: the same
+ * view counts down to `expiresAt` instead, and warns LONG_LIVED_WARN_DAYS
+ * ahead, so the yearly re-login is planned and not found by a failed request.
  * @param {Record<string, any>|null|undefined} account
  * @param {number} [now]
  * @returns {RefreshTokenExpiryView|null}
  */
 export function accountRefreshTokenExpiry(account, now = Date.now()) {
   if (!account || account.status === 'error') return null;
+  if (isLongLived(account)) {
+    return refreshTokenExpiryView(account.expiresAt, now, { noun: expiringTokenNoun(account), warnDays: LONG_LIVED_WARN_DAYS });
+  }
   return refreshTokenExpiryView(account.refreshTokenExpiresAt, now);
 }
 
@@ -225,7 +274,8 @@ export function refreshTokenExpiryWarning(account, now = Date.now()) {
 /**
  * The server's ahead-of-time warning: one log line per account per day, at
  * most, while its refresh token is within REFRESH_TOKEN_WARN_DAYS of a known
- * expiry. Called from a tick that already runs; the returned function takes the
+ * expiry, or its long-lived token within LONG_LIVED_WARN_DAYS of its own.
+ * Called from a tick that already runs; the returned function takes the
  * manager's accounts and returns the lines it logged.
  *
  * An account that is disabled, or already in `error`, is left out: the first
@@ -253,7 +303,7 @@ export function createRefreshTokenExpiryWarner({ log = (line) => console.error(l
       const last = warnedAt.get(key);
       if (last != null && at - last < DAY_MS) continue;
       warnedAt.set(key, at);
-      const line = `[TeamClaude] Account "${safeLine(account.name, 64)}": its refresh token ${view.phrase} — run: ${loginCommandFor(account)}`;
+      const line = `[TeamClaude] Account "${safeLine(account.name, 64)}": its ${expiringTokenNoun(account)} ${view.phrase} — run: ${loginCommandFor(account)}`;
       lines.push(line);
       log(line);
     }

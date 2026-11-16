@@ -234,3 +234,38 @@ test('back-to-back 401 requests rotate the token family once', async () => {
     upstream.close();
   }
 });
+
+// A page in front of the token endpoint (a 403 that is not its refusal) holds
+// the renewal of the refresh token it answered, and of no other: a new one
+// that arrived since, whose access token upstream then rejects, is renewed by
+// the 401's forced refresh as on any other account.
+test('a 401 inside a kept 403\'s hold still forces a renewal of a refresh token that arrived since', async () => {
+  const { server: upstream, seen } = revokingUpstream(new Set(['fresh']));
+  const upstreamPort = await listen(upstream);
+
+  const sent = [];
+  const am = new AccountManager(
+    [{ name: 'a', type: 'oauth', accessToken: 'expired', refreshToken: 'r-kept', expiresAt: Date.now() - HOUR }],
+    0.98,
+    {
+      refreshFn: async (rt) => {
+        sent.push(rt);
+        if (rt === 'r-kept') throw Object.assign(new Error('Token refresh failed (403): <html>Access denied</html>'), { status: 403, grantRefused: false });
+        return { accessToken: 'fresh', refreshToken: 'r3', expiresAt: Date.now() + HOUR };
+      },
+    },
+  );
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const proxyPort = await listen(proxy);
+
+  try {
+    assert.equal(await post(proxyPort), 503);          // the expired token, its renewal kept
+    am.updateAccountTokens(0, { accessToken: 'revoked', refreshToken: 'r-new', expiresAt: Date.now() + HOUR });
+    assert.equal(await post(proxyPort), 200);
+    assert.deepEqual(sent, ['r-kept', 'r-new']);
+    assert.deepEqual(seen, ['revoked', 'fresh']);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
