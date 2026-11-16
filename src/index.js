@@ -2935,7 +2935,11 @@ async function priorityCommand() {
   const { config, result } = await updateConfigOrExit(disk => {
     // An unknown account is reported before a missing number, as it always was.
     requireAccount(disk.accounts, name, orgFilter);
-    if (!spec.place && spec.priority === undefined) {
+    // A number outside the safe-integer range is refused here too, in the
+    // CLI's own words: setAccountPriority's refusal names the `priority` and
+    // `place` fields that POST /teamclaude/priority (the dashboard's call)
+    // sends, which no one typed.
+    if (!spec.place && !Number.isSafeInteger(spec.priority)) {
       throw new ConfigOpError('Provide an integer priority, or --first / --last.');
     }
     return setAccountPriority(disk, name, spec);

@@ -329,6 +329,11 @@ async function assertUntouched(staged, before, serverSave) {
 for (const [cliArgs, message] of /** @type {Array<[string[], RegExp]>} */ ([
   [['priority', 'nobody@example.com', '3'], /^Account "nobody@example\.com" not found$/m],
   [['priority', 'a@example.com'], /^Provide an integer priority, or --first \/ --last\.$/m],
+  // Outside the safe-integer range, either way: refused in the CLI's own
+  // words, not in the field names the dashboard sends.
+  [['priority', 'a@example.com', '99999999999999999999'], /^Provide an integer priority, or --first \/ --last\.$/m],
+  [['priority', 'a@example.com', '-99999999999999999999'], /^Provide an integer priority, or --first \/ --last\.$/m],
+  [['priority', 'a@example.com', '9007199254740993'], /^Provide an integer priority, or --first \/ --last\.$/m],
   [['disable', 'nobody@example.com'], /^Account "nobody@example\.com" not found$/m],
   [['cordon', 'nobody@example.com'], /^Account "nobody@example\.com" not found$/m],
   [['remove', 'nobody@example.com'], /^Account "nobody@example\.com" not found$/m],
