@@ -796,8 +796,10 @@ selected again against the account it cleared.
   over its threshold as well. An account parked on a reading with no known
   upstream limit name (the Sonnet weekly, a learned scoped bucket) is passed
   over, as is one out for any other reason (disabled, cordoned, capped by
-  `maxUsage` or `maxSpend`, throttled, in error). While upstream reports a
-  reset cooldown, nothing is claimed.
+  `maxUsage` or `maxSpend`, in error). A rate-limit hold, which the proxy sets
+  on the 429 that usually brings word of upstream's 5-hour wall, does not hide
+  the weekly reading behind it: the reset lifts the hold as well. While
+  upstream reports a reset cooldown, nothing is claimed.
 - An account that holds a usable reset and is passed over is named in the
   log with the reason (`Account "x": banked reset not redeemed: …`), once per
   account per cooldown (30 minutes) rather than once per refused request.

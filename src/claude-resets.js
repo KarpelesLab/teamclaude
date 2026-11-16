@@ -416,8 +416,8 @@ export class ClaudeResetRedeemer {
   /**
    * The upstream limits a reset must clear on an account the proxy itself holds
    * out of rotation at its weekly switch threshold, though upstream does not
-   * report it at a limit. The manager decides whether it is parked and by which
-   * readings, with the thresholds that apply to this account and model. Null
+   * report it at a weekly limit. The manager decides whether it is parked and by
+   * which readings, with the thresholds that apply to this account and model. Null
    * when it is not parked on a weekly reading (below its threshold, parked by
    * the 5-hour window alone, or barred for another reason); `unknown` names a
    * parking reading no grant can be shown to clear.
@@ -467,29 +467,35 @@ export class ClaudeResetRedeemer {
     // What a grant has to clear, and the grants that may be spent on it.
     /** @type {ResetStatus} */
     let wall = status;
-    if (!status.atLimit || !status.exhausted.length) {
-      // Upstream reports no wall. Selection stops using an account at its
-      // switch threshold, so a busy fleet never reaches one: every account
-      // parks a little short, and the pool is dry with resets banked (#685).
-      // Upstream accepts a claim there, so an account parked by a WEEKLY
-      // threshold counts as walled by the limits behind that reading. The
+    const atLimit = status.atLimit && status.exhausted.length > 0;
+    // A grant is scarce and a 5-hour wall lifts on its own within hours: spend
+    // one only where a weekly limit (the all-models week or a family's,
+    // `seven_day*`) is what turns the account away: upstream's, or the
+    // proxy's own threshold on a weekly reading.
+    if (!atLimit || !status.exhausted.some((/** @type {string} */ limit) => limit.startsWith('seven_day'))) {
+      // Upstream reports no weekly wall: no wall at all, or the 5-hour one
+      // alone. Selection stops using an account at its switch threshold, so a
+      // busy fleet never reaches one: every account parks a little short, and
+      // the pool is dry with resets banked (#685). Upstream accepts a claim
+      // there, so an account parked by a WEEKLY threshold counts as walled by
+      // the limits behind that reading, beside any upstream reports. The
       // status read carries the account's quota as of now, so the manager
       // judges on that and not on a reading that may have gone stale.
       if (read.usage && !read.usage.error) this.am.applyUsageData?.(account.index, read.usage);
       const parked = this._parkedLimits(account, model);
-      if (!parked) return this._decline(account, now + DECLINED_COOLDOWN_MS, 'not at a usage limit, nor held out of rotation by its weekly switch threshold');
+      if (!parked) {
+        return this._decline(account, now + DECLINED_COOLDOWN_MS, atLimit
+          ? 'no weekly limit is exhausted'
+          : 'not at a usage limit, nor held out of rotation by its weekly switch threshold');
+      }
       if (parked.unknown) return this._decline(account, now + DECLINED_COOLDOWN_MS, `no reset is known to clear its ${parked.unknown} reading`);
-      // A grant that says it needs the limit reached would answer `not_limited`.
-      const grants = status.grants.filter((/** @type {ResetGrant} */ g) => g.useRequiresLimit !== true);
+      // Short of any upstream limit, a grant that says it needs one reached
+      // would answer `not_limited`.
+      const grants = atLimit ? status.grants : status.grants.filter((/** @type {ResetGrant} */ g) => g.useRequiresLimit !== true);
       if (!grants.some((/** @type {ResetGrant} */ g) => usableGrant(g, now))) {
         return this._decline(account, now + DECLINED_COOLDOWN_MS, 'its reset can only be used at the upstream limit');
       }
       wall = { ...status, grants, exhausted: [...new Set([...parked.limits, ...status.exhausted])] };
-    } else if (!status.exhausted.some((/** @type {string} */ limit) => limit.startsWith('seven_day'))) {
-      // A grant is scarce and a 5-hour wall lifts on its own within hours: spend
-      // one only where a weekly limit (the all-models week or a family's,
-      // `seven_day*`) is what turns the account away.
-      return this._decline(account, now + DECLINED_COOLDOWN_MS, 'no weekly limit is exhausted');
     }
     // Spent on an account it would not return to service, a reset buys this
     // request nothing — and the grant is gone.

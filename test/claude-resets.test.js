@@ -397,6 +397,56 @@ test('parked by the weekly and the 5-hour window: a grant that leaves the 5-hour
   assert.deepEqual(spent.calls.grants, ['fable']);
 });
 
+test('at upstream\'s 5-hour wall and parked on a weekly reading: the weekly reading is what bars it, so a reset that clears both is spent', async () => {
+  const atFiveHour = { at_limit: true, exhausted: ['five_hour'] };
+  const { am, redeemer, calls } = parkedHarness({ quota: { unified5h: 1, unified7d: 0.99 }, blockExtra: atFiveHour, grants: [{ ...weeklyGrant, use_requires_limit: true }] });
+  const r = await redeemer.maybeRedeemForPool(am.accounts, { model: OPUS });
+  assert.equal(r.redeemed, true, r.reason);
+  assert.deepEqual(calls.grants, ['weekly'], 'at an upstream limit, a grant that needs one reached may be used');
+  // The 5-hour wall alone is still never worth a grant, and the weekly limit
+  // behind the parked reading has to be cleared too.
+  const fiveHourOnly = parkedHarness({ quota: { unified5h: 1, unified7d: 0.5 }, blockExtra: atFiveHour });
+  const alone = await fiveHourOnly.redeemer.maybeRedeemForPool(fiveHourOnly.am.accounts, { model: OPUS });
+  assert.equal(alone.redeemed, false); assert.equal(alone.reason, 'no weekly limit is exhausted');
+  const sessionOnly = parkedHarness({ quota: { unified5h: 1, unified7d: 0.99 }, blockExtra: atFiveHour, grants: [{ id: 'session', type: 'session', clears: ['five_hour'] }] });
+  const partial = await sessionOnly.redeemer.maybeRedeemForPool(sessionOnly.am.accounts, { model: OPUS });
+  assert.equal(partial.redeemed, false); assert.equal(partial.reason, 'its reset does not clear seven_day');
+  assert.equal(fiveHourOnly.calls.claim.length + sessionOnly.calls.claim.length, 0);
+});
+
+// The proxy usually learns of upstream's 5-hour wall from a 429, and holds the
+// account `throttled` for up to an hour, which outranks `quota`.
+test('held after the 429 of upstream\'s 5-hour wall and parked on a weekly reading: the reset is spent and lifts the hold', async () => {
+  const atFiveHour = { at_limit: true, exhausted: ['five_hour'] };
+  const { am, redeemer, calls } = parkedHarness({ quota: { unified5h: 1, unified7d: 0.99 }, blockExtra: atFiveHour });
+  am.markRateLimited(0, 3600);
+  assert.equal(am.unavailableReason(am.accounts[0], OPUS), 'throttled');
+  const r = await redeemer.maybeRedeemForPool(am.accounts, { model: OPUS });
+  assert.equal(r.redeemed, true, r.reason);
+  assert.deepEqual(calls.claim, ['a']);
+  assert.equal(am.unavailableReason(am.accounts[0], OPUS), null, 'the hold went with the reset');
+  // A hold whose weekly reading is under the threshold is still not worth one.
+  const held = parkedHarness({ quota: { unified5h: 1, unified7d: 0.5 }, blockExtra: atFiveHour });
+  held.am.markRateLimited(0, 3600);
+  assert.equal((await held.redeemer.maybeRedeemForPool(held.am.accounts, { model: OPUS })).reason, 'no weekly limit is exhausted');
+  assert.equal(held.calls.claim.length, 0);
+  // Nor is a weekly window that has already reset, read with no fresh quota:
+  // the hold must not keep an expired reading in play.
+  const lapsed = parkedHarness({ quota: { unified5h: 1, unified7d: 0.99 }, blockExtra: atFiveHour });
+  lapsed.am.accounts[0].quota.unified7dReset = Date.now() - 1;
+  lapsed.am.markRateLimited(0, 3600);
+  const read = lapsed.redeemer.statusFn;
+  lapsed.redeemer.statusFn = async account => ({ ...(await read(account)), usage: undefined });
+  assert.equal((await lapsed.redeemer.maybeRedeemForPool(lapsed.am.accounts, { model: OPUS })).reason, 'no weekly limit is exhausted');
+  assert.equal(lapsed.calls.claim.length, 0);
+  // A family weekly behind the hold parks the account for the model it
+  // governs, its 5-hour and shared readings under their thresholds.
+  const family = parkedHarness({ quota: { unified7dFable: 0.99 }, grants: [fableGrant] });
+  family.am.markRateLimited(0, 3600);
+  assert.equal((await family.redeemer.maybeRedeemForPool(family.am.accounts, { model: FABLE })).redeemed, true);
+  assert.deepEqual(family.calls.grants, ['fable']);
+});
+
 test('parked only by the 5-hour window: a weekly reset is never spent for it', async () => {
   const { am, redeemer, calls } = parkedHarness({ quota: { unified5h: 0.99, unified7d: 0.5 } });
   assert.equal(am.unavailableReason(am.accounts[0], OPUS), 'quota', 'the server would offer this account');
@@ -451,6 +501,13 @@ test('parked on a reading no grant is known to clear: nothing is spent', async (
 
 test('a grant that needs the upstream limit reached is not claimed below it', async () => {
   const { am, redeemer, calls } = parkedHarness({ quota: { unified7d: 0.99 }, grants: [{ ...weeklyGrant, use_requires_limit: true }] });
+  const r = await redeemer.maybeRedeemForPool(am.accounts, { model: OPUS });
+  assert.equal(r.redeemed, false); assert.match(r.reason, /only be used at the upstream limit/);
+  assert.equal(calls.claim.length, 0);
+});
+
+test('upstream at a limit it does not name: a grant that needs one reached is still not claimed', async () => {
+  const { am, redeemer, calls } = parkedHarness({ quota: { unified7d: 0.99 }, blockExtra: { at_limit: true }, grants: [{ ...weeklyGrant, use_requires_limit: true }] });
   const r = await redeemer.maybeRedeemForPool(am.accounts, { model: OPUS });
   assert.equal(r.redeemed, false); assert.match(r.reason, /only be used at the upstream limit/);
   assert.equal(calls.claim.length, 0);
