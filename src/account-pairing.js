@@ -221,6 +221,9 @@ export function mergeAccountsForSave(configAccounts, managerAccounts, diskAccoun
     } : a;
     const diskAcct = diskAccounts[rowFor.get(i)];
     const row = diskAcct ? { ...diskAcct, ...live } : live;
+    // The spread cannot delete a key, and an import clears the long-lived mark on
+    // the running entry only; left on disk, it would stop the account refreshing.
+    if (diskAcct && live.longLived !== true) delete row.longLived;
     // `endsAt` is the one account field nothing in this process edits: it is
     // set by `teamclaude ends` or by hand, on disk, and reaches memory at the
     // next reload. So the row is the authority, in both directions. Without

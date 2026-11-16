@@ -103,6 +103,10 @@ Switched to "me@example.com"
 Warning: "me@example.com" is disabled, so requests will not route to it until that changes.
 ```
 
+So a switch to an account with `allowExtraUsage: true` holds only while that account is under its switch threshold. Past it, rotation moves to any account that can serve normally, as it does without a switch. The target can still be picked by the exhausted-fleet fallback like any other account, and once rotation has moved away, a later automatic return to the account does not bring the earlier choice back.
+
+With `preferExtraUsage: true` alongside `allowExtraUsage: true` on the target, the switch also keeps traffic on that subscription past its threshold, among the subscriptions the preference would use. It does not widen what may be spent: another subscription that can serve normally still goes first, paid credits still wait for included quota left on any subscription, and an API account with a strictly lower `priority` number still outranks it. Where one of those applies, the switch is reported as not taking effect and rotation proceeds as above. See [Extra-usage fallback](quota.md#extra-usage-fallback).
+
 Taking an account out of rotation, or moving it in the priority order, has a headless path too — the web equivalent of `teamclaude disable` / `enable` and `teamclaude priority --first` / `--last`, and what the browser dashboard's buttons call:
 
 ```bash
