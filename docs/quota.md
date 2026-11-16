@@ -324,7 +324,7 @@ Without `preferExtraUsage`, automatic selection follows these rules:
 - **It goes back on its own.** As soon as any account's window resets — the paid one's included — selection returns to normal, and the "billing" mark clears even if no request for that model has come in since.
 - **Only the quota verdicts are overridden** — the switch threshold (a spent Fable bucket included, for Fable requests only) and, for the paid tier, a remembered upstream `rejected` status. Everything else still binds: `disabled`, `maxUsage`, `maxSpend`, a live upstream 429 hold, an entitlement cooldown, an error state, routes and model ownership, and the Claude/Codex partition. An account whose usage probe reports overage switched off upstream is skipped, since it would only 429; with no probe data, upstream decides.
 
-A temporary rate-limit throttle prevents requests to a fallback account while the throttle is active. It does not end the existing fallback episode by itself. Status continues to report that episode, and requests resume without a new fallback announcement or ramp once the throttle expires.
+A temporary rate-limit throttle prevents requests to a fallback account while the throttle is active. It does not end the existing fallback episode by itself: status continues to report that episode, and when no request arrives during the throttle, requests resume without a new fallback announcement or ramp once it expires. A request that arrives while the throttle leaves no account able to serve it does end the episode, quietly, so the first request after the throttle announces the account and ramps onto it again.
 
 To prefer a subscription's capacity before API fallback, also set `accounts[].preferExtraUsage: true`:
 
