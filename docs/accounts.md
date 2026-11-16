@@ -621,7 +621,11 @@ as well, and the server names it in the log at start and at each reload.
   either side of 00:00 UTC are in different cohorts. An account whose reset
   time is not known is in no cohort, and this cap does not hold it.
 - [`autoRedeemMaxPerDay`](configuration.md) — at most this many automatic
-  redemptions per rolling 24 hours, across all Codex accounts.
+  redemptions per rolling 24 hours, across all Codex accounts. The six-hour
+  hold after each redemption this cap counts already keeps those to 4 in any
+  24 hours, so a value of 4 or more never stops one. A consume whose answer
+  was lost arms only a 30-minute hold and is not counted until a retry reads
+  its answer, so it does not use up any of this cap.
 
 A credit you spend by hand from the resets panel is not stopped by any of the
 three. It is still recorded: it counts towards its cohort's share, because it

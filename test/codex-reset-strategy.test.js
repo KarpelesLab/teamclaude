@@ -364,6 +364,21 @@ test('the per-day cap is logged once, against the first account it stops, not on
   ]);
 });
 
+test('while every answer is read, the six-hour hold already keeps automatic redemptions to 4 a day', async () => {
+  // A dry refusal every half hour for a day, over more spent accounts than
+  // that: a per-day cap of 4 or more changes nothing, one of 3 binds.
+  for (const [perDay, spends] of [[undefined, 4], [4, 4], [10, 4], [3, 3]]) {
+    const { am, redeemer, calls } = harness({ days: Array(8).fill(3), config: { autoRedeemResets: true, autoRedeemMaxPerDay: perDay }, caughtUp: false });
+    let clock = Date.now();
+    redeemer.now = () => clock;
+    for (let i = 0; i < 48; i++) {
+      await redeemer.maybeRedeemForPool(am.accounts.filter(a => !calls.consume.includes(a.name)));
+      clock += 30 * 60 * 1000;
+    }
+    assert.equal(calls.consume.length, spends, `autoRedeemMaxPerDay ${perDay}`);
+  }
+});
+
 // ── a redemption made by hand ───────────────────────────────────────────────
 
 // The resets panel (reset-actions.js) spends through redeemGrant with
