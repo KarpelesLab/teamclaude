@@ -206,6 +206,33 @@ test('probe, warmup and distribute keep a token rotated meanwhile', async () => 
   assert.equal(distribute.saved.distributeSessions, true);
 });
 
+// #704 moved these three onto the fresh read too, with nothing here to fail if
+// one went back to saving the copy it had loaded. `routing` most of all: its
+// proxy check (skipped here) can take seconds, all of it inside the window.
+test('routing <url> sets the routing on a fresh read and keeps a token rotated meanwhile', async () => {
+  const { saved, res } = await runAcrossRace(['routing', 'a@example.com', 'socks5://127.0.0.1:9', '--no-check']);
+  assert.equal(byId(saved, 'a-id').routing, 'socks5://127.0.0.1:9');
+  assert.equal('routing' in byId(saved, 'b-id'), false);
+  assert.match(res.stdout, /Routing "a@example\.com" via /);
+});
+
+test('warmup reset and rolling keep a token rotated meanwhile', async () => {
+  const reset = await runAcrossRace(['warmup', 'reset', '05:00', '--timezone', 'UTC']);
+  assert.deepEqual(reset.saved.warmupSchedule, { resetTime: '05:00', timezone: 'UTC' });
+
+  const rolling = await runAcrossRace(['warmup', 'rolling', '05:00', '--timezone', 'UTC']);
+  assert.equal(rolling.saved.warmupSchedule.mode, 'rolling');
+  assert.equal(rolling.saved.warmupSchedule.resetTime, '05:00');
+});
+
+test('uncordon keeps a token rotated meanwhile', async () => {
+  const { saved, res } = await runAcrossRace(['uncordon', 'a@example.com'], config => {
+    config.accounts[0].cordoned = true;
+  });
+  assert.equal('cordoned' in byId(saved, 'a-id'), false);
+  assert.match(res.stdout, /Uncordoned account "a@example\.com"/);
+});
+
 // `accounts` writes the entry ids a file lacks before it pairs any row by id.
 // It saved the copy it had loaded, read outside the lock, over the whole file,
 // so a write landing after that read was lost: here the "server" has rotated
