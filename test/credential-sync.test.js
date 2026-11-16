@@ -774,7 +774,7 @@ test('a removal settled during a retry pause takes no lock when it wakes', async
   assert.equal(checks, 0, 'not even a sign-in check');
 });
 
-const NOT_RECORDED = (name, why) => new RegExp(`the removal of "${name}" was not recorded for your other installs \\(${why}\\); the account comes back here at the next pass that reads its row: remove it again then`);
+const NOT_RECORDED = (name, why) => new RegExp(`the removal of "${name}" was not recorded for your other installs \\(${why}\\); the account comes back here from its row, if the store holds one, at the next pass: remove it again then`);
 
 test('a sign-out while a removal is pending ends it: nothing is written, and the pass after signing back in adds the account back', async () => {
   const store = makeStore();

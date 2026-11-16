@@ -906,7 +906,7 @@ export class CredentialSync {
   _abandonRemoval(key, account, why) {
     if (this.pendingRemovals.get(key) !== account) return;
     this.pendingRemovals.delete(key);
-    this.log(`[TeamClaude] callback.net: the removal of "${safeLine(account.name, 64)}" was not recorded for your other installs (${why}); the account comes back here at the next pass that reads its row: remove it again then`);
+    this.log(`[TeamClaude] callback.net: the removal of "${safeLine(account.name, 64)}" was not recorded for your other installs (${why}); the account comes back here from its row, if the store holds one, at the next pass: remove it again then`);
   }
 
   /** The callback.net session the token file names now, kept as the last one seen. */
