@@ -355,6 +355,35 @@ test('a preferred conversation uses recovered legacy quota before resuming credi
     billing: [true, false, false], ramp: 1, enters: 2 });
 });
 
+// The weekly-rollover check moves a pin to the best account that can serve
+// normally. A pin the preference serves past its threshold is not asked it, as
+// the reclaim window is not: the move took the conversation onto the API key
+// for good while new conversations still went to the subscription.
+test('a weekly rollover does not move a conversation the preference serves past its threshold', t => {
+  const lines = [];
+  t.mock.method(console, 'log', (...args) => lines.push(args.join(' ')));
+  const HOUR = 3_600_000;
+  const am = new AccountManager([
+    oauth('subscription', { allowExtraUsage: true, preferExtraUsage: true }),
+    { name: 'api', type: 'apikey', apiKey: 'api-key', priority: 100 },
+  ], 0.98, { distributeSessions: true, expiryRouting: { enabled: true, preempt: true } });
+  const quota = am.accounts[0].quota;
+  Object.assign(quota, { unified5h: 0.99, unified5hReset: Date.now() + 2 * HOUR,
+    unified7d: 0.5, unified7dReset: Date.now() + 24 * HOUR, spend: { enabled: true } });
+  am._nextProbeAt = Date.now() + 60_000;
+  const turn = () => {
+    const picked = am.getActiveAccount(null, OPUS, null, 'conversation');
+    if (picked) am.recordSession('conversation', picked.index, OPUS);
+    return picked?.name ?? null;
+  };
+  const selected = [turn(), turn()];
+  // The weekly window rolls over: a reset a week out, the reading low again.
+  Object.assign(quota, { unified7d: 0.01, unified7dReset: Date.now() + 7 * 24 * HOUR });
+  selected.push(turn(), turn());
+  assert.deepEqual({ selected, released: lines.filter(line => line.includes('released')) },
+    { selected: Array(4).fill('subscription'), released: [] });
+});
+
 test('an exclusive model route still restricts extra usage', () => {
   const am = fleet({ preferExtraUsage: true });
   am.setRoutes([{ name: 'opus', match: ['claude-opus-*'], accounts: ['api'] }]);

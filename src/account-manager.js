@@ -2674,7 +2674,11 @@ export class AccountManager {
       // candidate rather than the bucket's pin alone, since a session sitting on
       // another family's account is just as stuck, and a rollover re-ranks so
       // that pressure picks the destination.
-      if (this.expiryRouting.enabled && this.expiryRouting.preempt
+      // Not asked of a pin the preference serves past its threshold, as the
+      // reclaim window below is not: the destination is picked among accounts
+      // that can serve normally, so the move took the conversation onto API
+      // capacity for good while the preference still named its subscription.
+      if (!fallback && this.expiryRouting.enabled && this.expiryRouting.preempt
           && this._pinRolledOver(sessionId, pinned, model)) {
         // Whether to move is decided on the burndown score, so the placement
         // scoring never changes which sessions lose their cache.
