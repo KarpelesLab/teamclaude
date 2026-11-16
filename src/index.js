@@ -794,11 +794,17 @@ async function serverCommand() {
     clearAddedAccountIds(config);
   };
 
-  const redeemer = new ResetCreditRedeemer(accountManager, { config });
+  // Their lines are written through the console as it is when each is said,
+  // like the prober's and the warmer's. Both are built while a TUI start
+  // holds the console (captureEarlyConsole) and before headless mode tees it
+  // into --activity-log, so a log bound now would write to a hold that is
+  // never read again, or past the activity file.
+  const redeemerLog = (/** @type {string} */ line) => console.log(line);
+  const redeemer = new ResetCreditRedeemer(accountManager, { config, log: redeemerLog });
   // Said at start and at each reload: a reset-credit limit set to a value it
   // cannot read is off, and nothing else would say so.
   for (const line of redeemPolicyWarnings(config)) console.error(line);
-  const claudeRedeemer = new ClaudeResetRedeemer(accountManager, { config });
+  const claudeRedeemer = new ClaudeResetRedeemer(accountManager, { config, log: redeemerLog });
   const resetActions = createResetActions({ accountManager, claudeRedeemer, codexRedeemer: redeemer });
 
   let tui = null;

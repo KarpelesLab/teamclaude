@@ -1,7 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { writeFile } from 'node:fs/promises';
-import { spawnServer } from '../test-helpers/spawn-server.js';
+import { watch } from 'node:fs';
+import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { closedPort, spawnServer } from '../test-helpers/spawn-server.js';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
 import { autoRedeemLine, renderStatus } from '../src/status-renderer.js';
@@ -558,6 +561,60 @@ test('the server says at start and at a reload which reset-credit limit it reads
     const reload = await fetch(`http://127.0.0.1:${server.port}/teamclaude/reload`, { method: 'POST', headers: { 'x-api-key': 'tc-test' }, signal: t.signal });
     assert.equal(reload.status, 200);
     await said(server, /autoRedeemMaxPerDay is "2\/day", which is not a whole number above 0, so the per-day cap is off/, t.signal);
+  } finally {
+    await server.stop();
+  }
+});
+
+/**
+ * Resolves once `file` holds `pattern`, read again on each change the file
+ * system reports rather than on a timer. Rejects once the test has ended.
+ */
+function written(file, pattern, signal) {
+  return new Promise((resolve, reject) => {
+    const watcher = watch(file);
+    const stop = () => { watcher.close(); signal.removeEventListener('abort', ended); };
+    const look = () => readFile(file, 'utf8').then(text => { if (pattern.test(text)) { stop(); resolve(); } }, () => {});
+    const ended = () => { stop(); reject(new Error(`${file} never held ${pattern}`)); };
+    watcher.on('change', look);
+    signal.addEventListener('abort', ended);
+    look();
+  });
+}
+
+test('a redeemer\'s line reaches the --activity-log file, not only the console', { timeout: 60_000 }, async t => {
+  // The redeemers are built before headless mode tees the console into the
+  // activity file, and under a TUI while its start holds the console, so a
+  // log bound as they are built reaches neither. A Codex account saved as
+  // spent, a day from its reset, under a 3-day floor: a refused Codex
+  // request has the walk skip it and say so.
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-redeem-log-'));
+  const activity = join(dir, 'activity.log');
+  const now = Date.now();
+  await writeFile(join(dir, 'config.state.json'), JSON.stringify({
+    quota: [{ provider: 'codex', accountId: 'acct-a', name: 'a', quota: { unified7d: 1, unified7dReset: now + DAY, unified7dSeenAt: now } }],
+  }));
+  // An upstream nothing listens on, for the probe a dry pool sends first.
+  const dead = await closedPort();
+  const server = await spawnServer({
+    dir, args: ['--activity-log', activity],
+    config: () => ({
+      proxy: { apiKey: 'tc-test' }, upstreamProxy: false, autoRedeemResets: true, autoRedeemMinDaysToReset: 3,
+      accounts: [{ name: 'a', type: 'oauth', provider: 'codex', accountId: 'acct-a', accessToken: 't-a', refreshToken: 'r-a', expiresAt: now + 3600_000, upstream: `http://127.0.0.1:${dead}` }],
+    }),
+  });
+  try {
+    const ask = () => fetch(`http://127.0.0.1:${server.port}/backend-api/codex/responses`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': 'tc-test' },
+      body: JSON.stringify({ model: 'gpt-5.6-sol', input: [] }), signal: t.signal,
+    }).then(res => res.text().then(() => res.status), () => null);
+    // The first request a dry pool turns away revalidates it with a probe;
+    // the next, inside the probe's minute, is refused outright.
+    await ask();
+    assert.equal(await ask(), 429);
+    const line = /Codex rate-limit reset on "a" skipped — natural weekly reset is [\d.]+d away, under the 3d minimum/;
+    await said(server, line, t.signal);
+    await written(activity, line, t.signal);
   } finally {
     await server.stop();
   }
