@@ -245,6 +245,26 @@ test('status diagnoses an accepted connection whose server never answers', async
 // $CLAUDE_CODE_SESSION_ID, which Claude Code exports to the commands it runs.
 const SID = '3f2a1b9c-0000-4000-8000-000000000001';
 
+test('a part of an account name works in both --session forms; a shared part lists what it matched', async () => {
+  await withProxy(async (am, configPath) => {
+    const env = { CLAUDE_CODE_SESSION_ID: SID };
+    for (const args of [['switch', '--session', '--to', 'acme'], ['switch', 'BOB', '--session']]) {
+      const res = await runCli(configPath, args, env);
+      assert.equal(res.code, 0, res.stderr);
+      assert.match(res.stdout, /pinned to "bob@example\.com \(Acme\)"/);
+      am.sessionPins.set(SID, null);
+    }
+    const shared = await runCli(configPath, ['switch', '--session', '--to', 'example.com'], env);
+    assert.equal(shared.code, 1);
+    assert.match(shared.stderr, /"example\.com" matches several accounts\nMatching accounts:\n {2}alice@example\.com\n {2}bob@example\.com \(Acme\)/);
+    assert.equal(am.sessionPins.peek(SID), null);
+
+    const fleet = await runCli(configPath, ['switch', 'acme']);
+    assert.equal(fleet.code, 1, 'the fleet switch takes exact names only');
+    assert.equal(am.currentIndex, 0);
+  });
+});
+
 test('switch NAME --session pins only that session, from $CLAUDE_CODE_SESSION_ID', async () => {
   await withProxy(async (am, configPath) => {
     const res = await runCli(configPath, ['switch', 'bob@example.com (Acme)', '--session'], { CLAUDE_CODE_SESSION_ID: SID });

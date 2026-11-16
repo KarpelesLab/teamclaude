@@ -2155,9 +2155,10 @@ async function switchSessionCommand(port, headers, positional) {
     const detail = typeof data.error === 'string' ? data.error : null;
     console.error(detail || `Session pin failed: unexpected reply from localhost:${port} (HTTP ${res.status}).`);
     if (!detail) console.error('An older server without this endpoint answers this way; restart it to pick up the new version.');
-    if (data.accounts?.length) {
-      console.error('Known accounts:');
-      for (const n of data.accounts) console.error(`  ${n}`);
+    const listed = data.matches?.length ? data.matches : data.accounts;
+    if (listed?.length) {
+      console.error(data.matches?.length ? 'Matching accounts:' : 'Known accounts:');
+      for (const n of listed) console.error(`  ${n}`);
     }
     process.exit(1);
   }

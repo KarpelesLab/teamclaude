@@ -1337,11 +1337,19 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           res.end(JSON.stringify({ ok: true, sessionId, account: null, cleared, seen }));
           return;
         }
-        const index = resolveAccountPin(accountManager, target);
+        let index = resolveAccountPin(accountManager, target);
         if (index == null) {
-          res.writeHead(404, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: false, error: `no such account "${target}"`, accounts: names() }));
-          return;
+          const containing = accountsContaining(accountManager, target);
+          if (containing.length === 1) index = containing[0];
+          else if (containing.length) {
+            res.writeHead(409, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: `"${target}" matches several accounts`, matches: containing.map(i => accountManager.accounts[i].name) }));
+            return;
+          } else {
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: `no such account "${target}"`, accounts: names() }));
+            return;
+          }
         }
         // The name, not the index: see session-pins.js.
         const name = accountManager.accounts[index].name;
@@ -1739,6 +1747,27 @@ export function resolveAccountPin(accountManager, token) {
   ]) if (i >= 0) return i;
 
   return null;
+}
+
+/**
+ * Indices of the accounts whose display name contains `token`, ignoring case.
+ *
+ * For a name a person types once: the caller stores the full name of the single
+ * match, so nothing that outlives the call depends on the part staying unique.
+ *
+ * @param {any} accountManager  an AccountManager, or anything with its `accounts`
+ * @param {string} token
+ * @returns {number[]}
+ */
+export function accountsContaining(accountManager, token) {
+  const part = String(token ?? '').trim().toLowerCase();
+  /** @type {number[]} */
+  const indices = [];
+  if (!part) return indices;
+  (accountManager.accounts || []).forEach((/** @type {any} */ a, /** @type {number} */ i) => {
+    if (String(a.name || '').toLowerCase().includes(part)) indices.push(i);
+  });
+  return indices;
 }
 
 /**
