@@ -321,9 +321,10 @@ export function byExhaustion(a, b) {
  * the automatic policy may spend on it at all, why not when it may not, and
  * what a credit spent on it now would buy, in weeks and as the days to the
  * natural reset (each to the step below, as the floor's reason states them;
- * see shownToReset). `armed` is about the policy and
- * the caps, not about the moment — an armed account whose weekly window is
- * still healthy is armed and simply not exhausted.
+ * see shownToReset). `armed` does not wait for the account to run out — an
+ * armed account whose weekly window is still healthy is armed and simply not
+ * exhausted — but it does move with the clock: the floor turns on how far
+ * away the reset is, and the caps on what the last day and week spent.
  *
  * @param {Object} args
  * @param {Record<string, any>} args.account

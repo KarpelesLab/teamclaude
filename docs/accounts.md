@@ -656,9 +656,11 @@ below, as the floor's reason gives them; `null` on a non-Codex row, and on
 every row while the switch is off) and the fleet's
 `redeemPolicy`
 (`{ minDaysToReset, maxShare, maxPerDay, redeemedLast24h }`, where
-`redeemedLast24h` counts automatic redemptions). `armed` is about the policy
-and the caps, not the moment: an armed account whose weekly window is still
-healthy is armed and simply not exhausted.
+`redeemedLast24h` counts automatic redemptions). `armed` does not wait for the
+account to run out: an armed account whose weekly window is still healthy is
+armed and simply not exhausted. It does move with the clock, as the floor and
+the caps do: under a 2-day minimum an account reads `armed` 3.5 days before its
+reset and `exempt` the day before it.
 
 ## Claude banked usage-limit resets
 
