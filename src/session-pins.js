@@ -78,6 +78,16 @@ export class SessionPins {
   }
 
   /**
+   * The account name `sessionId` is pinned to, or null, without counting as
+   * use: a reader that polls must not keep a pin alive.
+   * @param {string|null} sessionId
+   */
+  peek(sessionId, now = this._now()) {
+    const pin = sessionId ? this.pins.get(sessionId) : null;
+    return pin && now - pin.lastUsed <= this.ttlMs ? pin.account : null;
+  }
+
+  /**
    * Follow an account rename, so a pin keeps naming the account it was set on.
    * @param {string} from
    * @param {string} to

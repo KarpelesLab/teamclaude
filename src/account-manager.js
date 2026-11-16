@@ -3034,7 +3034,8 @@ export class AccountManager {
     // SENT, and being sent somewhere is not arriving there. The observation is
     // taken where the evidence is, at the start of the NEXT request from
     // wherever this one left the pin (see _restOn).
-    this.sessionTracker.touch(sessionId, accountIndex, bucket);
+    const record = this.sessionTracker.touch(sessionId, accountIndex, bucket);
+    if (record && model) record.model = model;
     // The load mode's input: one entry per routed request that carries a
     // session id, in every mode, so switching to load starts from a warm picture.
     this.sessionTracker.noteRouted(accountIndex);
@@ -3043,6 +3044,48 @@ export class AccountManager {
     if (!this.expiryRouting.enabled || !this.expiryRouting.preempt) return;
     this._firstSightOn(this.sessionTracker.refsFor(sessionId, bucket, true),
       this.accounts[accountIndex]);
+  }
+
+  /**
+   * Which account a client session is on, from its conversations seen within the
+   * active window of its LAST request. `cost`: the largest context among them,
+   * null for a conversation with no response on record (one restored across a
+   * restart, until its next response). `shown`: the manual pin, else the newest
+   * one's pin in `cost`'s bucket. A conversation with no model on record (a
+   * restored one) is in the bucket of its newest pin.
+   * @param {string|null} sessionId
+   * @param {number} [now]
+   * @returns {{ shown: { index: number|null, name: string|null, via: 'manual'|'affinity' }|null,
+   *   cost: { model: string|null, bucket: string, context: number|null }|null }|null}
+   */
+  sessionAccount(sessionId, now = Date.now()) {
+    const rows = this.sessionTracker.conversationsOf(sessionId, now);
+    let cost = null;
+    let display = null;
+    if (rows.length) {
+      const last = Math.max(...rows.map(r => r.lastSeen));
+      const recent = rows
+        .filter(r => last - r.lastSeen <= this.sessionTracker.activeTtlMs)
+        .map(r => {
+          const bucket = r.model != null ? this._weeklyBucketFor(r.model) : r.pinBucket ?? this._weeklyBucketFor(null);
+          return { row: r, bucket, context: r.tokens[bucket]?.context ?? null };
+        });
+      const size = (/** @type {{ context: number|null }} */ c) => c.context ?? -1;
+      const big = recent.reduce((a, b) => (size(b) > size(a) ? b : a));
+      cost = { model: big.row.model, bucket: big.bucket, context: big.context };
+      display = recent.filter(c => c.bucket === big.bucket).reduce((a, b) =>
+        (b.row.lastSeen > a.row.lastSeen || (b.row.lastSeen === a.row.lastSeen && size(b) > size(a)) ? b : a)).row;
+    }
+    let shown = null;
+    const manual = this.sessionPins.peek(sessionId, now);
+    if (manual != null) {
+      const index = this.accounts.findIndex(a => a.name === manual);
+      shown = { index: index < 0 ? null : index, name: manual, via: /** @type {const} */ ('manual') };
+    } else if (display && cost) {
+      const index = display.pins[cost.bucket] ?? this.sessionTracker.pinnedAccounts(display.id, now)[0];
+      if (index != null) shown = { index, name: this.accounts[index]?.name ?? null, via: /** @type {const} */ ('affinity') };
+    }
+    return shown || cost ? { shown, cost } : null;
   }
 
   /** Mark a session request as in flight / finished. Paired around the whole

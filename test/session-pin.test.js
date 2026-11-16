@@ -231,3 +231,16 @@ test('SessionTracker.knowsSession matches the session behind a conversation key'
   assert.equal(tracker.knowsSession(OTHER), true, 'a key with no conversation is the session id itself');
   assert.equal(tracker.knowsSession(null), false);
 });
+
+test('SessionPins.peek reads a pin without extending its lifetime', () => {
+  let now = 1_000;
+  const pins = new SessionPins({ ttlMs: HOUR, now: () => now });
+  pins.set(SESSION, 'b');
+  now += HOUR;
+  assert.equal(pins.peek(SESSION), 'b');
+  assert.equal(pins.pins.get(SESSION)?.lastUsed, 1_000, 'a peek is not use');
+  now += 1;
+  assert.equal(pins.peek(SESSION), null, 'idle past the window, however often it was peeked');
+  assert.equal(pins.peek(null), null);
+  assert.equal(pins.peek(OTHER), null);
+});
