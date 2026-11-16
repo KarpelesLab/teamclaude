@@ -2016,7 +2016,8 @@ export class AccountManager {
    * names — so no other cursor behaviour changes, and to the account being
    * unavailable for ANY model, so an account barred only for one family keeps
    * the cursor (#276). The destination is what rotation would pick for general traffic,
-   * through the same helpers selectActiveAccount uses.
+   * through the same helpers selectActiveAccount uses: the preferred pool's
+   * pick where the extra-usage preference applies.
    *
    * @param {string} provider
    */
@@ -2029,7 +2030,14 @@ export class AccountManager {
     const partition = this._excludeOtherProviders(null, provider);
     const extra = this._preferredExtraUsage(partition, null, null, provider);
     if (extra && !extra.has(parked.index)) return;
-    const best = /** @type {Record<string, any>|null} */ (this._pickBestAvailable(partition, null));
+    // Where the preference applies, general traffic goes to its pool rather
+    // than to the best account that can serve normally (previewRouteIndex
+    // reads it the same way). Asked of _pickBestAvailable alone, a status
+    // read moved the cursor to an API key, and logged the switch, while the
+    // next request went to a preferred subscription.
+    const best = /** @type {Record<string, any>|null} */ (extra
+      ? this._pickFallback(extra, null, provider, null, true)?.account ?? null
+      : this._pickBestAvailable(partition, null));
     if (!best) return;
     // The shared slot is this provider's only when it names one of its own
     // accounts; otherwise the provider's cursor is its own entry, and moving

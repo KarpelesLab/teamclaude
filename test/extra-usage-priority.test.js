@@ -384,6 +384,35 @@ test('a weekly rollover does not move a conversation the preference serves past 
     { selected: Array(4).fill('subscription'), released: [] });
 });
 
+// A status read unstrands the cursor from a paid account that can no longer
+// serve normally. Where the preference applies, the destination is its pool's
+// pick: chosen as the best account that can serve normally, the cursor and the
+// "Switched to" line named the API key while the next request went to the
+// preferred subscription that had included quota again.
+test('unstranding the cursor follows the preference', t => {
+  const lines = [];
+  t.mock.method(console, 'log', (...args) => lines.push(args.join(' ')));
+  const am = new AccountManager([
+    oauth('s1', { allowExtraUsage: true, preferExtraUsage: true }),
+    oauth('s2', { allowExtraUsage: true, preferExtraUsage: true }),
+    { name: 'api', type: 'apikey', apiKey: 'api-key', priority: 100 },
+  ], 0.98);
+  Object.assign(am.accounts[0].quota, { unified7d: 1, spend: { enabled: true } });
+  Object.assign(am.accounts[1].quota, { unified5h: 1, unified7d: 0.99, spend: { enabled: true } });
+  am._nextProbeAt = Date.now() + 60_000;
+  am.currentIndex = 2;
+  const first = am.getActiveAccount(null, OPUS)?.name;
+  // s2's five-hour window drops back: past its threshold on the weekly alone,
+  // with included quota left.
+  am.accounts[1].quota.unified5h = 0;
+  lines.length = 0;
+  const current = am.getStatus().currentAccount;
+  const switched = lines.filter(line => line.includes('Switched to'));
+  assert.deepEqual({ first, current, switched, next: am.getActiveAccount(null, OPUS)?.name },
+    { first: 's1', current: 's2', next: 's2',
+      switched: ['[TeamClaude] Switched to account "s2" — "s1" is past its switch threshold and only served as the fallback'] });
+});
+
 test('an exclusive model route still restricts extra usage', () => {
   const am = fleet({ preferExtraUsage: true });
   am.setRoutes([{ name: 'opus', match: ['claude-opus-*'], accounts: ['api'] }]);
