@@ -383,14 +383,19 @@ test('refuse manual redemption while that provider has an auto attempt in flight
     let started;
     const ready = new Promise(resolve => { started = resolve; });
     const pending = new Promise(resolve => { release = resolve; });
-    if (provider === 'claude') h.claudeRedeemer.statusFn = async () => { started(); await pending; return { reset: parseResetStatus(block()) }; };
-    else h.codexRedeemer.detailsFn = async () => { started(); await pending; return { credits: [credit()] }; };
+    // Only the automatic attempt's read waits: a manual claim let through
+    // reads at once, and shows here rather than waiting on it.
+    let reads = 0;
+    if (provider === 'claude') h.claudeRedeemer.statusFn = async () => { if (++reads === 1) { started(); await pending; } return { reset: parseResetStatus(block()) }; };
+    else h.codexRedeemer.detailsFn = async () => { if (++reads === 1) { started(); await pending; } return { credits: [credit()] }; };
     const redeemer = provider === 'claude' ? h.claudeRedeemer : h.codexRedeemer;
     const attempt = redeemer.maybeRedeemForPool([h.account]);
     await ready;
-    assert.match((await h.actions.redeem(h.account, provider === 'claude' ? 'weekly' : 'credit-1')).message, /automatic reset is in progress/);
-    assert.equal(h.calls.claims.length + h.calls.consumes.length, 0);
-    release();
+    try {
+      assert.match((await h.actions.redeem(h.account, provider === 'claude' ? 'weekly' : 'credit-1')).message, /automatic reset is in progress/);
+      assert.equal(reads, 1, `${provider}: declined before a read of its own`);
+      assert.equal(h.calls.claims.length + h.calls.consumes.length, 0);
+    } finally { release(); }
     assert.equal((await attempt).redeemed, true);
   }
 });
@@ -427,21 +432,95 @@ test('an account removed while its details are read is never claimed on, by hand
   }
 });
 
+/** A claim (or consume) whose first call waits for `release`, and the promise
+ *  that settles once that first call has started. */
+function heldFirst(verdict) {
+  let release, started;
+  const ready = new Promise(resolve => { started = resolve; });
+  const pending = new Promise(resolve => { release = resolve; });
+  const fn = async (_account, _attempt, n) => { if (n === 1) { started(); await pending; } return verdict; };
+  return { fn, ready, release: () => release() };
+}
+
+test('no automatic attempt starts while a manual claim is in flight, for either provider', async () => {
+  for (const provider of ['claude', 'codex']) {
+    const held = heldFirst(provider === 'claude' ? { result: 'reset', resetsLeft: 0, cleared: ['seven_day'] } : { code: 'reset', windowsReset: 2 });
+    const h = harness({ provider, armed: true, claim: held.fn, consume: held.fn });
+    const redeemer = provider === 'claude' ? h.claudeRedeemer : h.codexRedeemer;
+    const manual = h.actions.redeem(h.account, provider === 'claude' ? 'weekly' : 'credit-1');
+    await held.ready;
+    try {
+      assert.match((await redeemer.maybeRedeemForPool([h.account])).reason, /manual reset is in progress/, provider);
+    } finally { held.release(); }
+    assert.equal((await manual).redeemed, true);
+    assert.equal(h.calls.claims.length + h.calls.consumes.length, 1, provider);
+  }
+});
+
+test('a manual claim made straight on the redeemer is refused while an automatic attempt is in flight', async () => {
+  for (const provider of ['claude', 'codex']) {
+    const held = heldFirst(provider === 'claude' ? { result: 'reset', resetsLeft: 0, cleared: ['seven_day'] } : { code: 'reset', windowsReset: 2 });
+    const h = harness({ provider, armed: true, claim: held.fn, consume: held.fn });
+    const redeemer = provider === 'claude' ? h.claudeRedeemer : h.codexRedeemer;
+    const auto = redeemer.maybeRedeemForPool([h.account]);
+    await held.ready;
+    try {
+      const direct = await redeemer.redeemGrant(h.account, provider === 'claude' ? 'weekly' : 'credit-1', { manual: true });
+      assert.equal(direct.redeemed, false, provider);
+      assert.equal(direct.reason, 'an automatic reset is in progress');
+    } finally { held.release(); }
+    assert.equal((await auto).redeemed, true);
+    assert.equal(h.calls.claims.length + h.calls.consumes.length, 1, provider);
+  }
+});
+
+test('a panel reopened while its first read is pending shares that read', async () => {
+  const h = harness();
+  const [first, second] = await Promise.all([h.actions.read(h.account), h.actions.read(h.account)]);
+  assert.equal(h.calls.statuses, 1);
+  assert.equal(first, second);
+});
+
+test('a manual Claude fallback never claims on a reading dated after now', async () => {
+  const h = harness();
+  await h.actions.read(h.account);
+  h.clock.at -= 60_000;
+  h.claudeRedeemer.statusFn = async () => ({ error: 'HTTP 429', status: 429 });
+  assert.match((await h.actions.redeem(h.account, 'weekly')).message, /no recent reading to fall back on/);
+  assert.equal(h.calls.claims.length, 0);
+});
+
+test('a manual Codex claim replays its own credit\'s key, never an automatic attempt\'s unread one', async () => {
+  const h = harness({ provider: 'codex', armed: true, credits: [credit(), credit({ id: 'credit-2' })],
+    consume: (_account, _attempt, n) => n === 1 ? { error: 'lost verdict' } : { code: 'reset', windowsReset: 2 } });
+  await h.codexRedeemer.maybeRedeemForPool([h.account]);
+  const other = h.calls.consumes[0].creditId === 'credit-1' ? 'credit-2' : 'credit-1';
+  assert.equal((await h.actions.redeem(h.account, other)).redeemed, true);
+  assert.equal(h.calls.consumes[1].creditId, other);
+  assert.notEqual(h.calls.consumes[1].redeemRequestId, h.calls.consumes[0].redeemRequestId);
+});
+
 test('one manual redeem at a time, and auto cannot race its fresh read', async () => {
   const h = harness({ armed: true });
   let release;
   let started;
   const ready = new Promise(resolve => { started = resolve; });
   const pending = new Promise(resolve => { release = resolve; });
-  h.am.ensureTokenFresh = async () => { started(); await pending; };
+  // Only the first claim's refresh waits: anything let through beside it
+  // refreshes, reads and claims at once, and shows here rather than waiting.
+  let refreshes = 0;
+  h.am.ensureTokenFresh = async () => { if (++refreshes === 1) { started(); await pending; } };
   const first = h.actions.redeem(h.account, 'weekly');
   await ready;
-  assert.match((await h.actions.redeem(h.account, 'fable')).message, /manual reset is in progress/);
-  assert.match((await h.claudeRedeemer.maybeRedeemForPool([h.account])).reason, /manual reset is in progress/);
-  const codex = { ...h.account, index: 1, provider: 'codex', accountId: 'codex' };
-  h.am.accounts.push(codex);
-  assert.match((await h.actions.redeem(codex, 'credit-1')).message, /manual reset is in progress/);
-  release();
+  try {
+    assert.match((await h.actions.redeem(h.account, 'fable')).message, /manual reset is in progress/);
+    assert.match((await h.claudeRedeemer.maybeRedeemForPool([h.account])).reason, /manual reset is in progress/);
+    const codex = { ...h.account, index: 1, provider: 'codex', accountId: 'codex' };
+    h.am.accounts.push(codex);
+    assert.match((await h.actions.redeem(codex, 'credit-1')).message, /manual reset is in progress/);
+    assert.equal(refreshes, 1, 'nothing else refreshed a token while the first claim was out');
+    assert.equal(h.calls.statuses + h.calls.details + h.calls.claims.length + h.calls.consumes.length, 0);
+  } finally { release(); }
   assert.equal((await first).redeemed, true);
   assert.equal(h.calls.claims.length, 1);
 });

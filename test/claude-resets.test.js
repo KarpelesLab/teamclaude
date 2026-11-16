@@ -463,6 +463,22 @@ test('held after the 429 of upstream\'s 5-hour wall and parked on a weekly readi
   assert.deepEqual(family.calls.grants, ['fable']);
 });
 
+test('a weekly reading exactly at the switch threshold parks the account, as it does for selection', async () => {
+  const { am, redeemer, calls } = parkedHarness({ quota: { unified7d: 0.98 } });
+  assert.equal(am.unavailableReason(am.accounts[0], OPUS), 'quota');
+  assert.equal((await redeemer.maybeRedeemForPool(am.accounts, { model: OPUS })).redeemed, true);
+  assert.deepEqual(calls.claim, ['a']);
+});
+
+test('parked by a learned scoped weekly beside the shared one: a reset that clears only the shared weekly is not spent', async () => {
+  const scopedWeekly = { opus: { utilization: 0.99, resetAt: Date.now() + 3 * DAY } };
+  const { am, redeemer, calls } = parkedHarness({ quota: { unified7d: 0.99, scopedWeekly } });
+  const r = await redeemer.maybeRedeemForPool(am.accounts, { model: OPUS });
+  assert.equal(r.redeemed, false);
+  assert.equal(r.reason, 'no reset is known to clear its scopedWeekly reading');
+  assert.equal(calls.claim.length, 0);
+});
+
 test('parked only by the 5-hour window: a weekly reset is never spent for it', async () => {
   const { am, redeemer, calls } = parkedHarness({ quota: { unified5h: 0.99, unified7d: 0.5 } });
   assert.equal(am.unavailableReason(am.accounts[0], OPUS), 'quota', 'the server would offer this account');
