@@ -2257,19 +2257,32 @@ export function insightsChange(cur, prev, range) {
  * @param {string|number} bucket
  * @param {string} unit
  * @param {boolean} long
+ * @param {boolean} [withYear]  add the year to the long form, for a range that spans two (spansYears)
  */
-export function insightsBucketLabel(bucket, unit, long) {
+export function insightsBucketLabel(bucket, unit, long, withYear) {
   if (unit === 'hour') {
     var h = new Date(Number(bucket));
     // The hour's own minutes, not ':00': buckets are epoch hours, which start
     // at :30 or :45 local time in a zone with a fractional offset (India, Nepal).
     var hh = String(h.getHours()).padStart(2, '0') + ':' + String(h.getMinutes()).padStart(2, '0');
-    return long ? h.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' }) + ' ' + hh : hh;
+    return long ? h.toLocaleDateString([], withYear ? { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' } : { weekday: 'short', month: 'short', day: 'numeric' }) + ' ' + hh : hh;
   }
   var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(bucket));
   if (!m) return String(bucket);
   var d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
-  return d.toLocaleDateString([], long ? { weekday: 'short', month: 'short', day: 'numeric' } : { month: 'short', day: 'numeric' });
+  return d.toLocaleDateString([], long ? (withYear ? { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' } : { weekday: 'short', month: 'short', day: 'numeric' }) : { month: 'short', day: 'numeric' });
+}
+
+// Whether a reply's buckets fall in more than one calendar year, so that a
+// tooltip or table naming a day says which year: on All, Nov 16 can be there
+// twice. The axis keeps its short labels; the hover and the Table carry it.
+/** @param {any} data  a GET /teamclaude/insights reply */
+export function spansYears(data) {
+  var b = (data && data.buckets) || [];
+  if (b.length < 2) return false;
+  /** @param {string|number} x */
+  var year = function (x) { return typeof x === 'number' ? new Date(x).getFullYear() : String(x).slice(0, 4); };
+  return String(year(b[0])) !== String(year(b[b.length - 1]));
 }
 
 // The series the timeline stacks for one "split by" choice, bottom first, each
@@ -2942,7 +2955,9 @@ export function calendarGrid(data, values) {
   active.sort(function (x, y) { return x - y; });
   var q = function (/** @type {number} */ f) { return active.length ? active[Math.floor(f * (active.length - 1))] : 0; };
   var cuts = [q(0.25), q(0.5), q(0.75)];
-  var flat = cuts[0] === cuts[2];
+  // Flat only when every active day is the same: equal cuts with a day above
+  // them (a plateau and one spike) still give that day the top shade.
+  var flat = active.length > 0 && active[0] === active[active.length - 1];
   var level = function (/** @type {number} */ x) { return !(x > 0) ? 0 : flat ? 4 : x <= cuts[0] ? 1 : x <= cuts[1] ? 2 : x <= cuts[2] ? 3 : 4; };
   /** @type {({ i: number, key: string, value: number, level: number, today: boolean }|null)[][]} */
   var weeks = [];
@@ -3079,7 +3094,7 @@ const SHARED_HELPERS = [
   connectRequest, connectRowView, connectOutcome,
   peerLinkRequest, peerLinkOutcome, peerTestOutcome, linkSelfOptions, linkBackNotice, instanceLink, parseInstanceLink, linkAddMissing,
   accountSyncRequest, accountSyncUser, accountSyncOwnMode, accountSyncMembers, accountSyncLine, peerSyncCell, accountSyncApprovalHref, accountSyncSignInOutcome, accountSyncCancelOutcome, accountSyncOutcome,
-  fmtTokens, fmtUsd, fmtUsdShort, niceCeil, insightsRangeText, insightsChange, insightsBucketLabel, insightsSeries, stackSeries, seriesStats, recordedFrom, insightsDayKey, bucketAt, labelStep, pricedRequests, cacheHitRate, peakBucket, providerRows, topModels, fleetMissingText,
+  fmtTokens, fmtUsd, fmtUsdShort, niceCeil, insightsRangeText, spansYears, insightsChange, insightsBucketLabel, insightsSeries, stackSeries, seriesStats, recordedFrom, insightsDayKey, bucketAt, labelStep, pricedRequests, cacheHitRate, peakBucket, providerRows, topModels, fleetMissingText,
   costEstimated, sinceText, insightsTotals, runningTotals, rollingAverage, insightsTrend, calendarNote, insightsHeadline, insightsPace, monthTotals, calendarGrid, breakdownRows,
 ].map(fn => fn.toString()).join('\n\n');
 
@@ -6052,9 +6067,6 @@ ${SHARED_HELPERS}
       paint(svgEl('rect', { x: m.l, y: m.t, width: gw, height: ph, class: 'insnr' }, s), 'var(--panel2)');
       if (gw > 90) svgEl('text', { x: m.l + gw / 2, y: m.t + 14, 'text-anchor': 'middle', class: 'insref' }, s).textContent = 'not recorded';
     }
-    // Every series left on show has no price: say so where the bars would be,
-    // rather than let an empty plot read as $0.
-    if (o.note) svgEl('text', { x: m.l + pw / 2, y: m.t + ph / 2, 'text-anchor': 'middle', class: 'insref' }, s).textContent = o.note;
     // Four bands of grid: dashed and faint, with a solid baseline.
     for (var g = 0; g <= 4; g++) {
       var gy = m.t + ph - ph * g / 4;
@@ -6062,6 +6074,10 @@ ${SHARED_HELPERS}
       if (g) line.setAttribute('stroke-dasharray', '3 3');
       svgEl('text', { x: m.l - 8, y: gy + 4, 'text-anchor': 'end' }, s).textContent = g ? o.axis(top * g / 4) : '0';
     }
+    // Every series left on show has no price: say so where the bars would be,
+    // over the grid and clear of its midline, rather than let an empty plot
+    // read as $0.
+    if (o.note) svgEl('text', { x: m.l + pw / 2, y: m.t + ph * 3 / 8, 'text-anchor': 'middle', class: 'insref' }, s).textContent = o.note;
     // Labels anchored on the latest bucket and stepped back from it, as far
     // apart as the widest label needs.
     var sample = insightsBucketLabel(d.buckets[n - 1], d.unit, false);
@@ -6164,7 +6180,7 @@ ${SHARED_HELPERS}
     tipOn(hit, function (e) {
       var i = at(e);
       insightsCursor(i);
-      var title = insightsBucketLabel(d.buckets[i], d.unit, true) + (i === n - 1 ? ' (so far)' : '');
+      var title = insightsBucketLabel(d.buckets[i], d.unit, true, spansYears(d)) + (i === n - 1 ? ' (so far)' : '');
       if (i < (o.from || 0)) { showInsightsTip(e, title, [{ why: 'Before recording began: not idle, not recorded.' }]); return; }
       var none = shown.every(function (sr) { return sr.unpriced; });
       // The rows read like the marks under the pointer: each series' own
@@ -6252,7 +6268,7 @@ ${SHARED_HELPERS}
         pos[c.i] = { x: x, y: y };
         tipOn(sq, function (e) {
           insightsCursor(c.i);
-          showInsightsTip(e, insightsBucketLabel(c.key, 'day', true) + (c.today ? ' (so far)' : ''), c.level < 0
+          showInsightsTip(e, insightsBucketLabel(c.key, 'day', true, spansYears(d)) + (c.today ? ' (so far)' : ''), c.level < 0
             ? [{ why: 'Before recording began: not idle, not recorded.' }]
             : [{ label: mt.name, value: mt.fmt(c.value), color: mt.color }]);
         }, function () { insightsCursor(null); });
@@ -6397,7 +6413,7 @@ ${SHARED_HELPERS}
       e.stopPropagation();
       var i = bucketAt(e.clientX - s.getBoundingClientRect().left, band, n);
       insightsCursor(i);
-      showInsightsTip(e, insightsBucketLabel(d.buckets[i], d.unit, true) + (i === n - 1 ? ' (so far)' : ''), i < from
+      showInsightsTip(e, insightsBucketLabel(d.buckets[i], d.unit, true, spansYears(d)) + (i === n - 1 ? ' (so far)' : ''), i < from
         ? [{ why: 'Before recording began: not idle, not recorded.' }]
         : [{ label: r.label, value: fmt(r.values[i] || 0), color: r.color }]);
     };
@@ -6623,7 +6639,8 @@ ${SHARED_HELPERS}
     var mt = INS_METRICS[metric];
     var other = metric === 'cost' ? 'tokens' : 'cost';
     var ot = INS_METRICS[other];
-    var when = function (b) { return insightsBucketLabel(b, d.unit, true); };
+    var yrs = spansYears(d);
+    var when = function (b) { return insightsBucketLabel(b, d.unit, true, yrs); };
     var num = function (v) { return Math.round(v).toLocaleString(); };
     var rangeText = insightsRangeText(d.range);
     var hourly = d.unit === 'hour';
@@ -6673,7 +6690,7 @@ ${SHARED_HELPERS}
       var narrow = (host.clientWidth || 600) < 520;
       drawHero(host, d, series, {
         view: running ? 'total' : 'daily', height: narrow ? 210 : 280, name: heroTitle, fmt: mt.fmt, axis: mt.axis,
-        from: from, trend: nonePriced ? null : insightsTrend(shownSum, d.unit, from), note: nonePriced ? 'not priced: no list price for the series shown' : null,
+        from: from, trend: nonePriced ? null : insightsTrend(shownSum, d.unit, from), note: nonePriced ? 'not priced' : null,
         // The period before, as one figure: only against everything, not a part of it.
         ref: prevTotal != null && prevTotal > 0 && !anyHidden ? { value: prevTotal, label: 'previous ' + (hourly ? '24 hours' : parseInt(d.range, 10) + ' days') + ': ' + mt.fmt(prevTotal) } : null,
         other: otherValues, otherName: ot.name, otherFmt: ot.fmt,

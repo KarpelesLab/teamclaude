@@ -1384,9 +1384,12 @@ test('the Insights hero table follows the view, and says not recorded and not pr
   // labelled with a $0 figure.
   const claudeRow = page.built.slice(chartAt).find(e => /\btog\b/.test(String(e.className || '')) && e.listens('click'));
   assert.ok(claudeRow, 'the Claude legend row');
+  const notPriced = (/** @type {any[]} */ els) => els.filter(e => e.textContent === 'not priced').length;
+  const shownBefore = notPriced(page.built.slice(chartAt));
   const before = page.built.length;
   claudeRow.fire('click');
-  assert.ok(page.labelled('not priced: no list price for the series shown') >= 1, 'a note where the bars would be');
+  // The same page redrawn, plus one: the note in the plot.
+  assert.equal(notPriced(page.built.slice(before)), shownBefore + 1, 'a note where the bars would be');
   assert.equal(page.built.slice(before).filter(e => /\$0(?![.\d])/.test(String(e.textContent || ''))).length, 0, 'no $0 anywhere in the redraw');
 
   const priced = bootPage();

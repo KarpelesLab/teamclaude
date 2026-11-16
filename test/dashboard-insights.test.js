@@ -11,7 +11,7 @@ import {
   insightsSeries, stackSeries, topModels, fmtUsd, fmtUsdShort, fleetMissingText,
   seriesStats, cacheHitRate, peakBucket, providerRows,
   recordedFrom, insightsDayKey, bucketAt, labelStep, pricedRequests,
-  costEstimated, sinceText, insightsTotals, runningTotals, rollingAverage, insightsTrend, calendarNote, insightsHeadline, insightsPace, monthTotals, calendarGrid, breakdownRows,
+  costEstimated, sinceText, insightsTotals, runningTotals, rollingAverage, insightsTrend, calendarNote, insightsHeadline, insightsPace, monthTotals, calendarGrid, breakdownRows, spansYears,
 } from '../src/dashboard.js';
 
 test('the page ships every Insights helper it is tested against', () => {
@@ -19,7 +19,7 @@ test('the page ships every Insights helper it is tested against', () => {
   for (const fn of [fmtTokens, niceCeil, insightsRangeText, insightsChange, insightsBucketLabel, insightsSeries, stackSeries, topModels, fmtUsd, fmtUsdShort, fleetMissingText,
     seriesStats, cacheHitRate, peakBucket, providerRows,
     recordedFrom, insightsDayKey, bucketAt, labelStep, pricedRequests,
-    costEstimated, sinceText, insightsTotals, runningTotals, rollingAverage, insightsTrend, calendarNote, insightsHeadline, insightsPace, monthTotals, calendarGrid, breakdownRows]) {
+    costEstimated, sinceText, insightsTotals, runningTotals, rollingAverage, insightsTrend, calendarNote, insightsHeadline, insightsPace, monthTotals, calendarGrid, breakdownRows, spansYears]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
   assert.ok(html.includes('id="page-insights"'), 'the page section');
@@ -533,6 +533,22 @@ test('the calendar: weeks from Monday, shaded by quarter of active days, with ea
   assert.deepEqual(mid.weeks[0].slice(2, 5).map(c => c && c.level), [4, 4, 4]);
   assert.deepEqual(calendarGrid({ ...reply, buckets: dayRun('2026-11-04', 3) }, [0, 7, 2]).weeks[0].slice(2, 5).map(c => c && c.level), [0, 4, 4]);
   assert.deepEqual(calendarGrid({ ...reply, unit: 'hour' }, values).weeks, [], 'hours have no calendar');
+  // A plateau and one spike: the cuts are equal, but the spike still stands out.
+  const spike = calendarGrid({ ...reply, buckets: dayRun('2026-11-02', 6) }, [10, 10, 10, 10, 100, 1]);
+  assert.deepEqual(spike.weeks[0].slice(0, 5).map(c => c && c.level), [1, 1, 1, 1, 4]);
+});
+
+test('a range across two years names the year in its hovers and tables, and only then', () => {
+  assert.equal(spansYears({ buckets: ['2025-12-31', '2026-01-01'] }), true);
+  assert.equal(spansYears({ buckets: ['2026-11-01', '2026-11-15'] }), false);
+  assert.equal(spansYears({ buckets: ['2026-11-15'] }), false);
+  assert.equal(spansYears(null), false);
+  const day = '2025-11-16';
+  const plain = insightsBucketLabel(day, 'day', true);
+  const dated = insightsBucketLabel(day, 'day', true, true);
+  assert.equal(dated, new Date(2025, 10, 16).toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' }));
+  assert.notEqual(plain, dated);
+  assert.equal(insightsBucketLabel(day, 'day', false, true), insightsBucketLabel(day, 'day', false), 'the axis keeps its short labels');
 });
 
 test('where it went: ranked by the metric, unpriced rows after the priced ones, with the cost of a million tokens', () => {
