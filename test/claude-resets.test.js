@@ -509,6 +509,34 @@ test('a dry pool of parked accounts: the proxy hands the redeemer the model, and
   } finally { proxy.close(); upstream.close(); }
 });
 
+// unavailableReason names `quota` ahead of `route`, so an account the model's
+// route excludes reads as resettable unless the offer asks the route itself.
+test('a dry pool offers only the accounts the request model\'s route allows, parked or at the upstream limit', async () => {
+  for (const atLimit of [false, true]) {
+    let hits = 0;
+    const upstream = http.createServer((_req, res) => { hits++; res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"ok":true}'); });
+    const port = await new Promise(r => upstream.listen(0, '127.0.0.1', () => r(upstream.address().port)));
+    const { am, redeemer, calls } = parkedHarness({ accounts: [oauth('a'), oauth('b')], quota: { unified7d: atLimit ? 1 : 0.99 },
+      blockExtra: atLimit ? { at_limit: true, exhausted: ['seven_day'] } : {} });
+    am.setRoutes([{ name: 'fable-on-a', match: ['*fable*'], accounts: ['a'] }]);
+    // `b` would wait longest, so it is the one a route-blind offer spends on.
+    am.accounts[1].quota.unified7dReset = Date.now() + 6 * DAY;
+    am._nextProbeAt = Date.now() + H;
+    const offered = [];
+    const hooks = { redeemClaudeResetForPool: (cands, opts) => { offered.push(cands.map(a => a.name)); return redeemer.maybeRedeemForPool(cands, opts); } };
+    const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${port}` }, hooks);
+    try {
+      const pport = await new Promise(r => proxy.listen(0, '127.0.0.1', () => r(proxy.address().port)));
+      const res = await fetch(`http://127.0.0.1:${pport}/v1/messages`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: FABLE, max_tokens: 1, messages: [] }) });
+      await res.text();
+      assert.deepEqual(offered, [['a']], `atLimit=${atLimit}`);
+      assert.deepEqual(calls.claim, ['a'], `atLimit=${atLimit}`);
+      assert.equal(res.status, 200);
+      assert.equal(hits, 1);
+    } finally { proxy.close(); upstream.close(); }
+  }
+});
+
 // ── through the proxy ───────────────────────────────────────────────────────
 
 async function oneRefusedClaudeRequest({ onRedeem }) {

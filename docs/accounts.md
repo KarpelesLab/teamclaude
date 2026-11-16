@@ -807,7 +807,8 @@ selected again against the account it cleared.
   none clears the whole wall. Manual selection still chooses any usable grant.
 - `accounts[].autoRedeemReset: false` exempts an account, as it does for Codex;
   so does being disabled, having no organization id, or last reading zero held
-  resets.
+  resets. An account the refused request's model route does not allow is never
+  offered.
 
 After a reset the Claude pool holds off for an hour, so one dry pool costs one
 reset. A claim whose answer never arrived may still have spent the grant: its

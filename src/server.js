@@ -4356,6 +4356,10 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         && !(resetProvider === DEFAULT_PROVIDER && a.upstream)
         // Not a cordoned account: the reset would buy new work it takes none of.
         && !a.cordoned
+        // Nor one the request's model route excludes. unavailableReason names
+        // `quota` ahead of `route`, so such an account can read as resettable,
+        // and a reset there clears windows this request may never use.
+        && accountManager._routeAllows(a, ctx.model)
         && clears.has(accountManager.unavailableReason(a, ctx.model) ?? ''))
       : [];
     if (resettable.length) {
