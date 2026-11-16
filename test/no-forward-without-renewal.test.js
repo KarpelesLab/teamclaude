@@ -80,3 +80,26 @@ test('control: a renewal that works is used, and the request is served with the 
     assert.deepEqual(f.hits, ['live-a2']);
   } finally { f.close(); }
 });
+
+// A page in front of the token endpoint (a 403 that is not its refusal) keeps
+// the token and holds its renewal for a short while. That hold is the token's:
+// a sign-in or an import that brings a new refresh token meanwhile is renewed
+// and serves the next request, rather than waiting the old token's hold out.
+test('a new refresh token that arrives inside a kept 403\'s hold is renewed and serves the next request', async () => {
+  const f = await fleet([expired('a')], async (_account, refresh) => refresh());
+  const sent = [];
+  f.am._refreshFn = async (rt) => {
+    sent.push(rt);
+    if (rt === 'rt-a') throw Object.assign(new Error('Token refresh failed (403): <html>Access denied</html>'), { status: 403, grantRefused: false });
+    return { accessToken: `live-${rt}`, refreshToken: `${rt}-next`, expiresAt: Date.now() + 8 * H };
+  };
+  try {
+    const first = await f.send();
+    assert.equal(first.status, 503);
+    f.am.updateAccountTokens(0, { accessToken: 'dead-new', refreshToken: 'rt-new', expiresAt: Date.now() - H });
+    const r = await f.send();
+    assert.equal(r.status, 200);
+    assert.deepEqual(sent, ['rt-a', 'rt-new']);
+    assert.deepEqual(f.hits, ['live-rt-new']);
+  } finally { f.close(); }
+});

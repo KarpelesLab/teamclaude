@@ -97,13 +97,13 @@ test('the token-refresh passthrough is capped too', async () => {
 // the request open, and the runner's timeout would say so.
 test('the token-refresh passthrough answers 502 for an answer too large to hold, and drops the rest', async (t) => {
   const LIMIT = 4096;
-  /** @type {(ended: boolean) => void} */
+  /** @type {() => void} */
   let dropped = () => {};
-  const upstreamDropped = new Promise((resolve) => { dropped = resolve; });
+  const upstreamDropped = new Promise((resolve) => { dropped = () => resolve(undefined); });
   const upstream = http.createServer((req, res) => {
     req.resume();
     req.on('end', () => {
-      res.on('close', () => dropped(res.writableEnded));
+      res.on('close', () => dropped());
       res.writeHead(200, { 'content-type': 'application/json' });
       res.write(Buffer.alloc(2 * LIMIT, 0x61));
     });
@@ -126,7 +126,11 @@ test('the token-refresh passthrough answers 502 for an answer too large to hold,
       const res = await post(port, '/v1/oauth/token', '{}');
       assert.equal(res.status, 502);
       assert.match(res.text, /Upstream response too large/);
-      assert.equal(await upstreamDropped, false, 'the upstream connection was dropped with its answer unfinished');
+      // The await is the check: this upstream never ends its answer, so only
+      // the proxy dropping its connection settles it, and a proxy that
+      // answered but left the connection open leaves it to the runner's
+      // timeout.
+      await upstreamDropped;
       assert.ok(lines.some(l => /Token refresh passthrough: upstream answer larger than 4096 bytes, not relayed/.test(l)),
         `the operator is told which path it was, and the limit: ${lines.join(' | ')}`);
     });

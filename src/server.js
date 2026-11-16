@@ -10,7 +10,7 @@ import { patchAccountUuid } from './account-uuid-rewrite.js';
 import { sanitizeToolPairs } from './tool-pair-sanitize.js';
 import { sanitizeCacheControl, cacheControlSubfieldsToStrip } from './cache-control-sanitize.js';
 import { sanitizeContentBlocks, contentBlockTypesToStrip } from './content-block-sanitize.js';
-import { parseRequestModel, parseAdvisorModel } from './account-manager.js';
+import { parseRequestModel, parseAdvisorModel, refreshHeldUntil } from './account-manager.js';
 import { isTokenExpired } from './oauth.js';
 import { TopLevelFieldFinder, modelGlobMatches, parseRequestEffort, parseRequestStream } from './model.js';
 import { conversationDigest, pinKeyFor } from './conversation.js';
@@ -22,6 +22,7 @@ import { matchAccounts } from './identity.js';
 import { tunnelTls } from './sx.js';
 import { createEgressGuard } from './egress-guard.js';
 import { createDrainState, DRAIN_RETRY_AFTER_SECONDS } from './drain.js';
+import { resolveCompactBeforeSwitch, decideCompactBeforeSwitch, promptTooLongBody } from './compact-before-switch.js';
 import { isRoutingFailure, describeRouting } from './account-routing.js';
 import { safeLine } from './safe-text.js';
 import { upstreamErrorType } from './error-type.js';
@@ -275,7 +276,9 @@ async function readErrorBody(body, limit = ERROR_BODY_INSPECTION_LIMIT) {
   }
 }
 
-// The largest upstream answer the proxy holds whole. Three paths read a body to
+// The largest upstream answer the proxy holds whole, by default: the limit in
+// force is resolveBufferedResponseLimit's, and
+// TEAMCLAUDE_UPSTREAM_MAX_HELD_BYTES sets another. Three paths read a body to
 // its end before relaying it: the forward path's answer that is not an event
 // stream (for its usage figures and the log), the token-refresh passthrough and
 // the client-credential retry (each relayed in one write). Their upstreams are
@@ -296,13 +299,18 @@ const BUFFERED_RESPONSE_LIMIT = 64 * 1024 * 1024;
 /**
  * The limit in force. Read per call like the body idle timeout, so a test can
  * shrink it through TEAMCLAUDE_UPSTREAM_MAX_HELD_BYTES without reloading the
- * module (and without pushing 64 MiB through loopback to cross it). Unset,
- * empty or non-positive means the default.
+ * module (and without pushing 64 MiB through loopback to cross it). The
+ * setting is a whole number of bytes, parsed as upstream-fetch.js parses
+ * TEAMCLAUDE_UPSTREAM_MAX_SOCKETS and ..._QUEUE_TIMEOUT_MS (positiveInt):
+ * Number() of the text, which takes `0x1000`, `1e3` and surrounding spaces
+ * too, and the default unless that is a whole number from 1 to
+ * Number.MAX_SAFE_INTEGER (so unset, empty, zero, negative, a fraction,
+ * Infinity or `64MiB`).
  * @returns {number}
  */
 export function resolveBufferedResponseLimit() {
   const env = Number(envVar('UPSTREAM_MAX_HELD_BYTES'));
-  return env > 0 ? env : BUFFERED_RESPONSE_LIMIT;
+  return Number.isSafeInteger(env) && env > 0 ? env : BUFFERED_RESPONSE_LIMIT;
 }
 
 /**
@@ -374,9 +382,10 @@ export async function holdBody(stream, limit = resolveBufferedResponseLimit(), i
 }
 
 /**
- * Answer a passthrough whose upstream answer outgrew BUFFERED_RESPONSE_LIMIT:
- * the rest is dropped unread (which closes the upstream connection), the
- * operator is told which path it was, and the client gets a 502 that says why.
+ * Answer a passthrough whose upstream answer outgrew the hold limit
+ * (resolveBufferedResponseLimit): the rest is dropped unread (which closes the
+ * upstream connection), the operator is told which path it was, and the
+ * client gets a 502 that says why.
  * @param {any} res
  * @param {ReadableStream<Uint8Array>|null} body  holdBody's replay
  * @param {string} where  the path, for the log line
@@ -990,6 +999,16 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // Status endpoint
       if (req.method === 'GET' && req.url === '/teamclaude/status') {
         const status = accountManager.getStatus({ sessionDetail: config.proxy?.sessionDetail === true });
+        // The reset-credit policy's view of each account, beside the row the
+        // manager built for it. Rows are built from `accountManager.accounts`
+        // in order within this same tick, so the two line up by position; a
+        // server built without the hook (every test that is not about
+        // redemption) leaves the rows as they were.
+        if (hooks.describeAutoRedeem) {
+          status.accounts.forEach((/** @type {Record<string, any>} */ row, /** @type {number} */ i) => {
+            row.autoRedeem = hooks.describeAutoRedeem(accountManager.accounts[i]) ?? null;
+          });
+        }
         const extra = hooks.getStatusExtra?.() || {};
         res.writeHead(200, { 'Content-Type': 'application/json' });
         // Counters only: how full the upstream admission gate is (see
@@ -2376,6 +2395,38 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         return;
       }
 
+      // compactBeforeSwitch (issue #709, off unless set): a long conversation
+      // whose account is about to reach a switch threshold is answered once
+      // with the API's own "prompt is too long" 400, so Claude Code compacts it
+      // on the account that still holds its cache and the switch that follows
+      // carries a summary. Nothing is forwarded and no quota is spent on it.
+      // The first test is the whole cost while the setting is off. Never for a
+      // request something pins to an account (TC_ACCT, `/tc-acct/`, which is
+      // also how keep-warm sends, an operator session pin): a pinned request
+      // does not rotate, so no switch is coming. Read live from the shared
+      // config, so a reload applies to the next request.
+      const compactAsk = /** @type {any} */ (config)?.compactBeforeSwitch && pinnedIndex == null && sessionId && pinKey && provider === DEFAULT_PROVIDER
+        ? compactAskFor(accountManager, config, { method: req.method, url: req.url, bodyBytes: body.length, pinKey, sessionId, model, advisorModel })
+        : null;
+      if (compactAsk && !res.headersSent && !clientGone(res)) {
+        const { account, window: near, settings, asks } = compactAsk;
+        // Recorded before the answer is written: the client's compaction
+        // request follows at once and must find the record.
+        asks.record(compactAsk.pinKey, compactAsk.sessionId, body.length, settings.cooldownMs);
+        // What a relayed upstream 400 gives the client to act on: the JSON
+        // error and `x-should-retry: false`, which the API sends with a 400.
+        // No `request-id`: upstream issued none, and inventing one would name a
+        // request that does not exist there.
+        res.writeHead(400, { 'Content-Type': 'application/json', 'x-should-retry': 'false' });
+        res.end(promptTooLongBody(body.length));
+        const pct = (/** @type {number} */ v) => `${Math.round(v * 100)}%`;
+        console.log(`[TeamClaude] Asked session ${compactAsk.sessionId.slice(0, 8)} to compact before "${safeLine(account.name, 64)}" switches: ${near.bucket} is at ${pct(near.utilization)}, switch threshold ${pct(near.threshold)}, request body ${body.length} bytes. Answered 400 "prompt is too long" here; nothing was sent upstream (compactBeforeSwitch)`);
+        recordEarlyOutcome(accountManager, { pinKey }, req.url, true);
+        openEntry = null;   // this path owns the close below; the outer catch must not repeat it
+        if (!hideActivity) hooks.onRequestEnd?.(reqId, { callerRequestId: callerId, method: req.method, path: req.url, account: `(compact before switch: ${safeLine(account.name, 64)})`, status: 400, model, effort, sessionId, pinned: false, client: req.tcClient ?? forcedClient ?? null });
+        return;
+      }
+
       // Per-client attribution: the base server stamps req.tcClient from the
       // key that authenticated; the MITM terminating server has no per-request
       // key (auth happened at CONNECT time) and carries it as forcedClient
@@ -2583,6 +2634,53 @@ function answeredStatus(status) {
 function isCompletionPath(url) {
   const path = String(url || '').split('?')[0];
   return path.endsWith('/v1/messages') || path.endsWith('/responses');
+}
+
+/**
+ * Whether this request is the one a long conversation is asked to compact on
+ * (`compactBeforeSwitch`, issue #709): the account holding the conversation,
+ * the window that is inside the margin and the settings in force, or null to
+ * forward the request as usual.
+ *
+ * Gathers the facts only the server has and hands them to the pure decision in
+ * compact-before-switch.js. The caller has already ruled out a pinned request,
+ * a request with no client session and another provider's path. Here:
+ *   - only a completion (`POST /v1/messages`); count_tokens and every other
+ *     endpoint are forwarded;
+ *   - the body size is tested first, so a short request costs one comparison;
+ *   - only a Claude subscription account on the fleet upstream. A switch off an
+ *     API key or a third-party backend is not the cache rewrite this avoids,
+ *     and those upstreams did not write the error being quoted;
+ *   - the account comes from AccountManager.conversationHost, which reads where
+ *     the conversation is and where selection would send it without selecting.
+ *
+ * Decides and reads; the caller records the ask. Any throw in here forwards the
+ * request: a feature that edits answers must not be able to fail one.
+ *
+ * @param {any} accountManager
+ * @param {any} config
+ * @param {{ method: string|undefined, url: string|undefined, bodyBytes: number, pinKey: string, sessionId: string, model: string|null, advisorModel: string|null }} request
+ * @returns {{ account: Record<string, any>, window: { bucket: string, utilization: number, threshold: number }, settings: import('./compact-before-switch.js').CompactSettings, asks: import('./compact-before-switch.js').CompactAsks, pinKey: string, sessionId: string }|null}
+ */
+function compactAskFor(accountManager, config, { method, url, bodyBytes, pinKey, sessionId, model, advisorModel }) {
+  try {
+    const settings = resolveCompactBeforeSwitch(config?.compactBeforeSwitch);
+    if (!settings || bodyBytes < settings.minBodyBytes) return null;
+    if (method !== 'POST' || !String(classificationPath(url) || '').split('?')[0].endsWith('/v1/messages')) return null;
+    const asks = accountManager.compactAsks;
+    if (!asks) return null;
+    const account = accountManager.conversationHost(pinKey, model, advisorModel, DEFAULT_PROVIDER);
+    if (!account || !isSubscriptionAccount(account) || providerOf(account) !== DEFAULT_PROVIDER || account.upstream) return null;
+    const decision = decideCompactBeforeSwitch({
+      settings, bodyBytes, pinKey, sessionId, asks,
+      windows: accountManager.switchWindows(account, model),
+    });
+    if (!decision.ask || !decision.window) return null;
+    return { account, window: /** @type {any} */ (decision.window), settings, asks, pinKey, sessionId };
+  } catch (/** @type {any} */ err) {
+    reportFailure('[TeamClaude] compactBeforeSwitch: the decision failed, forwarding the request:', err);
+    return null;
+  }
 }
 
 // Outcomes for the exits that return BEFORE beginSession. They never open an
@@ -3040,8 +3138,9 @@ async function refuseOversizedBody(req, res) {
  * framing ones (content-encoding, content-length) and an upstream copy of
  * CORRELATION_HEADER (the proxy's own) are dropped, and so is the per-org
  * billing family when `stripOverage` is set (see isOverageHeader).
- * The answer is held whole and relayed in one write, so one larger than
- * BUFFERED_RESPONSE_LIMIT is a 502 instead (a token answer is a few hundred bytes).
+ * The answer is held whole and relayed in one write, so one larger than the
+ * hold limit (resolveBufferedResponseLimit) is a 502 instead (a token answer
+ * is a few hundred bytes).
  */
 async function relayRaw(req, res, upstream, sx, maxBodyBytes = DEFAULT_MAX_BODY_BYTES, stripOverage = false, strip = /** @type {Set<string>|null} */ (null)) {
   const bodyChunks = [];
@@ -3152,7 +3251,7 @@ export function resolveLogMaxBodyBytes(config) {
 // flight together hold up to this many bytes each, and nothing bounds the sum.
 // Each holds more than its body, too: a body rewritten for the account serving
 // it (rewriteRequestBody) is a second copy held beside it for the attempt, and
-// the answer may be held as well (BUFFERED_RESPONSE_LIMIT).
+// the answer may be held as well (resolveBufferedResponseLimit).
 export const DEFAULT_MAX_BODY_BYTES = 64 * 1024 * 1024;
 
 export function resolveMaxBodyBytes(config) {
@@ -3910,10 +4009,10 @@ function refusalMessage(refused, statuses, holds) {
 
 /**
  * The answer when the accounts a request reached all held an expired token that
- * could not be renewed. 503 with the Retry-After of the token endpoint's 429 hold
- * when there is one, else a short one: the renewal may go through on the next
- * request (the lock freed, the token endpoint back). Never a 401 or
- * a 403 — the client's own credential is fine.
+ * could not be renewed. 503 with the Retry-After of the hold on renewing its
+ * token when there is one, else a short one: the renewal may go through on the
+ * next request (the lock freed, the token endpoint back). Never a 401 or a 403
+ * — the client's own credential is fine.
  * @param {import('node:http').ServerResponse} res
  * @param {Record<string, any>} ctx
  */
@@ -3929,10 +4028,12 @@ function respondUnrenewed(res, ctx) {
   // A refresh token the endpoint rejected IS fixed by a re-login; say so then.
   const dead = accounts.find(fixedByReLogin);
   const relogin = dead ? ` ${reLoginAdvice(dead)}` : '';
-  // Come back when a renewal may be tried again: the longest 429 hold among these
-  // accounts (the token endpoint's Retry-After), or 30 s when none is held.
+  // Come back when a renewal may be tried again: the longest hold on renewing
+  // the token each account now holds (the token endpoint's Retry-After, or the
+  // short hold after a kept 400/401/403, see refreshHeldUntil), or 30 s when
+  // none is held.
   const now = Date.now();
-  const held = Math.max(0, ...accounts.map(a => (a._refreshHeldUntil ?? 0) - now));
+  const held = Math.max(0, ...accounts.map(a => refreshHeldUntil(a) - now));
   const retryAfter = held > 0 ? Math.ceil(held / 1000) : 30;
   ctx.status = 503;
   ctx.account = `(${[...ctx.unrenewed].join(', ')} not renewed)`;
@@ -3979,10 +4080,11 @@ function respondModelUnsupported(res, ctx, denied) {
  * transport, not relayStream's: the admission gate, the fleet upstream proxy,
  * this attempt's sx route and the default headers deadline all apply, since
  * this is an ordinary request and not a Remote Control long-poll. The body is
- * buffered the way the forward path buffers a non-streaming answer, up to
- * BUFFERED_RESPONSE_LIMIT; past it this answers 502 rather than relaying it, as
- * the calls that come here are Claude Code's bootstrap, settings and
- * connector-registry reads (see the scope branch of forwardRequest).
+ * buffered the way the forward path buffers a non-streaming answer, up to the
+ * hold limit (resolveBufferedResponseLimit); past it this answers 502 rather
+ * than relaying it, as the calls that come here are Claude Code's bootstrap,
+ * settings and connector-registry reads (see the scope branch of
+ * forwardRequest).
  * @param {any} req
  * @param {any} res
  * @param {string} upstream
@@ -5197,12 +5299,17 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     }
 
     // Any other body is held whole, for its usage figures and the log, up to
-    // BUFFERED_RESPONSE_LIMIT. Past it the rest is relayed as it arrives, the way
-    // an event stream is but unread: an answer that large is not a completion,
-    // so there is no usage in it to lose, and lines in it that look like an
-    // event stream's (a saved transcript) are not one's to book. The hold has
-    // its own silence budget (resolveHeldAnswerIdleTimeout), longer than a
-    // relay's: a non-streaming completion may be all silence after its head.
+    // the hold limit (resolveBufferedResponseLimit). Past it the rest is
+    // relayed as it arrives, the way an event stream is but unread: an answer
+    // that large is not a completion, so there is no usage in it to lose, and
+    // lines in it that look like an event stream's (a saved transcript) are
+    // not one's to book. The hold has its own silence budget
+    // (resolveHeldAnswerIdleTimeout), never shorter than a relay's: a
+    // non-streaming completion may be all silence after its head. At the
+    // defaults the two are both 120 s, so a hold is still cut at 120 s of
+    // silence; it waits longer whenever the head deadline is longer than the
+    // body-idle one: a Codex account (300 s), a raised headers timeout, or a
+    // lowered body-idle timeout.
     const held = isStreaming ? null : await holdBody(upstreamBody, undefined, resolveHeldAnswerIdleTimeout(account));
     if (held && !held.buf) {
       console.log(`[TeamClaude] A ${upstreamRes.status} answer from "${safeLine(account.name, 64)}" is larger than ${bufferedResponseLimitLabel()}; relaying it as it arrives instead of holding it`);
@@ -5215,7 +5322,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     if (held?.buf == null) {
       // Stream each chunk straight to the log as it is relayed — never hold the
       // whole body in memory: an SSE body (potentially ~1M tokens), or an answer
-      // past BUFFERED_RESPONSE_LIMIT.
+      // past the hold limit.
       const l = getLog();
       const bw = l ? l.bodyWriter('RESPONSE BODY (streamed)', contentType) : null;
       try {
@@ -5478,9 +5585,10 @@ export function bookUsageTotals(totals, usage) {
 /**
  * Relay a response body to the client as it arrives: an event stream, whose
  * usage is parsed from its SSE event lines along the way, or, with `scanUsage`
- * false, an answer the forward path would not hold (see
- * BUFFERED_RESPONSE_LIMIT), relayed unread, since a body that is not an event
- * stream can still carry lines shaped like one's (a saved transcript, a file).
+ * false, an answer the forward path would not hold (one past the hold limit,
+ * resolveBufferedResponseLimit), relayed unread, since a body that is not an
+ * event stream can still carry lines shaped like one's (a saved transcript, a
+ * file).
  * `onTotals` is told the usage that was booked, once the stream ends.
  *
  * Resolves to what the stream said about itself: `failed` names the first

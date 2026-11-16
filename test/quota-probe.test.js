@@ -499,6 +499,34 @@ test('prober skips an account holding a rejected refresh token, until a new one 
   assert.equal(probes, probesAfterRejection + 1);
 });
 
+// A 403 page in front of the token endpoint is not its refusal: the token is
+// kept and its renewal held for a short while, from the probe too, including
+// the forced renewal after the usage read's 401. The hold is that token's: a
+// new one (a sign-in, an import) is renewed by the next probe.
+test('the probe leaves a kept token alone inside its hold, and renews a new one at once', async () => {
+  const sent = [];
+  const am = new AccountManager(
+    [oauth('a', { refreshToken: 'rt-kept', expiresAt: Date.now() - 1000 })],
+    0.98,
+    {
+      refreshFn: async (rt) => {
+        sent.push(rt);
+        if (rt === 'rt-kept') throw Object.assign(new Error('Token refresh failed (403): <html>Access denied</html>'), { status: 403, grantRefused: false });
+        return { accessToken: 'at-renewed', refreshToken: 'rt-renewed', expiresAt: Date.now() + 3600_000 };
+      },
+    },
+  );
+  const read = [];
+  const prober = new Prober(am, { intervalMs: 0, probeFn: async (credential) => { read.push(credential); return { status: 401 }; }, log: () => {} });
+  await prober.probeAll();
+  await prober.probeAll();
+  assert.deepEqual(sent, ['rt-kept'], 'one renewal, not one per probe and per 401');
+  am.updateAccountTokens(0, { accessToken: 'at-new', refreshToken: 'rt-new', expiresAt: Date.now() - 1000 });
+  await prober.probeAll();
+  assert.deepEqual(sent, ['rt-kept', 'rt-new']);
+  assert.equal(read.at(-1), 'at-renewed');
+});
+
 // setInterval coerces a delay above 2^31-1 ms to 1 ms, which would turn an
 // interval meant as "practically never" into a tight probing loop.
 test('prober clamps its interval so the timer cannot overflow', () => {

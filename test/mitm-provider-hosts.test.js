@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { hostMode, mitmHosts, ensureCerts, createConnectHandler, TEST_HOST } from '../src/mitm.js';
+import { hostMode, mitmHosts, ensureCerts, createConnectHandler, resolveConnectPin, TEST_HOST } from '../src/mitm.js';
 import { providerForHost, isNeverIntercepted, interceptHostsFor } from '../src/provider.js';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
@@ -145,6 +145,7 @@ test('ensureCerts still accepts a single host', async () => {
 // Each row carries an entry id, as every row loadConfig hands out does: a reload
 // pairs rows by it, and drops the running account whose row is gone.
 const keyed = (name, provider) => ({ id: `id-${name}`, name, type: 'apikey', apiKey: `k-${name}`, ...(provider ? { provider } : {}) });
+const subscription = (name, provider) => ({ ...claude(name), id: `id-${name}`, ...(provider ? { provider } : {}) });
 const anthropicOnly = () => [keyed('claude-a')];
 const withCodex = () => [keyed('claude-a'), keyed('codex-c', 'codex')];
 const fleet = (accounts) => ({ proxy: {}, upstream: 'https://api.anthropic.com', accounts });
@@ -386,27 +387,39 @@ test('a host a reload adds is intercepted when the first leaf is minted after it
 });
 
 // A pin asks for accounts of the pool. A tunnel would serve the client on its
-// own login and drop the pin without a word, so a CONNECT pinned to a Codex
-// account, to a host the presented leaf does not name, is refused. A pin naming
-// Claude accounts only governs nothing there (TC_ACCT rides HTTPS_PROXY into
-// whatever a session starts), and is tunnelled as it was before the Codex
-// account was added. An unknown pin keeps its 407.
-test('a pinned CONNECT to a host the leaf does not name is refused only when the pin names that host\'s provider', async () => {
+// own login and drop the pin without a word, so a CONNECT to a host the
+// presented leaf does not name is refused when its pin names an account of
+// that host's provider (a Codex key or subscription, a disabled one too: a pin
+// is served from a disabled account) or an API key with an upstream of its
+// own (a gateway), or a list naming any of those. Any other pin is tunnelled,
+// as it was before the Codex account was added, because the pool does not
+// serve that pin on this host: a Claude subscription, among them a third-party
+// backend with no provider field (`oauth` with an upstream), or a plain API
+// key with no upstream of its own. TC_ACCT rides HTTPS_PROXY into whatever a
+// session starts. An unknown pin keeps its 407.
+test('a pinned CONNECT to a host the leaf does not name is refused only when its pin names any account the pool could serve there', async () => {
   await withServerScene(['chatgpt.com'], async (lines) => {
     const real = await standIn('chatgpt.com', 'the real host');
-    const config = fleet(anthropicOnly());
+    const gateway = { ...keyed('gw'), upstream: 'https://gateway.test' };
+    const backend = { id: 'id-backend', name: 'backend', type: 'oauth', accessToken: 't', upstream: 'https://backend.test' };
+    const config = fleet([...anthropicOnly(), subscription('claude-o'), gateway, backend]);
     await ensureCerts(mitmHosts(config));
     const s = await startProxy(config);
     try {
-      await reloadWith(config, s.am, withCodex());
-      const pinned = await handshake(s.port, 'chatgpt.com', real.port, real.caCertPem, 'codex-c');
-      assert.equal(pinned.status, 'HTTP/1.1 503 Service Unavailable');
+      await reloadWith(config, s.am, [...withCodex(), subscription('claude-o'), gateway, backend, subscription('codex-o', 'codex'), { ...subscription('codex-x', 'codex'), disabled: true }]);
+      const refused = ['codex-c', 'codex-o', 'codex-x', 'gw', 'codex-c,claude-o', 'claude-a,gw'];
+      for (const pin of refused) {
+        const pinned = await handshake(s.port, 'chatgpt.com', real.port, real.caCertPem, pin);
+        assert.equal(pinned.status, 'HTTP/1.1 503 Service Unavailable', `pin ${pin}`);
+      }
       const unknown = await handshake(s.port, 'chatgpt.com', real.port, real.caCertPem, 'no-such-account');
       assert.equal(unknown.status, 'HTTP/1.1 407 Proxy Authentication Required');
-      const claude = await handshake(s.port, 'chatgpt.com', real.port, real.caCertPem, 'claude-a');
-      assert.equal(claude.status, 'HTTP/1.1 200 Connection Established');
-      assert.deepEqual(claude.names, ['DNS:chatgpt.com']);
-      assert.equal(lines.filter((l) => l.includes('refused for pin')).length, 1, JSON.stringify(lines));
+      for (const pin of ['claude-o', 'claude-a', 'backend']) {
+        const tunnelled = await handshake(s.port, 'chatgpt.com', real.port, real.caCertPem, pin);
+        assert.equal(tunnelled.status, 'HTTP/1.1 200 Connection Established', `pin ${pin}`);
+        assert.deepEqual(tunnelled.names, ['DNS:chatgpt.com'], `pin ${pin}`);
+      }
+      assert.equal(lines.filter((l) => l.includes('refused for pin')).length, refused.length, JSON.stringify(lines));
     } finally {
       s.close();
       real.server.close();
@@ -467,11 +480,15 @@ test('a fallback the destination policy refuses is not reported as tunnelled', a
 // The decision needs the leaf, and the leaf can fail to load: no usable stored
 // chain and a config directory that cannot be written. Then no leaf names the
 // host, so it is decided as one that does not: an unpinned CONNECT is still
-// tunnelled and a pinned one refused, rather than both answered 502.
+// tunnelled and a pinned one refused, rather than both answered 502. The
+// config keeps a row the manager was not given, as resolveAccounts drops one
+// with no usable credential, so a config index and a manager index name
+// different accounts (account-pairing.js): the pin is read against the
+// manager's.
 test('a host off the list is tunnelled, or refused when pinned, when the leaf cannot load', async () => {
   await withServerScene(['chatgpt.com'], async () => {
     const real = await standIn('chatgpt.com', 'the real host');
-    const config = fleet(withCodex());
+    const config = fleet([{ id: 'id-nt', name: 'no-token', type: 'oauth', provider: 'codex', importFrom: '/nonexistent' }, ...withCodex()]);
     const lines = [];
     let loads = 0;
     /** @type {{ key: string, cert: string }|null} */
@@ -479,7 +496,7 @@ test('a host off the list is tunnelled, or refused when pinned, when the leaf ca
     const proxy = http.createServer();
     proxy.on('connect', createConnectHandler({
       config,
-      accountManager: new AccountManager(config.accounts, 0.98),
+      accountManager: new AccountManager(withCodex(), 0.98),
       ensureLeaf: async () => { loads++; if (leaf) return leaf; throw new Error('EROFS: read-only file system'); },
       leafHosts: ['api.anthropic.com'],
       log: (l) => lines.push(l),
@@ -504,6 +521,71 @@ test('a host off the list is tunnelled, or refused when pinned, when the leaf ca
     } finally {
       proxy.closeAllConnections?.();
       proxy.close();
+      real.server.close();
+    }
+  });
+});
+
+// The pin is decided on the accounts it resolved to when the CONNECT came in,
+// not once the leaf has loaded. A reload while the load is pending can remove
+// or rename the pinned account, or one a pin list names, and the pin resolved
+// again after it named nothing and was tunnelled on the client's own login.
+// Removing codex-c also moves the accounts after it down one place, so the
+// index it had, read again after the load, would name a Claude subscription.
+// The load is held open here until the reload has landed, so the CONNECT is
+// decided across it, and the stand-in for the real host must hear nothing.
+test('a pin is decided before the leaf loads, so a reload during the load cannot tunnel it', async () => {
+  await withServerScene(['chatgpt.com'], async () => {
+    const real = await standIn('chatgpt.com', 'the real host');
+    let dialled = 0;
+    real.server.on('connection', () => { dialled++; });
+    const chain = generateCertChain(['api.anthropic.com']);
+    const leaf = { key: chain.leafKeyPem, cert: chain.leafCertPem };
+    const start = () => [keyed('claude-a'), keyed('codex-c', 'codex'), subscription('claude-o'), keyed('codex-d', 'codex')];
+    try {
+      for (const [pin, after] of [
+        ['codex-c', [keyed('claude-a'), subscription('claude-o'), keyed('codex-d', 'codex')]],
+        ['codex-c,codex-d', [keyed('claude-a'), keyed('codex-c', 'codex'), subscription('claude-o')]],
+      ]) {
+        const config = fleet(start());
+        const am = new AccountManager(config.accounts, 0.98);
+        /** @type {() => void} */
+        let release = () => {};
+        const loaded = new Promise((r) => { release = () => r(undefined); });
+        /** @type {() => void} */
+        let entered = () => {};
+        const loading = new Promise((r) => { entered = () => r(undefined); });
+        const proxy = http.createServer();
+        proxy.on('connect', createConnectHandler({
+          config,
+          accountManager: am,
+          ensureLeaf: async () => { entered(); await loaded; return leaf; },
+          leafHosts: ['api.anthropic.com'],
+        }));
+        allowLoopbackForward(proxy);
+        await new Promise((r) => proxy.listen(0, '127.0.0.1', r));
+        try {
+          const port = /** @type {import('node:net').AddressInfo} */ (proxy.address()).port;
+          const pending = handshake(port, 'chatgpt.com', real.port, real.caCertPem, pin);
+          // A CONNECT answered before it asks for the leaf ends the handshake
+          // first, and the leaf is then never asked for: fail on that answer
+          // rather than wait for a load that will not come. An early
+          // rejection of the handshake fails the test here too.
+          const early = await Promise.race([loading.then(() => null), pending]);
+          assert.equal(early, null, `pin ${pin} was answered ${early?.status} before the leaf was asked for`);
+          await reloadWith(config, am, after);
+          const now = resolveConnectPin({ headers: { 'proxy-authorization': `Basic ${Buffer.from(`${pin}:`).toString('base64')}` } }, am, config.proxy);
+          assert.match(now.error || '', /Unknown account pin/, `the reload did not take ${pin} away`);
+          release();
+          assert.equal((await pending).status, 'HTTP/1.1 503 Service Unavailable', `pin ${pin}`);
+          assert.equal(dialled, 0, `pin ${pin} was tunnelled to the real host`);
+        } finally {
+          release();
+          proxy.closeAllConnections?.();
+          proxy.close();
+        }
+      }
+    } finally {
       real.server.close();
     }
   });

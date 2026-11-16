@@ -172,6 +172,15 @@ test('unsupported account types and Claude backends never read or spend a reset'
   }
 });
 
+test('a long-lived account never reads or spends a reset: its token serves inference only', async () => {
+  const { actions, account, calls } = harness({ extra: { longLived: true } });
+  const details = await actions.read(account);
+  assert.match(details.error, /long-lived token serves inference only/);
+  assert.deepEqual(details.grants, []);
+  assert.match((await actions.redeem(account, 'weekly')).message, /long-lived token serves inference only/);
+  assert.equal(calls.statuses + calls.details + calls.claims.length + calls.consumes.length, 0);
+});
+
 test('manual Claude claim sends a non-next grant id on the wire and re-applies quota', async () => {
   let body;
   const h = harness({ claim: (account, attempt) => claimClaudeReset(account, attempt, {

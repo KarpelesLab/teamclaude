@@ -144,3 +144,36 @@ test('a Retry-After too long for a Date does not throw out of ensureTokenFresh',
     srv.close();
   }
 });
+
+// A kept 400/401/403 (a page in front of the endpoint, not its refusal) holds
+// only the refresh token it was sent with. A 429 that follows holds them all,
+// whatever token the hold before it was about.
+test('a 429 after a kept 4xx holds every refresh token, not just the one the 4xx held', async () => {
+  const sent = [];
+  const m = mgr(async (rt) => {
+    sent.push(rt);
+    if (rt === 'rt-a') throw Object.assign(new Error('Token refresh failed (403): <html>Access denied</html>'), { status: 403, grantRefused: false });
+    throw rateLimited(undefined);
+  });
+  await m.ensureTokenFresh(0);
+  m.updateAccountTokens(0, { accessToken: 'at-new', refreshToken: 'rt-new', expiresAt: Date.now() - 1000 });
+  await m.ensureTokenFresh(0);
+  assert.deepStrictEqual(sent, ['rt-a', 'rt-new'], 'the kept 4xx did not hold the new token');
+  await m.ensureTokenFresh(0, true);
+  m.updateAccountTokens(0, { accessToken: 'at-newer', refreshToken: 'rt-newer', expiresAt: Date.now() - 1000 });
+  await m.ensureTokenFresh(0);
+  assert.deepStrictEqual(sent, ['rt-a', 'rt-new'], 'the 429 holds the token it was sent with and the one after it');
+});
+
+// A hold that has lapsed is armed again by the next 429, as the first one was.
+test('a 429 after a lapsed 429 hold holds the refreshes again', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.parse('2026-11-15T00:00:00Z') });
+  let calls = 0;
+  const m = mgr(async () => { calls++; throw rateLimited(undefined); });
+  await m.ensureTokenFresh(0);
+  t.mock.timers.tick(30_000);
+  await m.ensureTokenFresh(0);
+  await m.ensureTokenFresh(0);
+  await m.ensureTokenFresh(0, true);
+  assert.strictEqual(calls, 2, 'asked once when the first hold lapsed, then held again');
+});

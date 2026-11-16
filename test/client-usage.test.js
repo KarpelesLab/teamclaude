@@ -112,11 +112,11 @@ test('resolveConnectAuth: loopback is exempt but a valid key still names it', ()
 test('resolveConnectPin: any configured key in the username is auth, not a pin', () => {
   const am = new AccountManager([{ name: 'alice', type: 'api_key', apiKey: 'sk-x' }], 0.98);
   // legacy string form still works, and the key wins over the same-named account
-  assert.deepEqual(resolveConnectPin(basic('shared-key', ''), am, 'shared-key'), { pin: null, error: null });
+  assert.deepEqual(resolveConnectPin(basic('shared-key', ''), am, 'shared-key'), { pin: null, pins: [], error: null });
   // a clientKeys key must not be mistaken for an (unknown) account pin
-  assert.deepEqual(resolveConnectPin(basic('bob-key', ''), am, PROXY), { pin: null, error: null });
+  assert.deepEqual(resolveConnectPin(basic('bob-key', ''), am, PROXY), { pin: null, pins: [], error: null });
   // a real account name still pins
-  assert.deepEqual(resolveConnectPin(basic('alice', ''), am, PROXY), { pin: 'alice', error: null });
+  assert.deepEqual(resolveConnectPin(basic('alice', ''), am, PROXY), { pin: 'alice', pins: [0], error: null });
 });
 
 // ── end to end: responses book tokens against the presenting client ──
