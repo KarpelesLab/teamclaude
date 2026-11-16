@@ -256,7 +256,7 @@ export function blockedUntil(account, now = Date.now(), spentAt = () => 1) {
   return until;
 }
 
-/** @typedef {{ redeemed: boolean, reason: string, uncertain?: boolean, account?: string, result?: string|null, resetsLeft?: number|null, cleared?: string[] }} ClaudeRedeemResult */
+/** @typedef {{ redeemed: boolean, reason: string, uncertain?: boolean, available?: boolean, account?: string, result?: string|null, resetsLeft?: number|null, cleared?: string[] }} ClaudeRedeemResult */
 
 export class ClaudeResetRedeemer {
   /**
@@ -436,6 +436,12 @@ export class ClaudeResetRedeemer {
   async _attempt(accounts, model) {
     const now = this.now();
     if (now < this.fleetHoldUntil) return { redeemed: false, reason: 'holding off after a recent Claude reset attempt' };
+    // An account another attempt has just re-read (one this refusal waited on)
+    // may serve this request now: the pool is not dry, so nothing is spent and
+    // the server selects again.
+    if (accounts.some(a => this.am.unavailableReason?.(a, model) === null)) {
+      return { redeemed: false, available: true, reason: 'an account can serve the request after all' };
+    }
     const deadline = now + this.timeoutMs;
     const key = this._modelKey(model);
     // Ranked on the readings that bar this account for the refused model, each
@@ -465,7 +471,7 @@ export class ClaudeResetRedeemer {
     for (const account of candidates) {
       if (this.now() >= deadline) { reason = 'ran out of the redeem budget'; break; }
       const r = await this._redeem(account, deadline, model);
-      if (r.redeemed) return r;
+      if (r.redeemed || r.available) return r;
       reason = r.reason;
       if (this.now() < this.fleetHoldUntil) break;
     }
@@ -538,6 +544,14 @@ export class ClaudeResetRedeemer {
       state.cooldownUntil = now + DECLINED_COOLDOWN_MS;
       return { redeemed: false, account: name, reason: `could not read reset status (${read.error})` };
     }
+    // The status read carries the account's quota as of now, so the manager
+    // judges on that and not on a reading that may have gone stale.
+    if (read.usage && !read.usage.error) this.am.applyUsageData?.(account.index, read.usage);
+    // Stale enough that it can serve this request after all: the pool is not
+    // dry, so the walk ends without spending and the server selects again.
+    if (this.am.unavailableReason?.(account, model) === null) {
+      return { redeemed: false, available: true, account: name, reason: 'its fresh quota reading can serve the request' };
+    }
     const status = read.reset;
     if (!status || !status.eligible) {
       state.cooldownUntil = now + NOTHING_COOLDOWN_MS;
@@ -547,9 +561,6 @@ export class ClaudeResetRedeemer {
       state.cooldownUntil = now + NOTHING_COOLDOWN_MS;
       return { redeemed: false, account: name, reason: 'holds no usable reset' };
     }
-    // The status read carries the account's quota as of now, so the manager
-    // judges on that and not on a reading that may have gone stale.
-    if (read.usage && !read.usage.error) this.am.applyUsageData?.(account.index, read.usage);
     // What the proxy itself holds the account out on for this model, at its
     // weekly switch threshold. A reset that leaves one of those standing does
     // not return the account to service whatever upstream reports, so they

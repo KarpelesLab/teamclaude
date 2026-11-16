@@ -780,7 +780,9 @@ selected again against the account it cleared.
   fleet: rotation stops using an account at its threshold, so every account
   parks a little short of upstream's limit and upstream never reports a wall.
   The account's quota is re-read first, and the threshold is judged on that
-  reading.
+  reading. If that reading shows the account can serve the refused request
+  after all (the one the proxy held had gone stale), nothing is spent: the
+  pool was not dry, and the request is selected again.
 - **What the second state gives up:** the reset is spent while the account
   still has the last part of its week below upstream's limit — 2% at the
   default threshold of `0.98`, more with a lower one. That remainder goes with

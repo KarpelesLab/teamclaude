@@ -38,13 +38,20 @@ function fableSpent(account, resetIn) {
   return account;
 }
 
+// Every account is also held after the 429 that brought word of its wall, as
+// the proxy holds it, so it is out for a request that names no model too. The
+// status read reports the account's own readings until a claim lands on it.
 function harness({ accounts = [oauth('a')], status = () => block(), claim = () => ({ result: 'reset', reason: null, resetsLeft: 0, cleared: ['five_hour', 'seven_day', 'seven_day_overage_included'], cooldownUntil: null }), config = { ...ARMED } } = {}) {
   const am = new AccountManager(accounts, 0.98);
-  am.accounts.forEach((a, i) => fableSpent(a, (i + 1) * DAY));
+  am.accounts.forEach((a, i) => Object.assign(fableSpent(a, (i + 1) * DAY), { status: 'throttled', rateLimitedUntil: Date.now() + H }));
   const calls = { status: 0, claim: [], grants: [], keys: [], logs: [] };
+  const reading = (account) => {
+    const q = calls.claim.includes(account.name) ? { unified5h: 0, unified7d: 0, unified7dFable: 0 } : account.quota;
+    return { fiveHour: { utilization: q.unified5h }, sevenDay: { utilization: q.unified7d }, sevenDayFable: { utilization: q.unified7dFable } };
+  };
   const redeemer = new ClaudeResetRedeemer(am, {
     config, log: line => calls.logs.push(line),
-    statusFn: async (account) => { calls.status++; const b = status(account, calls); return { reset: parseResetStatus(b), usage: { fiveHour: { utilization: 0 }, sevenDay: { utilization: 0 }, sevenDayFable: { utilization: 0 } } }; },
+    statusFn: async (account) => { calls.status++; const b = status(account, calls); return { reset: parseResetStatus(b), usage: reading(account) }; },
     claimFn: async (account, c) => { calls.claim.push(account.name); calls.grants.push(c.grantId); calls.keys.push(c.requestId); return claim(calls.claim.length, c); },
   });
   am.ensureTokenFresh = async () => {};
@@ -374,6 +381,10 @@ function parkedHarness({ accounts = [oauth('a')], quota, upstream = null, grants
 
 const declines = calls => calls.logs.filter(l => /banked reset not redeemed/.test(l));
 
+// Held after a 429, as the proxy holds an account: one whose readings are under
+// its threshold is offered on that, and is out for every model.
+const held = am => { for (const a of am.accounts) Object.assign(a, { status: 'throttled', rateLimitedUntil: Date.now() + H }); return am; };
+
 test('parked at the switch threshold on the all-models weekly: the reset is spent though upstream reports no limit', async () => {
   const { am, redeemer, calls } = parkedHarness({ quota: { unified7d: 0.985 }, grants: [fableWithSession, weeklyGrant] });
   assert.equal(am.unavailableReason(am.accounts[0], OPUS), 'quota');
@@ -510,7 +521,7 @@ test('parked only by the 5-hour window: a weekly reset is never spent for it', a
 
 test('below its switch threshold: nothing is spent', async () => {
   const { am, redeemer, calls } = parkedHarness({ quota: { unified7d: 0.97 } });
-  const r = await redeemer.maybeRedeemForPool(am.accounts, { model: OPUS });
+  const r = await redeemer.maybeRedeemForPool(held(am).accounts, { model: OPUS });
   assert.equal(r.redeemed, false); assert.match(r.reason, /not at a usage limit/);
   assert.equal(calls.claim.length, 0);
 });
@@ -520,12 +531,12 @@ test('the threshold is the one that applies to the account: its own override, or
   const own = parkedHarness({ accounts: [oauth('a', { switchThreshold: 0.9 })], quota: { unified7d: 0.92 } });
   assert.equal((await own.redeemer.maybeRedeemForPool(own.am.accounts, { model: OPUS })).redeemed, true);
   const fleet = parkedHarness({ quota: { unified7d: 0.92 } });
-  assert.equal((await fleet.redeemer.maybeRedeemForPool(fleet.am.accounts, { model: OPUS })).redeemed, false);
+  assert.equal((await fleet.redeemer.maybeRedeemForPool(held(fleet.am).accounts, { model: OPUS })).redeemed, false);
   // A fresh fleet per model: the first redemption would hold the second off.
   const perBucket = () => parkedHarness({ quota: { unified7dFable: 0.92 }, threshold: { default: 0.98, unified7dFable: 0.9 } });
   const forFable = perBucket(), forOpus = perBucket();
   assert.equal((await forFable.redeemer.maybeRedeemForPool(forFable.am.accounts, { model: FABLE })).redeemed, true);
-  const opus = await forOpus.redeemer.maybeRedeemForPool(forOpus.am.accounts, { model: OPUS });
+  const opus = await forOpus.redeemer.maybeRedeemForPool(held(forOpus.am).accounts, { model: OPUS });
   assert.equal(opus.redeemed, false, 'the Fable bucket does not park an Opus request');
   assert.match(opus.reason, /not at a usage limit/);
 });
@@ -739,7 +750,7 @@ test('a token refresh that outlives the attempt\'s budget is left behind, not wa
 });
 
 test('concurrent refusals for one model share one attempt, whatever it decides', async () => {
-  const { am, redeemer, calls } = parkedHarness({ quota: { unified7d: 0.5 } });
+  const { am, redeemer, calls } = parkedHarness({ quota: { unified5h: 0.99 } });
   const [x, y] = await Promise.all([OPUS, OPUS].map(model => redeemer.maybeRedeemForPool(am.accounts, { model })));
   assert.equal(x.redeemed || y.redeemed, false);
   assert.equal(y.reason, x.reason);
@@ -776,6 +787,58 @@ test('a dry pool of parked accounts: the proxy hands the redeemer the model, and
     assert.equal(hits, 1);
     assert.deepEqual(calls.grants, ['fable'], 'the Fable bucket parked it, so the model reached the redeemer');
   } finally { proxy.close(); upstream.close(); }
+});
+
+/** Two accounts parked on the shared weekly; `x` ranks first on a stale local
+ *  reading, and its fresh read shows the week well short of the threshold. */
+function staleFleet() {
+  const h = parkedHarness({ accounts: [oauth('y'), oauth('x')], quota: a => (a.name === 'x' ? { unified7d: 0.5, unified7dFable: 0.3 } : { unified7d: 0.99 }) });
+  const x = h.am.accounts[1];
+  Object.assign(x.quota, { unified7d: 0.99, unified7dReset: Date.now() + 6 * DAY });
+  return { ...h, x };
+}
+
+// The fresh read is judged before anything about the account's own resets:
+// one that holds none, or is not eligible, can still serve the request.
+test('a stale account with no reset of its own still ends the walk once its fresh read shows it can serve', async () => {
+  for (const own of [grantBlock([{ ...weeklyGrant, resets_left: 0 }], NOT_WALLED), block({ eligible: false, ineligible_reason: 'tier' })]) {
+    const { am, redeemer, calls } = staleFleet();
+    const read = redeemer.statusFn;
+    redeemer.statusFn = async account => {
+      const r = await read(account);
+      return account.name === 'x' ? { ...r, reset: parseResetStatus(own) } : r;
+    };
+    const r = await redeemer.maybeRedeemForPool(am.accounts, { model: OPUS });
+    assert.equal(r.available, true, r.reason);
+    assert.deepEqual(calls.claim, [], 'the pool was not dry: no reset is spent on y');
+  }
+});
+
+test('a fresh read that shows an account can serve ends the walk without spending, and the request is served', async () => {
+  const served = [];
+  const upstream = http.createServer((req, res) => { served.push(req.headers.authorization); res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"ok":true}'); });
+  const port = await new Promise(r => upstream.listen(0, '127.0.0.1', () => r(upstream.address().port)));
+  const { am, redeemer, calls, x } = staleFleet();
+  am._nextProbeAt = Date.now() + H;
+  const hooks = { redeemClaudeResetForPool: (cands, opts) => redeemer.maybeRedeemForPool(cands, opts) };
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${port}` }, hooks);
+  try {
+    const pport = await new Promise(r => proxy.listen(0, '127.0.0.1', () => r(proxy.address().port)));
+    const res = await fetch(`http://127.0.0.1:${pport}/v1/messages`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: OPUS, max_tokens: 1, messages: [] }) });
+    await res.text();
+    assert.equal(res.status, 200);
+    assert.deepEqual(calls.claim, [], 'the pool was not dry: no reset is spent on y');
+    assert.deepEqual(served, [`Bearer ${x.credential}`]);
+  } finally { proxy.close(); upstream.close(); }
+});
+
+test('a refusal that waited on another model\'s walk sees what that walk re-read', async () => {
+  const { am, redeemer, calls } = staleFleet();
+  const [o, f] = await Promise.all([OPUS, FABLE].map(model => redeemer.maybeRedeemForPool(am.accounts, { model })));
+  assert.equal(o.available, true);
+  assert.equal(f.available, true, f.reason);
+  assert.deepEqual(calls.claim, []);
+  assert.equal(calls.status, 1, 'the Opus walk read x; the Fable refusal needs no read of its own');
 });
 
 // unavailableReason names `quota` ahead of `route`, so an account the model's
