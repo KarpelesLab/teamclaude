@@ -10,10 +10,12 @@ import { loadQuotaSeries, saveQuotaSeries } from './quota-series.js';
 import { installCrashHandlers } from './crash-log.js';
 import { AccountManager, distributionMode, accountRouting, isLongLived } from './account-manager.js';
 import { validateAdaptiveConfig } from './adaptive-distribution.js';
-import { createProxyServer, NO_USAGE_STORE, reloadedHeaderFlags, resolveAccountPin } from './server.js';
+import { createProxyServer, NO_USAGE_STORE, reloadedHeaderFlags, resolveAccountPin, SESSION_ID_SHAPE } from './server.js';
 import { openUsageStore, startTicks, closeUsageStore } from './usage/db.js';
 import { createDrainState, resolveDrainTimeoutSeconds } from './drain.js';
 import { compactBeforeSwitchStatus } from './compact-before-switch.js';
+import { renderStatusLine, moveCommand } from './claude-code-surface.js';
+import { NOTICE_DIR, stopHookTurn } from './advice-notice-state.js';
 import { importCredentials, loginOAuth, loginOAuthWithPastedCode, startOAuthLogin, fetchProfile, profileForCredentials, refreshAccessToken, isTokenExpired, isTokenExpiringSoon } from './oauth.js';
 import {
   sameIdentity,
@@ -48,7 +50,7 @@ import { RemoteControl, createAttachSession } from './tui-remote.js';
 import { SxManager } from './sx.js';
 import { autoUpdate, checkForUpdate, currentVersion, resolveVersionLabel, runUpdate, installKind, updateAvailableFromCache, updateCommandFor, PKG_NAME } from './updater.js';
 import { renderStatus, formatPercent } from './status-renderer.js';
-import { sanitizeText, safeLine } from './safe-text.js';
+import { sanitizeText, safeLine, shellWord } from './safe-text.js';
 import { parseEndsAt, describeEndsAt } from './ends-at.js';
 import { modelLabel } from './model.js';
 import { cacheUsageLabel } from './usage-label.js';
@@ -229,6 +231,14 @@ switch (command) {
     break;
   case 'switch':
     await switchCommand();
+    process.exit(0);
+    break;
+  case 'statusline':
+    await statuslineCommand();
+    process.exit(0);
+    break;
+  case 'stop-hook':
+    await stopHookCommand();
     process.exit(0);
     break;
   case 'remove':
@@ -2011,7 +2021,7 @@ async function switchCommand() {
   const headers = { 'x-api-key': config.proxy.apiKey };
   const name = args[1] && !args[1].startsWith('-') ? args[1] : null;
 
-  if (args.includes('--session')) {
+  if (args.includes('--session') || args.includes('--to')) {
     await switchSessionCommand(port, headers, name);
     return;
   }
@@ -2071,7 +2081,7 @@ async function switchCommand() {
     // Run from inside a Claude Code session (a `!` command, a tool), this is
     // easy to mistake for moving just that session (#543).
     if (process.env.CLAUDE_CODE_SESSION_ID) {
-      console.log(`This moved every session that is not pinned. To move only this one: teamclaude switch ${/^[\w.@+-]+$/.test(name) ? name : JSON.stringify(name)} --session`);
+      console.log(`This moved every session that is not pinned. To move only this one: teamclaude switch --session --to ${shellWord(name)}`);
     }
   } catch (err) {
     console.error('Cannot connect to proxy at localhost:' + port);
@@ -2083,33 +2093,56 @@ async function switchCommand() {
 
 /**
  * `teamclaude switch <account> --session [<id>]`: hold one client session on an
- * account, leaving the rest of the fleet alone (#543). `--clear` drops the pin.
+ * account, leaving the rest of the fleet alone (#543). `--session [<id>] --to
+ * <account>` does the same with the account last. `--clear` drops the pin,
+ * `--stay` declines the move advice, and no account prints that advice.
  * The id defaults to $CLAUDE_CODE_SESSION_ID, which Claude Code exports to the
  * commands it runs, so from inside a session the flag alone names it.
  * @param {number} port
  * @param {Record<string, string>} headers
- * @param {string|null} name
+ * @param {string|null} positional
  */
-async function switchSessionCommand(port, headers, name) {
-  const at = args.indexOf('--session');
-  const given = args[at + 1] && !args[at + 1].startsWith('-') ? args[at + 1] : null;
+async function switchSessionCommand(port, headers, positional) {
+  // Exactly `switch --session [<id>] --to <account>`: the account is the last
+  // word, verbatim even when shaped like a flag, and nothing may follow it.
+  const toAt = args.indexOf('--to');
+  if (toAt !== -1) {
+    const idOk = toAt === 2 || (toAt === 3 && !args[2].startsWith('-'));
+    if (args.length > toAt + 2 && args[1] === '--session' && idOk) {
+      console.error(`Unexpected words after the account "${args[toAt + 1]}": ${args.slice(toAt + 2).join(' ')}. Quote an account name with spaces as one word.`);
+      process.exit(1);
+    }
+    if (args.length !== toAt + 2 || args[1] !== '--session' || !idOk) {
+      console.error('Usage: teamclaude switch --session [<id>] --to <account>   (the account is the last word, whatever it looks like; nothing else may be given)');
+      process.exit(1);
+    }
+  }
+  const rest = toAt === -1 ? args : args.slice(0, toAt);
+  const at = rest.indexOf('--session');
+  const given = at !== -1 && rest[at + 1] && !rest[at + 1].startsWith('-') ? rest[at + 1] : null;
+  const clear = rest.includes('--clear');
+  const name = toAt === -1 ? positional : args[toAt + 1];
   const sessionId = given || process.env.CLAUDE_CODE_SESSION_ID || null;
-  const clear = args.includes('--clear');
   if (!sessionId) {
     console.error('No session to pin: pass --session <id>, or run this from inside a Claude Code session (it reads $CLAUDE_CODE_SESSION_ID).');
     process.exit(1);
   }
-  if (!clear && !name) {
-    console.error('Usage: teamclaude switch <account> --session [<id>]   (or: teamclaude switch --session [<id>] --clear)');
+  const decline = rest.includes('--stay');
+  if (decline && (clear || name)) {
+    console.error('Usage: teamclaude switch --session [<id>] --stay   (--stay keeps the session where it is, so it takes no account and no --clear)');
     process.exit(1);
   }
   const shown = sessionId.slice(0, 8);
   let res;
   try {
-    res = await fetch(`http://localhost:${port}/teamclaude/session-pin`, {
+    if (!clear && !name && !decline) {
+      await sessionAdviceReport(port, headers, sessionId);
+      return;
+    }
+    res = await fetch(`http://localhost:${port}/teamclaude/${decline ? 'session-advice/decline' : 'session-pin'}`, {
       method: 'POST',
       headers: { ...headers, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sessionId, account: clear ? null : name }),
+      body: JSON.stringify(decline ? { sessionId } : { sessionId, account: clear ? null : name }),
     });
   } catch (/** @type {any} */ err) {
     console.error('Cannot connect to proxy at localhost:' + port);
@@ -2132,6 +2165,10 @@ async function switchSessionCommand(port, headers, name) {
     console.log(data.cleared ? `Session ${shown} unpinned; it follows the fleet again.` : `Session ${shown} had no pin.`);
     return;
   }
+  if (decline) {
+    console.log(data.recorded ? `Session ${shown} stays where it is; its move advice is held for the cooldown.` : 'Session move advice is off (sessionAdvice.enabled), so there was nothing to hold.');
+    return;
+  }
   console.log(`Session ${shown} pinned to "${data.account}"; other sessions are unchanged.`);
   if (data.eligible === false) {
     console.error(`Warning: "${data.account}" is ${data.reason || 'not currently eligible'}, and a pinned session does not rotate away, so its requests will fail until that changes.`);
@@ -2142,6 +2179,134 @@ async function switchSessionCommand(port, headers, name) {
   if (data.seen === false) {
     console.error(`Warning: the proxy has not seen a request from session ${shown} in the last hour. The pin applies once one arrives;`
       + ' if this session does not run through teamclaude, or sends a different session id, it never will.');
+  }
+}
+
+/**
+ * `teamclaude switch --session [<id>]` with no account: the session's account,
+ * each account's weekly usage and the server's move advice (`--json`: raw).
+ * @param {number} port
+ * @param {Record<string, string>} headers
+ * @param {string} sessionId
+ */
+async function sessionAdviceReport(port, headers, sessionId) {
+  const res = await fetch(`http://localhost:${port}/teamclaude/session-advice?session=${encodeURIComponent(sessionId)}`, { headers });
+  const advice = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    console.error(typeof advice.error === 'string' ? advice.error : `Session advice failed: unexpected reply from localhost:${port} (HTTP ${res.status}).`);
+    process.exit(1);
+  }
+  if (args.includes('--json')) {
+    await writeStdout(`${JSON.stringify(advice, null, 2)}\n`);
+    return;
+  }
+  const quotaRes = await fetch(`http://localhost:${port}/teamclaude/quota`, { headers });
+  const quota = quotaRes.ok ? await quotaRes.json().catch(() => null) : null;
+  console.log(renderStatusLine(advice, quota));
+  console.log(`reason: ${advice.reason}`);
+  const command = moveCommand(advice, sessionId);
+  if (command) console.log(`move command: ${command}`);
+}
+
+// ── Claude Code status line and Stop hook ───────────────────
+
+// Both run inside Claude Code on every turn, so neither may fail it: a server
+// that is down or slow costs at most a second, and they exit 0 regardless.
+
+/**
+ * Claude Code's JSON on stdin, `{}` when there is none. Rejects, as for invalid
+ * JSON, on more than 256 KiB or a stdin still open after a second.
+ * @returns {Promise<any>}
+ */
+async function readStdinJson() {
+  if (process.stdin.isTTY) return {};
+  const maxBytes = 256 * 1024;
+  const text = await new Promise((resolve, reject) => {
+    /** @type {Buffer[]} */
+    const chunks = [];
+    let size = 0;
+    const done = (/** @type {Error|null} */ err) => {
+      clearTimeout(timer);
+      process.stdin.removeAllListeners('data').removeAllListeners('end').removeAllListeners('error');
+      if (err) {
+        process.stdin.destroy();
+        reject(err);
+      } else {
+        resolve(Buffer.concat(chunks).toString('utf8'));
+      }
+    };
+    const timer = setTimeout(() => done(new Error('stdin still open')), 1000);
+    process.stdin.on('data', (/** @type {Buffer} */ chunk) => {
+      size += chunk.length;
+      if (size > maxBytes) done(new Error('stdin too large'));
+      else chunks.push(chunk);
+    });
+    process.stdin.once('end', () => done(null));
+    process.stdin.once('error', done);
+  });
+  return text.trim() ? JSON.parse(text) : {};
+}
+
+/**
+ * GET a control route of the running server; null when it does not answer OK within a second.
+ * @param {any} config
+ * @param {string} path
+ */
+async function surfaceGet(config, path) {
+  try {
+    const res = await fetch(`http://localhost:${config.proxy.port}${path}`, {
+      headers: { 'x-api-key': config.proxy.apiKey },
+      signal: AbortSignal.timeout(1000),
+    });
+    return res.ok ? await res.json() : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The advice for stdin's session id, else for $CLAUDE_CODE_SESSION_ID: whether
+ * the two name the same session as the proxy's header is not established.
+ * Null when neither id names a session the proxy knows.
+ * @param {any} config
+ * @param {unknown} stdinId
+ * @returns {Promise<{ id: string, advice: any } | null>}
+ */
+async function surfaceAdvice(config, stdinId) {
+  const ids = new Set([stdinId, process.env.CLAUDE_CODE_SESSION_ID]
+    .filter(/** @returns {id is string} */ id => typeof id === 'string' && SESSION_ID_SHAPE.test(id)));
+  for (const id of ids) {
+    const advice = await surfaceGet(config, `/teamclaude/session-advice?session=${encodeURIComponent(id)}`);
+    if (advice?.account) return { id, advice };
+  }
+  return null;
+}
+
+async function statuslineCommand() {
+  let line = renderStatusLine(null, null);
+  try {
+    const config = await loadConfig({ applyProxy: false });
+    if (config) {
+      const input = await readStdinJson().catch(() => ({}));
+      const [found, quota] = await Promise.all([surfaceAdvice(config, input?.session_id), surfaceGet(config, '/teamclaude/quota')]);
+      line = renderStatusLine(found?.advice ?? null, quota);
+    }
+  } catch {
+    // The neutral line above.
+  }
+  await writeStdout(`${line}\n`);
+}
+
+async function stopHookCommand() {
+  try {
+    const config = await loadConfig({ applyProxy: false });
+    if (!config) return;
+    const input = await readStdinJson();
+    const found = await surfaceAdvice(config, input?.session_id);
+    const output = found && await stopHookTurn(NOTICE_DIR, found.id, found.advice);
+    if (output) await writeStdout(`${JSON.stringify(output)}\n`);
+  } catch {
+    // No output: the hook never decides the turn on its own failure.
   }
 }
 
@@ -3249,7 +3414,16 @@ Commands:
   switch [NAME]       Make the running server prefer one account (as 's' in the
                       TUI does); with no NAME, list accounts and mark the current
                       --session [ID] moves only that session ($CLAUDE_CODE_SESSION_ID
-                      by default); --session --clear drops its pin
+                      by default), as does exactly --session [ID] --to NAME (NAME
+                      last, verbatim); --session --clear drops its pin; --session
+                      alone prints its account and move advice (--json), and
+                      --session --stay declines that advice for the cooldown
+  statusline          Claude Code status line: reads its JSON on stdin, prints the
+                      session's account, weekly usage per account and any move
+                      advice; prints a neutral line when the server is down
+  stop-hook           Claude Code Stop hook: reads its JSON on stdin, prints a
+                      notice when the move advice newly applies (nothing while
+                      sessionAdvice is off); never fails the turn
   remove <name>       Remove an account (by name or email; --org to disambiguate)
   disable <name>      Temporarily exclude an account from rotation
   enable <name>       Re-enable a disabled account (also clears a stuck error)

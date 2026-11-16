@@ -2051,7 +2051,7 @@ export function clientPassthroughOrigin({ authority, url, config, accounts = [] 
 // odd gets in. The value becomes a Map key in the session tracker (the length
 // cap is what bounds that map per client) and a column in the TUI, where Node's
 // header parser would otherwise let C1 control bytes through untouched.
-const SESSION_ID_SHAPE = /^[A-Za-z0-9._-]{1,128}$/;
+export const SESSION_ID_SHAPE = /^[A-Za-z0-9._-]{1,128}$/;
 
 /** The session id a request carries, or null when the header is absent or
  *  malformed — a malformed one is treated as no session, not rejected.
