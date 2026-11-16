@@ -555,7 +555,8 @@ nothing is ever sent upstream. On a pool of two this is what almost every
 request gets. Only the accounts a reset would actually return to service are
 considered — an account you disabled or capped stays out whatever its windows
 say — and when several qualify, the one whose credit expires soonest is asked
-first.
+first (under [`autoRedeemMaxShare`](#the-spending-strategy), the most exhausted
+is).
 
 While it is on, a credit is spent only when **all** of this holds:
 
