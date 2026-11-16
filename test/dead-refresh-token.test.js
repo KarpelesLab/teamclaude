@@ -379,3 +379,188 @@ test('a Codex refresh rejected with a 400, 401 or 403 still marks the refresh to
     assert.strictEqual(calls, 1, String(status));
   }
 });
+
+// The hold a kept 4xx leaves is the refresh token's, compared by value as the
+// dead-token guard is: whatever answered had that token in front of it. A
+// different refresh token is tried at once, however it reached the account:
+// through updateAccountTokens (a reload, which is how a `teamclaude login` or
+// `import` in another process arrives, and credential sync adopting a renewal
+// another install stored), or written onto the account by the TUI's import.
+
+/** A page in front of the token endpoint answering 403, once `gate` resolves. */
+async function pageEndpoint(gate = Promise.resolve()) {
+  const srv = http.createServer(async (req, res) => {
+    req.resume();
+    await gate;
+    res.writeHead(403, { 'content-type': 'text/html' });
+    res.end('<html><body>Access denied</body></html>');
+  });
+  await new Promise((resolve) => srv.listen(0, '127.0.0.1', resolve));
+  return { url: `http://127.0.0.1:${srv.address().port}/token`, close: () => srv.close() };
+}
+
+/**
+ * An expiring account whose refresh token `rt-a` is answered by that page, as
+ * is every token in `paged`; any other is renewed. `sent` is every token sent.
+ */
+async function keptFor(paged = ['rt-a'], gate = undefined) {
+  const page = await pageEndpoint(gate);
+  const sent = [];
+  const m = new AccountManager([{
+    name: 'a', type: 'oauth', accessToken: 'at-old', refreshToken: 'rt-a', expiresAt: Date.now() - 1000,
+  }], 0.98, {
+    refreshFn: async (rt, _endpoint, routing, opts) => {
+      sent.push(rt);
+      if (paged.includes(rt)) return refreshAccessToken(rt, page.url, routing, opts);
+      return { accessToken: `at-${rt}`, refreshToken: `${rt}-next`, expiresAt: Date.now() + 3600_000 };
+    },
+  });
+  return { m, sent, close: page.close };
+}
+
+test('a kept 403 holds the refresh token it was sent with, forced or not, and a new one is tried at once', async () => {
+  const installs = {
+    'a reload or a token from the store (updateAccountTokens)': (m, expiresAt) => m.updateAccountTokens(0, { accessToken: 'at-new', refreshToken: 'rt-new', expiresAt }),
+    'the TUI import, which writes the account itself': (m, expiresAt) => Object.assign(m.accounts[0], { credential: 'at-new', refreshToken: 'rt-new', expiresAt }),
+  };
+  for (const [how, install] of Object.entries(installs)) {
+    // An expired access token, which the request path renews; or a live one
+    // upstream answered 401, which forces the renewal.
+    for (const force of [false, true]) {
+      const f = await keptFor();
+      try {
+        await f.m.ensureTokenFresh(0);
+        await f.m.ensureTokenFresh(0);
+        await f.m.ensureTokenFresh(0, true);
+        assert.deepStrictEqual(f.sent, ['rt-a'], `the kept token is not sent again inside its hold: ${how}`);
+        install(f.m, force ? Date.now() + 3600_000 : Date.now() - 1000);
+        await f.m.ensureTokenFresh(0, force);
+        assert.deepStrictEqual(f.sent, ['rt-a', 'rt-new'], `${how}, force=${force}`);
+        assert.strictEqual(f.m.accounts[0].credential, 'at-rt-new', `${how}, force=${force}`);
+      } finally {
+        f.close();
+      }
+    }
+  }
+});
+
+test('a token installed while the kept refresh was out is not held by it', async () => {
+  let release;
+  const f = await keptFor(['rt-a'], new Promise((resolve) => { release = resolve; }));
+  try {
+    const inflight = f.m.ensureTokenFresh(0);
+    f.m.updateAccountTokens(0, { accessToken: 'at-new', refreshToken: 'rt-new', expiresAt: Date.now() - 1000 });
+    release();
+    await inflight;
+    await f.m.ensureTokenFresh(0);
+    assert.deepStrictEqual(f.sent, ['rt-a', 'rt-new']);
+    assert.strictEqual(f.m.accounts[0].credential, 'at-rt-new');
+  } finally {
+    f.close();
+  }
+});
+
+// The hold is armed for the token that was sent, whatever the account holds
+// when the answer lands: should that token come back (a reload of an older
+// entry, say), it is still not sent again inside its 30 s. Unless the token
+// the account moved on to was kept in its turn: an account has one kept hold
+// at a time, and that one replaces it.
+test('a token kept while the account moved on to another is still held, should it come back', async () => {
+  let release;
+  const f = await keptFor(['rt-a'], new Promise((resolve) => { release = resolve; }));
+  try {
+    const inflight = f.m.ensureTokenFresh(0);
+    f.m.updateAccountTokens(0, { accessToken: 'at-new', refreshToken: 'rt-new', expiresAt: Date.now() + 3600_000 });
+    release();
+    await inflight;
+    f.m.updateAccountTokens(0, { accessToken: 'at-old-again', refreshToken: 'rt-a', expiresAt: Date.now() - 1000 });
+    await f.m.ensureTokenFresh(0);
+    await f.m.ensureTokenFresh(0, true);
+    assert.deepStrictEqual(f.sent, ['rt-a']);
+  } finally {
+    f.close();
+  }
+});
+
+// As for the dead-token guard, a new access token alone is not a new token to
+// try: the refresh token that was kept is the same one.
+test('a re-import of the kept refresh token with a new access token does not lift its hold', async () => {
+  const f = await keptFor();
+  try {
+    await f.m.ensureTokenFresh(0);
+    f.m.updateAccountTokens(0, { accessToken: 'at-reimported', refreshToken: 'rt-a', expiresAt: Date.now() - 1000 });
+    await f.m.ensureTokenFresh(0);
+    await f.m.ensureTokenFresh(0, true);
+    assert.deepStrictEqual(f.sent, ['rt-a']);
+  } finally {
+    f.close();
+  }
+});
+
+// The renewal a 401 forces is held the same way when it is the one kept.
+test('a kept 403 to a forced renewal holds that refresh token, forced or not', async () => {
+  const f = await keptFor();
+  try {
+    f.m.accounts[0].expiresAt = Date.now() + 3600_000; // live by the clock; upstream answered 401
+    await f.m.ensureTokenFresh(0, true);
+    await f.m.ensureTokenFresh(0, true);
+    f.m.accounts[0].expiresAt = Date.now() - 1000;
+    await f.m.ensureTokenFresh(0);
+    assert.deepStrictEqual(f.sent, ['rt-a']);
+  } finally {
+    f.close();
+  }
+});
+
+// A renewal that succeeds inside the hold, of a token the hold was not about,
+// ends it: what the account holds next is tried as any token would be.
+test('a renewal of a new token inside a kept hold ends the hold, so the token after it is tried at once', async () => {
+  const f = await keptFor();
+  try {
+    await f.m.ensureTokenFresh(0);
+    f.m.updateAccountTokens(0, { accessToken: 'at-new', refreshToken: 'rt-new', expiresAt: Date.now() - 1000 });
+    await f.m.ensureTokenFresh(0);
+    assert.strictEqual(f.m.accounts[0].credential, 'at-rt-new', 'rt-new renewed inside the hold');
+    f.m.updateAccountTokens(0, { accessToken: 'at-third', refreshToken: 'rt-third', expiresAt: Date.now() - 1000 });
+    await f.m.ensureTokenFresh(0);
+    assert.deepStrictEqual(f.sent, ['rt-a', 'rt-new', 'rt-third']);
+  } finally {
+    f.close();
+  }
+});
+
+test('a new token the page answers too is held in its turn', async () => {
+  const f = await keptFor(['rt-a', 'rt-new']);
+  try {
+    await f.m.ensureTokenFresh(0);
+    f.m.updateAccountTokens(0, { accessToken: 'at-new', refreshToken: 'rt-new', expiresAt: Date.now() - 1000 });
+    await f.m.ensureTokenFresh(0);
+    await f.m.ensureTokenFresh(0);
+    await f.m.ensureTokenFresh(0, true);
+    assert.deepStrictEqual(f.sent, ['rt-a', 'rt-new']);
+    assert.strictEqual(f.m.accounts[0].status, 'active');
+  } finally {
+    f.close();
+  }
+});
+
+test('the kept token is sent again once its 30 s hold has passed, and not before', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.parse('2026-11-15T00:00:00Z') });
+  const f = await keptFor();
+  try {
+    await f.m.ensureTokenFresh(0);
+    t.mock.timers.tick(29_999);
+    await f.m.ensureTokenFresh(0);
+    await f.m.ensureTokenFresh(0, true);
+    assert.deepStrictEqual(f.sent, ['rt-a'], 'one millisecond short is still held');
+    t.mock.timers.tick(1);
+    await f.m.ensureTokenFresh(0);
+    assert.deepStrictEqual(f.sent, ['rt-a', 'rt-a']);
+    // Kept again, it is held again, for 30 s from that answer.
+    await f.m.ensureTokenFresh(0);
+    await f.m.ensureTokenFresh(0, true);
+    assert.deepStrictEqual(f.sent, ['rt-a', 'rt-a'], 'the second answer arms the hold again');
+  } finally {
+    f.close();
+  }
+});
