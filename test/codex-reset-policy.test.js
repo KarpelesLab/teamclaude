@@ -58,6 +58,38 @@ test('each knob is normalised to its own range, and a bad value is off rather th
   assert.deepEqual(redeemPolicyFrom({ autoRedeemMinDaysToReset: null, autoRedeemMaxShare: '', autoRedeemMaxPerDay: [3] }), DEFAULT_REDEEM_POLICY);
 });
 
+test('a knob set to a value it cannot read is named in a warning, with what was read', async () => {
+  const { redeemPolicyWarnings } = await import('../src/codex-reset-policy.js');
+  assert.deepEqual(redeemPolicyWarnings({ autoRedeemMinDaysToReset: '3d', autoRedeemMaxShare: 50, autoRedeemMaxPerDay: 2.5 }), [
+    '[TeamClaude] autoRedeemMinDaysToReset is "3d", which is not a number of days above 0, so the minimum-days floor is off',
+    '[TeamClaude] autoRedeemMaxShare is 50, which is not a fraction strictly between 0 and 1, so the cohort share cap is off',
+    '[TeamClaude] autoRedeemMaxPerDay is 2.5, which is not a whole number above 0, so the per-day cap is off',
+  ]);
+  assert.match(redeemPolicyWarnings({ autoRedeemMaxShare: '50%' })[0], /autoRedeemMaxShare is "50%", /);
+  assert.match(redeemPolicyWarnings({ autoRedeemMaxShare: 0 })[0], /autoRedeemMaxShare is 0, /);
+  assert.match(redeemPolicyWarnings({ autoRedeemMinDaysToReset: -1 })[0], /autoRedeemMinDaysToReset is -1, /);
+  assert.match(redeemPolicyWarnings({ autoRedeemMaxPerDay: true })[0], /autoRedeemMaxPerDay is true, /);
+  // Nothing to say about a key that is absent, null, off as written, or usable.
+  for (const config of [
+    undefined, {},
+    { autoRedeemMinDaysToReset: null, autoRedeemMaxShare: null, autoRedeemMaxPerDay: null },
+    { autoRedeemMinDaysToReset: 0, autoRedeemMaxShare: 1, autoRedeemMaxPerDay: 0 },
+    { autoRedeemMinDaysToReset: '0', autoRedeemMaxShare: '1', autoRedeemMaxPerDay: '0' },
+    { autoRedeemMinDaysToReset: 2, autoRedeemMaxShare: 0.5, autoRedeemMaxPerDay: 3 },
+    { autoRedeemMinDaysToReset: 6.9 },
+  ]) assert.deepEqual(redeemPolicyWarnings(config), [], JSON.stringify(config));
+});
+
+test('a floor of 7 days or more is kept as written, and said to stop every automatic redemption', async () => {
+  const { redeemPolicyWarnings } = await import('../src/codex-reset-policy.js');
+  for (const days of [7, 10]) {
+    assert.equal(redeemPolicyFrom({ autoRedeemMinDaysToReset: days }).minDaysToReset, days);
+    assert.deepEqual(redeemPolicyWarnings({ autoRedeemMinDaysToReset: days }), [
+      `[TeamClaude] autoRedeemMinDaysToReset is ${days}, but an account whose 7-day weekly window has run out is always less than 7 days from its reset, so no Codex credit on such a window is redeemed automatically (the usage parser also reads a window of up to 7.7 days as weekly)`,
+    ]);
+  }
+});
+
 // ── the value of a credit ───────────────────────────────────────────────────
 
 test('a credit is worth the days to the natural reset over seven', () => {

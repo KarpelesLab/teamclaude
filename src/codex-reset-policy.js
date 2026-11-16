@@ -28,6 +28,7 @@
 // codex-reset-credits.js, which imports it — the dependency runs one way.
 
 import { providerOf } from './provider.js';
+import { safeLine } from './safe-text.js';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const WEEK_MS = 7 * DAY_MS;
@@ -49,28 +50,32 @@ const WEEK_MS = 7 * DAY_MS;
 export const DEFAULT_REDEEM_POLICY = Object.freeze({ minDaysToReset: 0, maxShare: 1, maxPerDay: 0 });
 
 /**
+ * Only a number, or a string that spells one, is read as a value. `true`, an
+ * array or an object would each coerce to a number, and a knob nobody set must
+ * not start limiting on the strength of that.
+ *
+ * @param {unknown} value
+ */
+const knob = value => (typeof value === 'number' ? value
+  : typeof value === 'string' && value.trim() !== '' ? Number(value) : NaN);
+
+/**
  * The policy as the config states it, each knob normalised to its own range
  * and falling back to "off" for anything that is not a usable number. A typo
- * in a hand-edited config therefore relaxes nothing it did not mean to —
- * every fallback is the conservative one only in the sense of being what the
- * fleet did before the key existed.
+ * in a hand-edited config therefore turns off the very limit it was meant to
+ * set, rather than failing the load: off is what the fleet did before the key
+ * existed, and redeemPolicyWarnings names every key it happens to, for the
+ * server to log at start and at each reload.
  *
  *  - `autoRedeemMinDaysToReset`: days, >= 0; 0 is off.
  *  - `autoRedeemMaxShare`: a fraction, 0 < share < 1 caps; 1 (or anything
  *    outside the range) is off.
  *  - `autoRedeemMaxPerDay`: a whole number >= 0; 0 is off.
  *
- * Only a number, or a string that spells one, is read as a value. `true`, an
- * array or an object would each coerce to a number, and a knob nobody set must
- * not start limiting on the strength of that.
- *
  * @param {Record<string, any>|null|undefined} config
  * @returns {RedeemPolicy}
  */
 export function redeemPolicyFrom(config) {
-  /** @param {unknown} value */
-  const knob = value => (typeof value === 'number' ? value
-    : typeof value === 'string' && value.trim() !== '' ? Number(value) : NaN);
   const minDays = knob(config?.autoRedeemMinDaysToReset);
   const share = knob(config?.autoRedeemMaxShare);
   const perDay = knob(config?.autoRedeemMaxPerDay);
@@ -79,6 +84,42 @@ export function redeemPolicyFrom(config) {
     maxShare: Number.isFinite(share) && share > 0 && share < 1 ? share : 1,
     maxPerDay: Number.isInteger(perDay) && perDay > 0 ? perDay : 0,
   };
+}
+
+/**
+ * One log line for each knob the config sets to a value redeemPolicyFrom
+ * cannot use, and so reads as off, saying which key and what it read: a
+ * limit an operator set with a typo (50 for a half share, "3d" for three
+ * days) is otherwise off in silence. A key that is absent, null, or set to
+ * its own off value (0, 1, 0) is not a typo and says nothing.
+ *
+ * Also a floor of 7 days or more, which is kept as written. A Codex weekly
+ * window is 7 days long, so an account that has used one up is always less
+ * than 7 days from its reset, and on such a window the floor stops every
+ * automatic redemption, which is what the fleet switch is for. The usage
+ * parser also reads a window of up to 7.7 days as weekly (codex-quota.js),
+ * and on one of those a floor from 7 to 7.5 can pass.
+ *
+ * @param {Record<string, any>|null|undefined} config
+ * @returns {string[]}
+ */
+export function redeemPolicyWarnings(config) {
+  const policy = redeemPolicyFrom(config);
+  /** @type {string[]} */
+  const lines = [];
+  /** @param {string} key @param {number} off @param {number} read @param {string} wanted @param {string} limit */
+  const check = (key, off, read, wanted, limit) => {
+    const value = config?.[key];
+    if (value == null || read !== off || knob(value) === off) return;
+    lines.push(`[TeamClaude] ${key} is ${safeLine(JSON.stringify(value) ?? String(value), 40)}, which is not ${wanted}, so the ${limit} is off`);
+  };
+  check('autoRedeemMinDaysToReset', 0, policy.minDaysToReset, 'a number of days above 0', 'minimum-days floor');
+  check('autoRedeemMaxShare', 1, policy.maxShare, 'a fraction strictly between 0 and 1', 'cohort share cap');
+  check('autoRedeemMaxPerDay', 0, policy.maxPerDay, 'a whole number above 0', 'per-day cap');
+  if (policy.minDaysToReset >= 7) {
+    lines.push(`[TeamClaude] autoRedeemMinDaysToReset is ${policy.minDaysToReset}, but an account whose 7-day weekly window has run out is always less than 7 days from its reset, so no Codex credit on such a window is redeemed automatically (the usage parser also reads a window of up to 7.7 days as weekly)`);
+  }
+  return lines;
 }
 
 /**

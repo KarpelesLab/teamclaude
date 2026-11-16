@@ -600,7 +600,9 @@ That has two consequences the switch above knows nothing about.
 
 Three keys shape what the switch spends, all off unless set, so a fleet that
 never sets them behaves exactly as before. They narrow the automatic policy and
-never widen it: every condition above still has to hold.
+never widen it: every condition above still has to hold. A key set to a value
+it cannot read, such as `50` for a half share or `"3d"` for three days, is off
+as well, and the server names it in the log at start and at each reload.
 
 - [`autoRedeemMinDaysToReset`](configuration.md) — never auto-redeem an
   account whose natural reset is closer than this many days. The account is

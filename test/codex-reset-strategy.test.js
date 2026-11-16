@@ -1,5 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { writeFile } from 'node:fs/promises';
+import { spawnServer } from '../test-helpers/spawn-server.js';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
 import { autoRedeemLine, renderStatus } from '../src/status-renderer.js';
@@ -476,6 +478,42 @@ test('/teamclaude/status carries each Codex account\'s standing and the fleet po
     assert.deepEqual(data.redeemPolicy, { minDaysToReset: 0, maxShare: 1, maxPerDay: 2, redeemedLast24h: 0 });
   } finally {
     cp.close();
+  }
+});
+
+/**
+ * Resolves once the spawned server's output carries `pattern`, read off its
+ * output events rather than a timer. Rejects once the test has ended however
+ * it ended (test/README.md), so the `finally` that stops the server runs.
+ */
+function said(server, pattern, signal) {
+  return new Promise((resolve, reject) => {
+    const stop = () => {
+      server.child.stdout.off('data', look);
+      server.child.stderr.off('data', look);
+      signal.removeEventListener('abort', ended);
+    };
+    const look = () => { if (pattern.test(server.output())) { stop(); resolve(); } };
+    const ended = () => { stop(); reject(new Error(`the server never said ${pattern}`)); };
+    server.child.stdout.on('data', look);
+    server.child.stderr.on('data', look);
+    signal.addEventListener('abort', ended);
+    look();
+  });
+}
+
+test('the server says at start and at a reload which reset-credit limit it reads as off', { timeout: 60_000 }, async t => {
+  const server = await spawnServer({
+    config: () => ({ proxy: { apiKey: 'tc-test' }, upstreamProxy: false, autoRedeemMaxShare: 50, accounts: [{ name: 'a', type: 'apikey', apiKey: 'k-a' }] }),
+  });
+  try {
+    await said(server, /autoRedeemMaxShare is 50, which is not a fraction strictly between 0 and 1, so the cohort share cap is off/, t.signal);
+    await writeFile(server.configPath, JSON.stringify({ ...server.config, autoRedeemMaxShare: 0.5, autoRedeemMaxPerDay: '2/day' }));
+    const reload = await fetch(`http://127.0.0.1:${server.port}/teamclaude/reload`, { method: 'POST', headers: { 'x-api-key': 'tc-test' }, signal: t.signal });
+    assert.equal(reload.status, 200);
+    await said(server, /autoRedeemMaxPerDay is "2\/day", which is not a whole number above 0, so the per-day cap is off/, t.signal);
+  } finally {
+    await server.stop();
   }
 });
 
