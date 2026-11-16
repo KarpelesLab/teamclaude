@@ -6052,7 +6052,7 @@ ${SHARED_HELPERS}
     var shown = series.filter(function (sr) { return !ins.hidden[sr.key]; });
     if (!shown.length) shown = series;
     var total = o.view === 'total';
-    var drawn = total ? shown.map(function (sr) { return { key: sr.key, label: sr.label, color: sr.color, values: runningTotals(sr.values) }; }) : shown;
+    var drawn = total ? shown.map(function (sr) { return { key: sr.key, label: sr.label, color: sr.color, unpriced: sr.unpriced, values: runningTotals(sr.values) }; }) : shown;
     var cols = stackSeries(drawn, n);
     var max = 0;
     cols.forEach(function (c) { if (c.length) max = Math.max(max, c[c.length - 1][1]); });
@@ -6072,7 +6072,7 @@ ${SHARED_HELPERS}
       var gy = m.t + ph - ph * g / 4;
       var line = paint(svgEl('line', { x1: m.l, x2: W - m.r, y1: gy, y2: gy, 'stroke-width': 1 }, s), null, g ? 'var(--igrid)' : 'var(--iaxis)');
       if (g) line.setAttribute('stroke-dasharray', '3 3');
-      svgEl('text', { x: m.l - 8, y: gy + 4, 'text-anchor': 'end' }, s).textContent = g ? o.axis(top * g / 4) : '0';
+      svgEl('text', { x: m.l - 8, y: gy + 4, 'text-anchor': 'end' }, s).textContent = o.note ? '' : g ? o.axis(top * g / 4) : '0';
     }
     // Every series left on show has no price: say so where the bars would be,
     // over the grid and clear of its midline, rather than let an empty plot
@@ -6110,6 +6110,9 @@ ${SHARED_HELPERS}
       }
     } else {
       drawn.forEach(function (sr, k) {
+        // An unpriced series has no height in a cost stack: its line would
+        // lie along the top of the priced ones and repaint their edge.
+        if (sr.unpriced) return;
         var up = '';
         var down = '';
         for (var i = 0; i < n; i++) {
@@ -6119,8 +6122,10 @@ ${SHARED_HELPERS}
         svgEl('path', { d: up + down + 'Z', fill: fills[k] }, s);
         paint(svgEl('path', { d: up, fill: 'none', 'stroke-width': 2, 'stroke-linejoin': 'round' }, s), null, sr.color);
       });
-      var last = cols[n - 1];
-      if (last.length) paint(svgEl('circle', { cx: X(n - 1), cy: Y(last[last.length - 1][1]), r: 3.5, 'stroke-width': 2 }, s), drawn[drawn.length - 1].color, 'var(--panel)');
+      // The end dot takes the colour of the top series that has a price.
+      var lastPriced = -1;
+      drawn.forEach(function (sr, k) { if (!sr.unpriced) lastPriced = k; });
+      if (lastPriced >= 0) paint(svgEl('circle', { cx: X(n - 1), cy: Y(cols[n - 1][lastPriced][1]), r: 3.5, 'stroke-width': 2 }, s), drawn[lastPriced].color, 'var(--panel)');
     }
     var refLine = function (v, text, left) {
       var y = Y(v);
@@ -6156,6 +6161,7 @@ ${SHARED_HELPERS}
     }
     // The shared cursor in the running total: a dot where it crosses each line.
     var dots = total ? drawn.map(function (sr) {
+      if (sr.unpriced) return null;
       var c = svgEl('circle', { r: 3, 'stroke-width': 2 }, s);
       paint(c, sr.color, 'var(--panel)');
       c.style.display = 'none';
@@ -6166,6 +6172,7 @@ ${SHARED_HELPERS}
         var off = i == null || i >= n;
         hl.style.display = off ? 'none' : '';
         dots.forEach(function (c, k) {
+          if (!c) return;
           c.style.display = off ? 'none' : '';
           if (!off) { c.setAttribute('cx', X(i)); c.setAttribute('cy', Y(cols[i][k][1])); }
         });
@@ -6641,6 +6648,8 @@ ${SHARED_HELPERS}
     var ot = INS_METRICS[other];
     var yrs = spansYears(d);
     var when = function (b) { return insightsBucketLabel(b, d.unit, true, yrs); };
+    // A table row for the bucket still filling says so, as its tooltip does.
+    var whenAt = function (b, i) { return when(b) + (i === d.buckets.length - 1 ? ' (so far)' : ''); };
     var num = function (v) { return Math.round(v).toLocaleString(); };
     var rangeText = insightsRangeText(d.range);
     var hourly = d.unit === 'hour';
@@ -6693,7 +6702,7 @@ ${SHARED_HELPERS}
         from: from, trend: nonePriced ? null : insightsTrend(shownSum, d.unit, from), note: nonePriced ? 'not priced' : null,
         // The period before, as one figure: only against everything, not a part of it.
         ref: prevTotal != null && prevTotal > 0 && !anyHidden ? { value: prevTotal, label: 'previous ' + (hourly ? '24 hours' : parseInt(d.range, 10) + ' days') + ': ' + mt.fmt(prevTotal) } : null,
-        other: otherValues, otherName: ot.name, otherFmt: ot.fmt,
+        other: otherValues, otherName: ot.name + (anyHidden ? ' (all series)' : ''), otherFmt: ot.fmt,
       });
       legendTable(host, series, mt.fmt, from);
     }, function () {
@@ -6709,8 +6718,8 @@ ${SHARED_HELPERS}
       return {
         cols: ['When'].concat(many ? series.map(function (sr) { return sr.label + suffix; }) : [], [mt.name + suffix], oth ? [ot.name + suffix] : []),
         rows: d.buckets.map(function (b, i) {
-          if (i < from) return [when(b)].concat(many ? series.map(function () { return 'not recorded'; }) : [], ['not recorded'], oth ? ['not recorded'] : []);
-          return [when(b)].concat(many ? series.map(function (sr, k) { return sr.unpriced ? 'not priced' : mt.fmt(cells[k][i] || 0); }) : [],
+          if (i < from) return [whenAt(b, i)].concat(many ? series.map(function () { return 'not recorded'; }) : [], ['not recorded'], oth ? ['not recorded'] : []);
+          return [whenAt(b, i)].concat(many ? series.map(function (sr, k) { return sr.unpriced ? 'not priced' : mt.fmt(cells[k][i] || 0); }) : [],
             [allUnpriced ? 'not priced' : mt.fmt(tot[i])], oth ? [ot.fmt(oth[i])] : []);
         }).reverse(),
       };
@@ -6735,7 +6744,7 @@ ${SHARED_HELPERS}
         drawCalendar(host, d, values, mt);
       }, function () {
         return { cols: ['Day', mt.name].concat(otherValues ? [ot.name] : []),
-          rows: d.buckets.map(function (b, i) { return [when(b), i < from ? 'not recorded' : mt.fmt(values[i])].concat(otherValues ? [i < from ? '' : ot.fmt(otherValues[i])] : []); }).reverse() };
+          rows: d.buckets.map(function (b, i) { return [whenAt(b, i), i < from ? 'not recorded' : mt.fmt(values[i])].concat(otherValues ? [i < from ? '' : ot.fmt(otherValues[i])] : []); }).reverse() };
       });
       if (showMonths) {
         insightsCard(row, 'months', 'By month', 'calendar months in the range' + (months[months.length - 1].projected != null ? ' · dashed: projected' : ''), function (host) {

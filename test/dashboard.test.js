@@ -1409,6 +1409,33 @@ test('the Insights hero table follows the view, and says not recorded and not pr
   assert.ok(priced.labelled('Est. API cost (running total)') >= 1, 'the column says which');
 });
 
+// In a cost running total an unpriced series has no height: it must not draw
+// a line or a dot along the top of the priced stack, where it would repaint
+// that edge in its own colour.
+test('the Insights running total draws no line or dot for a series with no price', async () => {
+  const page = bootPage();
+  await page.answer(200, { accounts: [{ name: 'g', provider: 'grok' }] });
+  page.click('Insights');
+  await page.answer(200, {
+    ...INSIGHTS,
+    totals: { requests: 2, input: 15, output: 0, cacheRead: 0, cacheWrite: 0 },
+    kinds: { cacheRead: [0, 0], cacheWrite: [0, 0], input: [5, 10], output: [0, 0] },
+    cost: { total: 2, values: [1, 1], previous: null, unpricedTokens: 5 },
+    providers: [
+      { provider: 'anthropic', tokens: 10, cost: 2, requests: 1, values: [5, 5], requestValues: [0, 1], costValues: [1, 1] },
+      { provider: 'grok', tokens: 5, cost: 0, requests: 1, values: [0, 5], requestValues: [0, 1], costValues: [0, 0] },
+    ],
+    accounts: [{ provider: 'grok', account: 'g', tokens: 5, cost: 0, requests: 1, values: [0, 5], requestValues: [0, 1], costValues: [0, 0] }],
+    models: [{ provider: 'anthropic', model: 'claude-opus-5-5', tokens: 10, requests: 1, cost: 2 }, { provider: 'grok', model: 'grok-4', tokens: 5, requests: 1, cost: null }],
+  });
+  const at = page.built.length;
+  page.click('Running total');
+  const drawn = page.built.slice(at);
+  assert.equal(drawn.filter(e => e.style.stroke === 'var(--ip-grok)' || e.style.fill === 'var(--ip-grok)').length, 0, 'no Grok line or dot');
+  assert.ok(drawn.some(e => e.style.stroke === 'var(--ip-claude)'), 'the priced series keeps its line');
+  assert.ok(drawn.some(e => e.style.fill === 'var(--ip-claude)'), 'the end dot is the top priced series');
+});
+
 // A range where nothing had a list price has no cost estimate at all: the
 // page draws the tokens, the cost headline says "not priced" and is no tab,
 // and no table (the chart's, the calendar's, the months', the list's)
