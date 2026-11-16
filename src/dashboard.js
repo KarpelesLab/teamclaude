@@ -6627,7 +6627,10 @@ ${SHARED_HELPERS}
     drawInsights();
     var again = ins.focus ? ins.focusables[ins.focus] : null;
     ins.focus = null;
-    if (again && again.focus) again.focus();
+    // Without preventScroll, focusing the rebuilt control scrolls it into
+    // view: a resize or a refresh would throw a reader further down the page
+    // back up to the control they last pressed.
+    if (again && again.focus) again.focus({ preventScroll: true });
   }
 
   function drawInsights() {

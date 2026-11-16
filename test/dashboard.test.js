@@ -1196,6 +1196,9 @@ function bootPage({ storedKey = null, storedTheme = null, storedInstance = null,
   // kept, so a test can drive a control the page created for itself — the
   // window buttons have no id to look up.
   const built = [];
+  // Focus is recorded, with the options it was given, and moves
+  // document.activeElement the way a browser does.
+  const focused = [];
   const stubEl = () => {
     // Listeners are recorded rather than absorbed, so a test can fire a click
     // the way the page registered it instead of reaching for an onclick the
@@ -1206,6 +1209,7 @@ function bootPage({ storedKey = null, storedTheme = null, storedInstance = null,
       style: {}, value: '', textContent: '', className: '', disabled: false,
       addEventListener: (type, fn) => { if (!listeners.has(type)) listeners.set(type, []); listeners.get(type).push(fn); },
       listens: type => (listeners.get(type) || []).length > 0,
+      focus: opts => { focused.push({ el: proxy, opts }); document.activeElement = proxy; },
     };
     const proxy = new Proxy(target, { get: (t, p) => (p in t ? t[p] : () => stubEl()) });
     // Fire with the proxy as `this`, the way the page sees the element, so a
@@ -1243,7 +1247,8 @@ function bootPage({ storedKey = null, storedTheme = null, storedInstance = null,
     removeAttribute: k => rootAttrs.delete(k),
     getAttribute: k => (rootAttrs.has(k) ? rootAttrs.get(k) : null),
   };
-  const document = { getElementById: byId, createElement: () => stubEl(), createElementNS: () => stubEl(), documentElement };
+  /** @type {any} */
+  const document = { getElementById: byId, createElement: () => stubEl(), createElementNS: () => stubEl(), documentElement, activeElement: null };
   const html = renderDashboardHtml();
   const script = inlineScripts(html).at(-1);
   let poll;
@@ -1276,7 +1281,7 @@ function bootPage({ storedKey = null, storedTheme = null, storedInstance = null,
   // The latest element built that matches, for a control with no label to
   // click by (an input the page made for itself).
   const findLast = pred => built.slice().reverse().find(pred);
-  return { byId, store, requests, answer, answerTo, runTimers, rootAttrs, click, labelled, findLast, built, poll: () => { mark = built.length; poll(); } };
+  return { byId, store, requests, answer, answerTo, runTimers, rootAttrs, click, labelled, findLast, built, focused, poll: () => { mark = built.length; poll(); } };
 }
 
 // The Insights page reads /teamclaude/insights only while it is open, like the
@@ -1497,6 +1502,36 @@ test('the Insights page does not redraw for a refresh identical to what it shows
   } finally {
     Date.now = realNow;
   }
+});
+
+// Every redraw rebuilds the controls and focuses the one that had focus again.
+// It must not scroll to it: a resize or a refresh would otherwise pull a
+// reader further down the page back up to the last control they pressed.
+test('the Insights redraw keeps focus on the control without scrolling to it', async () => {
+  const page = bootPage();
+  await page.answer(200, { accounts: [{ name: 'a', provider: 'anthropic' }] });
+  page.click('Insights');
+  await page.answer(200, INSIGHTS);
+  page.click('Running total');
+  const pressed = page.focused.at(-1);
+  assert.equal(pressed.el.textContent, 'Running total', 'the pressed view is focused again');
+  assert.deepEqual(pressed.opts, { preventScroll: true });
+  const realNow = Date.now;
+  try {
+    Date.now = () => realNow() + 61_000;
+    page.poll();
+    await page.answer(200, { accounts: [{ name: 'a', provider: 'anthropic' }] });
+    const before = page.built.length;
+    await page.answer(200, { ...INSIGHTS, requests: [1, 2] });
+    assert.ok(page.built.length > before, 'the changed reply is drawn');
+  } finally {
+    Date.now = realNow;
+  }
+  const kept = page.focused.at(-1);
+  assert.notEqual(kept.el, pressed.el, 'the rebuilt control, not the one taken off the page');
+  assert.equal(kept.el.textContent, 'Running total');
+  assert.deepEqual(kept.opts, { preventScroll: true });
+  assert.ok(page.focused.every(f => f.opts && f.opts.preventScroll), 'no Insights redraw focuses with scrolling');
 });
 
 // A failed read is throttled like a successful one: a proxy answering 404 or
