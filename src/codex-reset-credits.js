@@ -569,7 +569,7 @@ export class ResetCreditRedeemer {
    * armed it gets the status screen it had before.
    *
    * @param {Record<string, any>} account
-   * @returns {{armed: boolean, exemptReason: string|null, creditValueWeeks: number|null}|null}
+   * @returns {{armed: boolean, exemptReason: string|null, creditValueWeeks: number|null, daysToReset: number|null}|null}
    */
   describe(account) {
     if (!account || providerOf(account) !== 'codex' || !this._armed()) return null;

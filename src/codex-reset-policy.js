@@ -141,7 +141,9 @@ export function daysToReset(account, now = Date.now()) {
  * What a credit spent on this account right now is worth, as a fraction of a
  * week: the days until its natural reset over seven. Null when the reset is
  * unknown, which is not 0 — an unvalued credit is a different thing from a
- * worthless one, and the policy treats the two differently.
+ * worthless one, and the policy treats the two differently. The exact value:
+ * the status standing and the floor's reason state it to the hundredth
+ * below instead (shownToReset).
  *
  * @param {Record<string, any>|null|undefined} account
  * @param {number} [now]
@@ -169,10 +171,10 @@ export function creditValueWeeks(account, now = Date.now()) {
 export function minDaysReason(account, minDaysToReset, now = Date.now()) {
   if (!(minDaysToReset > 0)) return null;
   const days = daysToReset(account, now);
-  if (days == null) return `weekly reset time is unknown, so the credit cannot be valued against the ${formatDays(minDaysToReset)} minimum`;
+  if (days == null) return `weekly reset time is unknown, so the credit cannot be valued against the ${minDaysToReset}d minimum`;
   if (days >= minDaysToReset) return null;
-  const value = Math.min(1, days / 7);
-  return `natural weekly reset is ${formatDays(days)} away, under the ${formatDays(minDaysToReset)} minimum (the credit would buy ${value.toFixed(2)} of a week)`;
+  const shown = /** @type {{days: number, weeks: number}} */ (shownToReset(account, now));
+  return `natural weekly reset is ${formatDays(shown.days)} away, under the ${minDaysToReset}d minimum (the credit would buy ${shown.weeks.toFixed(2)} of a week)`;
 }
 
 /**
@@ -317,7 +319,9 @@ export function byExhaustion(a, b) {
 /**
  * The account's standing under the policy, for the status payload: whether
  * the automatic policy may spend on it at all, why not when it may not, and
- * what a credit spent on it now would buy. `armed` is about the policy and
+ * what a credit spent on it now would buy, in weeks and as the days to the
+ * natural reset (each to the step below, as the floor's reason states them;
+ * see shownToReset). `armed` is about the policy and
  * the caps, not about the moment — an armed account whose weekly window is
  * still healthy is armed and simply not exhausted.
  *
@@ -328,13 +332,14 @@ export function byExhaustion(a, b) {
  * @param {Record<string, any>[]} args.members  as shareCapVerdict takes them
  * @param {RedeemRecord[]} args.ledger
  * @param {number} args.now
- * @returns {{armed: boolean, exemptReason: string|null, creditValueWeeks: number|null}}
+ * @returns {{armed: boolean, exemptReason: string|null, creditValueWeeks: number|null, daysToReset: number|null}}
  */
 export function autoRedeemStanding({ account, autoRedeemResets, policy, members, ledger, now }) {
-  const creditValue = creditValueWeeks(account, now);
-  const value = creditValue == null ? null : Math.round(creditValue * 100) / 100;
+  const shown = shownToReset(account, now);
+  const value = shown ? shown.weeks : null;
+  const toReset = shown ? shown.days : null;
   /** @param {string} reason */
-  const exempt = reason => ({ armed: false, exemptReason: reason, creditValueWeeks: value });
+  const exempt = reason => ({ armed: false, exemptReason: reason, creditValueWeeks: value, daysToReset: toReset });
   if (autoRedeemResets !== true) return exempt('auto-redeem is switched off');
   if (account.autoRedeemReset === false) return exempt('auto-redeem is switched off for this account');
   const floor = minDaysReason(account, policy.minDaysToReset, now);
@@ -343,11 +348,32 @@ export function autoRedeemStanding({ account, autoRedeemResets, policy, members,
   if (!daily.ok) return exempt(/** @type {string} */ (daily.reason));
   const share = shareCapVerdict({ account, members, ledger, maxShare: policy.maxShare, now });
   if (!share.ok) return exempt(/** @type {string} */ (share.reason));
-  return { armed: true, exemptReason: null, creditValueWeeks: value };
+  return { armed: true, exemptReason: null, creditValueWeeks: value, daysToReset: toReset };
 }
 
-/** @param {number} days */
+/**
+ * How far the natural reset is, as the floor's reason and the status line
+ * state it: the days to the tenth below and the credit's worth in weeks to
+ * the hundredth below, both from the one reading and neither rounded up. A
+ * reset 1.96 days away is not yet 2, and rounded it would read as meeting
+ * the 2-day floor it is stopped by; two figures rounded different ways would
+ * disagree on one line. Counted in whole milliseconds, so a figure at an
+ * exact step never lands one low, as a division in days can (1.96 days is
+ * 0.28 of a week, and 1.96 / 7 * 100 is 27.999999999999996). Null when the
+ * reset is unknown.
+ *
+ * @param {Record<string, any>|null|undefined} account
+ * @param {number} now
+ * @returns {{days: number, weeks: number}|null}
+ */
+function shownToReset(account, now) {
+  const resetAt = account?.quota?.unified7dReset;
+  if (!Number.isFinite(resetAt)) return null;
+  const ms = Math.max(0, resetAt - now);
+  return { days: Math.floor(ms * 10 / DAY_MS) / 10, weeks: Math.min(100, Math.floor(ms * 100 / WEEK_MS)) / 100 };
+}
+
+/** @param {number} days  already to a tenth */
 function formatDays(days) {
-  const rounded = Math.round(days * 10) / 10;
-  return `${Number.isInteger(rounded) ? rounded : rounded.toFixed(1)}d`;
+  return `${Number.isInteger(days) ? days : days.toFixed(1)}d`;
 }

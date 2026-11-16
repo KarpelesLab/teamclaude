@@ -648,8 +648,11 @@ While `autoRedeemResets` is on, `teamclaude status` prints a `Redeem` line
 under each Codex account — `armed` or `exempt — <reason>`, and what a credit
 spent now is worth (`credit worth 0.43 of a week (3.0d to reset)`). The JSON
 carries the same under `accounts[].autoRedeem`
-(`{ armed, exemptReason, creditValueWeeks }`; `null` on a non-Codex row, and on
-every row while the switch is off) and the fleet's `redeemPolicy`
+(`{ armed, exemptReason, creditValueWeeks, daysToReset }`, the credit's worth
+in weeks to the hundredth below and the days to the natural reset to the tenth
+below, as the floor's reason gives them; `null` on a non-Codex row, and on
+every row while the switch is off) and the fleet's
+`redeemPolicy`
 (`{ minDaysToReset, maxShare, maxPerDay, redeemedLast24h }`, where
 `redeemedLast24h` counts automatic redemptions). `armed` is about the policy
 and the caps, not the moment: an armed account whose weekly window is still

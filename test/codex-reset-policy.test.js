@@ -124,6 +124,46 @@ test('the floor stops an account whose reset is too close, and says what the cre
   assert.equal(minDaysReason(codex('a', 5), 2, NOW), null);
 });
 
+test('the floor\'s reason never rounds the days up to the minimum they are under', () => {
+  // Rounded to the nearest tenth, 1.96 days read "2d away, under the 2d minimum".
+  assert.match(minDaysReason(codex('a', 1.96), 2, NOW), /^natural weekly reset is 1\.9d away, under the 2d minimum /);
+  assert.match(minDaysReason(codex('a', 2.96), 3, NOW), /^natural weekly reset is 2\.9d away, under the 3d minimum /);
+  assert.match(minDaysReason(codex('a', 1.04), 2, NOW), /^natural weekly reset is 1d away, under the 2d minimum /);
+  // A minimum is stated as set: 2.04 rounded is 2, which 2.03 days would floor to.
+  assert.match(minDaysReason(codex('a', 2.03), 2.04, NOW), /^natural weekly reset is 2d away, under the 2\.04d minimum /);
+});
+
+test('a standing states the weeks and the days from one reading, each to the step below', () => {
+  const at = ms => autoRedeemStanding({
+    account: codex('a', null, { quota: { unified7dReset: NOW + ms } }), autoRedeemResets: true,
+    policy: DEFAULT_REDEEM_POLICY, members: [], ledger: [], now: NOW,
+  });
+  // Weeks to the nearest hundredth beside days to the tenth below read 6.199
+  // days as "0.89 of a week (6.1d)", and 0.89 of a week is 6.23 days.
+  const v = at(6.199 * DAY);
+  assert.deepEqual([v.creditValueWeeks, v.daysToReset], [0.88, 6.1]);
+  // An exact step is not read one low: 1.96 days is 0.28 of a week, which a
+  // division in days floors to 0.27.
+  assert.deepEqual([at(1.96 * DAY).creditValueWeeks, at(1.96 * DAY).daysToReset], [0.28, 1.9]);
+  // Across the week, each figure is the step at or just below the reading.
+  const WEEK = 7 * DAY;
+  for (let ms = 0; ms <= WEEK; ms += 37 * 60 * 1000) {
+    const s = at(ms);
+    const hundredths = Math.round(s.creditValueWeeks * 100);
+    const tenths = Math.round(s.daysToReset * 10);
+    assert.ok(hundredths * WEEK / 100 <= ms && (ms < (hundredths + 1) * WEEK / 100 || hundredths === 100), `weeks at ${ms}ms`);
+    assert.ok(tenths * DAY / 10 <= ms && ms < (tenths + 1) * DAY / 10, `days at ${ms}ms`);
+  }
+});
+
+test('a reset already behind us reads as 0 weeks and 0 days, never less', () => {
+  // Nothing sweeps a passed reset until the account is next read.
+  const past = codex('a', null, { quota: { unified7dReset: NOW - 60 * 60 * 1000 } });
+  const s = autoRedeemStanding({ account: past, autoRedeemResets: true, policy: DEFAULT_REDEEM_POLICY, members: [], ledger: [], now: NOW });
+  assert.deepEqual([s.creditValueWeeks, s.daysToReset], [0, 0]);
+  assert.match(minDaysReason(past, 2, NOW), /^natural weekly reset is 0d away, under the 2d minimum \(the credit would buy 0\.00 of a week\)$/);
+});
+
 test('with the floor on, an account whose reset is unknown cannot be shown to clear it', () => {
   assert.match(minDaysReason(codex('a', null), 2, NOW), /reset time is unknown/);
 });
@@ -279,10 +319,10 @@ test('standing names the first thing that exempts an account, and the value eith
   const policy = { minDaysToReset: 2, maxShare: 0.5, maxPerDay: 1 };
   const a = codex('a', 3.5);
   const armed = autoRedeemStanding({ account: a, autoRedeemResets: true, policy, members: [a], ledger: [], now: NOW });
-  assert.deepEqual(armed, { armed: true, exemptReason: null, creditValueWeeks: 0.5 });
+  assert.deepEqual(armed, { armed: true, exemptReason: null, creditValueWeeks: 0.5, daysToReset: 3.5 });
 
   const off = autoRedeemStanding({ account: a, autoRedeemResets: false, policy, members: [a], ledger: [], now: NOW });
-  assert.deepEqual(off, { armed: false, exemptReason: 'auto-redeem is switched off', creditValueWeeks: 0.5 });
+  assert.deepEqual(off, { armed: false, exemptReason: 'auto-redeem is switched off', creditValueWeeks: 0.5, daysToReset: 3.5 });
 
   const optOut = autoRedeemStanding({ account: { ...a, autoRedeemReset: false }, autoRedeemResets: true, policy, members: [a], ledger: [], now: NOW });
   assert.equal(optOut.exemptReason, 'auto-redeem is switched off for this account');
@@ -295,5 +335,5 @@ test('standing names the first thing that exempts an account, and the value eith
   assert.match(full.exemptReason, /daily cap/);
 
   const unknown = autoRedeemStanding({ account: codex('u', null), autoRedeemResets: true, policy: DEFAULT_REDEEM_POLICY, members: [], ledger: [], now: NOW });
-  assert.deepEqual(unknown, { armed: true, exemptReason: null, creditValueWeeks: null });
+  assert.deepEqual(unknown, { armed: true, exemptReason: null, creditValueWeeks: null, daysToReset: null });
 });

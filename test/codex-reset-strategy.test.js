@@ -55,6 +55,8 @@ function harness({ days = [3, 3], extras = [], config = { autoRedeemResets: true
   const log = [];
   const redeemer = new ResetCreditRedeemer(am, {
     config,
+    // The clock the resets above were set against, so a day is a day.
+    now: () => now,
     log: line => log.push(line),
     detailsFn: async account => { calls.details.push(account.name); const rows = credits?.[account.name] ?? [credit({ id: `${account.name}-1` })]; return { credits: rows, availableCount: rows.length }; },
     consumeFn: async account => { calls.consume.push(account.name); return typeof code === 'function' ? code(account.name) : { code, windowsReset: 1, credit: null }; },
@@ -66,9 +68,10 @@ function harness({ days = [3, 3], extras = [], config = { autoRedeemResets: true
 // ── the preconditions ───────────────────────────────────────────────────────
 
 test('the floor is a precondition with its own reason, and off by default', () => {
-  const account = spent({ ...codex('a'), quota: {} }, 1);
+  const now = Date.now();
+  const account = spent({ ...codex('a'), quota: {} }, 1, now);
   assert.equal(redeemPreconditions({ account, autoRedeemResets: true }).ok, true, 'no floor passed: as before');
-  const floored = redeemPreconditions({ account, autoRedeemResets: true, minDaysToReset: 2 });
+  const floored = redeemPreconditions({ account, autoRedeemResets: true, minDaysToReset: 2, now });
   assert.equal(floored.ok, false);
   assert.match(floored.reason, /natural weekly reset is 1d away, under the 2d minimum/);
   // The exhaustion check comes first: a healthy window is "not exhausted",
@@ -424,7 +427,7 @@ test('a consume whose answer was lost comes back from the walk as uncertain', as
 
 test('describe answers for a Codex row and null for any other', () => {
   const { am, redeemer } = harness({ days: [3.5], config: { autoRedeemResets: true } });
-  assert.deepEqual(redeemer.describe(am.accounts[0]), { armed: true, exemptReason: null, creditValueWeeks: 0.5 });
+  assert.deepEqual(redeemer.describe(am.accounts[0]), { armed: true, exemptReason: null, creditValueWeeks: 0.5, daysToReset: 3.5 });
   assert.equal(redeemer.describe({ name: 'claude', type: 'oauth', quota: {} }), null);
   // With the fleet switch off nothing is spent automatically, so there is no
   // standing to report and the status screen prints no Redeem line.
@@ -447,6 +450,22 @@ test('the status screen prints a Redeem line per Codex account, and nothing wher
   assert.match(out, /Redeem\s+armed, credit worth 0\.50 of a week/);
   const plain = renderStatus({ currentAccount: 'a', switchThreshold: 0.98, routes: [], sessions: {}, accounts: [{ ...row, autoRedeem: undefined }] }, { color: false });
   assert.equal(/Redeem/.test(plain), false);
+});
+
+test('the Redeem line states the days to reset as the floor\'s reason does, never rounded up to the minimum', () => {
+  const paint = { dim: s => s, green: s => s, yellow: s => s, gray: s => s };
+  // 1.04 and 1.96 days: credits worth 0.15 and 0.28 of a week, which worked
+  // back to days read 1.05 and 1.96, and rounded read 1.1 and 2.0.
+  for (const [days, shown] of [[1.04, '1d away.*\\(1\\.0d to reset\\)'], [1.96, '1\\.9d away.*\\(1\\.9d to reset\\)']]) {
+    const { am, redeemer } = harness({ days: [days], config: { autoRedeemResets: true, autoRedeemMinDaysToReset: 2 } });
+    const line = autoRedeemLine({ autoRedeem: redeemer.describe(am.accounts[0]) }, paint);
+    assert.match(line, new RegExp(`exempt — natural weekly reset is ${shown}$`));
+    assert.match(line, /under the 2d minimum/);
+  }
+  // Its weeks and days agree with each other too: rounded to the nearest
+  // hundredth, 6.199 days read "0.89 of a week", which is 6.23 days.
+  const { am, redeemer } = harness({ days: [6.199] });
+  assert.match(autoRedeemLine({ autoRedeem: redeemer.describe(am.accounts[0]) }, paint), /armed, credit worth 0\.88 of a week \(6\.1d to reset\)$/);
 });
 
 // ── the control plane ───────────────────────────────────────────────────────
@@ -474,7 +493,7 @@ test('/teamclaude/status carries each Codex account\'s standing and the fleet po
   try {
     const { status, data } = await cp.call('/teamclaude/status');
     assert.equal(status, 200);
-    assert.deepEqual(data.accounts[0].autoRedeem, { armed: true, exemptReason: null, creditValueWeeks: 0.5 });
+    assert.deepEqual(data.accounts[0].autoRedeem, { armed: true, exemptReason: null, creditValueWeeks: 0.5, daysToReset: 3.5 });
     assert.deepEqual(data.redeemPolicy, { minDaysToReset: 0, maxShare: 1, maxPerDay: 2, redeemedLast24h: 0 });
   } finally {
     cp.close();
