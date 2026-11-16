@@ -567,7 +567,12 @@ test('a pin is decided before the leaf loads, so a reload during the load cannot
         try {
           const port = /** @type {import('node:net').AddressInfo} */ (proxy.address()).port;
           const pending = handshake(port, 'chatgpt.com', real.port, real.caCertPem, pin);
-          await loading;
+          // A CONNECT answered before it asks for the leaf ends the handshake
+          // first, and the leaf is then never asked for: fail on that answer
+          // rather than wait for a load that will not come. An early
+          // rejection of the handshake fails the test here too.
+          const early = await Promise.race([loading.then(() => null), pending]);
+          assert.equal(early, null, `pin ${pin} was answered ${early?.status} before the leaf was asked for`);
           await reloadWith(config, am, after);
           const now = resolveConnectPin({ headers: { 'proxy-authorization': `Basic ${Buffer.from(`${pin}:`).toString('base64')}` } }, am, config.proxy);
           assert.match(now.error || '', /Unknown account pin/, `the reload did not take ${pin} away`);
