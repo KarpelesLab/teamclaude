@@ -431,8 +431,8 @@ Two boundaries worth knowing:
   `chatgpt.com`, as one left by an earlier Codex account does. Otherwise that
   starts with the proxy's next restart, and until then `chatgpt.com` is
   tunnelled: the Codex CLI runs on its own ChatGPT login, nothing is pooled or
-  booked against the fleet, and a `CONNECT` pinned to a Codex account is
-  refused with `503`.
+  booked against the fleet, and a `CONNECT` pinned to a Codex account, or to
+  an API-key account with an `upstream` of its own, is refused with `503`.
   `teamclaude env` and `teamclaude run` warn while that restart is due (see
   [the trust model](proxy-modes.md#trust-model)).
 - `ab.chatgpt.com` is never intercepted. It is OpenAI's telemetry endpoint,
