@@ -236,7 +236,7 @@ test('relayStream (/v1/code/*) with stripOverageHeaders unset forwards everythin
   }
 });
 
-test('relayRaw (POST /v1/oauth/token): overage headers are stripped, plan-quota headers pass', async () => {
+test('relayRaw (POST /v1/oauth/token): overage headers are stripped, plan-quota headers pass', async (t) => {
   const upstream = upstreamWithHeaders();
   const upstreamPort = await listen(upstream);
   try {
@@ -248,6 +248,7 @@ test('relayRaw (POST /v1/oauth/token): overage headers are stripped, plan-quota 
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: '{"grant_type":"refresh_token"}',
+      signal: t.signal, // see the relayRaw Trailer tests
     });
     assert.equal(res.status, 200);
     assertOverageStripped(res.headers);
@@ -289,7 +290,16 @@ async function rawTokenUpstream(answer) {
 
 const refreshOnly = { getActiveAccount() { throw new Error('must not touch accounts on a client token refresh'); } };
 
-test('relayRaw (POST /v1/oauth/token): a 204 carrying Trailer is answered, without it', async () => {
+// The failure the relayRaw tests guard (these two, and the other two in this
+// file) leaves the request unanswered, and no wait of theirs has a deadline. The test fails
+// on the error that escapes the listener, or on Node 24 and later on its
+// timeout, and neither ends the wait; t.signal, which node:test aborts once the
+// test has ended however it ended, does (the fetch rejects, the socket is
+// destroyed), so the finally blocks after it still close the servers. Without
+// it they would hold the file open: on Node 24 and later for good, on Node 20
+// and 22, which apply the runner's timeout to the whole file, until it is
+// killed there.
+test('relayRaw (POST /v1/oauth/token): a 204 carrying Trailer is answered, without it', async (t) => {
   const upstream = await rawTokenUpstream('HTTP/1.1 204 No Content\r\ntrailer: x-checksum\r\n\r\n');
   try {
     const listener = createProxyRequestListener({ accountManager: refreshOnly, upstream: `http://127.0.0.1:${upstream.port}`, config: {} });
@@ -297,6 +307,7 @@ test('relayRaw (POST /v1/oauth/token): a 204 carrying Trailer is answered, witho
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: '{"grant_type":"refresh_token"}',
+      signal: t.signal,
     });
     assert.equal(res.status, 204);
     assert.equal(res.headers.get('trailer'), null);
@@ -305,7 +316,7 @@ test('relayRaw (POST /v1/oauth/token): a 204 carrying Trailer is answered, witho
   }
 });
 
-test('relayRaw (POST /v1/oauth/token): an HTTP/1.0 client is answered without the upstream\'s Trailer', async () => {
+test('relayRaw (POST /v1/oauth/token): an HTTP/1.0 client is answered without the upstream\'s Trailer', async (t) => {
   const upstream = await rawTokenUpstream(
     'HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntrailer: x-checksum\r\ntransfer-encoding: chunked\r\n\r\n' +
     '11\r\n{"access_token":1\r\n1\r\n}\r\n0\r\nx-checksum: abc\r\n\r\n',
@@ -317,6 +328,7 @@ test('relayRaw (POST /v1/oauth/token): an HTTP/1.0 client is answered without th
     const raw = await new Promise((resolve) => {
       let got = '';
       const s = net.connect(port, '127.0.0.1', () => s.write('POST /v1/oauth/token HTTP/1.0\r\nHost: 127.0.0.1\r\ncontent-type: application/json\r\ncontent-length: 2\r\n\r\n{}'));
+      t.signal.addEventListener('abort', () => s.destroy(), { once: true });
       s.on('data', (d) => { got += d; });
       s.on('close', () => resolve(got));
       s.on('error', () => {});
@@ -330,7 +342,7 @@ test('relayRaw (POST /v1/oauth/token): an HTTP/1.0 client is answered without th
   }
 });
 
-test('relayRaw (POST /v1/oauth/token) with stripOverageHeaders unset forwards everything unchanged', async () => {
+test('relayRaw (POST /v1/oauth/token) with stripOverageHeaders unset forwards everything unchanged', async (t) => {
   const upstream = upstreamWithHeaders();
   const upstreamPort = await listen(upstream);
   try {
@@ -342,6 +354,7 @@ test('relayRaw (POST /v1/oauth/token) with stripOverageHeaders unset forwards ev
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: '{"grant_type":"refresh_token"}',
+      signal: t.signal, // see the relayRaw Trailer tests
     });
     assert.equal(res.status, 200);
     for (const [name, value] of Object.entries(OVERAGE)) assert.equal(res.headers.get(name), value, name);

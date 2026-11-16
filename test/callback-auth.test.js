@@ -169,7 +169,8 @@ test('sign-in polls until the approval arrives, then trades the code for a token
   });
   assert.deepEqual(urls, [['https://oid.jp/AbC123', 900]]);
   assert.equal(sleeps.length, 2, 'one pause per empty poll');
-  assert.deepEqual(token, { access_token: 'at-1', refresh_token: 'rt-1', token_type: 'Bearer', expires_in: 3600, client_id: CLIENT, obtained_at: 1_000_000 });
+  // Stamped with when it was signed in, which tells this sign-in from the next.
+  assert.deepEqual(token, { access_token: 'at-1', refresh_token: 'rt-1', token_type: 'Bearer', expires_in: 3600, client_id: CLIENT, obtained_at: 1_000_000, signed_in_at: 1_000_000 });
 
   const paths = api.state.seen.map((s) => s.path);
   assert.deepEqual(paths, [
@@ -243,7 +244,7 @@ test('the token is kept beside the config, private, and a damaged file reads as 
 test('an expired access token is renewed once, saved, and the call repeated', async (t) => {
   await tempConfig(t);
   const api = await mockApi(t, { access: 'at-current' });
-  await saveCallbackToken({ access_token: 'at-stale', refresh_token: 'rt-1', client_id: CLIENT, obtained_at: 1 });
+  await saveCallbackToken({ access_token: 'at-stale', refresh_token: 'rt-1', client_id: CLIENT, obtained_at: 1, signed_in_at: 1 });
 
   const me = await callbackWhoami({ base: api.base, now: () => 5 });
   // The display name carried a terminal escape; it does not reach the caller.
@@ -253,8 +254,9 @@ test('an expired access token is renewed once, saved, and the call repeated', as
     ['OAuth2:token', null],
     ['OAuth2:me', 'Bearer at-2'],
   ]);
-  // The refresh token was not restated by the server and is kept.
-  assert.deepEqual(await loadCallbackToken(), { access_token: 'at-2', refresh_token: 'rt-1', token_type: 'Bearer', expires_in: 3600, client_id: CLIENT, obtained_at: 5 });
+  // The refresh token was not restated by the server and is kept, and so is
+  // the sign-in it renews.
+  assert.deepEqual(await loadCallbackToken(), { access_token: 'at-2', refresh_token: 'rt-1', token_type: 'Bearer', expires_in: 3600, client_id: CLIENT, obtained_at: 5, signed_in_at: 1 });
 });
 
 test('a token near the end of its stated lifetime is renewed before the call, not after a refusal', async (t) => {
