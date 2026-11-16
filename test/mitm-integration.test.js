@@ -4,15 +4,17 @@ import http2 from 'node:http2';
 import http from 'node:http';
 import net from 'node:net';
 import tls from 'node:tls';
-import { once } from 'node:events';
+import { EventEmitter, once } from 'node:events';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { mkdtempSync, readdirSync, readFileSync, rmSync, watch } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { ReadableStream } from 'node:stream/web';
+import { TextEncoder } from 'node:util';
 import { generateCertChain } from '../src/x509.js';
 import { createConnectHandler } from '../src/mitm.js';
-import { KEEP_ALIVE_TIMEOUT_MS } from '../src/server.js';
+import { KEEP_ALIVE_TIMEOUT_MS, streamResponse } from '../src/server.js';
 import { allowLoopbackForward } from '../src/forward-target.js';
 import { AccountManager } from '../src/account-manager.js';
 import { closeUsageStore, openUsageStore, usageStoreAvailable } from '../src/usage/db.js';
@@ -609,8 +611,19 @@ const AM_PATH = fileURLToPath(new URL('../src/account-manager.js', import.meta.u
 // `res.write` to a cancelled stream returns false, which sends streamResponse
 // into its backpressure wait. That wait listens for `drain` or `close`, and on a
 // stream that is already closed neither will ever arrive: `close` fired before
-// the listener existed and `drain` does not fire on a closed stream. The read
-// that would have broken out first is the one this change is about.
+// the listener existed and `drain` does not fire on a closed stream. So the
+// relay must not make that write, and three things keep it from doing so. The
+// stream's `close` cancels the read the relay is waiting on (streamResponse);
+// the same `close` fires the request's abort listener, which aborts the
+// upstream fetch (the request listener); and the relay asks clientGone before
+// each write, which on h2 reads `res.stream.destroyed`. Here the client cancels
+// while the relay waits on the upstream: the abort fires first, but the reader
+// cancel is what settles the read, as done. Without the reader cancel the
+// aborted fetch ends the read instead, and only with both gone does a chunk
+// read after the cancel reach the check before the write. When the chunk is
+// read in the same turn the client cancels, only that check can keep it off
+// the stream. The two streamResponse tests after this one take the reader
+// cancel and that check each on its own.
 //
 // A stranded handler holds the event loop, so this runs in a child. In process
 // it would leave the runner unable to exit whether it passed or failed, and a
@@ -632,10 +645,25 @@ function h2SseCancelInChild(signal) {
     process.stdin.on('close', () => process.exit(1));
     process.stdin.resume();
 
-    // Feeds the proxy after the client has left, so the proxy has chunks to
-    // write to a stream that is already closed: one chunk for the client to
-    // read, then nothing until the cancel has reached the proxy, then the rest,
-    // one write at a time.
+    // The proxy must not write to a stream its client has cancelled: after its
+    // close, such a write strands the handler (see above). Each one is
+    // counted, and the first also ends the wait for the handler below, so it
+    // is reported rather than waited on.
+    let wroteToClosed;
+    const wrote = new Promise(r => { wroteToClosed = r; });
+    let writesToClosed = 0;
+    const write = http2.Http2ServerResponse.prototype.write;
+    http2.Http2ServerResponse.prototype.write = function (...args) {
+      if (this.stream?.destroyed) { writesToClosed++; wroteToClosed(); }
+      return write.apply(this, args);
+    };
+
+    // Feeds the proxy one chunk for the client to read before it cancels, then
+    // nothing until the cancel has reached the proxy, then the rest, one write
+    // at a time. The rest is what a relay that missed the cancel would write
+    // to the closed stream. As it is, the stream's close ends the relay's read
+    // of the upstream first, and the proxy writes none of it, which the count
+    // above checks.
     let clientLeft;
     const clientGone = new Promise(r => { clientLeft = r; });
     const upstream = http.createServer(async (req, res) => {
@@ -694,11 +722,13 @@ function h2SseCancelInChild(signal) {
     await new Promise(r => client.ping(r));
     clientLeft();
 
-    // The entry closing is the signal that the handler returned. There is no
-    // deadline on it: a stranded handler never closes the entry, the child
-    // never reports, and the parent's test ends on the runner's timeout.
-    await returned;
-    process.stdout.write(JSON.stringify({ started: started.length, endedBeforeCancel, ended: ended.length }));
+    // The entry closing is the signal that the handler returned, and a write
+    // to the cancelled stream the signal that it wrote what it must not:
+    // whichever comes first is reported. There is no deadline on either: a
+    // handler stuck anywhere else never closes the entry, the child never
+    // reports, and the parent's test ends on the runner's timeout.
+    const outcome = await Promise.race([returned.then(() => 'returned'), wrote.then(() => 'wrote to the cancelled stream')]);
+    process.stdout.write(JSON.stringify({ outcome, started: started.length, endedBeforeCancel, ended: ended.length, writesToClosed }));
     process.exit(0);
   `;
   return new Promise((resolve) => {
@@ -709,10 +739,10 @@ function h2SseCancelInChild(signal) {
     child.stdout.on('data', d => out.push(String(d)));
     child.stderr.on('data', d => err.push(String(d)));
     child.stdin.on('error', () => {});
-    // A stranded handler keeps the child alive, so the parent has to be the one
-    // that ends it: once the test has ended, which for a child that never
-    // reports is the runner's timeout. Nothing is asserted on that; a test that
-    // got here has already failed.
+    // A handler stuck where the child cannot see it keeps the child alive, so
+    // the parent has to be the one that ends it: once the test has ended,
+    // which for a child that never reports is the runner's timeout. Nothing
+    // is asserted on that; a test that got here has already failed.
     signal.addEventListener('abort', () => child.kill('SIGKILL'), { once: true });
     child.on('close', (code) => {
       try { resolve(JSON.parse(out.join(''))); } catch { resolve({ error: out.join('') || `child produced nothing (exit ${code}): ${err.join('')}` }); }
@@ -721,14 +751,123 @@ function h2SseCancelInChild(signal) {
 }
 
 test('MITM h2: a cancelled stream does not strand the request handler', async (t) => {
-  // A cancelled h2 stream that left the request handler waiting on a drain or
-  // close that cannot arrive never closes its activity entry, and the child
+  // A write to the cancelled stream, after which a handler can wait on a drain
+  // or close that cannot arrive, is reported by the child as it is made. A
+  // handler stuck anywhere else never closes its activity entry, and the child
   // never reports: that failure is this test ending on the runner's timeout.
   const got = await h2SseCancelInChild(t.signal);
   assert.equal(got.error, undefined, `the child did not report: ${JSON.stringify(got)}`);
   assert.equal(got.started, 1, `one activity entry is opened, or this proves nothing: ${JSON.stringify(got)}`);
   assert.equal(got.endedBeforeCancel, 0, `the entry closed before the cancel, so nothing was cancelled mid-flight: ${JSON.stringify(got)}`);
+  assert.equal(got.writesToClosed, 0, `the handler wrote to the stream its client had cancelled, where a write can strand it: ${JSON.stringify(got)}`);
   assert.equal(got.ended, 1, `the cancelled stream's entry closed once: ${JSON.stringify(got)}`);
+});
+
+// A stand-in for an Http2ServerResponse whose client cancels the stream, as
+// Node 24.22.1 behaves: the response has no `destroyed` of its own, its stream
+// is both closed and destroyed by the time its one `close` is emitted, and a
+// write after that returns false and is followed by neither a `drain` nor
+// another `close`. `cancel()` is the client's cancel. A write to the open
+// stream is recorded in `written`; one to the closed stream is not, and
+// settles `wroteToClosed` instead, so the test can report it as it is made.
+//
+// It models only what streamResponse reads of a cancelled response today: the
+// response's `close` (where the reader cancel listens), `destroyed` and
+// `stream.destroyed` (what clientGone reads; `stream.closed` too, which
+// clientGone could read as well), what `write` returns, the `drain` or
+// `close` the backpressure wait listens for, `writableEnded` and `end()`. A
+// change that reads anything else of a cancelled stream (its `aborted`, say,
+// or a close listener on the stream rather than the response) must extend it,
+// or these tests fail a relay that is right.
+function cancellableH2Response() {
+  /** @type {(chunk: string) => void} */
+  let onWroteToClosed = () => {};
+  /** @type {Promise<string>} */
+  const wroteToClosed = new Promise((resolve) => { onWroteToClosed = resolve; });
+  const res = new class extends EventEmitter {
+    headersSent = true;
+    writableEnded = false;
+    stream = { destroyed: false, closed: false };
+    /** @type {string[]} */
+    written = [];
+    /** @param {Uint8Array} chunk */
+    write(chunk) {
+      const text = Buffer.from(chunk).toString('utf8');
+      if (this.stream.destroyed) { onWroteToClosed(text); return false; }
+      this.written.push(text);
+      return true;
+    }
+    end() { this.writableEnded = true; }
+    cancel() { this.stream.closed = true; this.stream.destroyed = true; this.emit('close'); }
+  }();
+  return { res, wroteToClosed };
+}
+
+// An upstream body the test feeds by hand. With a highWaterMark of 0 the
+// stream asks its source for a chunk only when a read is waiting, so
+// `nextRead()`, asked for before the relay can read, settles once the relay
+// waits on its next chunk.
+function handFedBody() {
+  /** @type {import('node:stream/web').ReadableStreamDefaultController<Uint8Array>} */
+  let controller;
+  let onPull = () => {};
+  let cancelled = false;
+  const body = new ReadableStream({
+    start(c) { controller = c; },
+    pull() { onPull(); },
+    cancel() { cancelled = true; },
+  }, { highWaterMark: 0 });
+  return {
+    body,
+    nextRead: () => new Promise((resolve) => { onPull = () => resolve(undefined); }),
+    send: (/** @type {string} */ text) => controller.enqueue(new TextEncoder().encode(text)),
+    cancelled: () => cancelled,
+  };
+}
+
+// The order the end-to-end test above cannot take: the upstream's next chunk
+// and the client's cancel in one turn. The read is answered before the stream
+// closes, so cancelling the reader on its close cannot take the chunk back,
+// and only the clientGone check before the write stands between the chunk and
+// the closed stream.
+test('MITM h2: a chunk read in the turn the client cancels is not written to the closed stream', async () => {
+  const { res, wroteToClosed } = cancellableH2Response();
+  const upstream = handFedBody();
+  let waiting = upstream.nextRead();
+  const relay = streamResponse(upstream.body, res, 0, { recordTokenUsage() {} }, null);
+  await waiting;
+  waiting = upstream.nextRead();
+  upstream.send('data: {"n":0}\n\n');
+  await waiting;                          // chunk 0 is relayed; the relay waits on the next
+  upstream.send('data: {"n":1}\n\n');     // that read is answered,
+  res.cancel();                           // and the client cancels in the same turn
+  const outcome = await Promise.race([
+    relay.then(() => 'returned'),
+    wroteToClosed.then((chunk) => `wrote ${JSON.stringify(chunk)} to the closed stream`),
+  ]);
+  assert.equal(outcome, 'returned');
+  assert.deepEqual(res.written, ['data: {"n":0}\n\n'], 'the chunk read before the cancel reached the client');
+  assert.equal(upstream.cancelled(), true, 'the upstream read was let go');
+});
+
+// The order the end-to-end test takes, with the relay on its own: the client
+// cancels while the relay waits on an upstream that has nothing more to send.
+// The stream's close cancels that read then and there. Without that, nothing
+// here would end the read before the upstream's next chunk or the body-idle
+// deadline (two minutes by default).
+test('MITM h2: a client cancel while the relay waits on the upstream cancels that read at once', async () => {
+  const { res } = cancellableH2Response();
+  const upstream = handFedBody();
+  let waiting = upstream.nextRead();
+  const relay = streamResponse(upstream.body, res, 0, { recordTokenUsage() {} }, null);
+  await waiting;
+  waiting = upstream.nextRead();
+  upstream.send('data: {"n":0}\n\n');
+  await waiting;                          // chunk 0 is relayed; the relay waits on the next
+  res.cancel();
+  assert.equal(upstream.cancelled(), true, 'the close cancelled the upstream read the relay was waiting on');
+  await relay;
+  assert.deepEqual(res.written, ['data: {"n":0}\n\n']);
 });
 
 // The base listener holds an idle keep-alive connection for KEEP_ALIVE_TIMEOUT_MS
