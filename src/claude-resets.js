@@ -36,6 +36,7 @@ import { randomUUID } from 'node:crypto';
 
 import { USAGE_URL, OAUTH_USAGE_BETA, USAGE_USER_AGENT, normalizeUsagePayload, isFableReset } from './oauth.js';
 import { providerOf, DEFAULT_PROVIDER } from './provider.js';
+import { modelFamily } from './model.js';
 import { safeLine } from './safe-text.js';
 import { rememberResetReading, resetRetryAt } from './reset-readings.js';
 import { proxyFetch } from './upstream-fetch.js';
@@ -54,6 +55,7 @@ const DECLINED_COOLDOWN_MS = 30 * 60 * 1000;
 // After an account turned out to hold nothing usable.
 const NOTHING_COOLDOWN_MS = 6 * 60 * 60 * 1000;
 export const CLAUDE_REDEEM_BUDGET_MS = 15_000;
+const BUDGET_LAPSED = Symbol('redeem budget lapsed');
 
 // The upstream limit behind each quota reading, in the names a grant's `clears`
 // uses, where a live redemption has shown it: #677 measured a grant that
@@ -268,10 +270,14 @@ export class ClaudeResetRedeemer {
     this.now = now;
     this.log = log;
     this.timeoutMs = timeoutMs;
-    /** @type {WeakMap<object, { cooldownUntil: number, requestIds: Map<string, string> }>} */
+    // `declined` holds the passes that depend on the refused request's model,
+    // by _modelKey: when the account may be asked again for such a request.
+    /** @type {WeakMap<object, { cooldownUntil: number, declined: Map<string, number>, requestIds: Map<string, string> }>} */
     this.state = new WeakMap();
     /** @type {Promise<ClaudeRedeemResult>|null} */
     this.inFlight = null;
+    /** @type {string|null} the _modelKey the attempt in flight was made for */
+    this.inFlightKey = null;
     // reset-actions holds this across the fresh read and the manual claim.
     this.manualInFlight = false;
     /** @type {number|null} */
@@ -321,8 +327,61 @@ export class ClaudeResetRedeemer {
   /** @param {object} account */
   _stateFor(account) {
     let s = this.state.get(account);
-    if (!s) { s = { cooldownUntil: 0, requestIds: new Map() }; this.state.set(account, s); }
+    if (!s) { s = { cooldownUntil: 0, declined: new Map(), requestIds: new Map() }; this.state.set(account, s); }
     return s;
+  }
+
+  /**
+   * What the parked verdict reads off a refused request's model: the weekly
+   * bucket that governs it (a route may name its own), and its family only
+   * where that bucket is the shared weekly and some account has learned a
+   * scoped bucket for the family, the one way a family gates beside it.
+   * Whether an account is parked for one such request says nothing about a
+   * request with another key, so the passes that turn on it, and an attempt
+   * in flight, are kept by this key. Bounded, unlike the model name a client
+   * sends.
+   *
+   * @param {string|null} model
+   */
+  _modelKey(model) {
+    const bucket = this.am._weeklyBucketFor?.(model) ?? '';
+    const family = modelFamily(model);
+    const scoped = bucket === 'unified7d' && family !== 'other'
+      && (this.am.accounts || []).some((/** @type {Record<string, any>} */ a) => a.quota?.scopedWeekly?.[family]);
+    return scoped ? `${bucket}:${family}` : bucket;
+  }
+
+  /**
+   * Refresh the account's token, never waiting longer for it than the attempt
+   * has left. `ensureTokenFresh` takes no timeout and joins any refresh
+   * already running, so awaited plainly it is unbounded, and a refusal waiting
+   * on this attempt (another key's, or the same) would be held as long; it is
+   * raced instead, as the Codex redeemer's `_freshToken` does. A refresh that
+   * lands late carries on in the background, and this attempt does not act on
+   * it.
+   *
+   * @param {Record<string, any>} account
+   * @param {number} deadline
+   * @returns {Promise<string|null>} why the attempt cannot go on, or null
+   */
+  async _freshToken(account, deadline) {
+    const left = deadline - this.now();
+    if (left <= 0) return 'ran out of the redeem budget';
+    /** @type {any} */
+    let timer = null;
+    const lapsed = new Promise(resolve => { timer = setTimeout(() => resolve(BUDGET_LAPSED), left); });
+    try {
+      // Wrapped so a synchronous throw arrives as a rejection, and settled both
+      // ways so losing the race cannot leave one unhandled.
+      const refreshed = (async () => this.am.ensureTokenFresh(account.index))()
+        .then(() => null, (/** @type {any} */ err) => err ?? new Error('token refresh failed'));
+      const outcome = await Promise.race([refreshed, lapsed]);
+      if (outcome === BUDGET_LAPSED) return 'ran out of the redeem budget refreshing the token';
+      if (outcome) return `token refresh failed (${safeLine(outcome.message || String(outcome), 80)})`;
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   /** @param {Record<string, any>} account */
@@ -347,9 +406,20 @@ export class ClaudeResetRedeemer {
     if (this.config?.autoRedeemResets !== true) return { redeemed: false, reason: 'auto-redeem is switched off' };
     if (!accounts?.length) return { redeemed: false, reason: 'no candidate accounts' };
     if (this.manualInFlight) return { redeemed: false, reason: 'a manual reset is in progress' };
-    if (this.inFlight) return this.inFlight;
-    const attempt = this._attempt(accounts, model).finally(() => { this.inFlight = null; });
+    const key = this._modelKey(model);
+    if (this.inFlight) {
+      // Concurrent refusals with the same key are one decision about the
+      // fleet, so they share one attempt. A refusal with another key waits for
+      // it instead: that attempt judged other readings, and its passes say
+      // nothing about this one. Attempts still never overlap, so one dry pool
+      // costs one reset; a reset that landed answers this refusal too.
+      if (this.inFlightKey === key) return this.inFlight;
+      const earlier = await this.inFlight;
+      return earlier.redeemed ? earlier : this.maybeRedeemForPool(accounts, { model });
+    }
+    const attempt = this._attempt(accounts, model).finally(() => { this.inFlight = null; this.inFlightKey = null; });
     this.inFlight = attempt;
+    this.inFlightKey = key;
     return attempt;
   }
 
@@ -361,6 +431,7 @@ export class ClaudeResetRedeemer {
     const now = this.now();
     if (now < this.fleetHoldUntil) return { redeemed: false, reason: 'holding off after a recent Claude reset attempt' };
     const deadline = now + this.timeoutMs;
+    const key = this._modelKey(model);
     // Ranked on the readings that bar this account for the refused model, each
     // against the threshold selection holds it to (the account's own, the
     // bucket's or the fleet's): the 5-hour window against its own, the shared
@@ -382,7 +453,7 @@ export class ClaudeResetRedeemer {
       // spent" and hold the resets of every other account.
       .filter(a => this._isClaude(a) && a.orgUuid && !a.disabled && !a.cordoned && a.autoRedeemReset !== false && a.longLived !== true)
       .filter(a => a.quota?.resetCredits?.available !== 0)
-      .filter(a => now >= this._stateFor(a).cooldownUntil)
+      .filter(a => now >= this._stateFor(a).cooldownUntil && now >= (this._stateFor(a).declined.get(key) ?? 0))
       .sort((a, b) => until(b) - until(a));
     let reason = 'no Claude account holds a usable reset';
     for (const account of candidates) {
@@ -399,16 +470,21 @@ export class ClaudeResetRedeemer {
    * Pass over an account that holds a usable reset, and say so. The cooldown
    * set here is also what rate-limits the line: the walk skips the account
    * until it ends, so a dry pool being polled logs one line per account per
-   * cooldown, not one per refusal.
+   * cooldown, not one per refusal. A pass that turns on the refused request's
+   * model is kept under its `key` (_modelKey), and skips the account only for
+   * requests with the same one.
    *
    * @param {Record<string, any>} account
    * @param {number} until  when this account may be asked again
    * @param {string} reason
+   * @param {string|null} [key]
    * @returns {ClaudeRedeemResult}
    */
-  _decline(account, until, reason) {
+  _decline(account, until, reason, key = null) {
     const name = safeLine(account.name, 64);
-    this._stateFor(account).cooldownUntil = until;
+    const state = this._stateFor(account);
+    if (key == null) state.cooldownUntil = until;
+    else state.declined.set(key, until);
     this.log(`[TeamClaude] Account "${name}": banked reset not redeemed: ${safeLine(reason, 160)}`);
     return { redeemed: false, account: name, reason };
   }
@@ -446,9 +522,10 @@ export class ClaudeResetRedeemer {
     const name = safeLine(account.name, 64);
     const state = this._stateFor(account);
     const now = this.now();
-    try { await this.am.ensureTokenFresh(account.index); } catch (/** @type {any} */ err) {
-      return { redeemed: false, account: name, reason: `token refresh failed (${safeLine(err?.message || String(err), 80)})` };
-    }
+    // The passes below that turn on the model are kept for this key alone.
+    const key = this._modelKey(model);
+    const refused = await this._freshToken(account, deadline);
+    if (refused) return { redeemed: false, account: name, reason: refused };
     const left = () => Math.max(1, deadline - this.now());
     const read = await this.readStatus(account, { timeoutMs: left() });
     if (read?.error) {
@@ -486,9 +563,9 @@ export class ClaudeResetRedeemer {
       if (!parked) {
         return this._decline(account, now + DECLINED_COOLDOWN_MS, atLimit
           ? 'no weekly limit is exhausted'
-          : 'not at a usage limit, nor held out of rotation by its weekly switch threshold');
+          : 'not at a usage limit, nor held out of rotation by its weekly switch threshold', key);
       }
-      if (parked.unknown) return this._decline(account, now + DECLINED_COOLDOWN_MS, `no reset is known to clear its ${parked.unknown} reading`);
+      if (parked.unknown) return this._decline(account, now + DECLINED_COOLDOWN_MS, `no reset is known to clear its ${parked.unknown} reading`, key);
       // Short of any upstream limit, a grant that says it needs one reached
       // would answer `not_limited`.
       const grants = atLimit ? status.grants : status.grants.filter((/** @type {ResetGrant} */ g) => g.useRequiresLimit !== true);
@@ -504,7 +581,8 @@ export class ClaudeResetRedeemer {
       // No usable grant covers the whole wall. Name the limits none clears,
       // or the whole wall when separate grants only cover parts of it.
       const uncovered = wall.exhausted.filter((/** @type {string} */ limit) => !wall.grants.some((/** @type {ResetGrant} */ g) => usableGrant(g, now) && g.clears.includes(limit)));
-      return this._decline(account, now + DECLINED_COOLDOWN_MS, `its reset does not clear ${(uncovered.length ? uncovered : wall.exhausted).join(', ')}`);
+      return this._decline(account, now + DECLINED_COOLDOWN_MS, `its reset does not clear ${(uncovered.length ? uncovered : wall.exhausted).join(', ')}`,
+        wall === status ? null : key);
     }
     // Upstream already says a claim now would answer `cooldown`: save the POST.
     if (status.cooldownUntil != null && status.cooldownUntil > now) {

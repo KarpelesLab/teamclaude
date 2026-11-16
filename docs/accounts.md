@@ -802,7 +802,14 @@ selected again against the account it cleared.
   upstream reports a reset cooldown, nothing is claimed.
 - An account that holds a usable reset and is passed over is named in the
   log with the reason (`Account "x": banked reset not redeemed: …`), once per
-  account per cooldown (30 minutes) rather than once per refused request.
+  account per cooldown (30 minutes) rather than once per refused request. A
+  reason that depends on the refused request's model (whether a weekly reading
+  parks the account for it) holds only for requests judged on the same
+  readings: those whose model the same weekly bucket governs (the Fable
+  weekly, the Sonnet weekly, or the all-models one, unless a route names
+  another), and, where some account has learned a scoped weekly bucket for
+  the model's family, those of that family. Passing an account over for an
+  Opus request does not pass it over for a Fable one.
 - Among usable, unpaused, unexpired grants that clear every exhausted limit,
   it spends the cheapest kind: **Fable**, then **session**, then **weekly**.
   Within the same kind it spends the soonest-expiring grant (no expiry comes
