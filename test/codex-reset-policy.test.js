@@ -145,6 +145,8 @@ test('a standing states the weeks and the days from one reading, each to the ste
   // An exact step is not read one low: 1.96 days is 0.28 of a week, which a
   // division in days floors to 0.27.
   assert.deepEqual([at(1.96 * DAY).creditValueWeeks, at(1.96 * DAY).daysToReset], [0.28, 1.9]);
+  // A credit is never worth more than a week, however far a reset reads.
+  assert.deepEqual([at(7.5 * DAY).creditValueWeeks, at(7.5 * DAY).daysToReset], [1, 7.5]);
   // Across the week, each figure is the step at or just below the reading.
   const WEEK = 7 * DAY;
   for (let ms = 0; ms <= WEEK; ms += 37 * 60 * 1000) {
@@ -250,6 +252,19 @@ test('a manual redemption takes a slot of its cohort, and keeps the cohort at it
   assert.deepEqual({ ok: v.ok, size: v.size, allowed: v.allowed, used: v.used }, { ok: false, size: 2, allowed: 1, used: 1 });
 });
 
+test('a redemption up to a week old still holds its cohort\'s slot', () => {
+  // a was redeemed five days ago, out of the cohort b still resets in: a
+  // day from now. Its timer then restarted, so it resets in two. The phase
+  // it moved stays moved until the members reset on their own.
+  const a = codex('a', 2);
+  const b = codex('b', 1);
+  const ledger = [{ account: a, name: 'a', cohort: resetCohort(b), at: NOW - 5 * DAY, manual: false }];
+  const v = shareCapVerdict({ account: b, members: [a, b], ledger, maxShare: 0.5, now: NOW });
+  assert.deepEqual({ ok: v.ok, size: v.size, allowed: v.allowed, used: v.used }, { ok: false, size: 2, allowed: 1, used: 1 });
+  assert.equal(recentRedemptions(ledger, NOW + 2 * DAY - 1).length, 1, 'just under a week old');
+  assert.equal(recentRedemptions(ledger, NOW + 2 * DAY).length, 0, 'a week old');
+});
+
 test('a redemption from another cohort, or from more than a week ago, is not charged to this one', () => {
   const members = [codex('a', 2), codex('b', 5)];
   const ledger = [
@@ -333,6 +348,16 @@ test('standing names the first thing that exempts an account, and the value eith
 
   const full = autoRedeemStanding({ account: a, autoRedeemResets: true, policy, members: [a], ledger: [{ account: {}, name: 'x', cohort: 0, at: NOW, manual: false }], now: NOW });
   assert.match(full.exemptReason, /daily cap/);
+
+  // The share cap, with the per-day cap off: another member of a's cohort
+  // was redeemed by hand, which takes the one slot a half share of two has.
+  const b = codex('b', 3.5);
+  const shared = autoRedeemStanding({
+    account: a, autoRedeemResets: true, policy: { ...policy, maxPerDay: 0 }, members: [a],
+    ledger: [{ account: b, name: 'b', cohort: resetCohort(a), at: NOW, manual: true }], now: NOW,
+  });
+  assert.equal(shared.armed, false);
+  assert.match(shared.exemptReason, /^its reset cohort of 2 already had 1 redeemed, the 50% share cap allows 1$/);
 
   const unknown = autoRedeemStanding({ account: codex('u', null), autoRedeemResets: true, policy: DEFAULT_REDEEM_POLICY, members: [], ledger: [], now: NOW });
   assert.deepEqual(unknown, { armed: true, exemptReason: null, creditValueWeeks: null, daysToReset: null });
