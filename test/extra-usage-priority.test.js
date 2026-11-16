@@ -416,6 +416,116 @@ test('an explicit API switch remains eligible and serves requests with the prefe
     { switched: true, eligibility: { eligible: true }, selected: ['api', 'api'], current: 'api', paid: false });
 });
 
+// With distributeSessions on, new conversations are placed within the best
+// priority tier and never read a manual choice, so a switch to an outranked
+// account is reported as not taking effect. Nor may it take effect through the
+// preference: setting the preference aside for that choice moved new
+// conversations off the preferred subscription onto the higher-priority key.
+// A switch to the top tier still sets it aside, as does any switch to an
+// available account with distribution off.
+for (const mode of [false, true, 'adaptive', 'load']) {
+  test(`distributeSessions ${mode}: a switch to an outranked API key and the preference`, t => {
+    t.mock.method(console, 'log', () => {});
+    const am = new AccountManager([
+      oauth('subscription', { allowExtraUsage: true, preferExtraUsage: true }),
+      { name: 'k1', type: 'apikey', apiKey: 'k1', priority: 0 },
+      { name: 'k2', type: 'apikey', apiKey: 'k2', priority: 10 },
+    ], 0.98, { distributeSessions: mode });
+    Object.assign(am.accounts[0].quota, { unified7d: 0.99, spend: { enabled: true } });
+    am._nextProbeAt = Date.now() + 60_000;
+    am.currentIndex = 1;
+    am.setCurrentAccount(2);
+    const outranked = { eligible: am.eligibility(2, { manualSwitch: true }).eligible,
+      selected: ['n1', 'n2'].map(id => am.getActiveAccount(null, OPUS, null, id)?.name),
+      untagged: am.getActiveAccount(null, OPUS)?.name, preferred: am.eligibility(0) };
+    am.setCurrentAccount(1);
+    const top = { eligible: am.eligibility(1, { manualSwitch: true }).eligible, selected: am.getActiveAccount(null, OPUS, null, 'n3')?.name };
+    const kept = mode ? 'subscription' : 'k2';
+    assert.deepEqual({ outranked, top }, {
+      outranked: { eligible: !mode, selected: [kept, kept], untagged: kept,
+        preferred: mode ? { eligible: true } : { eligible: false, reason: 'at or above the switch threshold' } },
+      top: { eligible: true, selected: 'k1' },
+    });
+  });
+}
+
+// The preference's pick for such a switch leaves the cursor where it is, as
+// placement does, so the operator's choice stays recorded and takes the
+// traffic once distribution is turned off. Moving the cursor released it.
+test('a switch reported as not taking effect is still in place when distribution is turned off', t => {
+  t.mock.method(console, 'log', () => {});
+  const am = new AccountManager([
+    oauth('subscription', { allowExtraUsage: true, preferExtraUsage: true }),
+    { name: 'k1', type: 'apikey', apiKey: 'k1', priority: 0 },
+    { name: 'k2', type: 'apikey', apiKey: 'k2', priority: 10 },
+  ], 0.98, { distributeSessions: true });
+  Object.assign(am.accounts[0].quota, { unified7d: 0.99, spend: { enabled: true } });
+  am._nextProbeAt = Date.now() + 60_000;
+  am.currentIndex = 1;
+  am.setCurrentAccount(2);
+  const placed = am.getActiveAccount(null, OPUS, null, 'conversation')?.name;
+  const recorded = { current: am.getStatus().currentAccount, manual: am._manualAccount?.name ?? null };
+  am.setDistributeSessions(false, { drain: false });
+  assert.deepEqual({ placed, recorded, after: am.getActiveAccount(null, OPUS)?.name },
+    { placed: 'subscription', recorded: { current: 'k2', manual: 'k2' }, after: 'k2' });
+});
+
+// The pick leaves the cursor on a switch that new conversations do not read,
+// and on nothing else: once the switched-to account cannot serve the request
+// (here it was disabled), or this request has already tried it, the
+// preference's pick takes the cursor as it did before.
+for (const [label, change, tried] of [
+  ['disabled', am => { am.accounts[2].disabled = true; }, null],
+  ['already tried by the request', () => {}, new Set([2])],
+]) {
+  test(`distributeSessions: the preference's pick takes the cursor from a switch ${label}`, t => {
+    t.mock.method(console, 'log', () => {});
+    const am = new AccountManager([
+      oauth('subscription', { allowExtraUsage: true, preferExtraUsage: true }),
+      { name: 'k1', type: 'apikey', apiKey: 'k1', priority: 0 },
+      { name: 'k2', type: 'apikey', apiKey: 'k2', priority: 10 },
+    ], 0.98, { distributeSessions: true });
+    Object.assign(am.accounts[0].quota, { unified7d: 0.99, spend: { enabled: true } });
+    am._nextProbeAt = Date.now() + 60_000;
+    am.currentIndex = 1;
+    am.setCurrentAccount(2);
+    change(am);
+    const selected = am.getActiveAccount(tried, OPUS, null, 'conversation')?.name;
+    assert.deepEqual({ selected, current: am.getStatus().currentAccount, manual: am._manualAccount?.name ?? null },
+      { selected: 'subscription', current: 'subscription', manual: null });
+  });
+}
+
+// Only an account that can serve the request outranks the switch, and only
+// one of the same provider, as placement sees them. A Codex subscription of
+// better priority takes no Claude conversation, and an API key a route keeps
+// off the request's model takes none of that model's: neither leaves the
+// switch unread, so it stays in charge and the conversation goes to it. For
+// the Codex case eligibility(), which asks with no exclusions of its own,
+// agrees: the preference stands aside, so the preferred subscription is not
+// reported eligible. (Asked without a model, it cannot see the route.)
+for (const [label, extra, routes, preferred] of [
+  ['another provider', oauth('codex', { provider: 'codex', priority: 0 }), null,
+    { eligible: false, reason: 'at or above the switch threshold' }],
+  ['a key the model route excludes', { name: 'k1', type: 'apikey', apiKey: 'k1', priority: 0 },
+    [{ name: 'opus', match: ['claude-opus-*'], accounts: ['subscription', 'k2'] }], null],
+]) {
+  test(`distributeSessions: a higher-priority account of ${label} does not leave a switch unread`, t => {
+    t.mock.method(console, 'log', () => {});
+    const am = new AccountManager([
+      oauth('subscription', { allowExtraUsage: true, preferExtraUsage: true }),
+      { name: 'k2', type: 'apikey', apiKey: 'k2', priority: 10 },
+      extra,
+    ], 0.98, { distributeSessions: true });
+    if (routes) am.setRoutes(routes);
+    Object.assign(am.accounts[0].quota, { unified7d: 0.99, spend: { enabled: true } });
+    am._nextProbeAt = Date.now() + 60_000;
+    am.setCurrentAccount(1);
+    assert.equal(am.getActiveAccount(null, OPUS, null, 'conversation')?.name, 'k2');
+    if (preferred) assert.deepEqual(am.eligibility(0), preferred);
+  });
+}
+
 test('automatic cursor movements clear an earlier manual API choice', () => {
   const am = fleet({ preferExtraUsage: true });
   am.setCurrentAccount(1);
