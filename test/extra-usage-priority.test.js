@@ -684,6 +684,92 @@ test('with distribution off, the preferred subscription already serving keeps th
     { selected: ['s1', 's1', 's1', 's2', 's2'], preview: 0, billing: [false, true, false] });
 });
 
+// The sticky pick keeps the subscription already serving only while no
+// candidate in the tier outranks it on priority (docs/quota.md: "Priority
+// still decides between them first").
+test('with distribution off, the preferred subscription already serving yields to a higher-priority one in its tier', t => {
+  t.mock.method(console, 'log', () => {});
+  const am = new AccountManager([
+    oauth('s1', { priority: 5, allowExtraUsage: true, preferExtraUsage: true }),
+    oauth('s2', { priority: 0, allowExtraUsage: true, preferExtraUsage: true }),
+    { name: 'api', type: 'apikey', apiKey: 'api-key', priority: 100 },
+  ], 0.98);
+  am._nextProbeAt = Date.now() + 60_000;
+  am.currentIndex = 2;
+  am.accounts[0].quota.unified7d = 0.99;
+  am.accounts[1].quota.unified7d = 1;
+  const selected = [am.getActiveAccount(null, OPUS)?.name];
+  // s2 has included quota again: the same tier as s1, and a better priority.
+  am.accounts[1].quota.unified7d = 0.99;
+  selected.push(am.getActiveAccount(null, OPUS)?.name);
+  assert.deepEqual(selected, ['s1', 's2']);
+});
+
+// The sticky pick reads the scope's route cursor first: every selection records
+// it, including a pinned turn, which leaves the fleet's cursor where it was.
+// Here a conversation pinned to s1 has been served Fable from it while the
+// cursor stayed on an account outside the preferred pool; once distribution
+// is off, Fable stays on s1 rather than moving to the less utilized s2.
+test('with distribution off, the sticky preferred pick reads the route cursor of the scope', t => {
+  t.mock.method(console, 'log', () => {});
+  const fable = 'claude-fable-5';
+  const am = new AccountManager([
+    oauth('main'),
+    oauth('s1', { allowExtraUsage: true, preferExtraUsage: true }),
+    oauth('s2', { allowExtraUsage: true, preferExtraUsage: true }),
+    { name: 'api', type: 'apikey', apiKey: 'api-key', priority: 100 },
+  ], 0.98, { distributeSessions: true });
+  am._nextProbeAt = Date.now() + 60_000;
+  Object.assign(am.accounts[0].quota, { unified7d: 0.2, unified7dFable: 1 });
+  Object.assign(am.accounts[1].quota, { unified7d: 0.2, unified7dFable: 0.99 });
+  Object.assign(am.accounts[2].quota, { unified7d: 0.2, unified7dFable: 0.985 });
+  am.recordSession('conversation', 1, fable);
+  const pinned = am.getActiveAccount(null, fable, null, 'conversation')?.name;
+  const current = am.getStatus().currentAccount;
+  am.setDistributeSessions(false);
+  assert.deepEqual({ pinned, current, untagged: am.getActiveAccount(null, fable)?.name },
+    { pinned: 's1', current: 'main', untagged: 's1' });
+});
+
+// A failover hop asks the preference as selection does: off the API key that
+// just refused the request, it goes to the preferred subscription, not to the
+// next API key.
+test('a failover hop follows the preference', t => {
+  t.mock.method(console, 'log', () => {});
+  const am = fleet({ preferExtraUsage: true });
+  am.addAccount({ name: 'api-2', type: 'apikey', apiKey: 'api-key-2', priority: 100 });
+  assert.equal(am.pickAlternate(new Set([1]), OPUS)?.name, 'subscription');
+});
+
+// The manual choice counts only while its provider's cursor is still on it:
+// _setCurrent releases it on a move to another account, and _manualSelection
+// catches a cursor that left by any other path. The cursor is moved directly
+// here, the way this file's fleets place it.
+test('a manual API choice whose cursor has left no longer sets the preference aside', t => {
+  t.mock.method(console, 'log', () => {});
+  const am = fleet({ preferExtraUsage: true, weekly: 0.99 });
+  am.setCurrentAccount(1);
+  const chosen = am.getActiveAccount(null, OPUS)?.name;
+  am.currentIndex = 0;
+  assert.deepEqual({ chosen, left: am.getActiveAccount(null, OPUS)?.name }, { chosen: 'api', left: 'subscription' });
+});
+
+// A reload applies preferExtraUsage through the startup test: it needs
+// allowExtraUsage on an Anthropic OAuth account.
+for (const [label, entry] of [
+  ['permission off', oauth('account', { allowExtraUsage: false, preferExtraUsage: true })],
+  ['missing permission', oauth('account', { preferExtraUsage: true })],
+  ['API key', { name: 'account', type: 'apikey', apiKey: 'key', allowExtraUsage: true, preferExtraUsage: true }],
+]) {
+  test(`a reload ignores preferExtraUsage without the extra-usage permission (${label})`, async t => {
+    t.mock.method(console, 'warn', () => {});
+    const config = { accounts: [{ ...entry, preferExtraUsage: false }] };
+    const am = new AccountManager(config.accounts, 0.98);
+    await syncAccountsFromDisk({ accounts: [entry] }, config, am);
+    assert.deepEqual({ allow: am.accounts[0].allowExtraUsage, prefer: am.accounts[0].preferExtraUsage }, { allow: false, prefer: false });
+  });
+}
+
 test('removing the preference restores single-account legacy billing episodes', async t => {
   t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
   const config = { accounts: [
