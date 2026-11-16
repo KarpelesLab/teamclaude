@@ -352,6 +352,18 @@ test('an account the share cap holds back does not end the walk: the next one is
   assert.deepEqual(calls.consume, ['a', 'c']);
 });
 
+test('the per-day cap is logged once, against the first account it stops, not once per account', async () => {
+  const { am, redeemer, log } = harness({ days: [3, 4, 5], config: { autoRedeemResets: true, autoRedeemMaxPerDay: 1 }, caughtUp: false });
+  let clock = Date.now();
+  redeemer.now = () => clock;
+  assert.equal((await redeemer.maybeRedeemForPool([am.accounts[0]])).redeemed, true);
+  clock += 7 * 60 * 60 * 1000;
+  assert.match((await redeemer.maybeRedeemForPool(am.accounts.slice(1))).reason, /daily cap of 1/);
+  assert.deepEqual(log.filter(line => /skipped/.test(line)), [
+    '[TeamClaude] Codex rate-limit reset on "b" skipped — the daily cap of 1 auto-redemption is reached (1 in the last 24h)',
+  ]);
+});
+
 // ── a redemption made by hand ───────────────────────────────────────────────
 
 // The resets panel (reset-actions.js) spends through redeemGrant with

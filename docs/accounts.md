@@ -637,8 +637,10 @@ All three concern Codex accounts only. A
 [Claude banked reset](#claude-banked-usage-limit-resets) leaves the weekly
 timer where it was, so none of them is applied to it.
 
-Every account the policy passes over is logged, once per reason and at most
-every ten minutes while the reason stands:
+Each account the floor or the share cap passes over is logged with its
+reason. The per-day cap stops the whole fleet at once, so it is logged against
+the first account it stops. A reason is logged when it first applies to an
+account, and again at most every ten minutes while it stands:
 `[TeamClaude] Codex rate-limit reset on "<name>" skipped — <reason>`.
 The caps are asked before any account's credit rows are read, since a read
 costs a token refresh and a request, so a line for a cap can name an account
