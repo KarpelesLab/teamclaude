@@ -610,7 +610,10 @@ never widen it: every condition above still has to hold.
 - [`autoRedeemMaxShare`](configuration.md) — of the armed accounts whose
   natural resets fall on the same UTC calendar day (a **cohort**), redeem at
   most this share (rounded up), most-exhausted first, so the rest keep their
-  phase. The cohort is sized as it was before any of it was redeemed this week;
+  phase. A disabled or cordoned account, or one waiting for a sign-in, is
+  never offered a reset, so it does not count towards its cohort's size unless
+  it was redeemed this week; a capped one does. The cohort is sized as it was
+  before any of it was redeemed this week;
   otherwise each redemption would shrink it and let the next one through. A
   cohort is a calendar day, not a 24-hour span: two resets an hour apart on
   either side of 00:00 UTC are in different cohorts. An account whose reset

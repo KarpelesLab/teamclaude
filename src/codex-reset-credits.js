@@ -527,12 +527,21 @@ export class ResetCreditRedeemer {
 
   /**
    * The accounts the automatic policy may spend on: what a reset cohort is
-   * counted over. Read off the manager each time, so an account added or
-   * exempted since the last refusal is counted as it stands now.
+   * counted over. Three kinds are left out, which a refusal never offers the
+   * walk (server.js) and which last until the operator acts: a disabled
+   * account, a cordoned one, and one in `status: 'error'` (a refused refresh
+   * token or credential, until it signs in again).
+   * Counted, they would size the cohort above the part of it that can move,
+   * and let all of that part move under a cap meant to hold some of it back.
+   * A capped account (maxUsage, maxSpend) is not offered either, but it stays
+   * counted: its cap is read off its usage, which changes within the week.
+   * Read off the manager each time, so a change since the last refusal is
+   * counted as it stands now.
    */
   _members() {
     const armed = this._armed();
-    return (this.am.accounts || []).filter((/** @type {Record<string, any>} */ a) => autoRedeemArmed(a, armed));
+    return (this.am.accounts || []).filter((/** @type {Record<string, any>} */ a) =>
+      autoRedeemArmed(a, armed) && !a.disabled && !a.cordoned && a.status !== 'error');
   }
 
   /**

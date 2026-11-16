@@ -151,8 +151,9 @@ export function resetCohort(account) {
 /**
  * Whether this account is one the auto-redeem policy may ever spend on: a
  * Codex account on an armed fleet that has not opted out. The cohort is
- * counted over these, not over every Codex row — an account that can never
- * redeem is not one the cap needs to hold back.
+ * counted over these, less the disabled, cordoned and error-state ones the
+ * redeemer also leaves out (see its _members), not over every Codex row — an
+ * account that can never redeem is not one the cap needs to hold back.
  *
  * @param {Record<string, any>|null|undefined} account
  * @param {boolean} autoRedeemResets
@@ -223,7 +224,7 @@ export function dailyCapVerdict(ledger, maxPerDay, now) {
  *
  * @param {Object} args
  * @param {Record<string, any>} args.account
- * @param {Record<string, any>[]} args.members  every account the policy may spend on (see autoRedeemArmed), this one included
+ * @param {Record<string, any>[]} args.members  the armed Codex accounts a cohort is counted over (see autoRedeemArmed); `account` is counted whether listed or not
  * @param {RedeemRecord[]} args.ledger
  * @param {number} args.maxShare
  * @param {number} args.now
@@ -235,7 +236,11 @@ export function shareCapVerdict({ account, members, ledger, maxShare, now }) {
   const moved = recentRedemptions(ledger, now).filter(r => r.cohort === cohort);
   // One account counts once, whichever list it is on: a member that redeemed
   // and (somehow) still states a reset in the same bucket is not two accounts.
+  // The account asked about is in its own cohort whether or not it is listed:
+  // the status payload asks about a disabled or cordoned one too, which the
+  // members leave out.
   const population = new Set(members.filter(m => resetCohort(m) === cohort));
+  population.add(account);
   for (const r of moved) population.add(/** @type {Record<string, any>} */ (r.account));
   const size = population.size;
   const used = moved.length;
@@ -279,7 +284,7 @@ export function byExhaustion(a, b) {
  * @param {Record<string, any>} args.account
  * @param {boolean} args.autoRedeemResets
  * @param {RedeemPolicy} args.policy
- * @param {Record<string, any>[]} args.members  the fleet's armed Codex accounts
+ * @param {Record<string, any>[]} args.members  as shareCapVerdict takes them
  * @param {RedeemRecord[]} args.ledger
  * @param {number} args.now
  * @returns {{armed: boolean, exemptReason: string|null, creditValueWeeks: number|null}}

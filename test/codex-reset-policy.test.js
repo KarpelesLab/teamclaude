@@ -190,6 +190,15 @@ test('a redemption from another cohort, or from more than a week ago, is not cha
   assert.equal(v.size, 1);
 });
 
+test('the account asked about is in its own cohort even when the members leave it out', () => {
+  // The status payload asks about a disabled or cordoned account too, which
+  // the redeemer's members do not list: alone on its day it is a cohort of
+  // one, not of none.
+  const a = codex('a', 2);
+  const v = shareCapVerdict({ account: a, members: [codex('b', 5)], ledger: [], maxShare: 0.5, now: NOW });
+  assert.deepEqual({ ok: v.ok, size: v.size, allowed: v.allowed, used: v.used }, { ok: true, size: 1, allowed: 1, used: 0 });
+});
+
 test('an account with no stated reset belongs to no cohort and is not capped by one', () => {
   const members = [codex('a', null)];
   assert.equal(shareCapVerdict({ account: members[0], members, ledger: [], maxShare: 0.5, now: NOW }).ok, true);

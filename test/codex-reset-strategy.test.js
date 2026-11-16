@@ -42,11 +42,12 @@ function credit(extra = {}) {
 
 /**
  * A redeemer over a pool of spent Codex accounts whose resets are `days` away
- * each, with both endpoints faked and the log captured.
+ * each, with both endpoints faked and the log captured. `extras[i]` is merged
+ * into the i-th account's config entry.
  */
-function harness({ days = [3, 3], config = { autoRedeemResets: true }, code = 'reset', credits = null, caughtUp = true } = {}) {
+function harness({ days = [3, 3], extras = [], config = { autoRedeemResets: true }, code = 'reset', credits = null, caughtUp = true } = {}) {
   const now = Date.now();
-  const am = new AccountManager(days.map((_, i) => codex(String.fromCharCode(97 + i))), 0.98);
+  const am = new AccountManager(days.map((_, i) => codex(String.fromCharCode(97 + i), extras[i])), 0.98);
   am.accounts.forEach((account, i) => spent(account, days[i], now));
   const calls = { consume: [], details: [] };
   const log = [];
@@ -161,6 +162,92 @@ test('without a share cap the soonest-expiring credit is still spent first', asy
   am.accounts[1].quota.unified7d = 1.3;
   assert.equal((await redeemer.maybeRedeemForPool(am.accounts)).redeemed, true);
   assert.deepEqual(calls.consume, ['a']);
+});
+
+test('a share cap leaves a disabled and a cordoned account out of a cohort, and keeps a capped one in', async () => {
+  // Four accounts reset on one UTC day, and two of them are out of service.
+  // Half of the two that can move is one; counted over all four it was both.
+  // A fifth, capped and resetting on another day, is not offered either, but
+  // stays in the members: its cap is read off its usage, which changes within
+  // the week.
+  const { am, redeemer, calls, log } = harness({
+    days: [3, 3, 3, 3, 5], extras: [{}, {}, { disabled: true }, { cordoned: true }, { maxUsage: { unified7d: 0.5 } }],
+    config: { autoRedeemResets: true, autoRedeemMaxShare: 0.5 }, caughtUp: false,
+  });
+  let clock = Date.now();
+  sameUtcDay(am.accounts.slice(0, 4), 3, clock);
+  redeemer.now = () => clock;
+  // What server.js offers a refusal: the two in service, and here the ones a
+  // redemption has not touched.
+  const offered = () => am.accounts.slice(0, 2).filter(a => !redeemer.ledger.some(r => r.account === a));
+  assert.equal((await redeemer.maybeRedeemForPool(offered())).redeemed, true);
+  clock += 7 * 60 * 60 * 1000;
+  const second = await redeemer.maybeRedeemForPool(offered());
+  assert.equal(second.redeemed, false);
+  assert.match(second.reason, /cohort of 2 already had 1 redeemed, the 50% share cap allows 1/);
+  assert.equal(calls.consume.length, 1);
+  assert.ok(log.some(line => /skipped — its reset cohort of 2 already had 1 redeemed/.test(line)));
+  assert.equal(am.unavailableReason(am.accounts[4]), 'capped');
+  assert.deepEqual(redeemer._members().map(a => a.name), ['a', 'b', 'e']);
+});
+
+test('a cohort is counted over armed Codex accounts only: a Claude row and an opted-out one on the same day do not widen it', async () => {
+  const { am, redeemer, calls } = harness({
+    days: [3, 3, 3, 3], extras: [{}, {}, { autoRedeemReset: false }, { provider: 'anthropic' }],
+    config: { autoRedeemResets: true, autoRedeemMaxShare: 0.5 }, caughtUp: false,
+  });
+  let clock = Date.now();
+  sameUtcDay(am.accounts, 3, clock);
+  redeemer.now = () => clock;
+  const offered = () => am.accounts.slice(0, 2).filter(a => !redeemer.ledger.some(r => r.account === a));
+  assert.equal((await redeemer.maybeRedeemForPool(offered())).redeemed, true);
+  clock += 7 * 60 * 60 * 1000;
+  assert.equal((await redeemer.maybeRedeemForPool(offered())).redeemed, false);
+  assert.equal(calls.consume.length, 1, 'one of the two armed Codex accounts, not two of four rows');
+});
+
+test('an account waiting for a sign-in does not widen its cohort either', async () => {
+  // `status: 'error'` is a refused refresh token or credential: it lasts
+  // until a new sign-in, and a refusal never offers it.
+  const { am, redeemer, calls } = harness({ days: [3, 3, 3, 3], config: { autoRedeemResets: true, autoRedeemMaxShare: 0.5 }, caughtUp: false });
+  let clock = Date.now();
+  sameUtcDay(am.accounts, 3, clock);
+  redeemer.now = () => clock;
+  am.accounts[2].status = 'error';
+  am.accounts[3].status = 'error';
+  const offered = () => am.accounts.filter(a => a.status !== 'error' && !redeemer.ledger.some(r => r.account === a));
+  assert.equal((await redeemer.maybeRedeemForPool(offered())).redeemed, true);
+  clock += 7 * 60 * 60 * 1000;
+  assert.match((await redeemer.maybeRedeemForPool(offered())).reason, /cohort of 2 already had 1 redeemed, the 50% share cap allows 1/);
+  assert.equal(calls.consume.length, 1);
+});
+
+test('a throttled account of the same day still counts in its cohort: a refusal offers it', async () => {
+  const { am, redeemer, calls } = harness({ days: [3, 3, 3], config: { autoRedeemResets: true, autoRedeemMaxShare: 0.5 }, caughtUp: false });
+  let clock = Date.now();
+  sameUtcDay(am.accounts, 3, clock);
+  redeemer.now = () => clock;
+  Object.assign(am.accounts[2], { status: 'throttled', rateLimitedUntil: Date.now() + 60 * 60 * 1000 });
+  const offered = () => am.accounts.slice(0, 2).filter(a => !redeemer.ledger.some(r => r.account === a));
+  assert.equal((await redeemer.maybeRedeemForPool(offered())).redeemed, true);
+  clock += 7 * 60 * 60 * 1000;
+  assert.equal((await redeemer.maybeRedeemForPool(offered())).redeemed, true, 'a half share of three allows two');
+  assert.equal(calls.consume.length, 2);
+});
+
+test('the status standing sizes a cohort over the same accounts the walk does', async () => {
+  const { am, redeemer } = harness({
+    days: [3, 3, 3, 3], extras: [{}, {}, { disabled: true }, { cordoned: true }],
+    config: { autoRedeemResets: true, autoRedeemMaxShare: 0.5 }, caughtUp: false,
+  });
+  let clock = Date.now();
+  sameUtcDay(am.accounts, 3, clock);
+  redeemer.now = () => clock;
+  const [a, b] = am.accounts;
+  assert.equal((await redeemer.redeemGrant(a, 'a-1', { manual: true })).redeemed, true);
+  const standing = redeemer.describe(b);
+  assert.equal(standing.armed, false);
+  assert.equal(standing.exemptReason, 'its reset cohort of 2 already had 1 redeemed, the 50% share cap allows 1');
 });
 
 test('accounts in different cohorts are capped separately', async () => {
