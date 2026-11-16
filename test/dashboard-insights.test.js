@@ -403,6 +403,12 @@ test('the headlines: cost and tokens against the period before, and what the cos
   const older = { ...all, sinceDay: '2025-11-16', buckets: ['2025-11-16', '2026-11-15'] };
   assert.equal(insightsHeadline(older, 'tokens').vs, 'since ' + new Date(2025, 10, 16).toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' }));
   assert.equal(sinceText('2026-10-06', '2026-11-15'), insightsBucketLabel('2026-10-06', 'day', true));
+  // Recording began before the year the history keeps: the totals start at
+  // the first day still kept, and so does the headline.
+  const expired = { ...all, sinceDay: '2025-10-15', buckets: ['2025-11-15', '2026-11-14'] };
+  const kept = 'since ' + new Date(2025, 10, 15).toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' });
+  assert.equal(insightsHeadline(expired, 'tokens').vs, kept);
+  assert.equal(insightsHeadline({ ...expired, cost: { total: 30, values: [10, 20], previous: null, unpricedTokens: 0 } }, 'cost').vs, kept);
   assert.equal(insightsHeadline({ ...data, since: null, previous: null }, 'tokens').vs, 'nothing recorded yet');
 });
 

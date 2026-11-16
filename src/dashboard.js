@@ -2746,8 +2746,14 @@ export function insightsHeadline(data, metric) {
   var p = d.previous;
   var range = d.range || '30d';
   var span = 'the previous ' + (range === '24h' ? '24 hours' : parseInt(range, 10) + ' days');
+  // On All, the start is the later of the day recording began and the first
+  // day still kept: after a year the oldest days leave the history, and the
+  // totals no longer cover them.
+  var b = d.buckets || [];
+  var start = d.since == null ? '' : d.sinceDay || insightsDayKey(d.since);
+  if (b.length && String(b[0]) > start) start = String(b[0]);
   var empty = d.since == null ? 'nothing recorded yet'
-    : range === 'all' ? 'since ' + sinceText(d.sinceDay || insightsDayKey(d.since), String((d.buckets || [])[(d.buckets || []).length - 1] || ''))
+    : range === 'all' ? 'since ' + sinceText(start, String(b[b.length - 1] || ''))
       : 'no earlier period on record';
   if (metric === 'cost') {
     var c = d.cost;
