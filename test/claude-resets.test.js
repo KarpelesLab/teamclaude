@@ -765,6 +765,53 @@ test('a refusal for another model that waited on a reset that landed is answered
   assert.deepEqual(calls.claim, ['a']);
 });
 
+// The offer is filtered by route, the key is not: a refusal that joins or
+// waits on another's attempt may not have been offered the account that
+// attempt answered for.
+test('another refusal\'s answer about an account this one was not offered is not this one\'s answer', async () => {
+  // An Opus attempt over x, y and z finds x serviceable; a Haiku refusal
+  // offered z alone joins it, then makes its own attempt.
+  const joined = parkedHarness({ accounts: [oauth('x'), oauth('y'), oauth('z')], quota: a => ({ unified7d: a.name === 'x' ? 0.5 : 0.99 }) });
+  const [x, , z] = joined.am.accounts;
+  Object.assign(x.quota, { unified7d: 0.99, unified7dReset: Date.now() + 6 * DAY });
+  const [opus, haiku] = await Promise.all([
+    joined.redeemer.maybeRedeemForPool(joined.am.accounts, { model: OPUS }),
+    joined.redeemer.maybeRedeemForPool([z], { model: 'claude-haiku-4-5' }),
+  ]);
+  assert.equal(opus.available, true); assert.equal(opus.account, 'x');
+  assert.equal(haiku.redeemed, true, haiku.reason); assert.equal(haiku.account, 'z');
+  assert.deepEqual(joined.calls.claim, ['z']);
+  // The same when the attempt answers before walking, x already able to serve.
+  const early = parkedHarness({ accounts: [oauth('x'), oauth('z')], quota: a => ({ unified7d: a.name === 'x' ? 0.5 : 0.99 }) });
+  const [, ez] = early.am.accounts;
+  const [eo, eh] = await Promise.all([
+    early.redeemer.maybeRedeemForPool(early.am.accounts, { model: OPUS }),
+    early.redeemer.maybeRedeemForPool([ez], { model: 'claude-haiku-4-5' }),
+  ]);
+  assert.equal(eo.available, true); assert.equal(eo.account, 'x');
+  assert.equal(eh.redeemed, true, eh.reason);
+  assert.deepEqual(early.calls.claim, ['z']);
+  // A Fable refusal offered z alone waits on an Opus attempt that spends on
+  // y: that reset does not serve it, and its own attempt holds off.
+  const waited = parkedHarness({ accounts: [oauth('y'), oauth('z')], quota: { unified7d: 0.99 } });
+  const [y2, z2] = waited.am.accounts;
+  const [o, f] = await Promise.all([
+    waited.redeemer.maybeRedeemForPool([y2], { model: OPUS }),
+    waited.redeemer.maybeRedeemForPool([z2], { model: FABLE }),
+  ]);
+  assert.equal(o.redeemed, true);
+  assert.equal(f.redeemed, false); assert.match(f.reason, /holding off/);
+  assert.deepEqual(waited.calls.claim, ['y']);
+  // `available` speaks for its own key: a Fable refusal offered the same
+  // account does not take an Opus walk's answer that it can serve Opus, and
+  // walks itself, the account still parked on its Fable weekly.
+  const other = parkedHarness({ quota: { unified7d: 0.99, unified7dFable: 0.99 }, upstream: { unified7d: 0.5 } });
+  const [o3, f3] = await Promise.all([OPUS, FABLE].map(model => other.redeemer.maybeRedeemForPool(other.am.accounts, { model })));
+  assert.equal(o3.available, true);
+  assert.equal(f3.redeemed, true, f3.reason);
+  assert.deepEqual(other.calls.claim, ['a']);
+});
+
 test('an account holding no reset is passed over without a line', async () => {
   const { am, redeemer, calls } = parkedHarness({ quota: { unified7d: 0.99 }, grants: [{ ...weeklyGrant, resets_left: 0 }] });
   assert.equal((await redeemer.maybeRedeemForPool(am.accounts, { model: OPUS })).redeemed, false);

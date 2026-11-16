@@ -279,6 +279,10 @@ export class ClaudeResetRedeemer {
     this.inFlight = null;
     /** @type {string|null} the _modelKey the attempt in flight was made for */
     this.inFlightKey = null;
+    // The account an attempt's answer is about, when it is about one (a reset
+    // that landed, or `available`); see maybeRedeemForPool.
+    /** @type {WeakMap<object, Record<string, any>>} */
+    this.answeredFor = new WeakMap();
     // reset-actions holds this across the fresh read and the manual claim.
     this.manualInFlight = false;
     /** @type {number|null} */
@@ -418,10 +422,17 @@ export class ClaudeResetRedeemer {
       // fleet, so they share one attempt. A refusal with another key waits for
       // it instead: that attempt judged other readings, and its passes say
       // nothing about this one. Attempts still never overlap, so one dry pool
-      // costs one reset; a reset that landed answers this refusal too.
-      if (this.inFlightKey === key) return this.inFlight;
+      // costs one reset; a reset that landed answers this refusal too. An
+      // answer about one account (a reset that landed, or `available`) serves
+      // only a refusal that was offered that account, though: the offer
+      // follows the request's route and the key does not. Any other refusal
+      // makes its own attempt.
+      const sameKey = this.inFlightKey === key;
       const earlier = await this.inFlight;
-      return earlier.redeemed ? earlier : this.maybeRedeemForPool(accounts, { model });
+      const about = this.answeredFor.get(earlier);
+      const offered = about != null && accounts.includes(about);
+      if (sameKey ? (!about || offered) : (earlier.redeemed && offered)) return earlier;
+      return this.maybeRedeemForPool(accounts, { model });
     }
     const attempt = this._attempt(accounts, model).finally(() => { this.inFlight = null; this.inFlightKey = null; });
     this.inFlight = attempt;
@@ -439,8 +450,11 @@ export class ClaudeResetRedeemer {
     // An account another attempt has just re-read (one this refusal waited on)
     // may serve this request now: the pool is not dry, so nothing is spent and
     // the server selects again.
-    if (accounts.some(a => this.am.unavailableReason?.(a, model) === null)) {
-      return { redeemed: false, available: true, reason: 'an account can serve the request after all' };
+    const serving = accounts.find(a => this.am.unavailableReason?.(a, model) === null);
+    if (serving) {
+      const r = { redeemed: false, available: true, account: safeLine(serving.name, 64), reason: 'an account can serve the request after all' };
+      this.answeredFor.set(r, serving);
+      return r;
     }
     const deadline = now + this.timeoutMs;
     const key = this._modelKey(model);
@@ -471,7 +485,7 @@ export class ClaudeResetRedeemer {
     for (const account of candidates) {
       if (this.now() >= deadline) { reason = 'ran out of the redeem budget'; break; }
       const r = await this._redeem(account, deadline, model);
-      if (r.redeemed || r.available) return r;
+      if (r.redeemed || r.available) { this.answeredFor.set(r, account); return r; }
       reason = r.reason;
       if (this.now() < this.fleetHoldUntil) break;
     }
