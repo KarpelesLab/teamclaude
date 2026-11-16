@@ -288,6 +288,27 @@ test('preferred billing affinity checks the advisor route before priority preemp
   assert.deepEqual(am.getStatus().accounts.map(a => a.onExtraUsage), [false, false]);
 });
 
+// A family-only diversion moves that family alone (#276). The preference's
+// pick arrives with an exclude naming every account outside its pool, the
+// current one included, so judged on that set the current account was not
+// "barred for this model only": the cursor moved onto the preferred
+// subscription and the Opus traffic followed it there.
+test('a Fable diversion onto a preferred subscription leaves the Opus traffic where it was', t => {
+  t.mock.method(console, 'log', () => {});
+  const fable = 'claude-fable-5';
+  const am = new AccountManager([
+    oauth('main'),
+    oauth('s1', { allowExtraUsage: true, preferExtraUsage: true }),
+    { name: 'api', type: 'apikey', apiKey: 'api-key', priority: 100 },
+  ], 0.98);
+  am._nextProbeAt = Date.now() + 60_000;
+  Object.assign(am.accounts[0].quota, { unified7d: 0.2, unified7dFable: 1 });
+  Object.assign(am.accounts[1].quota, { unified7d: 0.5, unified7dFable: 0.99 });
+  const selected = [OPUS, fable, OPUS, fable].map(model => am.getActiveAccount(null, model)?.name);
+  assert.deepEqual({ selected, current: am.getStatus().currentAccount },
+    { selected: ['main', 's1', 'main', 's1'], current: 'main' });
+});
+
 test('advisor restrictions do not preserve billing after the account recovers included quota', () => {
   const am = fleet({ preferExtraUsage: true, weekly: 0.2 });
   const advisor = 'claude-fable-5';

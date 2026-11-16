@@ -2438,7 +2438,7 @@ export class AccountManager {
     const manual = this._manualSelection(exclude, model, advisorModel, provider);
     if (!eligiblePin && manual?.fallback) return this._activateFallback(manual, exclude, model, provider, advisorModel);
     const extra = this._preferredExtraUsage(exclude, model, advisorModel, provider);
-    if (extra) return this._selectFallback(extra, model, advisorModel, true);
+    if (extra) return this._selectFallback(extra, model, advisorModel, true, exclude);
     if (sessionId && this.distributeSessions && !pinned) {
       const account = this._pickLeastLoaded(exclude, model, advisorModel);
       if (account) return account;
@@ -3634,17 +3634,20 @@ export class AccountManager {
    * nor restarts this one. A switch within the scope — another account, or the
    * same one stepping from free quota onto paid — is announced and ramped like
    * any switch (see _noteFallback).
-   * An explicitly preferred pool can be used while API capacity remains.
+   * An explicitly preferred pool can be used while API capacity remains. It
+   * arrives as an `exclude` naming every account outside the pool, so the
+   * request's own exclusions come separately as `requestExclude`.
    * @param {Set<number>|null} [exclude]
    * @param {string|null} [model]
    * @param {string|null} [advisorModel]
    * @param {boolean} [preferExtraUsage]
+   * @param {Set<number>|null} [requestExclude]
    */
-  _selectFallback(exclude = null, model = null, advisorModel = null, preferExtraUsage = false) {
+  _selectFallback(exclude = null, model = null, advisorModel = null, preferExtraUsage = false, requestExclude = exclude) {
     const provider = this._selectingProvider ?? DEFAULT_PROVIDER;
     const pick = this._pickFallback(exclude, model, provider, advisorModel, preferExtraUsage);
     if (!pick) return null;
-    return this._activateFallback(pick, exclude, model, provider, advisorModel, preferExtraUsage);
+    return this._activateFallback(pick, exclude, model, provider, advisorModel, preferExtraUsage, requestExclude);
   }
 
   /**
@@ -3656,14 +3659,21 @@ export class AccountManager {
    * `preferExtraUsage` says the pick came from the preferred pool; otherwise
    * the episode is marked preferred when the account is one the preference
    * would have chosen anyway, which is what lets the sweep keep it.
+   *
+   * "Barred for this model only" is judged on the request's own exclusions
+   * (`requestExclude`). The preferred pool's `exclude` names every account
+   * outside the pool, the current one included, so judged on it a Fable-only
+   * diversion onto a preferred subscription moved the cursor and the Opus
+   * traffic followed it there (#276).
    * @param {{ account: Record<string, any>, paid: boolean }} pick
    * @param {Set<number>|null} exclude
    * @param {string|null} model
    * @param {string} provider
    * @param {string|null} [advisorModel]
-   * @param {boolean} [preferExtraUsage] */
-  _activateFallback(pick, exclude, model, provider, advisorModel = null, preferExtraUsage = false) {
-    if (!this._currentBarredOnlyFor(model, null, exclude)) this._setCurrent(pick.account);
+   * @param {boolean} [preferExtraUsage]
+   * @param {Set<number>|null} [requestExclude] */
+  _activateFallback(pick, exclude, model, provider, advisorModel = null, preferExtraUsage = false, requestExclude = exclude) {
+    if (!this._currentBarredOnlyFor(model, null, requestExclude)) this._setCurrent(pick.account);
     const preferred = preferExtraUsage || this._preferredFallbackCandidates(exclude, model, advisorModel, provider).includes(pick.account);
     if (this._noteFallback(this._cursorKey(model, null, provider), pick, model, false, advisorModel, preferred)) this._beginRamp(pick.account);
     return pick.account;
