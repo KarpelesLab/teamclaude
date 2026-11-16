@@ -20,6 +20,7 @@ import {
   orgKey,
   matchAccounts,
   findUpsertTarget,
+  apiKeyNamed,
   updateAccountEntry,
   canUpsertOAuthAccount,
   isTokenRejection,
@@ -1230,6 +1231,7 @@ async function importCommand() {
   // applied) before anything reaches the network. The list is not written back
   // from this copy — upsertOAuthAccount re-reads the file when it saves.
   const config = await loadOrCreateConfig();
+  refuseApiKeyName(config);
 
   let name = argValue('--name');
   const jsonStr = argValue('--json');
@@ -1273,6 +1275,35 @@ async function importCommand() {
 }
 
 // ── login ───────────────────────────────────────────────────
+
+/**
+ * Why a login or import is not saved under an API-key account's name (see
+ * apiKeyNamed), and what to do. The `--name` advice is for the command line;
+ * the TUI's sign-in takes no name.
+ * @param {string} name
+ * @param {boolean} cli
+ */
+function apiKeyNameRefusal(name, cli) {
+  return `"${name}" already names an API-key account: ${cli ? 'sign in under another --name, or ' : ''}remove or rename that account first`;
+}
+
+/**
+ * Exit when `--name` names an API-key account and no Claude OAuth one, before
+ * anything is opened, read or renewed. The save would refuse that name
+ * (upsertOAuthAccount), but only after the sign-in, or the renewal an import's
+ * stale token needs, had been spent, and their token would be dropped. With a
+ * Claude OAuth account of that name, the login may well be its own, and goes
+ * ahead. A Codex account of that name is no such reason: a Claude login is
+ * never a Codex account's (sameIdentity tells the providers apart).
+ * @param {Record<string, any>} config
+ */
+function refuseApiKeyName(config) {
+  const name = argValue('--name');
+  const accounts = config?.accounts || [];
+  if (!name || accounts.some((/** @type {any} */ a) => a?.type === 'oauth' && providerOf(a) === 'anthropic' && a.name === name) || !apiKeyNamed(accounts, name)) return;
+  console.error(apiKeyNameRefusal(name, true));
+  process.exit(1);
+}
 
 /**
  * The --routing flag: the account's own egress proxy URL
@@ -1607,6 +1638,7 @@ async function loginApiCommand() {
 
 async function loginOAuthCommand({ pasteOnly = false, longLived = false } = {}) {
   const loaded = await loadOrCreateConfig(); // first run: create the file; the save re-reads it
+  refuseApiKeyName(loaded);
   let name = argValue('--name');
   const { routing, store } = loginRouting(loaded);
   await requireWorkingRouting(routing, upstreamFor({ type: 'oauth' }, loaded.upstream));
@@ -3546,6 +3578,14 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
       console.log(`Updated account "${prev.name}"`);
       if (!storeRouting) noteUnusedRouting(prev, routing);
     } else {
+      // Not under the name it was given, or its profile's email, when an
+      // API-key account holds that name (apiKeyNamed). A --name of one was
+      // refused before anything was spent (refuseApiKeyName); this catches a
+      // name known only now (a profile's email, or a sign-in as another
+      // account than the OAuth entry of that name), whose token is then
+      // dropped. The " (org)" name a second organization gets below is not
+      // checked. Thrown, the update is abandoned and nothing is written.
+      if (apiKeyNamed(config.accounts, account.name)) throw new ConfigOpError(apiKeyNameRefusal(account.name, fatal));
       // New org for this person: if another entry shares the accountUuid, the bare
       // email name would collide — disambiguate both with " (org)".
       if (!userNamed && account.accountUuid) {
@@ -3564,6 +3604,11 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
       console.log(`Added account "${account.name}"`);
     }
     signedIn = config.accounts[idx >= 0 ? idx : config.accounts.length - 1];
+  }).catch((/** @type {any} */ err) => {
+    // A refusal above; the TUI's login reports it as its failure.
+    if (!(err instanceof ConfigOpError) || !fatal) throw err;
+    console.error(err.message);
+    process.exit(1);
   });
   // Said once the entry is known: one that already holds the account the
   // token answer named is renewed under its own name, not the one given.

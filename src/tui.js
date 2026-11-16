@@ -5,6 +5,7 @@ import { importCredentials, fetchProfile, formatMoney } from './oauth.js';
 import {
   sameIdentity,
   findUpsertTarget,
+  apiKeyNamed,
   updateAccountEntry,
   canUpsertOAuthAccount,
   oauthIdentityFields,
@@ -2560,6 +2561,11 @@ export class TUI {
         // keep its traffic off this machine's address.
         if (prev.routing) this._addLog(`Note: "${safeLine(prev.name, 64)}" has its own proxy, and this import's profile lookup did not go through it`);
       } else {
+        // Not under a name an API-key account holds (apiKeyNamed).
+        if (apiKeyNamed(this.config.accounts, entry.name)) {
+          this._addLog(`Import refused: "${entry.name}" already names an API-key account; remove or rename that account first`);
+          return;
+        }
         // New org for this person: disambiguate colliding email names with " (org)".
         if (profile?.accountUuid) {
           const orgLbl = a => a.orgName || (a.orgUuid ? a.orgUuid.slice(0, 8) : 'org');

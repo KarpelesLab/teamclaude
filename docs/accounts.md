@@ -18,7 +18,14 @@ If the profile cannot be identified, login stops without adding a placeholder
 account. Retry after confirming the credential is valid, or pass
 `teamclaude login --name <name>` to add it without profile detection. A
 credential the upstream rejects with 401 (and that cannot be refreshed) is
-refused regardless of `--name` — log in again to get a fresh one.
+refused regardless of `--name` — log in again to get a fresh one. A login or
+import whose `--name` is an API-key account's, and no Claude OAuth account's, is
+refused before anything is opened, read or renewed. One that would still end up
+saved under such a name (a sign-in as another account than the OAuth one of that
+name, or a login or import without `--name` whose profile's email is that name)
+is refused when it is saved, and its token, or the one a renewal gave it, is
+dropped. Either way nothing is written: give it another `--name`, or remove or
+rename that account first.
 
 ## Long-lived login
 

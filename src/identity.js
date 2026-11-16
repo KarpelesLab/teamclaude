@@ -122,9 +122,31 @@ export function findUpsertTarget(accounts, incoming) {
     const byUuid = accounts.findIndex(a => a?.accountUuid && sameIdentity(a, incoming));
     if (byUuid >= 0) return byUuid;
   }
-  const byIdentity = accounts.findIndex(a => sameIdentity(a, incoming));
+  // The passes left can fall back to the name, so there only an entry of the
+  // incoming's type can be it. An API-key entry carries no UUID, so
+  // sameIdentity compared names, and a login named after an API-key account
+  // turned that entry into an OAuth one that still held the key. Such a login
+  // is refused instead (apiKeyNamed).
+  const byIdentity = accounts.findIndex(a => a?.type === incoming?.type && sameIdentity(a, incoming));
   if (byIdentity >= 0) return byIdentity;
-  return accounts.findIndex(a => a.name === incoming.name && !distinctAccounts(a, incoming));
+  return accounts.findIndex(a => a?.type === incoming?.type && a.name === incoming.name && !distinctAccounts(a, incoming));
+}
+
+/**
+ * The API-key entry named `name`, or null. A Claude login or import is refused
+ * under the name it was given, or its profile's email, when such an entry
+ * holds it, and nothing is written: the API-key entry is never turned into an
+ * OAuth one (findUpsertTarget), and a second entry under its name could not be
+ * told from it by the commands and routes that go by name (`remove`; `rename`
+ * refuses a name another account holds for the same reason). The " (org)" name
+ * a second organization of one person gets, and a Codex login, are not
+ * checked.
+ * @param {Array<Record<string, any>>} accounts
+ * @param {unknown} name
+ * @returns {Record<string, any>|null}
+ */
+export function apiKeyNamed(accounts, name) {
+  return accounts.find(a => a?.type === 'apikey' && a.name === name) ?? null;
 }
 
 /**

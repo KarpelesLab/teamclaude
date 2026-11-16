@@ -415,3 +415,81 @@ test('a long-lived login whose answer names the account and its organization ren
   assert.deepEqual(saved[0], before[0]);
   assert.deepEqual([saved[1].accessToken, saved[1].longLived, 'refreshToken' in saved[1]], ['at-year', true, false]);
 });
+
+// A login named after an API-key account turned the key's entry into an OAuth
+// one that still held the key. Named so on the command line, with no OAuth
+// account of that name, it is refused before its sign-in link: nothing is
+// spent, nothing is written, and it says what to do.
+const apiKeyWork = () => ({ id: 'k-id', name: 'work', type: 'apikey', apiKey: 'sk-ant-api03-made-up', priority: 100 });
+const REFUSED = /"work" already names an API-key account: sign in under another --name, or remove or rename that account first/;
+
+test('a login named after an API-key account is refused before its sign-in link, and nothing is written', async (t) => {
+  for (const kind of ['--long-lived', '--token']) {
+    const dir = await mkdtemp(join(tmpdir(), 'teamclaude-long-lived-'));
+    t.after(() => rm(dir, { recursive: true, force: true }));
+    const configPath = join(dir, 'config.json');
+    const config = { proxy: { port: 1, apiKey: 'tc-test' }, upstreamProxy: false, accounts: [apiKeyWork()] };
+    await writeFile(configPath, JSON.stringify(config));
+    const run = await runPasteFlow(['--import', tokenEndpointPreload, cliPath, 'login', kind, '--name', 'work'], {
+      env: { TEAMCLAUDE_CONFIG: configPath, TEAMCLAUDE_TEST_TOKEN_RESPONSE: JSON.stringify(yearGrant()), PATH: await inertBin(dir) },
+      signal: t.signal,
+    });
+    assert.equal(run.status, 1, `${kind}: ${run.stdout}\n${run.stderr}`);
+    assert.equal(run.authorizeUrl, null, `${kind}: a sign-in link was printed`);
+    assert.match(run.stderr, REFUSED, kind);
+    assert.doesNotMatch(run.stderr, /token-endpoint stub: answered|\n\s+at /, kind);
+    assert.deepEqual(JSON.parse(await readFile(configPath, 'utf8')), config, kind);
+  }
+});
+
+// A Codex account of that name is no reason to go ahead: a Claude login is
+// never a Codex account's, so it is refused before its link all the same.
+test('a long-lived login named after a Codex and an API-key account is refused before its sign-in link', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-long-lived-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const configPath = join(dir, 'config.json');
+  const codex = { id: 'c-id', name: 'work', type: 'oauth', provider: 'codex', accountId: 'acct-w', accessToken: 'at-c', refreshToken: 'rt-c', expiresAt: Date.now() + 3_600_000 };
+  const config = { proxy: { port: 1, apiKey: 'tc-test' }, upstreamProxy: false, accounts: [codex, apiKeyWork()] };
+  await writeFile(configPath, JSON.stringify(config));
+  const run = await runPasteFlow(['--import', tokenEndpointPreload, cliPath, 'login', '--long-lived', '--name', 'work'], {
+    env: { TEAMCLAUDE_CONFIG: configPath, TEAMCLAUDE_TEST_TOKEN_RESPONSE: JSON.stringify(yearGrant()), PATH: await inertBin(dir) },
+    signal: t.signal,
+  });
+  assert.equal(run.status, 1, `${run.stdout}\n${run.stderr}`);
+  assert.equal(run.authorizeUrl, null, 'a sign-in link was printed');
+  assert.match(run.stderr, REFUSED);
+  assert.doesNotMatch(run.stderr, /token-endpoint stub: answered|\n\s+at /);
+  assert.deepEqual(JSON.parse(await readFile(configPath, 'utf8')), config);
+});
+
+// With an OAuth account of that name too, the login may be its own and goes
+// ahead. It renews that one when it is; when its answer names another account,
+// the save refuses it all the same (its token is then dropped, and nothing is
+// written).
+const workTwice = () => [
+  { id: 'w-id', name: 'work', type: 'oauth', accountUuid: 'uuid-W', orgUuid: 'org-W', orgName: 'Org W', accessToken: 'at-W', refreshToken: 'rt-W', expiresAt: Date.now() + 3_600_000 },
+  apiKeyWork(),
+];
+
+test('a long-lived login named after an OAuth and an API-key account renews the OAuth one, and is refused when it is another account', async (t) => {
+  const own = await longLivedLoginAs(t, workTwice(), yearGrant(), 'work');
+  assert.equal(own.status, 0, `${own.stdout}\n${own.stderr}`);
+  assert.match(own.stdout, /Updated account "work"/);
+  assert.deepEqual(own.saved.map(a => [a.type, a.accessToken ?? a.apiKey]), [['oauth', 'at-year'], ['apikey', 'sk-ant-api03-made-up']]);
+
+  const before = workTwice();
+  const other = await longLivedLoginAs(t, before, yearGrant({ account: { uuid: 'uuid-Y' }, organization: { uuid: 'org-Y', name: 'Org Y' } }), 'work');
+  assert.equal(other.status, 1, `${other.stdout}\n${other.stderr}`);
+  assert.match(other.stderr, REFUSED);
+  assert.doesNotMatch(other.stderr, /\n\s+at /, 'a refusal, not a crash');
+  assert.doesNotMatch(other.stdout, /Added account|Updated account|Saved to/);
+  assert.deepEqual(other.saved, before);
+});
+
+// Only an API-key account's name is refused: an entry of no kind (a hand edit
+// with no "type", which is never loaded) does not stop the login.
+test('a long-lived login named after an entry with no type is not refused', async (t) => {
+  const { status, stdout, stderr } = await longLivedLoginAs(t, [{ id: 'u-id', name: 'work', accessToken: 'at-hand' }], yearGrant(), 'work');
+  assert.equal(status, 0, `${stdout}\n${stderr}`);
+  assert.doesNotMatch(stderr, /already names/);
+});
