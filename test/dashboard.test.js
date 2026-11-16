@@ -1377,6 +1377,17 @@ test('the Insights hero table follows the view, and says not recorded and not pr
   assert.ok(page.labelled('not recorded') >= 1, 'the day before recording began');
   assert.ok(page.labelled('not priced') >= 1, 'Grok by provider');
   assert.equal(zeroCells(at), 0, 'no $0 for a cost with no price');
+  const chartAt = page.built.length;
+  page.click('Chart');
+  // Hide the one priced series (its legend row, the first the chart built):
+  // what is left has no cost, so the plot says so, and no trend line is
+  // labelled with a $0 figure.
+  const claudeRow = page.built.slice(chartAt).find(e => /\btog\b/.test(String(e.className || '')) && e.listens('click'));
+  assert.ok(claudeRow, 'the Claude legend row');
+  const before = page.built.length;
+  claudeRow.fire('click');
+  assert.ok(page.labelled('not priced: no list price for the series shown') >= 1, 'a note where the bars would be');
+  assert.equal(page.built.slice(before).filter(e => /\$0(?![.\d])/.test(String(e.textContent || ''))).length, 0, 'no $0 anywhere in the redraw');
 
   const priced = bootPage();
   await priced.answer(200, { accounts: [{ name: 'a', provider: 'anthropic' }] });

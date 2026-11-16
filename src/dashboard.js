@@ -6052,6 +6052,9 @@ ${SHARED_HELPERS}
       paint(svgEl('rect', { x: m.l, y: m.t, width: gw, height: ph, class: 'insnr' }, s), 'var(--panel2)');
       if (gw > 90) svgEl('text', { x: m.l + gw / 2, y: m.t + 14, 'text-anchor': 'middle', class: 'insref' }, s).textContent = 'not recorded';
     }
+    // Every series left on show has no price: say so where the bars would be,
+    // rather than let an empty plot read as $0.
+    if (o.note) svgEl('text', { x: m.l + pw / 2, y: m.t + ph / 2, 'text-anchor': 'middle', class: 'insref' }, s).textContent = o.note;
     // Four bands of grid: dashed and faint, with a solid baseline.
     for (var g = 0; g <= 4; g++) {
       var gy = m.t + ph - ph * g / 4;
@@ -6661,13 +6664,16 @@ ${SHARED_HELPERS}
       : 'stacked by ' + split.text + (series.length > 1 ? ' · click a row to hide it' : '')) + ' · ' + rangeText;
     var prevTotal = metric === 'cost' ? (d.cost ? d.cost.previous : null)
       : d.previous ? d.previous.input + d.previous.output + d.previous.cacheRead + d.previous.cacheWrite : null;
+    // With every priced series hidden, what is left has no cost to draw: no
+    // trend (it would read "$0") and a note in the plot instead of bars.
+    var nonePriced = metric === 'cost' && series.length > 0 && series.every(function (sr) { return ins.hidden[sr.key] || sr.unpriced; });
     // The trend follows the series shown, so hiding one takes it out of the line too.
     var shownSum = values.map(function (_, i) { return series.reduce(function (x, sr) { return x + (ins.hidden[sr.key] ? 0 : sr.values[i] || 0); }, 0); });
     insightsCard(hb, 'hero', heroTitle, heroSub, function (host) {
       var narrow = (host.clientWidth || 600) < 520;
       drawHero(host, d, series, {
         view: running ? 'total' : 'daily', height: narrow ? 210 : 280, name: heroTitle, fmt: mt.fmt, axis: mt.axis,
-        from: from, trend: insightsTrend(shownSum, d.unit, from),
+        from: from, trend: nonePriced ? null : insightsTrend(shownSum, d.unit, from), note: nonePriced ? 'not priced: no list price for the series shown' : null,
         // The period before, as one figure: only against everything, not a part of it.
         ref: prevTotal != null && prevTotal > 0 && !anyHidden ? { value: prevTotal, label: 'previous ' + (hourly ? '24 hours' : parseInt(d.range, 10) + ' days') + ': ' + mt.fmt(prevTotal) } : null,
         other: otherValues, otherName: ot.name, otherFmt: ot.fmt,
