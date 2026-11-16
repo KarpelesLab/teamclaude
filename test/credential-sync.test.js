@@ -4,7 +4,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AccountManager } from '../src/account-manager.js';
-import { saveCallbackToken } from '../src/callback-auth.js';
+import { getCallbackAuthPath, saveCallbackToken } from '../src/callback-auth.js';
 import { CredentialSync, refreshOutsideProxy, syncKeyFor, isSyncable, encodeBlob, decodeBlob, entryFromBlob, needsSignIn, tombstoneOf, tombstone, KEY_PREFIX, TOMBSTONE_TTL_MS, REMOVAL_PENDING_MAX_MS } from '../src/credential-sync.js';
 
 // Credential sync through callback.net: every signed-in install keeps its OAuth
@@ -667,7 +667,7 @@ test('a removal from a CLI command makes one attempt, with no wait for the lock'
   store.byKey(key).Locked = { unixms: String(store.now()), unix: Math.floor(store.now() / 1000) };
   // As index.js builds it for `teamclaude remove`: no fleet of its own.
   const sleeps = [];
-  const cli = new CredentialSync({ accountManager: /** @type {any} */ ({ accounts: [] }), addAccount: () => null, api: store.api, isSignedIn: async () => true, now: store.now, log: () => {}, sleep: async (ms) => { sleeps.push(ms); store.tick(ms); } });
+  const cli = new CredentialSync({ accountManager: /** @type {any} */ ({ accounts: [] }), addAccount: () => null, api: store.api, isSignedIn: async () => true, session: async () => 'session-1', now: store.now, log: () => {}, sleep: async (ms) => { sleeps.push(ms); store.tick(ms); } });
   const entry = claude('b');
   assert.equal(await cli.onAccountRemoved({ ...entry, credential: entry.accessToken }, { wait: false }), false);
   assert.deepEqual(sleeps, [], 'no wait');
@@ -1226,15 +1226,24 @@ test('a pass reads the session before it lists the rows: a sign-in during the li
   assert.equal((await home.sync.sync()).added, 1, 'the next pass adds it from their row');
 });
 
-/** A config path of the test's own, so the callback.net token file beside it is too. */
+/**
+ * A config path of the test's own, so the callback.net token file beside it is
+ * too. TEAMROUTER_CONFIG wins over TEAMCLAUDE_CONFIG (envVar), so it is cleared
+ * for the test, as tempConfig in callback-auth.test.js does: one exported for a
+ * developer's own install would take these writes into their real token file.
+ */
 async function tokenFile(t) {
   const dir = await mkdtemp(join(tmpdir(), 'teamclaude-sync-'));
-  const prev = process.env.TEAMCLAUDE_CONFIG;
+  const prev = { c: process.env.TEAMCLAUDE_CONFIG, r: process.env.TEAMROUTER_CONFIG };
+  delete process.env.TEAMROUTER_CONFIG;
   process.env.TEAMCLAUDE_CONFIG = join(dir, 'config.json');
   t.after(async () => {
-    if (prev === undefined) delete process.env.TEAMCLAUDE_CONFIG; else process.env.TEAMCLAUDE_CONFIG = prev;
+    if (prev.c === undefined) delete process.env.TEAMCLAUDE_CONFIG; else process.env.TEAMCLAUDE_CONFIG = prev.c;
+    if (prev.r !== undefined) process.env.TEAMROUTER_CONFIG = prev.r;
     await rm(dir, { recursive: true, force: true });
   });
+  // Before anything is written: the token file is this test's, or the test stops here.
+  assert.equal(getCallbackAuthPath(), join(dir, 'config.callback.json'));
 }
 
 test('the session is the sign-in the token file names: a renewal of it keeps a pending removal, a new sign-in ends one', async (t) => {
