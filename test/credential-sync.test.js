@@ -232,6 +232,100 @@ test('a long-lived account near its end takes no refreshing login from the store
   assert.equal(am.accounts[0].status, 'error');
 });
 
+// A long-lived login named onto an entry keeps the ids an earlier full login
+// recorded, and the row that login stored stays. The account is not carried,
+// but removing it must still remove that identity: without the tombstone the
+// next pass added it straight back from the row, as a refreshing account.
+test('removing a long-lived account that carries a stored identity leaves the tombstone, and the next pass adds nothing back', async () => {
+  const store = makeStore();
+  const ordinary = claude('a', { credential: 'at-a-0', refreshToken: 'rt-a-0' });
+  store.put(syncKeyFor(claude('a')), encodeBlob(ordinary, tokensOf(ordinary), { now: T0 - H, by: 'office' }));
+  const { sync, am, settled } = setup([claude('a', { accessToken: 'at-a-year', refreshToken: undefined, longLived: true, expiresAt: T0 + 300 * 24 * H })], { store });
+  await sync.sync('start');
+  assert.equal(am.accounts[0].longLived, true);
+
+  am.removeAccount(0);
+  assert.deepEqual(await settled(), [true]);
+  assert.notEqual(tombstoneOf(store.byKey(syncKeyFor(claude('a'))).Data), null);
+  store.tick(60_000);
+  assert.equal((await sync.sync('interval')).added, 0);
+  assert.deepEqual(am.accounts, []);
+});
+
+test('`teamclaude remove` of a long-lived account that carries a stored identity writes the tombstone', async () => {
+  const store = makeStore();
+  const ordinary = claude('a', { credential: 'at-a-0', refreshToken: 'rt-a-0' });
+  store.put(syncKeyFor(claude('a')), encodeBlob(ordinary, tokensOf(ordinary), { now: T0 - H, by: 'office' }));
+  // As index.js builds it for `teamclaude remove`: no fleet of its own, the config entry as it was.
+  const cli = new CredentialSync({ accountManager: /** @type {any} */ ({ accounts: [] }), addAccount: () => null, api: store.api, isSignedIn: async () => true, session: async () => 'session-1', now: store.now, log: () => {}, sleep: async (ms) => store.tick(ms) });
+  const entry = claude('a', { accessToken: 'at-a-year', refreshToken: undefined, longLived: true });
+  assert.equal(await cli.onAccountRemoved({ ...entry, credential: entry.accessToken }, { wait: false }), true);
+  assert.notEqual(tombstoneOf(store.byKey(syncKeyFor(claude('a'))).Data), null);
+});
+
+// A long-lived account has no store key of its own, and the identity scan an
+// ordinary removal falls back to takes an organization one side does not know
+// for a match: an entry with an account UUID and no organization would match
+// every organization's row of that person, and the first one listed would be
+// removed on every install. Its removal is written only into the row under its
+// own key, wherever the list has it. With none, nothing is written, and the
+// line says how many of the person's accounts come back here.
+test('a long-lived account\'s removal is written only into the row under its own key, wherever it is listed', async () => {
+  const rowsOf = {
+    org1: claude('p', { orgUuid: 'org-1', orgName: 'Org 1' }),
+    org2: claude('p', { orgUuid: 'org-2', orgName: 'Org 2' }),
+    orgless: claude('p', { orgUuid: undefined, orgName: undefined }),
+    org2ByName: claude('p', { orgUuid: undefined, orgName: 'Org 2' }),
+  };
+  const removal = async (rows, entry, { others = [], emptied = [] } = {}) => {
+    const store = makeStore();
+    for (const r of rows) {
+      const tokens = tokensOf({ ...rowsOf[r], credential: rowsOf[r].accessToken });
+      store.put(syncKeyFor(rowsOf[r]), encodeBlob(rowsOf[r], emptied.includes(r) ? { ...tokens, refreshToken: '' } : tokens, { now: T0 - H, by: 'office' }));
+    }
+    const { sync, am, settled, logs } = setup([{ name: 'ci', type: 'oauth', accountUuid: 'uuid-p', accessToken: 'at-year', longLived: true, expiresAt: T0 + 300 * 24 * H, ...entry }, ...others], { store });
+    await sync.sync('start');
+    am.removeAccount(0);
+    const written = await settled();
+    return {
+      written,
+      tombstoned: rows.filter((r) => tombstoneOf(store.byKey(syncKeyFor(rowsOf[r])).Data) != null),
+      line: logs.find((l) => /was not recorded for your other installs/.test(l)) ?? null,
+    };
+  };
+  const org2 = { orgUuid: 'org-2', orgName: 'Org 2' };
+
+  // Its own row, before or after another of the person's.
+  assert.deepEqual(await removal(['org1', 'orgless'], {}), { written: [true], tombstoned: ['orgless'], line: null });
+  assert.deepEqual(await removal(['orgless', 'org1'], {}), { written: [true], tombstoned: ['orgless'], line: null });
+  assert.deepEqual(await removal(['orgless', 'org2'], org2), { written: [true], tombstoned: ['org2'], line: null });
+  assert.deepEqual(await removal(['org2', 'orgless'], org2), { written: [true], tombstoned: ['org2'], line: null });
+
+  // None under its key: nothing is written, and the line names what comes back.
+  const byName = await removal(['org2ByName'], { orgUuid: 'org-2' });
+  assert.deepEqual([byName.written, byName.tombstoned], [[false], []]);
+  assert.match(String(byName.line), /the removal of "ci" was not recorded for your other installs: the store holds no row under its account and organization\. The account of that person it holds is added here at the next pass, and removing one removes it on every install$/);
+  const both = await removal(['org1', 'org2'], {});
+  assert.deepEqual([both.written, both.tombstoned], [[false], []]);
+  assert.match(String(both.line), /The 2 accounts of that person it holds are added here at the next pass/);
+  assert.doesNotMatch(String(both.line), /remove it again/);
+  // One of them held here by an ordinary account already does not come back.
+  const held = await removal(['org1', 'org2'], {}, { others: [rowsOf.org1] });
+  assert.match(String(held.line), /The account of that person it holds is added here at the next pass/);
+  // Another person's row is not counted, though nothing here holds it: from the
+  // CLI's sync, which has no fleet of its own.
+  const cliStore = makeStore();
+  for (const a of [rowsOf.org1, rowsOf.org2, claude('q')]) cliStore.put(syncKeyFor(a), encodeBlob(a, tokensOf({ ...a, credential: a.accessToken }), { now: T0 - H, by: 'office' }));
+  const cliLogs = [];
+  const cli = new CredentialSync({ accountManager: /** @type {any} */ ({ accounts: [] }), addAccount: () => null, api: cliStore.api, isSignedIn: async () => true, session: async () => 'session-1', now: cliStore.now, log: (l) => cliLogs.push(l), sleep: async (ms) => cliStore.tick(ms) });
+  const ci = { name: 'ci', type: 'oauth', accountUuid: 'uuid-p', accessToken: 'at-year', longLived: true };
+  assert.equal(await cli.onAccountRemoved({ ...ci, credential: ci.accessToken }, { wait: false }), false);
+  assert.match(cliLogs.join('\n'), /The 2 accounts of that person it holds are added here at the next pass/);
+  // Nothing of the person in the store that the pass would add: nothing to say.
+  assert.deepEqual(await removal([], org2), { written: [false], tombstoned: [], line: null });
+  assert.deepEqual(await removal(['org2'], {}, { emptied: ['org2'] }), { written: [false], tombstoned: [], line: null });
+});
+
 test('the newer token wins each way: the store\'s is adopted, this install\'s is stored', async () => {
   const store = makeStore();
   const a = claude('a');

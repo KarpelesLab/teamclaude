@@ -193,6 +193,17 @@ export function syncKeyFor(a) {
 }
 
 /**
+ * The key a removal of an account is recorded under: its store key, or, for a
+ * long-lived account, which the sync does not carry, the key its identity
+ * would have (see onAccountRemoved). Null when it has no identity to key one.
+ * @param {Record<string, any>} a
+ * @returns {string|null}
+ */
+function removalKeyFor(a) {
+  return syncKeyFor(isLongLived(a) ? { ...a, longLived: false } : a);
+}
+
+/**
  * The row's contents for an account, with the tokens it should carry.
  * @param {Record<string, any>} a
  * @param {Tokens} tokens
@@ -676,6 +687,43 @@ export class CredentialSync {
   }
 
   /**
+   * The row stored under `key`, as last seen, else from a fresh list; null
+   * when the store has none.
+   *
+   * Where a long-lived account's removal is written (see onAccountRemoved).
+   * Such an account has no store key of its own, and the identity scan
+   * _rowFor falls back to takes an organization one side does not know for a
+   * match: an entry with an account UUID and no organization would match
+   * every organization's row of that person, and whichever was listed first
+   * would be removed everywhere. Its removal goes only into the row its
+   * identity's key names.
+   * @param {string} key
+   * @returns {Promise<Row|null>}
+   */
+  async _rowByKey(key) {
+    const seen = this.rows.get(key);
+    if (seen) return seen;
+    this.rows = await this._list();
+    return this.rows.get(key) ?? null;
+  }
+
+  /**
+   * A long-lived account's removal found no row under its own key, and is
+   * given up on. Said only when the store holds rows this account kept from
+   * being added here (sameIdentity, as the pass matches them) and no account
+   * still here does: with it gone, the next pass adds them, as refreshing
+   * accounts, and removing one of those records a tombstone for it on every
+   * install.
+   * @param {Record<string, any>} account
+   */
+  _noRowOfItsOwn(account) {
+    const held = [...this.rows.values()].filter((r) => r.blob && !needsSignIn(r.blob) && sameIdentity(r.blob, account)
+      && !this.am.accounts.some((a) => sameIdentity(a, /** @type {Blob} */ (r.blob)))).length;
+    if (!held) return;
+    this.log(`[TeamClaude] callback.net: the removal of "${safeLine(account.name, 64)}" was not recorded for your other installs: the store holds no row under its account and organization. The ${held === 1 ? 'account' : `${held} accounts`} of that person it holds ${held === 1 ? 'is' : 'are'} added here at the next pass, and removing one removes it on every install`);
+  }
+
+  /**
    * Whether a row names an account removed here whose tombstone is not
    * written yet (see pendingRemovals): by key, or by the identity it carries.
    * @param {Row} row
@@ -849,13 +897,20 @@ export class CredentialSync {
    * signed out after it, or signed in to it again, the removal is given up
    * on. An account a pass evicts for a tombstone is removed in the store
    * already, and nothing is written.
+   * A long-lived account is not carried (isSyncable), but its identity can
+   * be: a long-lived login named onto an entry keeps the ids an earlier full
+   * login recorded, and the row that login stored would add the account back
+   * here, as a refreshing one, at the next pass. So its removal is recorded
+   * for that identity (removalKeyFor), as any account's is, and removes that
+   * account from every install. It is written only into the row stored under
+   * that key (_rowByKey); one with no identity has no row to write it into.
    * Resolves with whether a tombstone was written.
    * @param {Record<string, any>} account
    * @param {{ wait?: boolean }} [opts]
    * @returns {Promise<boolean>}
    */
   async onAccountRemoved(account, { wait = true } = {}) {
-    const key = syncKeyFor(account);
+    const key = removalKeyFor(account);
     if (!key || this._evicting.delete(account)) return false;
     // Before anything is awaited: a pass running meanwhile must not add the
     // account back from its row.
@@ -977,13 +1032,14 @@ export class CredentialSync {
    * removal is tied to (each checked on entry, and again with the lock held,
    * just before the write), and when this install is signed out of
    * callback.net. Left pending, to be tried again, when the store cannot be
-   * reached or when the lock is not had within `waitMs`.
+   * reached or when the lock is not had within `waitMs`. A long-lived
+   * account's row is the one under its own key, and none else (_rowByKey).
    * @param {Record<string, any>} account
    * @param {number} waitMs  how long a held lock is waited for
    * @returns {Promise<boolean>} whether a tombstone was written
    */
   async _recordRemoval(account, waitMs) {
-    const key = /** @type {string} */ (syncKeyFor(account));
+    const key = /** @type {string} */ (removalKeyFor(account));
     const name = safeLine(account.name, 64);
     const settle = () => { this._settleRemoval(key, account); return false; };
     // Settled meanwhile (written by a pass, dropped by a sign-in here): done.
@@ -999,8 +1055,11 @@ export class CredentialSync {
       }
       // Signed in again since: the store may be another user's.
       if (this._dropIfSessionChanged(key, account, await this._readSession())) return false;
-      const row = await this._findRow(account);
-      if (!row) return settle();
+      const row = isLongLived(account) ? await this._rowByKey(key) : await this._findRow(account);
+      if (!row) {
+        if (isLongLived(account)) this._noRowOfItsOwn(account);
+        return settle();
+      }
       const lease = await this._lockWaiting(row, waitMs, () => this.pendingRemovals.get(key) === account);
       if (!lease && this.pendingRemovals.get(key) !== account) return false; // settled while it waited
       if (!lease) {
