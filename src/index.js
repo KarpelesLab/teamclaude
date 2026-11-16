@@ -2806,9 +2806,10 @@ function resolveAccount(accounts, query, orgFilter) {
 
 /**
  * resolveAccount for use inside a config update: the same two refusals, in the
- * same words, thrown rather than printed. Exiting there would leave the config
- * lock behind for the next writer to wait out; thrown, the update is abandoned
- * with the file untouched and updateConfigOrExit prints the message.
+ * same words, thrown rather than printed. Thrown, the update is abandoned with
+ * the file untouched, the lock is released, and updateConfigOrExit prints the
+ * message. Exiting there would leave the lock file behind for the next writer
+ * to find its holder gone and break (config.js).
  * @param {any[]} accounts
  * @param {string} query
  * @param {string|null} orgFilter
