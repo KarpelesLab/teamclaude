@@ -16,9 +16,10 @@
 //    a successful fresh read that removes or blocks a grant is authoritative.
 //  - Spending names any usable grant; auto-redeem picks the cheapest kind that
 //    clears every exhausted limit, then the soonest expiry and `next_grant_id`.
-//    "Exhausted" is what upstream reports at its own limit, or — for an account
-//    the proxy parked at its weekly switch threshold before upstream's limit
-//    was ever reached (#685) — the limits behind the readings that parked it.
+//    "Exhausted" is what upstream reports at its own limit, together with the
+//    limits behind the readings on which the proxy parks the account at its
+//    weekly switch threshold (#685), which a busy fleet reaches before
+//    upstream's limit.
 //    The endpoint is organization-scoped
 //    (POST /api/organizations/<orgUuid>/reset_rate_limits), and the body is
 //    `{ program: "cedar_ember", grant_id, request_id }`.
@@ -546,6 +547,15 @@ export class ClaudeResetRedeemer {
       state.cooldownUntil = now + NOTHING_COOLDOWN_MS;
       return { redeemed: false, account: name, reason: 'holds no usable reset' };
     }
+    // The status read carries the account's quota as of now, so the manager
+    // judges on that and not on a reading that may have gone stale.
+    if (read.usage && !read.usage.error) this.am.applyUsageData?.(account.index, read.usage);
+    // What the proxy itself holds the account out on for this model, at its
+    // weekly switch threshold. A reset that leaves one of those standing does
+    // not return the account to service whatever upstream reports, so they
+    // are part of the wall on every path, an upstream weekly wall included.
+    const parked = this._parkedLimits(account, model);
+    if (parked?.unknown) return this._decline(account, now + DECLINED_COOLDOWN_MS, `no reset is known to clear its ${parked.unknown} reading`, key);
     // What a grant has to clear, and the grants that may be spent on it.
     /** @type {ResetStatus} */
     let wall = status;
@@ -560,17 +570,12 @@ export class ClaudeResetRedeemer {
       // busy fleet never reaches one: every account parks a little short, and
       // the pool is dry with resets banked (#685). Upstream accepts a claim
       // there, so an account parked by a WEEKLY threshold counts as walled by
-      // the limits behind that reading, beside any upstream reports. The
-      // status read carries the account's quota as of now, so the manager
-      // judges on that and not on a reading that may have gone stale.
-      if (read.usage && !read.usage.error) this.am.applyUsageData?.(account.index, read.usage);
-      const parked = this._parkedLimits(account, model);
+      // the limits behind that reading, beside any upstream reports.
       if (!parked) {
         return this._decline(account, now + DECLINED_COOLDOWN_MS, atLimit
           ? 'no weekly limit is exhausted'
           : 'not at a usage limit, nor held out of rotation by its weekly switch threshold', key);
       }
-      if (parked.unknown) return this._decline(account, now + DECLINED_COOLDOWN_MS, `no reset is known to clear its ${parked.unknown} reading`, key);
       // Short of any upstream limit, a grant that says it needs one reached
       // would answer `not_limited`.
       const grants = atLimit ? status.grants : status.grants.filter((/** @type {ResetGrant} */ g) => g.useRequiresLimit !== true);
@@ -578,6 +583,10 @@ export class ClaudeResetRedeemer {
         return this._decline(account, now + DECLINED_COOLDOWN_MS, 'its reset can only be used at the upstream limit');
       }
       wall = { ...status, grants, exhausted: [...new Set([...parked.limits, ...status.exhausted])] };
+    } else if (parked) {
+      // At upstream's own weekly wall, a park the proxy holds as well (the
+      // shared weekly behind a Fable wall) has to be cleared with it.
+      wall = { ...status, exhausted: [...new Set([...parked.limits, ...status.exhausted])] };
     }
     // Spent on an account it would not return to service, a reset buys this
     // request nothing — and the grant is gone.

@@ -430,6 +430,27 @@ test('at upstream\'s 5-hour wall and parked on a weekly reading: the weekly read
   assert.equal(fiveHourOnly.calls.claim.length + sessionOnly.calls.claim.length, 0);
 });
 
+// The Fable reset is the cheapest kind that clears an upstream Fable wall, but
+// the shared weekly behind it keeps the account parked for Opus and for Fable.
+test('at upstream\'s Fable wall on an account the shared weekly parks: only a reset that clears both is spent', async () => {
+  const fableWall = { at_limit: true, exhausted: ['seven_day_overage_included'] };
+  for (const model of [OPUS, FABLE]) {
+    const both = parkedHarness({ quota: { unified7d: 0.99, unified7dFable: 1 }, blockExtra: fableWall, grants: [fableGrant, weeklyGrant] });
+    assert.equal((await both.redeemer.maybeRedeemForPool(both.am.accounts, { model })).redeemed, true, model);
+    assert.deepEqual(both.calls.grants, ['weekly'], model);
+    assert.equal(both.am.unavailableReason(both.am.accounts[0], model), null, model);
+    const fableOnly = parkedHarness({ quota: { unified7d: 0.99, unified7dFable: 1 }, blockExtra: fableWall, grants: [fableGrant] });
+    const r = await fableOnly.redeemer.maybeRedeemForPool(fableOnly.am.accounts, { model });
+    assert.equal(r.redeemed, false, model); assert.equal(r.reason, 'its reset does not clear seven_day');
+    assert.equal(fableOnly.calls.claim.length, 0);
+  }
+  // A park on a reading no grant is known to clear stands at an upstream wall too.
+  const scoped = parkedHarness({ quota: { unified7d: 1, scopedWeekly: { opus: { utilization: 0.99, resetAt: Date.now() + 3 * DAY } } },
+    blockExtra: { at_limit: true, exhausted: ['seven_day'] } });
+  assert.equal((await scoped.redeemer.maybeRedeemForPool(scoped.am.accounts, { model: OPUS })).reason, 'no reset is known to clear its scopedWeekly reading');
+  assert.equal(scoped.calls.claim.length, 0);
+});
+
 // The proxy usually learns of upstream's 5-hour wall from a 429, and holds the
 // account `throttled` for up to an hour, which outranks `quota`.
 test('held after the 429 of upstream\'s 5-hour wall and parked on a weekly reading: the reset is spent and lifts the hold', async () => {

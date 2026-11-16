@@ -793,7 +793,10 @@ selected again against the account it cleared.
   those limits are the ones behind the readings that parked it for the
   refused request's model: the all-models weekly (`seven_day`), the Fable
   weekly (`seven_day_overage_included`), and the 5-hour window too if that is
-  over its threshold as well. An account parked on a reading with no known
+  over its threshold as well. They count beside upstream's own limits even when
+  upstream reports a weekly one: an account at its Fable limit that the proxy
+  also holds out on the all-models weekly needs a reset that clears both, not
+  the Fable reset alone. An account parked on a reading with no known
   upstream limit name (the Sonnet weekly, a learned scoped bucket) is passed
   over, as is one out for any other reason (disabled, cordoned, capped by
   `maxUsage` or `maxSpend`, in error). A rate-limit hold, which the proxy sets
