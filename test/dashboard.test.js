@@ -1196,6 +1196,9 @@ function bootPage({ storedKey = null, storedTheme = null, storedInstance = null,
   // kept, so a test can drive a control the page created for itself — the
   // window buttons have no id to look up.
   const built = [];
+  // Focus is recorded, with the options it was given, and moves
+  // document.activeElement the way a browser does.
+  const focused = [];
   const stubEl = () => {
     // Listeners are recorded rather than absorbed, so a test can fire a click
     // the way the page registered it instead of reaching for an onclick the
@@ -1206,6 +1209,7 @@ function bootPage({ storedKey = null, storedTheme = null, storedInstance = null,
       style: {}, value: '', textContent: '', className: '', disabled: false,
       addEventListener: (type, fn) => { if (!listeners.has(type)) listeners.set(type, []); listeners.get(type).push(fn); },
       listens: type => (listeners.get(type) || []).length > 0,
+      focus: opts => { focused.push({ el: proxy, opts }); document.activeElement = proxy; },
     };
     const proxy = new Proxy(target, { get: (t, p) => (p in t ? t[p] : () => stubEl()) });
     // Fire with the proxy as `this`, the way the page sees the element, so a
@@ -1243,7 +1247,8 @@ function bootPage({ storedKey = null, storedTheme = null, storedInstance = null,
     removeAttribute: k => rootAttrs.delete(k),
     getAttribute: k => (rootAttrs.has(k) ? rootAttrs.get(k) : null),
   };
-  const document = { getElementById: byId, createElement: () => stubEl(), createElementNS: () => stubEl(), documentElement };
+  /** @type {any} */
+  const document = { getElementById: byId, createElement: () => stubEl(), createElementNS: () => stubEl(), documentElement, activeElement: null };
   const html = renderDashboardHtml();
   const script = inlineScripts(html).at(-1);
   let poll;
@@ -1276,7 +1281,7 @@ function bootPage({ storedKey = null, storedTheme = null, storedInstance = null,
   // The latest element built that matches, for a control with no label to
   // click by (an input the page made for itself).
   const findLast = pred => built.slice().reverse().find(pred);
-  return { byId, store, requests, answer, answerTo, runTimers, rootAttrs, click, labelled, findLast, built, poll: () => { mark = built.length; poll(); } };
+  return { byId, store, requests, answer, answerTo, runTimers, rootAttrs, click, labelled, findLast, built, focused, poll: () => { mark = built.length; poll(); } };
 }
 
 // The Insights page reads /teamclaude/insights only while it is open, like the
@@ -1310,6 +1315,233 @@ test('the Insights page asks for history only while open, once per range, and sa
   assert.deepEqual(page.requests.map(r => r.url), ['/teamclaude/insights?range=7d']);
   await page.answer(404, {});
   assert.match(page.byId('insNote').textContent, /older proxy that keeps no usage history/);
+});
+
+// The headlines pick what every chart draws, and the pick is remembered; the
+// hero's view and the "Where it went" tabs redraw without asking again. A
+// reply from a proxy too old to estimate the cost draws the tokens.
+test('the Insights headlines pick the metric and remember it; the views redraw without a fetch', async () => {
+  const page = bootPage();
+  await page.answer(200, { accounts: [{ name: 'a', provider: 'anthropic' }] });
+  page.click('Insights');
+  const priced = {
+    ...INSIGHTS,
+    cost: { total: 2, values: [1, 1], previous: null, unpricedTokens: 0 },
+    providers: [{ provider: 'anthropic', tokens: 10, cost: 2, requests: 2, values: [5, 5], requestValues: [1, 1], costValues: [1, 1] }],
+    accounts: [{ provider: 'anthropic', account: 'a', tokens: 10, cost: 2, requests: 2, values: [5, 5], requestValues: [1, 1], costValues: [1, 1] }],
+    models: [{ provider: 'anthropic', model: 'claude-opus-5-5', tokens: 10, requests: 2, cost: 2 }],
+  };
+  await page.answer(200, priced);
+  assert.equal(page.byId('insNote').style.display, 'none');
+  // Two days are too few for a calendar or months: one line says what they need.
+  assert.ok(page.built.some(e => /need four weeks/.test(String(e.textContent))), 'the short-range line');
+  const heads = () => page.built.filter(e => typeof e.className === 'string' && /^inshead( sel)?$/.test(e.className));
+  assert.equal(heads().slice(-2)[0].className, 'inshead sel', 'the cost is drawn first');
+  heads().slice(-1)[0].fire('click');
+  assert.equal(page.store.get('teamclaude-insights-metric'), 'tokens');
+  assert.equal(heads().slice(-1)[0].className, 'inshead sel', 'the tokens headline is now the one drawn');
+  page.click('Running total');
+  page.click('Accounts');
+  page.click('Providers');
+  assert.deepEqual(page.requests, [], 'a view or a tab is drawn from the copy in hand');
+
+  // A reply with no cost estimate draws the tokens, whatever was picked.
+  const old = bootPage();
+  await old.answer(200, { accounts: [] });
+  old.click('Insights');
+  await old.answer(200, INSIGHTS);
+  assert.equal(old.byId('insNote').style.display, 'none');
+  const oldHeads = old.built.filter(e => typeof e.className === 'string' && /^inshead( sel)?$/.test(e.className));
+  assert.deepEqual(oldHeads.map(e => e.className), ['inshead', 'inshead sel'], 'no cost to draw: the tokens are');
+});
+
+// The hero's Table says what the chart shows: the view picked (a running
+// total adds up), "not recorded" before recording began, and "not priced"
+// for cost with no price, whether split by provider or drawn as one total.
+test('the Insights hero table follows the view, and says not recorded and not priced rather than $0', async () => {
+  const page = bootPage();
+  await page.answer(200, { accounts: [{ name: 'g', provider: 'grok' }] });
+  page.click('Insights');
+  // Claude priced, Grok not, and the first day from before recording began.
+  const partly = {
+    ...INSIGHTS, since: 1, sinceDay: '2026-01-02',
+    totals: { requests: 2, input: 15, output: 0, cacheRead: 0, cacheWrite: 0 },
+    kinds: { cacheRead: [0, 0], cacheWrite: [0, 0], input: [0, 15], output: [0, 0] },
+    cost: { total: 2, values: [0, 2], previous: null, unpricedTokens: 5 },
+    providers: [
+      { provider: 'anthropic', tokens: 10, cost: 2, requests: 1, values: [0, 10], requestValues: [0, 1], costValues: [0, 2] },
+      { provider: 'grok', tokens: 5, cost: 0, requests: 1, values: [0, 5], requestValues: [0, 1], costValues: [0, 0] },
+    ],
+    accounts: [{ provider: 'grok', account: 'g', tokens: 5, cost: 0, requests: 1, values: [0, 5], requestValues: [0, 1], costValues: [0, 0] }],
+    models: [{ provider: 'anthropic', model: 'claude-opus-5-5', tokens: 10, requests: 1, cost: 2 }, { provider: 'grok', model: 'grok-4', tokens: 5, requests: 1, cost: null }],
+  };
+  await page.answer(200, partly);
+  const zeroCells = (/** @type {number} */ since) => page.built.slice(since).filter(e => e.className === 'num' && e.textContent === '$0').length;
+  const at = page.built.length;
+  page.click('Table');
+  assert.ok(page.labelled('not recorded') >= 1, 'the day before recording began');
+  assert.ok(page.labelled('not priced') >= 1, 'Grok by provider');
+  assert.equal(zeroCells(at), 0, 'no $0 for a cost with no price');
+  const chartAt = page.built.length;
+  page.click('Chart');
+  // Hide the one priced series (its legend row, the first the chart built):
+  // what is left has no cost, so the plot says so, and no trend line is
+  // labelled with a $0 figure.
+  const claudeRow = page.built.slice(chartAt).find(e => /\btog\b/.test(String(e.className || '')) && e.listens('click'));
+  assert.ok(claudeRow, 'the Claude legend row');
+  const notPriced = (/** @type {any[]} */ els) => els.filter(e => e.textContent === 'not priced').length;
+  const shownBefore = notPriced(page.built.slice(chartAt));
+  const before = page.built.length;
+  claudeRow.fire('click');
+  // The same page redrawn, plus one: the note in the plot.
+  assert.equal(notPriced(page.built.slice(before)), shownBefore + 1, 'a note where the bars would be');
+  assert.equal(page.built.slice(before).filter(e => /\$0(?![.\d])/.test(String(e.textContent || ''))).length, 0, 'no $0 anywhere in the redraw');
+
+  const priced = bootPage();
+  await priced.answer(200, { accounts: [{ name: 'a', provider: 'anthropic' }] });
+  priced.click('Insights');
+  await priced.answer(200, {
+    ...INSIGHTS,
+    cost: { total: 3, values: [1, 2], previous: null, unpricedTokens: 0 },
+    providers: [{ provider: 'anthropic', tokens: 10, cost: 3, requests: 2, values: [5, 5], requestValues: [1, 1], costValues: [1, 2] }],
+    models: [{ provider: 'anthropic', model: 'claude-opus-5-5', tokens: 10, requests: 2, cost: 3 }],
+  });
+  priced.click('Table');
+  assert.ok(priced.labelled('$2.00') >= 1, 'per day: the second day alone');
+  priced.click('Running total');
+  assert.ok(priced.labelled('$3.00') >= 1, 'running total: both days');
+  assert.equal(priced.labelled('$2.00'), 0, 'no day-by-day figure under a running total');
+  assert.ok(priced.labelled('Est. API cost (running total)') >= 1, 'the column says which');
+});
+
+// In a cost running total an unpriced series has no height: it must not draw
+// a line or a dot along the top of the priced stack, where it would repaint
+// that edge in its own colour.
+test('the Insights running total draws no line or dot for a series with no price', async () => {
+  const page = bootPage();
+  await page.answer(200, { accounts: [{ name: 'g', provider: 'grok' }] });
+  page.click('Insights');
+  await page.answer(200, {
+    ...INSIGHTS,
+    totals: { requests: 2, input: 15, output: 0, cacheRead: 0, cacheWrite: 0 },
+    kinds: { cacheRead: [0, 0], cacheWrite: [0, 0], input: [5, 10], output: [0, 0] },
+    cost: { total: 2, values: [1, 1], previous: null, unpricedTokens: 5 },
+    providers: [
+      { provider: 'anthropic', tokens: 10, cost: 2, requests: 1, values: [5, 5], requestValues: [0, 1], costValues: [1, 1] },
+      { provider: 'grok', tokens: 5, cost: 0, requests: 1, values: [0, 5], requestValues: [0, 1], costValues: [0, 0] },
+    ],
+    accounts: [{ provider: 'grok', account: 'g', tokens: 5, cost: 0, requests: 1, values: [0, 5], requestValues: [0, 1], costValues: [0, 0] }],
+    models: [{ provider: 'anthropic', model: 'claude-opus-5-5', tokens: 10, requests: 1, cost: 2 }, { provider: 'grok', model: 'grok-4', tokens: 5, requests: 1, cost: null }],
+  });
+  const at = page.built.length;
+  page.click('Running total');
+  const drawn = page.built.slice(at);
+  assert.equal(drawn.filter(e => e.style.stroke === 'var(--ip-grok)' || e.style.fill === 'var(--ip-grok)').length, 0, 'no Grok line or dot');
+  assert.ok(drawn.some(e => e.style.stroke === 'var(--ip-claude)'), 'the priced series keeps its line');
+  assert.ok(drawn.some(e => e.style.fill === 'var(--ip-claude)'), 'the end dot is the top priced series');
+});
+
+// A range where nothing had a list price has no cost estimate at all: the
+// page draws the tokens, the cost headline says "not priced" and is no tab,
+// and no table (the chart's, the calendar's, the months', the list's)
+// prints a $0 for it.
+test('the Insights page with nothing priced draws the tokens and never prints $0 for the cost', async () => {
+  const page = bootPage();
+  await page.answer(200, { accounts: [{ name: 'g', provider: 'grok' }] });
+  page.click('Insights');
+  const n = 30;
+  const days = Array.from({ length: n }, (_, i) => '2026-10-' + String(i + 1).padStart(2, '0'));
+  const zeros = days.map(() => 0);
+  const per = days.map(() => 100);
+  await page.answer(200, {
+    range: '30d', unit: 'day', buckets: days, since: 1, sinceDay: '2026-01-01',
+    totals: { requests: n, input: 100 * n, output: 0, cacheRead: 0, cacheWrite: 0 }, previous: null, requests: days.map(() => 1),
+    kinds: { cacheRead: zeros, cacheWrite: zeros, input: per, output: zeros },
+    cost: { total: 0, values: zeros, previous: null, unpricedTokens: 100 * n },
+    providers: [{ provider: 'grok', tokens: 100 * n, cost: 0, requests: n, values: per, requestValues: days.map(() => 1), costValues: zeros }],
+    accounts: [{ provider: 'grok', account: 'g', tokens: 100 * n, cost: 0, requests: n, values: per, requestValues: days.map(() => 1), costValues: zeros }],
+    models: [{ provider: 'grok', model: 'grok-4', tokens: 100 * n, requests: n, cost: null }],
+  });
+  const heads = page.built.filter(e => typeof e.className === 'string' && /^inshead( sel)?$/.test(e.className));
+  assert.deepEqual(heads.slice(-2).map(e => e.className), ['inshead', 'inshead sel'], 'the tokens are drawn');
+  assert.ok(page.built.some(e => e.textContent === 'not priced'), 'the cost headline');
+  assert.ok(page.built.some(e => e.textContent === '3.0k tokens, none at a known list price'));
+  const dollars = () => page.built.filter(e => typeof e.textContent === 'string' && /^(≈ )?\$0(\.00)?$/.test(e.textContent)).length;
+  assert.equal(dollars(), 0, 'no $0 anywhere on the page');
+  // Each card's table in turn: the chart's, the calendar's, the months', the list's.
+  for (let k = 0; k < 4; k++) {
+    const tables = page.built.filter(e => e.textContent === 'Table' && e.listens('click'));
+    tables[tables.length - (4 - k)].fire('click');
+  }
+  assert.ok(page.built.filter(e => e.textContent === 'Chart').length >= 4, 'all four tables open');
+  assert.equal(dollars(), 0, 'no $0 in any table');
+});
+
+// The minute's refresh usually brings back what is on screen: it is not
+// drawn again, which would drop a tooltip being read. A changed reply is.
+test('the Insights page does not redraw for a refresh identical to what it shows', async () => {
+  const page = bootPage();
+  await page.answer(200, { accounts: [{ name: 'a', provider: 'anthropic' }] });
+  page.click('Insights');
+  await page.answer(200, INSIGHTS);
+  const realNow = Date.now;
+  try {
+    let skew = 0;
+    Date.now = () => realNow() + skew;
+    const refresh = async (/** @type {any} */ reply) => {
+      skew += 61_000;
+      page.poll();
+      await page.answer(200, { accounts: [{ name: 'a', provider: 'anthropic' }] });
+      assert.deepEqual(page.requests.map(r => r.url), ['/teamclaude/insights?range=30d'], 'a minute on, it asks again');
+      const before = page.built.length;
+      await page.answer(200, reply);
+      return page.built.length - before;
+    };
+    assert.equal(await refresh(JSON.parse(JSON.stringify(INSIGHTS))), 0, 'the same reply builds nothing');
+    assert.ok(await refresh({ ...INSIGHTS, requests: [1, 2] }) > 0, 'a changed reply is drawn');
+  } finally {
+    Date.now = realNow;
+  }
+});
+
+// Every redraw rebuilds the controls and focuses the one that had focus again.
+// It must not scroll to it: a resize or a refresh would otherwise pull a
+// reader further down the page back up to the last control they pressed.
+test('the Insights redraw keeps focus on the control without scrolling to it', async () => {
+  const page = bootPage();
+  await page.answer(200, { accounts: [{ name: 'a', provider: 'anthropic' }] });
+  page.click('Insights');
+  await page.answer(200, INSIGHTS);
+  page.click('Running total');
+  const pressed = page.focused.at(-1);
+  assert.equal(pressed.el.textContent, 'Running total', 'the pressed view is focused again');
+  assert.deepEqual(pressed.opts, { preventScroll: true });
+  const realNow = Date.now;
+  try {
+    Date.now = () => realNow() + 61_000;
+    page.poll();
+    await page.answer(200, { accounts: [{ name: 'a', provider: 'anthropic' }] });
+    const before = page.built.length;
+    await page.answer(200, { ...INSIGHTS, requests: [1, 2] });
+    assert.ok(page.built.length > before, 'the changed reply is drawn');
+  } finally {
+    Date.now = realNow;
+  }
+  const kept = page.focused.at(-1);
+  assert.notEqual(kept.el, pressed.el, 'the rebuilt control, not the one taken off the page');
+  assert.equal(kept.el.textContent, 'Running total');
+  assert.deepEqual(kept.opts, { preventScroll: true });
+  assert.ok(page.focused.every(f => f.opts && f.opts.preventScroll), 'no Insights redraw focuses with scrolling');
+
+  // The body is emptied before it is filled again, so its old height is held
+  // while the new content goes in: otherwise the page is briefly short and
+  // the browser pulls the scroll position up.
+  const body = page.byId('insBody');
+  const heights = [];
+  body.offsetHeight = 900;
+  body.style = { opacity: '', get minHeight() { return heights.at(-1) ?? ''; }, set minHeight(v) { heights.push(v); } };
+  page.findLast(e => e.textContent === 'Per day' && e.listens('click')).fire('click');
+  assert.deepEqual(heights, ['900px', ''], 'held while drawing, released after');
 });
 
 // A failed read is throttled like a successful one: a proxy answering 404 or
