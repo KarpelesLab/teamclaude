@@ -282,6 +282,8 @@ export class ClaudeResetRedeemer {
     this.manualInFlight = false;
     /** @type {number|null} */
     this.fleetHoldStartedAt = null;
+    // The latest fleet hold this process armed (see fleetHoldUntil).
+    this.heldUntil = 0;
   }
 
   /**
@@ -289,10 +291,12 @@ export class ClaudeResetRedeemer {
    * refusal — and the rest of this one's walk — spending a sibling's reset on
    * top of it. Kept on the accounts' saved quota (`claudeResetHoldUntil`), so a
    * restart minutes after a claim that may have landed does not spend another;
-   * the latest any account carries holds them all.
+   * the latest any account carries holds them all. The latest this process
+   * armed counts as well, because an account removed while its claim was in
+   * flight takes its saved hold out of the fleet.
    */
   get fleetHoldUntil() {
-    let until = 0;
+    let until = this.heldUntil;
     for (const account of this.am.accounts || []) {
       const held = account.quota?.claudeResetHoldUntil;
       if (Number.isFinite(held)) until = Math.max(until, held);
@@ -309,6 +313,7 @@ export class ClaudeResetRedeemer {
     const held = account.quota.claudeResetHoldUntil;
     if (!Number.isFinite(held) || until >= held) this.fleetHoldStartedAt = this.now();
     account.quota.claudeResetHoldUntil = Number.isFinite(held) ? Math.max(held, until) : until;
+    this.heldUntil = Math.max(this.heldUntil, until);
   }
 
   /** Every status read, including auto-redeem and post-claim quota reapply.
@@ -588,6 +593,8 @@ export class ClaudeResetRedeemer {
     if (status.cooldownUntil != null && status.cooldownUntil > now) {
       return this._decline(account, status.cooldownUntil, 'upstream reports a reset cooldown');
     }
+    // Removed while it was read: no request can be served from it any more.
+    if (!this.am.accounts?.includes(account)) return { redeemed: false, account: name, reason: 'account is no longer listed' };
     return this.redeemGrant(account, grant.id, { deadline, kind: claudeGrantKind(grant) });
   }
 

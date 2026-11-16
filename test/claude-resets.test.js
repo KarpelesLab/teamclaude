@@ -276,6 +276,22 @@ test('no verdict on one account: no sibling is spent in the same refusal', async
   assert.equal(calls.claim.length, 1);
 });
 
+// The hold is saved on the account it was armed for, and a removed account is
+// no longer among those fleetHoldUntil reads.
+test('a claim on an account removed while it was in flight still holds the rest of the fleet off', async () => {
+  for (const verdict of [{ result: 'reset', resetsLeft: 0, cleared: ['seven_day_overage_included'] }, { error: 'socket hang up' }]) {
+    const h = harness({ accounts: [oauth('a'), oauth('b')], claim: () => {
+      h.am.removeAccount(h.am.accounts.findIndex(a => a.name === h.calls.claim.at(-1)));
+      return verdict;
+    } });
+    await h.redeemer.maybeRedeemForPool(h.am.accounts);
+    assert.deepEqual(h.am.accounts.map(a => a.name), ['a'], 'b, which waits longest, was claimed on and removed');
+    const next = await h.redeemer.maybeRedeemForPool(h.am.accounts);
+    assert.equal(next.redeemed, false); assert.match(next.reason, /holding off/, JSON.stringify(verdict));
+    assert.deepEqual(h.calls.claim, ['b']);
+  }
+});
+
 test('a 5-hour wall alone is never worth a grant', async () => {
   const { am, redeemer, calls } = harness({ status: () => block({ exhausted: ['five_hour'] }) });
   const r = await redeemer.maybeRedeemForPool(am.accounts);

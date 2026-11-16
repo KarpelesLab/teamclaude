@@ -395,6 +395,38 @@ test('refuse manual redemption while that provider has an auto attempt in flight
   }
 });
 
+test('an account removed before the panel acts is neither read nor claimed on', async () => {
+  const h = harness();
+  h.am.accounts.length = 0;
+  assert.equal((await h.actions.read(h.account)).error, 'account is no longer listed');
+  assert.equal((await h.actions.redeem(h.account, 'weekly')).message, 'Manual reset on "test-account": account is no longer listed');
+  assert.deepEqual(h.calls.tokens, [], 'no token refresh for an account that is gone');
+  assert.equal(h.calls.statuses + h.calls.claims.length, 0);
+});
+
+// A removal (CLI, MCP, a reload) can land while the token is refreshed or the
+// details are read; the claim after it cannot be undone.
+test('an account removed while its details are read is never claimed on, by hand or automatically', async () => {
+  for (const provider of ['claude', 'codex']) {
+    const h = harness({ provider });
+    const remove = () => { h.am.accounts.length = 0; };
+    if (provider === 'claude') { const read = h.claudeRedeemer.statusFn; h.claudeRedeemer.statusFn = async (...args) => { remove(); return read(...args); }; }
+    else { const read = h.codexRedeemer.detailsFn; h.codexRedeemer.detailsFn = async (...args) => { remove(); return read(...args); }; }
+    const result = await h.actions.redeem(h.account, provider === 'claude' ? 'weekly' : 'credit-1');
+    assert.equal(result.message, 'Manual reset on "test-account": account is no longer listed', provider);
+    assert.equal(h.calls.claims.length + h.calls.consumes.length, 0, provider);
+  }
+  for (const provider of ['claude', 'codex']) {
+    const h = harness({ provider, armed: true });
+    const remove = () => { h.am.accounts.length = 0; };
+    if (provider === 'claude') { const read = h.claudeRedeemer.statusFn; h.claudeRedeemer.statusFn = async (...args) => { remove(); return read(...args); }; }
+    else { const read = h.codexRedeemer.detailsFn; h.codexRedeemer.detailsFn = async (...args) => { remove(); return read(...args); }; }
+    const auto = await (provider === 'claude' ? h.claudeRedeemer : h.codexRedeemer).maybeRedeemForPool([h.account]);
+    assert.equal(auto.redeemed, false, provider); assert.equal(auto.reason, 'account is no longer listed');
+    assert.equal(h.calls.claims.length + h.calls.consumes.length, 0, provider);
+  }
+});
+
 test('one manual redeem at a time, and auto cannot race its fresh read', async () => {
   const h = harness({ armed: true });
   let release;
