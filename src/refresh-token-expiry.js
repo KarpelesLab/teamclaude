@@ -29,16 +29,23 @@ const MAX_AHEAD_MS = 10 * 365 * DAY_MS;
 const MAX_PAST_MS = DAY_MS;
 
 /**
- * A stored expiry (epoch ms) when it is one, else null. The config file and the
- * status payload are both read from outside this process.
+ * A stored expiry (epoch ms) when it is one, else null. The config file, the
+ * credential store and the status payload are all read from outside this
+ * process.
  * @param {unknown} value
+ * @param {number} [now]
  * @returns {number|null}
  */
-export function knownRefreshTokenExpiry(value) {
+export function knownRefreshTokenExpiry(value, now = Date.now()) {
   // Epoch milliseconds only: below 1e11 is epoch seconds (or a count of
-  // something), which would read as 1973 and warn "expired" for ever, and
-  // above 8.64e15 is no date at all.
-  return typeof value === 'number' && value >= 1e11 && value <= 8.64e15 ? value : null;
+  // something), which would read as 1973 and warn "expired" for ever. And no
+  // further out than a stated date may be (refreshTokenExpiryFromResponse):
+  // beyond that is no refresh token's date, and kept, it would hide the real
+  // one's approach for as long as the refreshes state no lifetime, since a
+  // refresh that states none keeps the date it holds.
+  // Long past is still a date here, unlike in a response: a token that has
+  // expired keeps the date it expired on, which status shows.
+  return typeof value === 'number' && value >= 1e11 && value <= now + MAX_AHEAD_MS ? value : null;
 }
 
 /** @param {unknown} v @returns {number|null} a finite number from a number or a numeric string */
