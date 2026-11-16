@@ -1532,6 +1532,16 @@ test('the Insights redraw keeps focus on the control without scrolling to it', a
   assert.equal(kept.el.textContent, 'Running total');
   assert.deepEqual(kept.opts, { preventScroll: true });
   assert.ok(page.focused.every(f => f.opts && f.opts.preventScroll), 'no Insights redraw focuses with scrolling');
+
+  // The body is emptied before it is filled again, so its old height is held
+  // while the new content goes in: otherwise the page is briefly short and
+  // the browser pulls the scroll position up.
+  const body = page.byId('insBody');
+  const heights = [];
+  body.offsetHeight = 900;
+  body.style = { opacity: '', get minHeight() { return heights.at(-1) ?? ''; }, set minHeight(v) { heights.push(v); } };
+  page.findLast(e => e.textContent === 'Per day' && e.listens('click')).fire('click');
+  assert.deepEqual(heights, ['900px', ''], 'held while drawing, released after');
 });
 
 // A failed read is throttled like a successful one: a proxy answering 404 or

@@ -6624,7 +6624,15 @@ ${SHARED_HELPERS}
     var active = typeof document !== 'undefined' ? document.activeElement : null;
     if (!ins.focus && active) for (var k in ins.focusables) if (ins.focusables[k] === active) { ins.focus = k; break; }
     ins.focusables = Object.create(null);
+    // drawInsights empties the body before it fills it again, and the charts
+    // read its width part-way through. That layout sees a short page, and the
+    // browser pulls the scroll position up to fit. Holding the old height
+    // until the new content is in keeps the reader where they were.
+    var body = document.getElementById('insBody');
+    var held = typeof body.offsetHeight === 'number' && body.offsetHeight > 0;
+    if (held) body.style.minHeight = body.offsetHeight + 'px';
     drawInsights();
+    if (held) body.style.minHeight = '';
     var again = ins.focus ? ins.focusables[ins.focus] : null;
     ins.focus = null;
     // Without preventScroll, focusing the rebuilt control scrolls it into
