@@ -418,7 +418,9 @@ test('an event stream relayed with a request log on reaches the client whole', a
 // 2 MiB crosses it), which is relayed the way a stream is: with a log on it
 // must still arrive whole, and as it arrives. The upstream holds its last chunk
 // back until the client has a byte, so a proxy holding the answer whole never
-// sees its end and never shows the client anything.
+// sees its end and shows the client nothing: the hold is cut at its idle
+// deadline instead (120 s at the defaults, as long as npm test's runner
+// timeout), and the test fails on whichever of the two comes first.
 test('an answer past the hold limit relayed with a request log on reaches the client whole, as it arrives', async (t) => {
   const total = 2 * 1024 * 1024;
   const got = await withEnv({ TEAMCLAUDE_UPSTREAM_MAX_HELD_BYTES: 64 * 1024 },

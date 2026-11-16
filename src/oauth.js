@@ -11,7 +11,7 @@ import { LOGIN_TIMEOUT_MS, codeRace, openBrowser, pasteFromTerminal } from './lo
 import { safeLine } from './safe-text.js';
 import { resetRetryAt } from './reset-readings.js';
 import { anthropicLink } from './account-refusal.js';
-import { refreshTokenExpiryFromResponse, withFamilyExpiry } from './refresh-token-expiry.js';
+import { refreshTokenExpiryFromResponse, withFamilyExpiry, signInRefreshTokenExpiry } from './refresh-token-expiry.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
 const execFileAsync = promisify(execFile);
@@ -389,7 +389,8 @@ export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_
  * states when the refresh token itself lapses; see refreshTokenExpiryFromResponse
  * for the two spellings read and why. It is what THIS response said: a caller
  * refreshing a token it already has a date for keeps the earlier of the two
- * (withFamilyExpiry), and a new sign-in takes it as it is.
+ * (withFamilyExpiry), and a new Claude sign-in takes it as it is, or assumes
+ * one when none was stated (signInRefreshTokenExpiry, in exchangeCodeForTokens).
  */
 export function tokenPairFromResponse(data, { previousRefreshToken = undefined, now = Date.now() } = {}) {
   const accessToken = data?.access_token;
@@ -919,10 +920,18 @@ export function isFableReset(clears) {
 const OAUTH_AUTHORIZE = 'https://claude.ai/oauth/authorize';
 const OAUTH_SCOPES = 'org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload';
 const MANUAL_LOGIN_REDIRECT_URI = 'https://console.anthropic.com/oauth/code/callback';
+// What `claude setup-token` asks for, and nothing else: the same flow on the
+// same client id and URLs, with the scope `user:inference` alone and
+// `expires_in` of one year (in seconds) on the code exchange. A token on that
+// scope serves inference only; see long-lived.js for what that leaves out.
+const LONG_LIVED_SCOPES = 'user:inference';
+const LONG_LIVED_EXPIRES_IN = 365 * 24 * 3600;
 
 /**
  * Exchange an OAuth authorization code for access/refresh tokens.
- * Shared by both browser-callback and manual/paste login paths.
+ * Shared by both browser-callback and manual/paste login paths. With
+ * `expiresIn`, asks for that lifetime and fails unless the expiry granted is
+ * within a day of it, which absorbs rounding and clock skew on `expires_at`.
  * `routing` is the about-to-be-added account's own egress proxy (the login
  * CLI's --routing): the exchange and the profile fetch that follows are that
  * account's traffic too.
@@ -932,8 +941,10 @@ const MANUAL_LOGIN_REDIRECT_URI = 'https://console.anthropic.com/oauth/code/call
  * @param {string} redirectUri
  * @param {string} [tokenEndpoint]
  * @param {import('./account-routing.js').RoutingProxy|null} [routing]
+ * @param {number} [expiresIn]
  */
-async function exchangeCodeForTokens(code, state, codeVerifier, redirectUri, tokenEndpoint = DEFAULT_TOKEN_ENDPOINT, routing = null) {
+async function exchangeCodeForTokens(code, state, codeVerifier, redirectUri, tokenEndpoint = DEFAULT_TOKEN_ENDPOINT, routing = null, expiresIn = undefined) {
+  const requestedAt = Date.now();
   const tokenRes = await proxyFetch(tokenEndpoint, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -944,6 +955,7 @@ async function exchangeCodeForTokens(code, state, codeVerifier, redirectUri, tok
       client_id: DEFAULT_CLIENT_ID,
       redirect_uri: redirectUri,
       code_verifier: codeVerifier,
+      ...(expiresIn !== undefined && { expires_in: expiresIn }),
     }),
     routing,
   });
@@ -953,7 +965,18 @@ async function exchangeCodeForTokens(code, state, codeVerifier, redirectUri, tok
     throw new Error(`Token exchange failed (${tokenRes.status}): ${text}`);
   }
 
-  return tokenPairFromResponse(await tokenRes.json());
+  const data = await tokenRes.json();
+  const tokens = tokenPairFromResponse(data);
+  if (expiresIn !== undefined && tokens.expiresAt < requestedAt + (expiresIn - 86_400) * 1000) {
+    const usable = normalizeExpiresAt(data?.expires_at) != null || Number(data?.expires_in) > 0;
+    const granted = usable
+      ? `a token for ${Math.round((tokens.expiresAt - requestedAt) / 1000)}s`
+      : 'no usable expiry';
+    throw new Error(`Token exchange granted ${granted}, short of the ${expiresIn}s requested`);
+  }
+  // A sign-in dates its refresh token even when the response does not, as
+  // Claude Code does; see signInRefreshTokenExpiry.
+  return signInRefreshTokenExpiry(tokens);
 }
 
 /**
@@ -1034,13 +1057,13 @@ export function parseAuthCode(input, expectedState) {
  * @param {string} codeChallenge
  * @param {string} state
  */
-function buildAuthUrl(redirectUri, codeChallenge, state) {
+function buildAuthUrl(redirectUri, codeChallenge, state, scope = OAUTH_SCOPES) {
   const authUrl = new URL(OAUTH_AUTHORIZE);
   authUrl.searchParams.set('code', 'true');
   authUrl.searchParams.set('client_id', DEFAULT_CLIENT_ID);
   authUrl.searchParams.set('response_type', 'code');
   authUrl.searchParams.set('redirect_uri', redirectUri);
-  authUrl.searchParams.set('scope', OAUTH_SCOPES);
+  authUrl.searchParams.set('scope', scope);
   authUrl.searchParams.set('code_challenge', codeChallenge);
   authUrl.searchParams.set('code_challenge_method', 'S256');
   authUrl.searchParams.set('state', state);
@@ -1084,12 +1107,18 @@ function isLoopbackAddress(text, port) {
  * @param {AbortSignal | null} [opts.signal]  cancels the wait and closes the listener
  * @param {number} [opts.timeoutMs]  0 waits for ever
  * @param {typeof exchangeCodeForTokens} [opts.exchange]  injectable so tests need no token endpoint
+ * @param {boolean} [opts.longLived]  the `claude setup-token` request: a one-year
+ *   token on LONG_LIVED_SCOPES, returned marked `longLived` and without any
+ *   refresh token the response carries. Such a token is not refreshed, and a
+ *   refresh would replace the year-long access token with a short one
+ * @param {string} [opts.tokenEndpoint]
  */
-export async function startOAuthLogin({ loopback = true, routing = null, signal = null, timeoutMs = LOGIN_TIMEOUT_MS, exchange = exchangeCodeForTokens } = {}) {
+export async function startOAuthLogin({ loopback = true, routing = null, signal = null, timeoutMs = LOGIN_TIMEOUT_MS, exchange = exchangeCodeForTokens, longLived = false, tokenEndpoint = DEFAULT_TOKEN_ENDPOINT } = {}) {
+  const scope = longLived ? LONG_LIVED_SCOPES : OAUTH_SCOPES;
   const codeVerifier = randomBytes(32).toString('base64url');
   const codeChallenge = createHash('sha256').update(codeVerifier).digest('base64url');
   const state = randomBytes(32).toString('base64url');
-  const url = buildAuthUrl(MANUAL_LOGIN_REDIRECT_URI, codeChallenge, state);
+  const url = buildAuthUrl(MANUAL_LOGIN_REDIRECT_URI, codeChallenge, state, scope);
 
   const callback = loopback ? await startCallbackServer(state) : null;
   const loopbackRedirect = callback ? `http://localhost:${callback.port}/callback` : null;
@@ -1117,14 +1146,14 @@ export async function startOAuthLogin({ loopback = true, routing = null, signal 
   });
   const tokens = race.result.then(answer => {
     console.log('Exchanging authorization code for tokens...');
-    return exchange(answer.code, answer.state, codeVerifier, answer.redirectUri, DEFAULT_TOKEN_ENDPOINT, routing);
-  });
+    return exchange(answer.code, answer.state, codeVerifier, answer.redirectUri, tokenEndpoint, routing, longLived ? LONG_LIVED_EXPIRES_IN : undefined);
+  }).then(creds => (longLived ? { accessToken: creds.accessToken, expiresAt: creds.expiresAt, longLived: true } : creds));
   // Awaited by every caller; this only stops one that failed before awaiting
   // from leaving a later rejection unhandled, which would end the process.
   tokens.catch(() => {});
   return {
     url,
-    browserUrl: loopbackRedirect ? buildAuthUrl(loopbackRedirect, codeChallenge, state) : null,
+    browserUrl: loopbackRedirect ? buildAuthUrl(loopbackRedirect, codeChallenge, state, scope) : null,
     submit: race.submit,
     settled: race.settled,
     tokens,
@@ -1175,11 +1204,12 @@ export async function loginOAuth({ routing = null, input = process.stdin } = {})
  * holds nothing open. A paste that cannot be used is asked for again; the end
  * of input ends the login.
  *
- * @param {{ routing?: import('./account-routing.js').RoutingProxy | null, input?: NodeJS.ReadStream }} [opts]
+ * @param {{ routing?: import('./account-routing.js').RoutingProxy | null, input?: NodeJS.ReadStream, longLived?: boolean, tokenEndpoint?: string }} [opts]
+ *   `longLived`: see startOAuthLogin.
  */
-export async function loginOAuthWithPastedCode({ routing = null, input = process.stdin } = {}) {
+export async function loginOAuthWithPastedCode({ routing = null, input = process.stdin, longLived = false, tokenEndpoint = DEFAULT_TOKEN_ENDPOINT } = {}) {
   const controller = new AbortController();
-  const flow = await startOAuthLogin({ loopback: false, routing, signal: controller.signal, timeoutMs: 0 });
+  const flow = await startOAuthLogin({ loopback: false, routing, signal: controller.signal, timeoutMs: 0, longLived, tokenEndpoint });
 
   console.log('Authorization URL:');
   console.log(`  ${flow.url}\n`);

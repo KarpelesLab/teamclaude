@@ -32,8 +32,13 @@ function clampInterval(ms) {
 // Which accounts the probe reads, one rule per source. Exported so the status
 // payload a server builds before its Prober exists states the same answer the
 // Prober will (#512), instead of keeping a copy of the rule.
+//
+// A long-lived account (long-lived.js) is not one: its token carries
+// `user:inference` alone, and the usage and profile reads both answer it 403
+// `oauth_scope_insufficient`, every cycle. Its quota comes from the headers of
+// its own responses.
 const isAnthropicProbeTarget = (/** @type {any} */ account) => !!account && providerOf(account) === 'anthropic'
-  && account.type === 'oauth' && !!account.credential && !account.upstream;
+  && account.type === 'oauth' && !!account.credential && !account.upstream && account.longLived !== true;
 
 const isCodexProbeTarget = (/** @type {any} */ account) => !!account && providerOf(account) === 'codex'
   && account.type === 'oauth' && !!account.credential && !!account.accountId && !account.upstream;

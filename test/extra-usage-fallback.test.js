@@ -58,6 +58,40 @@ test('without the opt-in the spent fleet still answers null', () => {
   assert.equal(am.getActiveAccount(null, OPUS), null);
 });
 
+for (const [owner, expected] of [['api', null], ['subscription', 'subscription']]) {
+  test(`exhausted-fleet failover respects the advisor route owned by ${owner}`, () => {
+    const am = spentFleet([
+      oauth('subscription', { allowExtraUsage: true }),
+      { name: 'api', type: 'apikey', apiKey: 'api-key', disabled: true },
+    ]);
+    am.setRoutes([{ name: 'fable', match: ['claude-fable-*'], accounts: [owner] }]);
+    const tier = am.fallbackTier(am.accounts[0], OPUS, FABLE);
+    const alternate = quietly(() => am.pickAlternate(new Set(), OPUS, FABLE));
+    const initial = quietly(() => am.getActiveAccount(null, OPUS, FABLE));
+    assert.deepEqual({ tier, alternate: alternate?.name ?? null, initial: initial?.name ?? null },
+      { tier: expected ? 'paid' : null, alternate: expected, initial: 'subscription' });
+  });
+}
+
+// Under `advisorEligibility: "prefer"` the advisor model describes the request
+// and does not filter the fleet. With the fleet spent, the 429 hop finds no
+// account for the request model, so the advisor is not set aside (0 of 0), and
+// the advisor's route must not then refuse the one account that can serve.
+test('under advisorEligibility "prefer" the exhausted-fleet hop ignores the advisor route', () => {
+  const am = new AccountManager([
+    oauth('subscription', { allowExtraUsage: true }),
+    { name: 'api', type: 'apikey', apiKey: 'api-key', disabled: true },
+  ], 0.98, { advisorEligibility: 'prefer' });
+  setQuota(am.accounts[0], { unified7d: 1.0 });
+  am._nextProbeAt = Date.now() + 60_000;
+  am.setRoutes([{ name: 'fable', match: ['claude-fable-*'], accounts: ['api'] }]);
+  const tier = am.fallbackTier(am.accounts[0], OPUS, FABLE);
+  const alternate = quietly(() => am.pickAlternate(new Set(), OPUS, FABLE));
+  const initial = quietly(() => am.getActiveAccount(null, OPUS, FABLE));
+  assert.deepEqual({ tier, alternate: alternate?.name ?? null, initial: initial?.name ?? null },
+    { tier: 'paid', alternate: 'subscription', initial: 'subscription' });
+});
+
 // ── free quota first ─────────────────────────────────────────
 
 // The switch threshold is a rotation preference: an account between it and

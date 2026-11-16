@@ -94,21 +94,21 @@ async function postOverTunnel(tlsSock) {
 
 test('the Basic username selects the account', () => {
   const am = { accounts: [{ name: 'work' }, { name: 'personal' }] };
-  assert.deepEqual(resolveConnectPin({ headers: { 'proxy-authorization': basic('work:k') } }, am, 'k'), { pin: 'work', error: null });
+  assert.deepEqual(resolveConnectPin({ headers: { 'proxy-authorization': basic('work:k') } }, am, 'k'), { pin: 'work', pins: [0], error: null });
   // No key configured — username alone still pins.
-  assert.deepEqual(resolveConnectPin({ headers: { 'proxy-authorization': basic('personal:') } }, am, null), { pin: 'personal', error: null });
+  assert.deepEqual(resolveConnectPin({ headers: { 'proxy-authorization': basic('personal:') } }, am, null), { pin: 'personal', pins: [1], error: null });
   // A rotation index is not a pin form — array position moves under deletion.
-  assert.deepEqual(resolveConnectPin({ headers: { 'proxy-authorization': basic('1:') } }, am, null), { pin: null, error: 'Unknown account pin "1…" (1 chars)' });
+  assert.deepEqual(resolveConnectPin({ headers: { 'proxy-authorization': basic('1:') } }, am, null), { pin: null, pins: [], error: 'Unknown account pin "1…" (1 chars)' });
 });
 
 // The documented remote form is `--proxy http://<key>@host:port`, which puts the
 // API KEY in the username slot. That must stay auth, never be read as a pin.
 test('a username equal to the proxy key is auth, not a pin', () => {
   const am = { accounts: [{ name: 'work' }] };
-  assert.deepEqual(resolveConnectPin({ headers: { 'proxy-authorization': basic('secret:') } }, am, 'secret'), { pin: null, error: null });
+  assert.deepEqual(resolveConnectPin({ headers: { 'proxy-authorization': basic('secret:') } }, am, 'secret'), { pin: null, pins: [], error: null });
   // Even when an account is (unwisely) named after the key, auth wins.
   const clash = { accounts: [{ name: 'secret' }] };
-  assert.deepEqual(resolveConnectPin({ headers: { 'proxy-authorization': basic('secret:') } }, clash, 'secret'), { pin: null, error: null });
+  assert.deepEqual(resolveConnectPin({ headers: { 'proxy-authorization': basic('secret:') } }, clash, 'secret'), { pin: null, pins: [], error: null });
 });
 
 // A typo'd pin that silently served from the wrong account is the failure this
@@ -127,9 +127,9 @@ test('an unknown username is an error rather than an ignored pin', () => {
 // has to match, as a single one does, and the pin travels on as written.
 test('the Basic username may name several accounts, each of which has to match', () => {
   const am = { accounts: [{ name: 'work' }, { name: 'personal' }, { name: 'me (Acme, Inc.)' }] };
-  assert.deepEqual(resolveConnectPin({ headers: { 'proxy-authorization': basic('work,personal:') } }, am, null), { pin: 'work,personal', error: null });
+  assert.deepEqual(resolveConnectPin({ headers: { 'proxy-authorization': basic('work,personal:') } }, am, null), { pin: 'work,personal', pins: [0, 1], error: null });
   // A name with a comma in it is still the one account it names.
-  assert.deepEqual(resolveConnectPin({ headers: { 'proxy-authorization': basic('me (Acme, Inc.):') } }, am, null), { pin: 'me (Acme, Inc.)', error: null });
+  assert.deepEqual(resolveConnectPin({ headers: { 'proxy-authorization': basic('me (Acme, Inc.):') } }, am, null), { pin: 'me (Acme, Inc.)', pins: [2], error: null });
   const { pin, error } = resolveConnectPin({ headers: { 'proxy-authorization': basic('work,typo:') } }, am, null);
   assert.equal(pin, null);
   assert.match(error, /Unknown account pin "wo…" \(9 chars\)/);
@@ -138,8 +138,8 @@ test('the Basic username may name several accounts, each of which has to match',
 
 test('no header, or a Bearer key, yields no pin', () => {
   const am = { accounts: [{ name: 'work' }] };
-  assert.deepEqual(resolveConnectPin({ headers: {} }, am, 'secret'), { pin: null, error: null });
-  assert.deepEqual(resolveConnectPin({ headers: { 'proxy-authorization': 'Bearer secret' } }, am, 'secret'), { pin: null, error: null });
+  assert.deepEqual(resolveConnectPin({ headers: {} }, am, 'secret'), { pin: null, pins: [], error: null });
+  assert.deepEqual(resolveConnectPin({ headers: { 'proxy-authorization': 'Bearer secret' } }, am, 'secret'), { pin: null, pins: [], error: null });
   assert.equal(connectPinToken({ headers: {} }), null);
 });
 

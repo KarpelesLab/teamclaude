@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { once } from 'node:events';
+import { once, EventEmitter } from 'node:events';
 import { setTimeout as delay } from 'node:timers/promises';
 import { upstreamFetch, DEFAULT_UPSTREAM_MAX_SOCKETS } from '../src/upstream-fetch.js';
 
@@ -191,4 +191,33 @@ test('streams an SSE response body incrementally', async () => {
   assert.match(text, /event: b/);
 
   server.close();
+});
+
+// The body passes backpressure on to the socket: nodeToWeb pauses the
+// IncomingMessage whenever the web stream's queue is full and resumes it when
+// the reader asks for more, so a reader that stops (a relay waiting for its
+// client to drain) stops the upstream too, rather than the proxy taking in all
+// it sends. Over loopback that takes megabytes to see, through the socket
+// buffers; on a stand-in for the IncomingMessage it is the order of the calls,
+// over two fills. nodeToWeb is imported in the test, so a build without the
+// export fails this test and not the file.
+test('the response body pauses its socket while its queue is full, and resumes it when read', async () => {
+  const { nodeToWeb } = await import('../src/upstream-fetch.js');
+  const res = new class extends EventEmitter {
+    /** @type {string[]} */
+    calls = [];
+    pause() { this.calls.push('pause'); return this; }
+    resume() { this.calls.push('resume'); return this; }
+    destroy() { this.calls.push('destroy'); return this; }
+  }();
+  const reader = nodeToWeb(/** @type {any} */ (res)).getReader();
+  res.emit('data', Buffer.from('a'));
+  assert.equal(res.calls.at(-1), 'pause', `a chunk not yet read fills the queue, and the socket is paused: ${res.calls}`);
+  const { value } = await reader.read();
+  assert.equal(Buffer.from(value).toString(), 'a');
+  assert.equal(res.calls.at(-1), 'resume', `reading it asks for more, which resumes the socket: ${res.calls}`);
+  res.emit('data', Buffer.from('b'));
+  assert.equal(res.calls.at(-1), 'pause', `the next unread chunk pauses it again, not only the first: ${res.calls}`);
+  await reader.cancel();
+  assert.equal(res.calls.at(-1), 'destroy', 'a reader that cancels drops the connection');
 });

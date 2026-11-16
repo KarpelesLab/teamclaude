@@ -113,9 +113,9 @@ test('the client-credential retry drops usage-dimension headers too', async () =
 // closes its connection is the proxy dropping it.
 test('a client-credential answer too large to hold is a 502, and the rest is dropped', async (t) => {
   const LIMIT = 4096;
-  /** @type {(ended: boolean) => void} */
+  /** @type {() => void} */
   let dropped = () => {};
-  const upstreamDropped = new Promise((resolve) => { dropped = resolve; });
+  const upstreamDropped = new Promise((resolve) => { dropped = () => resolve(undefined); });
   const tokens = [];
   const upstream = http.createServer((req, res) => {
     const token = (req.headers.authorization || '').replace(/^Bearer /, '');
@@ -125,7 +125,7 @@ test('a client-credential answer too large to hold is a 502, and the rest is dro
       res.end(JSON.stringify({ type: 'error', error: { type: 'permission_error', message: 'scope', details: { error_code: 'oauth_scope_insufficient' } } }));
       return;
     }
-    res.on('close', () => dropped(res.writableEnded));
+    res.on('close', () => dropped());
     res.writeHead(200, { 'content-type': 'application/json' });
     res.write(Buffer.alloc(2 * LIMIT, 0x61));
   });
@@ -152,7 +152,11 @@ test('a client-credential answer too large to hold is a 502, and the rest is dro
       assert.equal(status, 502);
       assert.match(body, /Upstream response too large/);
       assert.deepEqual(tokens, ['a-token', 'client-token']);
-      assert.equal(await upstreamDropped, false, 'the upstream connection was dropped with its answer unfinished');
+      // The await is the check: this upstream never ends its answer, so only
+      // the proxy dropping its connection settles it, and a proxy that
+      // answered but left the connection open leaves it to the runner's
+      // timeout.
+      await upstreamDropped;
       assert.ok(lines.some(l => /Client-credential relay: upstream answer larger than 4096 bytes, not relayed/.test(l)),
         `the operator is told which path it was, and the limit: ${lines.join(' | ')}`);
       assert.equal((await requestEnded).status, 502, 'the activity row reports the 502');

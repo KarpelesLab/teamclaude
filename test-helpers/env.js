@@ -37,3 +37,23 @@ export async function withEnv(vars, fn) {
     }
   }
 }
+
+/**
+ * An environment for a spawned child with the proxy variables taken out.
+ *
+ * A child inherits the shell, so a developer's `HTTPS_PROXY` or `ALL_PROXY`
+ * would carry the child's request to a local stub out through that proxy, and
+ * the test would then assert on whatever the proxy answered (test/README.md).
+ * `NO_PROXY=*` covers a client that reads only that one.
+ * @param {Record<string, string|undefined>} [extra]  set on top, the caller's own settings
+ * @param {Record<string, string|undefined>} [base]
+ * @returns {Record<string, string|undefined>}
+ */
+export function childEnvWithoutProxy(extra = {}, base = process.env) {
+  return {
+    ...base,
+    HTTPS_PROXY: '', https_proxy: '', ALL_PROXY: '', all_proxy: '',
+    HTTP_PROXY: '', http_proxy: '', NO_PROXY: '*', no_proxy: '*',
+    ...extra,
+  };
+}
