@@ -417,7 +417,7 @@ async function serverCommand() {
     console.error(`[TeamClaude] Bad adaptiveDistribution setting in ${getConfigPath()}: ${err.message}`);
     process.exit(1);
   }
-  const accountManager = new AccountManager(accounts, threshold, { routes: config.routes, ramp: config.stormRamp, distributeSessions: config.distributeSessions, expiryRouting: config.expiryRouting, preferSoonestWeeklyReset: config.preferSoonestWeeklyReset, switchOnSessionReset: config.switchOnSessionReset, advisorEligibility: config.advisorEligibility, adaptive, listener: localListener(config) });
+  const accountManager = new AccountManager(accounts, threshold, { routes: config.routes, ramp: config.stormRamp, distributeSessions: config.distributeSessions, expiryRouting: config.expiryRouting, sessionAdvice: config.sessionAdvice, preferSoonestWeeklyReset: config.preferSoonestWeeklyReset, switchOnSessionReset: config.switchOnSessionReset, advisorEligibility: config.advisorEligibility, adaptive, listener: localListener(config) });
   // Names the activity log's session column from Claude Code's own on-disk
   // session titles. Built whether or not the TUI runs, so a reload has one
   // object to reconfigure.
@@ -682,6 +682,8 @@ async function serverCommand() {
     accountManager.setPreferSoonestWeeklyReset(config.preferSoonestWeeklyReset);
     config.switchOnSessionReset = diskConfig.switchOnSessionReset;
     accountManager.setSwitchOnSessionReset(config.switchOnSessionReset);
+    config.sessionAdvice = diskConfig.sessionAdvice;
+    accountManager.setSessionAdvice(config.sessionAdvice);
     // And the advisor mode: read off the manager on every selection, so the
     // setter is the whole application. Absent on disk means 'strict' again.
     config.advisorEligibility = diskConfig.advisorEligibility;

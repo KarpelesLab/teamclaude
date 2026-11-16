@@ -746,6 +746,7 @@ const CLIENT_KEY_REFUSED_PATHS = new Map([
   // Not a config write, but it names a session and moves it: one tenant must
   // not be able to put another tenant's session on an account of its choosing.
   ['/teamclaude/session-pin', 'a client key cannot pin sessions'],
+  ['/teamclaude/session-advice/decline', 'a client key cannot decline session advice'],
   // Drain stops new traffic for the whole proxy, which is the operator's call.
   ['/teamclaude/drain', 'a client key cannot drain the proxy'],
   ['/teamclaude/undrain', 'a client key cannot drain the proxy'],
@@ -1024,6 +1025,50 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         const extra = hooks.getQuotaExtra?.() || {};
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ...accountManager.getQuotaSummary(), ...extra }, null, 2));
+        return;
+      }
+
+      // Session move advice for ONE session (?session=<x-claude-code-session-id>):
+      // its account, the conversation a move would re-read, and whether to move.
+      // A read, so the POST-only refusal map above does not cover it; it names a
+      // session's account and context size, which a client key may not see.
+      if (req.method === 'GET' && (req.url === '/teamclaude/session-advice' || req.url?.startsWith('/teamclaude/session-advice?'))) {
+        if (req.tcClient) {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'a client key cannot read session advice' }));
+          return;
+        }
+        const session = new URL(req.url, 'http://localhost').searchParams.get('session');
+        if (session == null || !SESSION_ID_SHAPE.test(session)) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'missing or malformed "session"' }));
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ session, ...accountManager.sessionAdvice(session) }, null, 2));
+        return;
+      }
+
+      // Decline the advice for one session: hold it for cooldownMinutes, as a
+      // move does. Body: {"sessionId": "<id>"}. With the feature off nothing is
+      // recorded and the answer says so.
+      if (req.method === 'POST' && req.url === '/teamclaude/session-advice/decline') {
+        let sessionId;
+        try {
+          sessionId = JSON.parse((await readControlBody(req)) || '{}')?.sessionId;
+        } catch (/** @type {any} */ err) {
+          const tooLarge = err.message === 'body too large';
+          res.writeHead(tooLarge ? 413 : 400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: tooLarge ? 'request body too large' : 'invalid request body' }));
+          return;
+        }
+        if (typeof sessionId !== 'string' || !SESSION_ID_SHAPE.test(sessionId)) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'missing or malformed "sessionId"' }));
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, recorded: accountManager.noteAdviceCooldown(sessionId) }));
         return;
       }
 
@@ -1308,6 +1353,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           return;
         }
         accountManager.sessionPins.set(sessionId, name);
+        accountManager.noteAdviceCooldown(sessionId);
         const { eligible, reason } = accountManager.eligibility(index);
         console.log(`[TeamClaude] Session ${shown} pinned to account "${name}" (manual)`
           + (eligible ? '' : ` — ${reason}, so its requests will fail until that changes`));
@@ -4188,16 +4234,18 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // serve a Codex request from it, sending an OpenAI-shaped body to
   // api.anthropic.com with a Claude token. Subscriptions only: an API-key
   // account is metered capacity with no tie to a caller, so a pin to one stands.
-  const pinnedWrongProvider = pinned
-    && isSubscriptionAccount(pinned)
-    && providerOf(pinned) !== (ctx.provider || DEFAULT_PROVIDER);
+  // A hop is taken as-is below, so on it only the provider partition is asked.
+  const pinBar = !pinned ? null : hopTo == null
+    ? accountManager.pinBars(pinned, ctx.model, ctx.advisorModel, ctx.provider || DEFAULT_PROVIDER)
+    : (canServeProvider(pinned, ctx.provider || DEFAULT_PROVIDER) ? null : 'provider');
+  const pinnedWrongProvider = pinBar === 'provider';
   // The hop's destination was picked by pickAlternate against this request's
   // own exclusions, and is taken as-is: re-selecting here would walk the fleet
   // cursor onto it, which is exactly the move a detour must not make (#286).
   const account = hopTo != null
     ? accountManager.accounts[hopTo]
     : ctx.pinnedIndex != null
-      ? (pinned && !pinnedWrongProvider && !accountManager.capBars(pinned, ctx.model, ctx.advisorModel) ? pinned : null)
+      ? (pinned && !pinBar ? pinned : null)
       : accountManager.getActiveAccount(
         ctx.tried, ctx.model, ctx.advisorModel, ctx.pinKey, ctx.provider, selection,
       );
