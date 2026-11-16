@@ -234,14 +234,21 @@ export async function claimClaudeReset(account, { grantId, requestId }, { fetchI
  * windows it has spent. The pool-dry walk spends on the account that would wait
  * longest, since a reset there buys the most.
  *
+ * A window counts as spent at `spentAt(bucket)`: upstream's own limit unless
+ * the caller says otherwise, and never where the caller answers Infinity. The
+ * walk passes the thresholds selection holds the refused request's model to,
+ * since a fleet parks at those and not at 1, and leaves out the windows that
+ * do not bar that model.
+ *
  * @param {Record<string, any>} account
  * @param {number} now
+ * @param {(bucket: string) => number} [spentAt]
  */
-export function blockedUntil(account, now = Date.now()) {
+export function blockedUntil(account, now = Date.now(), spentAt = () => 1) {
   const q = account?.quota || {};
   let until = 0;
   for (const [use, reset] of [['unified5h', 'unified5hReset'], ['unified7d', 'unified7dReset'], ['unified7dFable', 'unified7dFableReset'], ['unified7dSonnet', 'unified7dSonnetReset']]) {
-    if (q[use] != null && q[use] >= 0.98 && q[reset] > now) until = Math.max(until, q[reset]);
+    if (q[use] != null && q[use] >= spentAt(use) && q[reset] > now) until = Math.max(until, q[reset]);
   }
   return until;
 }
@@ -354,6 +361,20 @@ export class ClaudeResetRedeemer {
     const now = this.now();
     if (now < this.fleetHoldUntil) return { redeemed: false, reason: 'holding off after a recent Claude reset attempt' };
     const deadline = now + this.timeoutMs;
+    // Ranked on the readings that bar this account for the refused model, each
+    // against the threshold selection holds it to (the account's own, the
+    // bucket's or the fleet's): the 5-hour window against its own, the shared
+    // weekly and the model's family bucket against the governing bucket's, as
+    // _nearQuotaBucket compares them. Another family's window does not bar the
+    // model, so it does not count. A fleet parked below upstream's limit is
+    // then ranked on its readings rather than left in config order. With no
+    // model, every window counts against its own bucket's threshold.
+    const governing = model ? this.am._weeklyBucketFor?.(model) ?? 'unified7d' : null;
+    const until = (/** @type {Record<string, any>} */ a) => blockedUntil(a, now, bucket => {
+      const at = (/** @type {string} */ b) => this.am.thresholdFor?.(b, a) ?? 1;
+      if (bucket === 'unified5h' || !governing) return at(bucket);
+      return bucket === 'unified7d' || bucket === governing ? at(governing) : Infinity;
+    });
     const candidates = accounts
       // Not a cordoned account: a reset there would buy new work it takes none of.
       // Nor a long-lived one (long-lived.js): its token cannot read reset status
@@ -362,7 +383,7 @@ export class ClaudeResetRedeemer {
       .filter(a => this._isClaude(a) && a.orgUuid && !a.disabled && !a.cordoned && a.autoRedeemReset !== false && a.longLived !== true)
       .filter(a => a.quota?.resetCredits?.available !== 0)
       .filter(a => now >= this._stateFor(a).cooldownUntil)
-      .sort((a, b) => blockedUntil(b, now) - blockedUntil(a, now));
+      .sort((a, b) => until(b) - until(a));
     let reason = 'no Claude account holds a usable reset';
     for (const account of candidates) {
       if (this.now() >= deadline) { reason = 'ran out of the redeem budget'; break; }

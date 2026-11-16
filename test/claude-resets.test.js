@@ -474,6 +474,54 @@ test('several parked accounts: still one reset, on the account that would wait l
   assert.equal(calls.claim.length, 1);
 });
 
+test('parked below 0.98: the reset still goes to the account that would wait longest', async () => {
+  // The fleet's threshold, and the accounts' own under the fleet default.
+  for (const [threshold, own] of [[0.9, {}], [0.98, { switchThreshold: 0.9 }]]) {
+    for (const order of [['soon', 'late'], ['late', 'soon']]) {
+      const { am, redeemer, calls } = parkedHarness({ accounts: order.map(name => oauth(name, own)), quota: { unified7d: 0.92 }, threshold });
+      for (const a of am.accounts) a.quota.unified7dReset = Date.now() + (a.name === 'late' ? 6 : 1) * DAY;
+      assert.equal((await redeemer.maybeRedeemForPool(am.accounts, { model: OPUS })).redeemed, true);
+      assert.deepEqual(calls.claim, ['late'], `threshold ${threshold}, own ${JSON.stringify(own)}, config order ${order}`);
+    }
+  }
+  // A request that names no model: each window at its own bucket's threshold.
+  const { am, redeemer, calls } = parkedHarness({ accounts: [oauth('soon'), oauth('late')], quota: { unified7d: 0.92 }, threshold: 0.9 });
+  for (const a of am.accounts) a.quota.unified7dReset = Date.now() + (a.name === 'late' ? 6 : 1) * DAY;
+  assert.equal((await redeemer.maybeRedeemForPool(am.accounts)).redeemed, true);
+  assert.deepEqual(calls.claim, ['late'], 'no model');
+});
+
+test('the ranking reads only what bars the refused model, each against the threshold that governs it', async () => {
+  // A Fable request holds the shared weekly to the Fable bucket's threshold.
+  for (const order of [['soon', 'late'], ['late', 'soon']]) {
+    const { am, redeemer, calls } = parkedHarness({ accounts: order.map(name => oauth(name)), quota: { unified7d: 0.92, unified7dFable: 0.5 },
+      threshold: { default: 0.98, unified7dFable: 0.9 } });
+    for (const a of am.accounts) a.quota.unified7dReset = Date.now() + (a.name === 'late' ? 6 : 1) * DAY;
+    assert.equal((await redeemer.maybeRedeemForPool(am.accounts, { model: FABLE })).redeemed, true);
+    assert.deepEqual(calls.claim, ['late'], `per-bucket threshold, config order ${order}`);
+  }
+  // A Fable window does not bar an Opus request: `soon` is back for Opus in a
+  // day, though its Fable weekly waits six.
+  for (const order of [['soon', 'late'], ['late', 'soon']]) {
+    const { am, redeemer, calls } = parkedHarness({ accounts: order.map(name => oauth(name)),
+      quota: a => (a.name === 'soon' ? { unified7d: 0.99, unified7dFable: 0.99 } : { unified7d: 0.99 }) });
+    for (const a of am.accounts) {
+      a.quota.unified7dReset = Date.now() + (a.name === 'late' ? 3 : 1) * DAY;
+      if (a.name === 'soon') a.quota.unified7dFableReset = Date.now() + 6 * DAY;
+    }
+    assert.equal((await redeemer.maybeRedeemForPool(am.accounts, { model: OPUS })).redeemed, true);
+    assert.deepEqual(calls.claim, ['late'], `another family's window, config order ${order}`);
+  }
+  // The 5-hour window bars every model: `a` is back for Opus only when its
+  // 5-hour window resets, in four hours, though its weekly resets in one.
+  const five = parkedHarness({ accounts: [oauth('a'), oauth('b')], quota: a => (a.name === 'a' ? { unified5h: 0.99, unified7d: 0.99 } : { unified7d: 0.99 }) });
+  const [a5, b5] = five.am.accounts;
+  Object.assign(a5.quota, { unified7dReset: Date.now() + H, unified5hReset: Date.now() + 4 * H });
+  b5.quota.unified7dReset = Date.now() + 2 * H;
+  assert.equal((await five.redeemer.maybeRedeemForPool(five.am.accounts, { model: OPUS })).redeemed, true);
+  assert.deepEqual(five.calls.claim, ['a'], 'the 5-hour window');
+});
+
 test('a decline is logged once per account per cooldown, not once per refusal', async () => {
   const { am, redeemer, calls, advance } = parkedHarness({ quota: { unified7d: 0.99 }, grants: [fableGrant] });
   for (let i = 0; i < 3; i++) assert.equal((await redeemer.maybeRedeemForPool(am.accounts, { model: OPUS })).redeemed, false);

@@ -768,7 +768,10 @@ request before choosing anyone, the redeemer spends a reset, and the request is
 selected again against the account it cleared.
 
 - It spends on the account that would otherwise wait longest for its own
-  windows to reset, since that is where a reset buys the most.
+  windows to reset, since that is where a reset buys the most. Only the
+  windows that bar the refused request's model count (the 5-hour window, the
+  all-models weekly and that model's family weekly), each at the threshold
+  rotation holds that model to.
 - It fires when the pool is dry and the account is in one of two states:
   upstream itself reports it **at** a limit, or the proxy is holding it out of
   rotation because a **weekly** reading is at or past the
