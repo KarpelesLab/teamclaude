@@ -638,6 +638,9 @@ timer where it was, so none of them is applied to it.
 Every account the policy passes over is logged, once per reason and at most
 every ten minutes while the reason stands:
 `[TeamClaude] Codex rate-limit reset on "<name>" skipped — <reason>`.
+The caps are asked before any account's credit rows are read, since a read
+costs a token refresh and a request, so a line for a cap can name an account
+that turns out to hold no credit.
 
 While `autoRedeemResets` is on, `teamclaude status` prints a `Redeem` line
 under each Codex account — `armed` or `exempt — <reason>`, and what a credit

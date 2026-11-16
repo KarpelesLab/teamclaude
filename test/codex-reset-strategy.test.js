@@ -283,6 +283,70 @@ test('the per-day cap stops the fleet after N automatic redemptions in 24 hours,
   assert.equal(calls.consume.length, 2);
 });
 
+test('a reached per-day cap is asked before any token is refreshed or credit row read', async () => {
+  const { am, redeemer, calls } = harness({ days: [3, 4, 5], config: { autoRedeemResets: true, autoRedeemMaxPerDay: 1 } });
+  let clock = Date.now();
+  redeemer.now = () => clock;
+  const refreshes = [];
+  const ensure = am.ensureTokenFresh.bind(am);
+  am.ensureTokenFresh = async index => { refreshes.push(index); return ensure(index); };
+  assert.equal((await redeemer.maybeRedeemForPool([am.accounts[0]])).redeemed, true);
+  const [details, refreshed] = [calls.details.length, refreshes.length];
+  // Past the fleet hold and past the cached rows, three times over.
+  for (let i = 0; i < 3; i++) {
+    clock += 7 * 60 * 60 * 1000;
+    const capped = await redeemer.maybeRedeemForPool(am.accounts.slice(1));
+    assert.match(capped.reason, /daily cap of 1/);
+  }
+  assert.deepEqual(calls.details.slice(details), []);
+  assert.deepEqual(refreshes.slice(refreshed), []);
+  assert.deepEqual(calls.consume, ['a']);
+});
+
+test('a reached per-day cap over accounts that all fail their preconditions answers with the precondition', async () => {
+  const { am, redeemer, calls } = harness({ days: [3, 1], config: { autoRedeemResets: true, autoRedeemMaxPerDay: 1, autoRedeemMinDaysToReset: 2 } });
+  let clock = Date.now();
+  redeemer.now = () => clock;
+  assert.equal((await redeemer.maybeRedeemForPool([am.accounts[0]])).redeemed, true);
+  clock += 7 * 60 * 60 * 1000;
+  // b is under the floor, so no account is left to put to the cap.
+  const result = await redeemer.maybeRedeemForPool([am.accounts[1]]);
+  assert.equal(result.redeemed, false);
+  assert.match(result.reason, /under the 2d minimum/);
+  assert.deepEqual(calls.consume, ['a']);
+});
+
+test('an account the share cap holds back has no credit row read', async () => {
+  const { am, redeemer, calls } = harness({ days: [3, 3], config: { autoRedeemResets: true, autoRedeemMaxShare: 0.5 }, caughtUp: false });
+  let clock = Date.now();
+  sameUtcDay(am.accounts, 3, clock);
+  redeemer.now = () => clock;
+  const [a, b] = am.accounts;
+  a.quota.unified7d = 1.3;
+  assert.equal((await redeemer.maybeRedeemForPool([a, b])).redeemed, true);
+  assert.deepEqual(calls.consume, ['a']);
+  const read = calls.details.length;
+  clock += 7 * 60 * 60 * 1000;
+  assert.match((await redeemer.maybeRedeemForPool([b])).reason, /share cap allows 1/);
+  assert.deepEqual(calls.details.slice(read), [], 'past the cached rows, and still not read');
+});
+
+test('an account the share cap holds back does not end the walk: the next one is still asked', async () => {
+  // a and b share a cohort, and a redemption of a has used its one slot; c is
+  // alone in a later one. b is the most exhausted, so it is asked first.
+  const { am, redeemer, calls } = harness({ days: [3, 3, 5], config: { autoRedeemResets: true, autoRedeemMaxShare: 0.5 }, caughtUp: false });
+  let clock = Date.now();
+  sameUtcDay(am.accounts.slice(0, 2), 3, clock);
+  redeemer.now = () => clock;
+  const [a, b, c] = am.accounts;
+  assert.equal((await redeemer.redeemGrant(a, 'a-1', { manual: true })).redeemed, true);
+  clock += 7 * 60 * 60 * 1000;
+  b.quota.unified7d = 1.3;
+  const next = await redeemer.maybeRedeemForPool([b, c]);
+  assert.equal(next.redeemed, true);
+  assert.deepEqual(calls.consume, ['a', 'c']);
+});
+
 // ── a redemption made by hand ───────────────────────────────────────────────
 
 // The resets panel (reset-actions.js) spends through redeemGrant with

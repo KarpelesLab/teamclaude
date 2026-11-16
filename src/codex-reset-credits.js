@@ -653,12 +653,40 @@ export class ResetCreditRedeemer {
     // client is waiting on the refusal, not on an account, so a pool of three
     // must not hold it three times as long as a pool of one.
     const deadline = now + this.timeoutMs;
+    const policy = this._policy();
 
-    /** @type {Array<{account: Record<string, any>, credits: ResetCredit[]}>} */
-    const holders = [];
+    // Everything that costs nothing is asked before anything is fetched: the
+    // preconditions, then the caps. A read costs a token refresh and a request
+    // per account, and a cap that says no says it again on every refusal past
+    // the cached rows, with the client waiting on each.
+    /** @type {Record<string, any>[]} */
+    const askable = [];
     let reason = 'no Codex account holds a credit worth spending';
     for (const account of accounts) {
-      const ready = await this._ready(account, this._stateFor(account), now, deadline);
+      const why = this._precheck(account, this._stateFor(account), now);
+      if (why) reason = why;
+      else askable.push(account);
+    }
+    // The per-day cap is a fact about the fleet, so it is asked once and said
+    // once, against the first account it stops. It counts automatic
+    // redemptions only.
+    const daily = dailyCapVerdict(this.ledger, policy.maxPerDay, now);
+    if (!daily.ok && askable.length) {
+      this._logSkip(askable[0], this._stateFor(askable[0]), /** @type {string} */ (daily.reason), now);
+      return { redeemed: false, reason: /** @type {string} */ (daily.reason) };
+    }
+    const members = policy.maxShare < 1 ? this._members() : [];
+    /** @type {Array<{account: Record<string, any>, credits: ResetCredit[]}>} */
+    const holders = [];
+    for (const account of askable) {
+      const state = this._stateFor(account);
+      const share = shareCapVerdict({ account, members, ledger: this.ledger, maxShare: policy.maxShare, now });
+      if (!share.ok) {
+        reason = /** @type {string} */ (share.reason);
+        this._logSkip(account, state, reason, now);
+        continue;
+      }
+      const ready = await this._ready(account, state, now, deadline);
       if (ready.credits) holders.push({ account, credits: ready.credits });
       else reason = ready.reason ?? reason;
     }
@@ -670,29 +698,13 @@ export class ResetCreditRedeemer {
     // reading it never looks at would only invite one of the two to go stale.
     const rows = new Map(holders.map(holder => [holder.account, holder.credits]));
     const ordered = orderRedeemCandidates(holders);
-    const policy = this._policy();
     // Under a share cap the cohort's slots go to the most exhausted first —
     // that is what the cap promises — so the walk is re-ranked on exhaustion
     // (byExhaustion, which settles every tie itself). Without a cap the
     // ordering is the one it always was.
     if (policy.maxShare < 1) ordered.sort((a, b) => byExhaustion(a.account, b.account));
-    // The per-day cap is a fact about the fleet, so it is asked once, before
-    // the walk, and said once, against the first account it would have stopped.
-    // It counts automatic redemptions only.
-    const daily = dailyCapVerdict(this.ledger, policy.maxPerDay, now);
-    if (!daily.ok && ordered.length) {
-      this._logSkip(ordered[0].account, this._stateFor(ordered[0].account), /** @type {string} */ (daily.reason), now);
-      return { redeemed: false, reason: /** @type {string} */ (daily.reason) };
-    }
-    const members = policy.maxShare < 1 ? this._members() : [];
     for (const { account } of ordered) {
       const state = this._stateFor(account);
-      const share = shareCapVerdict({ account, members, ledger: this.ledger, maxShare: policy.maxShare, now });
-      if (!share.ok) {
-        reason = /** @type {string} */ (share.reason);
-        this._logSkip(account, state, reason, now);
-        continue;
-      }
       const result = await this._decide(account, state, rows.get(account) || [], now, deadline);
       if (result.redeemed) return result;
       reason = result.reason;
@@ -706,20 +718,16 @@ export class ResetCreditRedeemer {
   }
 
   /**
-   * The checks and the credit rows that come before any decision, for one
-   * account.
-   *
-   * Answers with the account's rows, or with why it is not a candidate at all.
-   * An EMPTY row list is still rows: the account holds nothing, and it is the
-   * policy below that says so in its own words.
+   * The checks that come before any decision and need nothing fetched, for
+   * one account: why it is not a candidate at all, or null when it is one
+   * whose credit rows are worth reading.
    *
    * @param {Record<string, any>} account
    * @param {RedeemState} state
    * @param {number} now
-   * @param {number} deadline
-   * @returns {Promise<{credits?: ResetCredit[], reason?: string}>}
+   * @returns {string|null}
    */
-  async _ready(account, state, now, deadline) {
+  _precheck(account, state, now) {
     const autoRedeemResets = this._armed();
     const { minDaysToReset } = this._policy();
     const pre = redeemPreconditions({ account, autoRedeemResets, minDaysToReset, now });
@@ -728,21 +736,34 @@ export class ResetCreditRedeemer {
       // account that could otherwise redeem, so it is the one that is logged:
       // an operator who set it should be able to see it bite.
       if (minDaysReason(account, minDaysToReset, now) === pre.reason) this._logSkip(account, state, pre.reason, now);
-      return { reason: pre.reason };
+      return pre.reason;
     }
-    if (now < state.cooldownUntil) return { reason: 'cooling down after a recent attempt' };
+    if (now < state.cooldownUntil) return 'cooling down after a recent attempt';
 
     // The HOLDINGS count the usage probe last saw — the same number the TUI and
     // the dashboard draw, and not the redeemable set: it knows nothing about
     // plan support. So it is only ever a negative gate. Zero holdings means zero
     // redeemable and stops us here for free; anything else decides nothing, and
-    // the detail rows below are what the policy actually reads. An ABSENT
-    // reading is likewise not "none": the probe is off by default, and the
-    // detail fetch reports the count anyway.
-    if (account.quota?.resetCredits?.available === 0) {
-      return { reason: 'holds no reset credits' };
-    }
+    // the detail rows _ready reads are what the policy actually reads. An
+    // ABSENT reading is likewise not "none": the probe is off by default, and
+    // the detail fetch reports the count anyway.
+    if (account.quota?.resetCredits?.available === 0) return 'holds no reset credits';
+    return null;
+  }
 
+  /**
+   * The credit rows that come before any decision, for an account _precheck
+   * passed: the rows, or why they could not be had. An EMPTY row list is still
+   * rows: the account holds nothing, and it is the policy below that says so
+   * in its own words.
+   *
+   * @param {Record<string, any>} account
+   * @param {RedeemState} state
+   * @param {number} now
+   * @param {number} deadline
+   * @returns {Promise<{credits?: ResetCredit[], reason?: string}>}
+   */
+  async _ready(account, state, now, deadline) {
     const credits = await this._credits(account, state, now, deadline);
     if (credits.error) {
       state.cooldownUntil = now + RETRY_COOLDOWN_MS;
