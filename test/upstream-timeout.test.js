@@ -5,7 +5,7 @@ import { once } from 'node:events';
 import { ReadableStream } from 'node:stream/web';
 import { Writable } from 'node:stream';
 import { TextEncoder, TextDecoder } from 'node:util';
-import { upstreamFetch, DEFAULT_HEADERS_TIMEOUT_MS } from '../src/upstream-fetch.js';
+import { upstreamFetch, resolveHeadersTimeout, DEFAULT_HEADERS_TIMEOUT_MS } from '../src/upstream-fetch.js';
 import { readWithIdleTimeout, streamResponse, createProxyServer } from '../src/server.js';
 import { AccountManager } from '../src/account-manager.js';
 import { withEnv } from '../test-helpers/env.js';
@@ -225,6 +225,29 @@ test('the env override beats the caller default', async () => {
   }
 });
 
+// setTimeout keeps its delay in a signed 32-bit integer and fires a larger one
+// after 1 ms, so a headers-timeout setting meant as "practically never" cut
+// the wait for every head at about 1 ms: a backend answering in 50 ms was a
+// "socket hang up" about 10 ms in. It is read as the longest delay a timer
+// holds instead, as the body-idle setting is. Asserted on the value, which is
+// what the head timer is armed with.
+test('a headers-timeout setting past the timer range is read as the longest timer, not as 1 ms', async () => {
+  const HEAD = 'TEAMCLAUDE_UPSTREAM_HEADERS_TIMEOUT_MS';
+  await withEnv({ [HEAD]: 99_999_999_999 }, () => {
+    assert.equal(resolveHeadersTimeout(null), 2 ** 31 - 1);
+    assert.equal(resolveHeadersTimeout(null, 300_000), 2 ** 31 - 1, "over a caller's default too");
+  });
+  await withEnv({ [HEAD]: 'Infinity' }, () => {
+    assert.equal(resolveHeadersTimeout(null), 2 ** 31 - 1);
+  });
+  await withEnv({ [HEAD]: 2 ** 31 }, () => {
+    assert.equal(resolveHeadersTimeout(null), 2 ** 31 - 1, 'one past it is read as it');
+  });
+  await withEnv({ [HEAD]: 2 ** 31 - 1 }, () => {
+    assert.equal(resolveHeadersTimeout(null), 2 ** 31 - 1, 'the longest timer itself is kept');
+  });
+});
+
 // ── the same deadline while an answer is held ───────────────────────────────
 
 // An answer that is not an event stream is read whole before it is relayed
@@ -361,7 +384,25 @@ test('a held answer that goes quiet is cut at its idle deadline, as a quiet stre
     const got = await postQuiet(port, '/v1/messages');
     assert.equal(got.ended, false, 'the connection closed, with no clean end');
     assert.equal(got.complete, false);
-    assert.ok(errors.some(l => /Upstream error \(account "backend"\).*idle for 300ms/.test(l)), `the body-idle deadline is what ended it: ${errors.join(' | ')}`);
+    assert.ok(errors.some(l => /Upstream error \(account "backend"\).*idle for 300ms/.test(l)), `the hold's idle deadline is what ended it: ${errors.join(' | ')}`);
+  });
+});
+
+// The same hold under a head deadline longer than the body-idle one, 600 ms
+// against 300, set as above once the upstream has the request. The upstream
+// never speaks again, so only the hold's deadline can end the request, and the
+// line names the one that did: the head deadline, which a hold timed by the
+// body-idle deadline alone (as the two passthroughs' are) never waits for.
+test('a forwarded answer held whole waits out a head deadline longer than the body-idle one', async (t) => {
+  const HEAD = 'TEAMCLAUDE_UPSTREAM_HEADERS_TIMEOUT_MS';
+  await withEnv({ TEAMCLAUDE_UPSTREAM_BODY_TIMEOUT_MS: 300, [HEAD]: null }, async () => {
+    const { port, errors } = await quietProxy(t, quietUpstream(() => { process.env[HEAD] = '600'; }), (upstreamPort) => ({
+      accounts: [{ name: 'backend', type: 'apikey', apiKey: 'k1', upstream: `http://127.0.0.1:${upstreamPort}` }],
+      upstream: 'http://127.0.0.1:9',
+    }));
+    const got = await postQuiet(port, '/v1/messages');
+    assert.equal(got.ended, false, 'the connection closed, with no clean end');
+    assert.ok(errors.some(l => /Upstream error \(account "backend"\).*idle for 600ms/.test(l)), `the head deadline is what ended it: ${errors.join(' | ')}`);
   });
 });
 

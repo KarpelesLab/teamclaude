@@ -114,6 +114,13 @@ const USE_GLOBAL_FETCH = /^(1|true|yes|on)$/i.test(envVar('UPSTREAM_GLOBAL_FETCH
 // operator's fleet-wide override), then the caller's default, then this one.
 export const DEFAULT_HEADERS_TIMEOUT_MS = 120_000;
 
+// The longest delay setTimeout keeps: it holds the delay in a signed 32-bit
+// integer and fires one past it after 1 ms, so an operator's setting meant as
+// "practically never" cut every wait for a head at about 1 ms. A larger
+// setting is read as this (about 24.8 days), as server.js reads the body-idle
+// deadline.
+const MAX_TIMER_MS = 2 ** 31 - 1;
+
 /**
  * @param {number|null|undefined} perCall
  * @param {number|null|undefined} [fallbackMs]
@@ -122,7 +129,7 @@ export const DEFAULT_HEADERS_TIMEOUT_MS = 120_000;
 export function resolveHeadersTimeout(perCall, fallbackMs) {
   if (perCall != null) return perCall;
   const env = Number(envVar('UPSTREAM_HEADERS_TIMEOUT_MS'));
-  return env > 0 ? env : positiveInt(fallbackMs, DEFAULT_HEADERS_TIMEOUT_MS);
+  return env > 0 ? Math.min(env, MAX_TIMER_MS) : positiveInt(fallbackMs, DEFAULT_HEADERS_TIMEOUT_MS);
 }
 
 function headersTimeoutError(ms) {
@@ -336,7 +343,7 @@ function sendNodeRequest(u, opts, timeoutMs, { transport, agent }, release) {
 // fires after 'end'), which crashes the process. The `closed` guard makes close
 // idempotent; backpressure via pause/resume so a slow consumer doesn't buffer the
 // whole (possibly minutes-long) stream in memory.
-function nodeToWeb(res) {
+export function nodeToWeb(res) {
   let closed = false;
   const close = (controller) => {
     if (closed) return;

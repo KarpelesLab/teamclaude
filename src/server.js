@@ -276,7 +276,9 @@ async function readErrorBody(body, limit = ERROR_BODY_INSPECTION_LIMIT) {
   }
 }
 
-// The largest upstream answer the proxy holds whole. Three paths read a body to
+// The largest upstream answer the proxy holds whole, by default: the limit in
+// force is resolveBufferedResponseLimit's, and
+// TEAMCLAUDE_UPSTREAM_MAX_HELD_BYTES sets another. Three paths read a body to
 // its end before relaying it: the forward path's answer that is not an event
 // stream (for its usage figures and the log), the token-refresh passthrough and
 // the client-credential retry (each relayed in one write). Their upstreams are
@@ -297,13 +299,18 @@ const BUFFERED_RESPONSE_LIMIT = 64 * 1024 * 1024;
 /**
  * The limit in force. Read per call like the body idle timeout, so a test can
  * shrink it through TEAMCLAUDE_UPSTREAM_MAX_HELD_BYTES without reloading the
- * module (and without pushing 64 MiB through loopback to cross it). Unset,
- * empty or non-positive means the default.
+ * module (and without pushing 64 MiB through loopback to cross it). The
+ * setting is a whole number of bytes, parsed as upstream-fetch.js parses
+ * TEAMCLAUDE_UPSTREAM_MAX_SOCKETS and ..._QUEUE_TIMEOUT_MS (positiveInt):
+ * Number() of the text, which takes `0x1000`, `1e3` and surrounding spaces
+ * too, and the default unless that is a whole number from 1 to
+ * Number.MAX_SAFE_INTEGER (so unset, empty, zero, negative, a fraction,
+ * Infinity or `64MiB`).
  * @returns {number}
  */
 export function resolveBufferedResponseLimit() {
   const env = Number(envVar('UPSTREAM_MAX_HELD_BYTES'));
-  return env > 0 ? env : BUFFERED_RESPONSE_LIMIT;
+  return Number.isSafeInteger(env) && env > 0 ? env : BUFFERED_RESPONSE_LIMIT;
 }
 
 /**
@@ -375,9 +382,10 @@ export async function holdBody(stream, limit = resolveBufferedResponseLimit(), i
 }
 
 /**
- * Answer a passthrough whose upstream answer outgrew BUFFERED_RESPONSE_LIMIT:
- * the rest is dropped unread (which closes the upstream connection), the
- * operator is told which path it was, and the client gets a 502 that says why.
+ * Answer a passthrough whose upstream answer outgrew the hold limit
+ * (resolveBufferedResponseLimit): the rest is dropped unread (which closes the
+ * upstream connection), the operator is told which path it was, and the
+ * client gets a 502 that says why.
  * @param {any} res
  * @param {ReadableStream<Uint8Array>|null} body  holdBody's replay
  * @param {string} where  the path, for the log line
@@ -3130,8 +3138,9 @@ async function refuseOversizedBody(req, res) {
  * framing ones (content-encoding, content-length) and an upstream copy of
  * CORRELATION_HEADER (the proxy's own) are dropped, and so is the per-org
  * billing family when `stripOverage` is set (see isOverageHeader).
- * The answer is held whole and relayed in one write, so one larger than
- * BUFFERED_RESPONSE_LIMIT is a 502 instead (a token answer is a few hundred bytes).
+ * The answer is held whole and relayed in one write, so one larger than the
+ * hold limit (resolveBufferedResponseLimit) is a 502 instead (a token answer
+ * is a few hundred bytes).
  */
 async function relayRaw(req, res, upstream, sx, maxBodyBytes = DEFAULT_MAX_BODY_BYTES, stripOverage = false, strip = /** @type {Set<string>|null} */ (null)) {
   const bodyChunks = [];
@@ -3242,7 +3251,7 @@ export function resolveLogMaxBodyBytes(config) {
 // flight together hold up to this many bytes each, and nothing bounds the sum.
 // Each holds more than its body, too: a body rewritten for the account serving
 // it (rewriteRequestBody) is a second copy held beside it for the attempt, and
-// the answer may be held as well (BUFFERED_RESPONSE_LIMIT).
+// the answer may be held as well (resolveBufferedResponseLimit).
 export const DEFAULT_MAX_BODY_BYTES = 64 * 1024 * 1024;
 
 export function resolveMaxBodyBytes(config) {
@@ -4071,10 +4080,11 @@ function respondModelUnsupported(res, ctx, denied) {
  * transport, not relayStream's: the admission gate, the fleet upstream proxy,
  * this attempt's sx route and the default headers deadline all apply, since
  * this is an ordinary request and not a Remote Control long-poll. The body is
- * buffered the way the forward path buffers a non-streaming answer, up to
- * BUFFERED_RESPONSE_LIMIT; past it this answers 502 rather than relaying it, as
- * the calls that come here are Claude Code's bootstrap, settings and
- * connector-registry reads (see the scope branch of forwardRequest).
+ * buffered the way the forward path buffers a non-streaming answer, up to the
+ * hold limit (resolveBufferedResponseLimit); past it this answers 502 rather
+ * than relaying it, as the calls that come here are Claude Code's bootstrap,
+ * settings and connector-registry reads (see the scope branch of
+ * forwardRequest).
  * @param {any} req
  * @param {any} res
  * @param {string} upstream
@@ -5289,12 +5299,17 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     }
 
     // Any other body is held whole, for its usage figures and the log, up to
-    // BUFFERED_RESPONSE_LIMIT. Past it the rest is relayed as it arrives, the way
-    // an event stream is but unread: an answer that large is not a completion,
-    // so there is no usage in it to lose, and lines in it that look like an
-    // event stream's (a saved transcript) are not one's to book. The hold has
-    // its own silence budget (resolveHeldAnswerIdleTimeout), longer than a
-    // relay's: a non-streaming completion may be all silence after its head.
+    // the hold limit (resolveBufferedResponseLimit). Past it the rest is
+    // relayed as it arrives, the way an event stream is but unread: an answer
+    // that large is not a completion, so there is no usage in it to lose, and
+    // lines in it that look like an event stream's (a saved transcript) are
+    // not one's to book. The hold has its own silence budget
+    // (resolveHeldAnswerIdleTimeout), never shorter than a relay's: a
+    // non-streaming completion may be all silence after its head. At the
+    // defaults the two are both 120 s, so a hold is still cut at 120 s of
+    // silence; it waits longer whenever the head deadline is longer than the
+    // body-idle one: a Codex account (300 s), a raised headers timeout, or a
+    // lowered body-idle timeout.
     const held = isStreaming ? null : await holdBody(upstreamBody, undefined, resolveHeldAnswerIdleTimeout(account));
     if (held && !held.buf) {
       console.log(`[TeamClaude] A ${upstreamRes.status} answer from "${safeLine(account.name, 64)}" is larger than ${bufferedResponseLimitLabel()}; relaying it as it arrives instead of holding it`);
@@ -5307,7 +5322,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     if (held?.buf == null) {
       // Stream each chunk straight to the log as it is relayed — never hold the
       // whole body in memory: an SSE body (potentially ~1M tokens), or an answer
-      // past BUFFERED_RESPONSE_LIMIT.
+      // past the hold limit.
       const l = getLog();
       const bw = l ? l.bodyWriter('RESPONSE BODY (streamed)', contentType) : null;
       try {
@@ -5570,9 +5585,10 @@ export function bookUsageTotals(totals, usage) {
 /**
  * Relay a response body to the client as it arrives: an event stream, whose
  * usage is parsed from its SSE event lines along the way, or, with `scanUsage`
- * false, an answer the forward path would not hold (see
- * BUFFERED_RESPONSE_LIMIT), relayed unread, since a body that is not an event
- * stream can still carry lines shaped like one's (a saved transcript, a file).
+ * false, an answer the forward path would not hold (one past the hold limit,
+ * resolveBufferedResponseLimit), relayed unread, since a body that is not an
+ * event stream can still carry lines shaped like one's (a saved transcript, a
+ * file).
  * `onTotals` is told the usage that was booked, once the stream ends.
  *
  * Resolves to what the stream said about itself: `failed` names the first
