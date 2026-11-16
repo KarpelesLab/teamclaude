@@ -356,7 +356,10 @@ export class ClaudeResetRedeemer {
     const deadline = now + this.timeoutMs;
     const candidates = accounts
       // Not a cordoned account: a reset there would buy new work it takes none of.
-      .filter(a => this._isClaude(a) && a.orgUuid && !a.disabled && !a.cordoned && a.autoRedeemReset !== false)
+      // Nor a long-lived one (long-lived.js): its token cannot read reset status
+      // or claim, and a scope denial on the claim would read as "may have been
+      // spent" and hold the resets of every other account.
+      .filter(a => this._isClaude(a) && a.orgUuid && !a.disabled && !a.cordoned && a.autoRedeemReset !== false && a.longLived !== true)
       .filter(a => a.quota?.resetCredits?.available !== 0)
       .filter(a => now >= this._stateFor(a).cooldownUntil)
       .sort((a, b) => blockedUntil(b, now) - blockedUntil(a, now));

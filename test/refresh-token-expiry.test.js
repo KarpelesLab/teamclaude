@@ -1,7 +1,8 @@
 // A refresh token seems to live a fixed time from the sign-in that issued it
 // (#674), and the account then needs a new login with no warning. The date is
-// kept and shown only where it was stated: by the token endpoint, or by the
-// credential file an account was imported from. Nothing here may invent one.
+// kept and shown where it was stated: by the token endpoint, or by the
+// credential file an account was imported from. The one date that is assumed
+// is a Claude sign-in's, 30 days out, as Claude Code records it.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { tokenPairFromResponse } from '../src/oauth.js';
@@ -17,6 +18,7 @@ import {
   REFRESH_TOKEN_WARN_DAYS, refreshTokenExpiryFromResponse, earlierRefreshTokenExpiry, withFamilyExpiry,
   expiryAfterReplacement, setRefreshTokenExpiry, refreshTokenExpiryView, accountRefreshTokenExpiry,
   refreshTokenExpiryWarning, createRefreshTokenExpiryWarner, localDate, knownRefreshTokenExpiry,
+  signInRefreshTokenExpiry, ASSUMED_SIGN_IN_LIFETIME_MS,
 } from '../src/refresh-token-expiry.js';
 
 const NOW = 1_700_000_000_000;
@@ -43,7 +45,31 @@ test('both spellings in one response: the sooner date', () => {
   assert.equal(refreshTokenExpiryFromResponse(body, NOW), NOW + 3 * DAY);
 });
 
-test('a response that states nothing believable yields no date, never an assumed one', () => {
+test('a Claude sign-in that states no lifetime is dated 30 days out, and a stated one stands', () => {
+  assert.equal(ASSUMED_SIGN_IN_LIFETIME_MS, 30 * DAY);
+  const silent = tokenPairFromResponse({ access_token: 'a', refresh_token: 'r', expires_in: 28800 }, { now: NOW });
+  assert.equal('refreshTokenExpiresAt' in silent, false, 'the response itself stated nothing');
+  assert.deepEqual(signInRefreshTokenExpiry(silent, NOW), { ...silent, refreshTokenExpiresAt: NOW + 30 * DAY });
+  assert.equal('refreshTokenExpiresAt' in silent, false, 'the input is not written to');
+
+  const stated = tokenPairFromResponse({ access_token: 'a', refresh_token: 'r', refresh_token_expires_in: 7 * 86400 }, { now: NOW });
+  assert.equal(signInRefreshTokenExpiry(stated, NOW).refreshTokenExpiresAt, NOW + 7 * DAY);
+
+  // No refresh token, nothing to lapse: such a sign-in is given no date.
+  const bare = { accessToken: 'a', refreshToken: undefined, expiresAt: NOW + H };
+  assert.equal('refreshTokenExpiresAt' in signInRefreshTokenExpiry(bare, NOW), false);
+});
+
+test('an assumed sign-in date is dropped by a refresh that succeeds after it', () => {
+  const signedIn = signInRefreshTokenExpiry({ accessToken: 'a', refreshToken: 'r', expiresAt: NOW + H }, NOW);
+  const refreshed = { accessToken: 'b', refreshToken: 'r2', expiresAt: NOW + 31 * DAY + H };
+  // Inside the 30 days a refresh that states nothing keeps the date.
+  assert.equal(withFamilyExpiry(signedIn, refreshed, NOW + 29 * DAY).refreshTokenExpiresAt, NOW + 30 * DAY);
+  // Past them, the refresh that just worked disproved it.
+  assert.equal('refreshTokenExpiresAt' in withFamilyExpiry(signedIn, refreshed, NOW + 31 * DAY), false);
+});
+
+test('a response that states nothing believable yields no date: a refresh never assumes one', () => {
   const nonsense = [
     null, undefined, 'text', {},
     { expires_in: 28800 },                                      // the access token's, not the refresh token's

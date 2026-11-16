@@ -20,6 +20,32 @@ account. Retry after confirming the credential is valid, or pass
 credential the upstream rejects with 401 (and that cannot be refreshed) is
 refused regardless of `--name` — log in again to get a fresh one.
 
+## Long-lived login
+
+```bash
+teamclaude login --long-lived --name work
+```
+
+Signs an account in with a token that lasts a year and is never refreshed. It makes the request `claude setup-token` makes: the usual sign-in flow, on the same client id and addresses, asking for the scope `user:inference` alone, with `expires_in` set to one year when the code is exchanged. The flow is the copy/paste one of `login --token`. The entry is saved with `"longLived": true` and no refresh token.
+
+Use it for an account that only has to serve completions through the proxy, where you would rather renew one login a year than depend on every refresh succeeding. For everything else, the ordinary `teamclaude login` is the better choice, because an inference-only token leaves out the following.
+
+- **`--name` is required.** The token cannot read the account's profile, so the proxy has no email, plan or organization to name it by, and the login stops before the sign-in link is shown when `--name` is missing. The account is known by that name only. Giving the name of an existing account replaces that account's token and keeps what an earlier full login recorded about it (its ids, organization and plan).
+- **No usage reads.** The quota probe, the profile re-check and `teamclaude accounts` skip the account, because the usage and profile endpoints answer such a token with `403 oauth_scope_insufficient`. Its quota is what the responses to its own requests state in their headers. Until it has served a request, its bars are empty, and what only the usage read reports (extra-usage spend, banked resets) is not shown.
+- **No resets.** Automatic and manual reset redemption leave the account out.
+- **Re-login once a year.** Nothing renews the token. `teamclaude status` shows `Login    long-lived token expires in 200 days (2027-06-04)`. From 14 days out the row turns yellow and names the command, the TUI draws the same line under the account's row, and the server logs one line per account per day. After the date, the first request the token is refused for takes the account out of rotation as `error`, with `teamclaude login --long-lived` as the remedy. Renew it with the same `--name`.
+- **Not synced.** With [callback.net sync](#syncing-accounts-across-machines-callbacknet), the token is never stored for your other installs, and a refreshing login stored by another install never replaces it.
+
+`teamclaude status` marks the account with a `Token` row saying so, and its `Probe` row reads `not applicable`. `GET /teamclaude/status` carries `accounts[].longLived: true` and `accounts[].expiresAt` (epoch ms) for such an account, and neither key for any other.
+
+The login fails, and saves nothing, when the token endpoint grants a lifetime more than a day short of the year. `--long-lived` cannot be combined with `--api`, `--codex` or `--oauth`.
+
+Claude Code's own identity and control-plane calls go out on its own login (see [MITM mode](proxy-modes.md#mitm-proxy-mode-default)), so they do not depend on this token. Any other `GET` that the token is refused for takes the [scope-denial retry](routing.md#token-scope-denials) on the client's login.
+
+An ordinary `login` or `import` of the same account removes the mark, and the account is refreshed again. A long-lived login onto an entry that names an `importFrom` file removes that delegation, since the file would be read over the saved token on every load. On an entry that still names `importFrom`, the mark is ignored: that file is a refreshing login.
+
+A token you already have from `claude setup-token` can be used without this command: add an entry by hand with `"type": "oauth"`, `"longLived": true` and the token as `"accessToken"` (see `config.example.json`). Without an `"expiresAt"` (epoch ms) on the entry, the proxy does not know when the token ends and cannot warn ahead of it.
+
 ## Import from Claude Code
 
 If you already have Claude Code set up, import its credentials directly:
@@ -235,7 +261,7 @@ Accounts can also be added, removed and reordered from the TUI settings screen: 
 
 An account leaves rotation as `error` when upstream rejects its refresh token, or answers 401 to a token that has none to refresh with. `teamclaude status` names which, instead of pointing at the logs — `needs a re-login: upstream rejected its refresh token (400 invalid_grant: Refresh token expired); last good refresh 3d ago — run: teamclaude login`, with the token endpoint's own OAuth error and description when it sent them, and when the last refresh that worked happened if this process saw one — and `GET /teamclaude/status` carries the same under `accounts[].errorReason`: `code` (`refresh_rejected` or `credential_rejected`), `detail`, `since` (epoch ms), `remedy`, the login command that brings it back, and `link` (`null` here). It is `null` whenever the account is not in `error`. `accounts[].lastRefreshAt` (epoch ms, `null` until a refresh succeeds in this process) is the last refresh that worked: an expired token after days idle reads differently from one rotated away by a login elsewhere. The TUI names the reason in the status column (`re-login` for those two codes, `on hold` for `account_on_hold`, `refused` for upstream's other account refusals below, `error` for any other) and draws the same line under the account's row. For a Claude account, upstream rejects the refresh token only with the token endpoint's own `invalid_grant`, or with a refusal for an account on hold (`account_on_hold`, below). Any other `400`, `401` or `403` to a refresh, such as a page from a firewall or proxy in front of the endpoint, or an OAuth error about the client or the request, leaves the account in rotation with its token, as a `5xx` does. Unlike a `5xx`, it also holds that refresh token for 30 seconds: no request or probe sends it again until then, while a different one that reaches the account (a sign-in, an import, a renewal another install stored on callback.net, once a sync pass takes it) is tried at once. An account has one such hold at a time: if that different token is answered the same way, its own hold replaces the first.
 
-**Knowing ahead of time.** A refresh token can have a lifetime of its own, counted from the sign-in and not extended by the refreshes in between; once it lapses the account needs a new login whatever state it was in. TeamClaude shows that date only where it was stated: by the token endpoint's response at login or refresh, or by the credential file an account was imported from (Claude Code's own store carries `refreshTokenExpiresAt`). It never assumes a lifetime, so an account for which nobody stated a date shows none, and that says nothing about how long its token has left. Which field the token endpoint uses, if any, is not confirmed: `refresh_token_expires_in` and `refresh_token_expires_at` are both read. Where the date is known, `teamclaude status` prints it under the account — `Login    refresh token expires in 6 days (2026-12-10)` — and `GET /teamclaude/status` / `status --json` carry it as `accounts[].refreshTokenExpiresAt` (epoch ms; the key is absent when unknown). From 5 days out the row turns yellow and names the login command, the TUI draws the same line under the account's row, and the running server logs one line per account per day: `Account "<name>": its refresh token expires in 3 days — run: teamclaude login`. Past the date it reads `expired` for as long as the account is still in rotation. A refresh keeps the earlier of the date held and the one newly stated; a new login or import replaces it, or clears it when it states none. With [callback.net sync](#syncing-accounts-across-machines-callbacknet), the date travels in the same row as the token it describes, between installs recent enough to write it; a token taken from an older install arrives without one.
+**Knowing ahead of time.** A refresh token can have a lifetime of its own, counted from the sign-in and not extended by the refreshes in between; once it lapses the account needs a new login whatever state it was in. TeamClaude takes that date from where it is stated: the token endpoint's response at login or refresh (`refresh_token_expires_in`, the field Claude Code reads; `refresh_token_expires_at` is read too), or the credential file an account was imported from (Claude Code's own store carries `refreshTokenExpiresAt`). For a Claude account, a `teamclaude login` whose response states no lifetime records 30 days from the sign-in, which is what Claude Code records in the same case, and matches the 28 to 30 days measured in [#674](https://github.com/KarpelesLab/teamclaude/issues/674). That date is an expectation, not a statement from the provider: if a refresh still succeeds after it, the date is dropped. Nothing else is assumed: a refresh that states no lifetime leaves the date as it was, a Codex login gets one only when its response states it, and an account signed in before this was recorded shows none until its next login, which says nothing about how long its token has left. Where the date is known, `teamclaude status` prints it under the account — `Login    refresh token expires in 6 days (2026-12-10)` — and `GET /teamclaude/status` / `status --json` carry it as `accounts[].refreshTokenExpiresAt` (epoch ms; the key is absent when unknown). From 5 days out the row turns yellow and names the login command, the TUI draws the same line under the account's row, and the running server logs one line per account per day: `Account "<name>": its refresh token expires in 3 days — run: teamclaude login`. Past the date it reads `expired` for as long as the account is still in rotation. A refresh keeps the earlier of the date held and the one newly stated; a new login or import replaces it, or clears it when it states none. With [callback.net sync](#syncing-accounts-across-machines-callbacknet), the date travels in the same row as the token it describes, between installs recent enough to write it; a token taken from an older install arrives without one.
 
 It also leaves rotation when upstream refuses the account itself ([account refusals](routing.md#account-refusals)). Then `code` is upstream's error code, such as `verification_required` or `account_on_hold`, `detail` is upstream's message, and `link` is the address in that message when it is a plain https link on `claude.ai`, `anthropic.com` (or a subdomain of either) or `platform.claude.com`. Status reads `refused by upstream: <message> — once resolved, run: teamclaude login`: resolve it at the link, then sign in again to bring the account back. A sign-in on another install signed in to [callback.net](#syncing-accounts-across-machines-callbacknet) puts it back in rotation here too, at this install's next pass. So does any other new token for the account, since this install cannot tell one from a sign-in: one another install renewed, at the next pass, or tokens changed on disk, at the next reload. That is a trade-off: if upstream still refuses the account, the first request sent to it is refused again and fails over, which takes the account out of rotation again, and until then status shows it active, without the refusal. A refused account's refresh token failing afterwards does not replace the refusal, and a refusal replaces a dead-token error, since signing in again alone would not bring the account back.
 
@@ -555,6 +581,71 @@ just reset. The whole decision — token refresh, credit read and redemption —
 held to a 10-second budget, because the waiting client's patience for the
 response head is finite and the retry needs the rest of it. Every attempt and outcome is
 logged.
+
+### The spending strategy
+
+A Codex reset does one more thing than it says: besides clearing the spent
+weekly window it **restarts the 7-day timer from the moment of redemption**
+(verified on a live account; an Anthropic reset leaves the timer where it was).
+That has two consequences the switch above knows nothing about.
+
+- A credit buys the days left to the natural reset, not a week. An account
+  whose reset was T days away gets T days of fresh window and then the reset it
+  would have had anyway: the credit was worth **T/7 of a week**. Spent the day
+  before the natural reset, it bought almost nothing.
+- Redeeming several accounts at once moves all their timers to the same
+  moment. A pool whose resets were spread across the week — what keeps one
+  account available while another is out — collapses into a **sawtooth**: a
+  full pool, then a dry fleet, together, every seven days.
+
+Three keys shape what the switch spends, all off unless set, so a fleet that
+never sets them behaves exactly as before. They narrow the automatic policy and
+never widen it: every condition above still has to hold.
+
+- [`autoRedeemMinDaysToReset`](configuration.md) — never auto-redeem an
+  account whose natural reset is closer than this many days. The account is
+  skipped with a line in the log saying what the credit would have bought. An
+  account whose reset time is not known cannot be shown to clear the floor and
+  is skipped too. The floor also holds for a credit that is about to expire.
+- [`autoRedeemMaxShare`](configuration.md) — of the armed accounts whose
+  natural resets fall on the same UTC calendar day (a **cohort**), redeem at
+  most this share (rounded up), most-exhausted first, so the rest keep their
+  phase. The cohort is sized as it was before any of it was redeemed this week;
+  otherwise each redemption would shrink it and let the next one through. A
+  cohort is a calendar day, not a 24-hour span: two resets an hour apart on
+  either side of 00:00 UTC are in different cohorts. An account whose reset
+  time is not known is in no cohort, and this cap does not hold it.
+- [`autoRedeemMaxPerDay`](configuration.md) — at most this many automatic
+  redemptions per rolling 24 hours, across all Codex accounts.
+
+A credit you spend by hand from the resets panel is not stopped by any of the
+three. It is still recorded: it counts towards its cohort's share, because it
+moved that account's timer like any other redemption, and it does not count
+towards `autoRedeemMaxPerDay`, which limits only what is spent automatically.
+
+The record of past redemptions covers one week and is kept in memory. A restart
+forgets it: the per-day count starts again at zero and a cohort is sized on the
+accounts it has at that moment. The three keys are read at each refusal, so a
+change applies on the next reload without a restart.
+
+All three concern Codex accounts only. A
+[Claude banked reset](#claude-banked-usage-limit-resets) leaves the weekly
+timer where it was, so none of them is applied to it.
+
+Every account the policy passes over is logged, once per reason and at most
+every ten minutes while the reason stands:
+`[TeamClaude] Codex rate-limit reset on "<name>" skipped — <reason>`.
+
+While `autoRedeemResets` is on, `teamclaude status` prints a `Redeem` line
+under each Codex account — `armed` or `exempt — <reason>`, and what a credit
+spent now is worth (`credit worth 0.43 of a week (3.0d to reset)`). The JSON
+carries the same under `accounts[].autoRedeem`
+(`{ armed, exemptReason, creditValueWeeks }`; `null` on a non-Codex row, and on
+every row while the switch is off) and the fleet's `redeemPolicy`
+(`{ minDaysToReset, maxShare, maxPerDay, redeemedLast24h }`, where
+`redeemedLast24h` counts automatic redemptions). `armed` is about the policy
+and the caps, not the moment: an armed account whose weekly window is still
+healthy is armed and simply not exhausted.
 
 ## Claude banked usage-limit resets
 

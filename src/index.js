@@ -5,14 +5,15 @@ import { createInterface } from 'node:readline';
 import { createWriteStream, existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import net from 'node:net';
-import { loadOrCreateConfig, loadConfig, loadConfigPersistingIds, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, getQuotaSeriesPath, getUsageDbPath, loadState, saveState } from './config.js';
+import { loadOrCreateConfig, loadConfig, loadConfigPersistingIds, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, getQuotaSeriesPath, getUsageDbPath, loadState, createStatePersister } from './config.js';
 import { loadQuotaSeries, saveQuotaSeries } from './quota-series.js';
 import { installCrashHandlers } from './crash-log.js';
-import { AccountManager, distributionMode, accountRouting } from './account-manager.js';
+import { AccountManager, distributionMode, accountRouting, isLongLived } from './account-manager.js';
 import { validateAdaptiveConfig } from './adaptive-distribution.js';
 import { createProxyServer, NO_USAGE_STORE, reloadedHeaderFlags, resolveAccountPin } from './server.js';
 import { openUsageStore, startTicks, closeUsageStore } from './usage/db.js';
 import { createDrainState, resolveDrainTimeoutSeconds } from './drain.js';
+import { compactBeforeSwitchStatus } from './compact-before-switch.js';
 import { importCredentials, loginOAuth, loginOAuthWithPastedCode, startOAuthLogin, fetchProfile, profileForCredentials, refreshAccessToken, isTokenExpired, isTokenExpiringSoon } from './oauth.js';
 import {
   sameIdentity,
@@ -357,6 +358,7 @@ async function serverCommand() {
   const earlyConsole = tuiExpected ? captureEarlyConsole() : null;
 
   const config = await loadOrCreateConfig();
+  const persistSessionAffinity = config.persistSessionAffinity === true;
   // Token writes below pair rows by entry id against a re-read of the file, so
   // the ids have to be on disk before the first refresh, not just in memory.
   await persistMintedAccountIds(config);
@@ -429,6 +431,8 @@ async function serverCommand() {
     return null;
   });
   if (savedState?.quota) accountManager.restoreQuotaState(savedState.quota);
+  // Startup-only opt-in: reload cannot reimport an older affinity snapshot.
+  if (persistSessionAffinity) accountManager.restoreAffinityState(savedState?.affinity);
 
   // Per-client usage (proxy.clientKeys). Restored alongside quota so the
   // per-client counters survive a restart the same way rotation state does.
@@ -458,9 +462,10 @@ async function serverCommand() {
   accountManager.selectActiveAccount();
 
   // Periodically persist quota (and once more on shutdown) to the state file.
-  const persistQuotaState = () =>
-    saveState({ quota: accountManager.exportQuotaState(), clients: clientUsage.exportState(), usageDimensions: dimensionUsage.exportState() })
-      .catch(err => console.error(`[TeamClaude] Failed to save quota state: ${err.message}`));
+  const persistQuotaState = createStatePersister(() => ({
+    quota: accountManager.exportQuotaState(), clients: clientUsage.exportState(), usageDimensions: dimensionUsage.exportState(),
+    ...(persistSessionAffinity ? { affinity: accountManager.exportAffinityState() } : {}),
+  }), { onError: err => console.error(`[TeamClaude] Failed to save quota state: ${err.message}`) });
   let quotaSaveInterval = null;
   // Sampled on the same minute tick, but only written when a sample was taken
   // or something was pruned: about once per SAMPLE_INTERVAL_MS.
@@ -705,9 +710,19 @@ async function serverCommand() {
     // and this one has to hot-apply in particular: "stop spending credits" must
     // not wait for a restart.
     config.autoRedeemResets = diskConfig.autoRedeemResets === true;
+    // The spending strategy beside the switch (codex-reset-policy.js), read
+    // off this object per refusal the same way. Copied raw: the redeemer
+    // normalises each knob as it reads it, so a bad value here is "off" there
+    // rather than a reload that fails.
+    config.autoRedeemMinDaysToReset = diskConfig.autoRedeemMinDaysToReset;
+    config.autoRedeemMaxShare = diskConfig.autoRedeemMaxShare;
+    config.autoRedeemMaxPerDay = diskConfig.autoRedeemMaxPerDay;
     // Read by the prober off this object per cycle, like the switch above.
     config.probeDisabledAccounts = diskConfig.probeDisabledAccounts === true;
     config.blockedModels = Array.isArray(diskConfig.blockedModels) ? diskConfig.blockedModels : [];
+    // Resolved off this object per request (server.js compactAskFor), so the
+    // assignment is the whole application, and removing the key turns it off.
+    config.compactBeforeSwitch = diskConfig.compactBeforeSwitch;
     // Sampled off this object when each request is dispatched (server.js
     // shouldStripOverageHeaders / shouldSynthesizeQuotaHeaders), so the reload
     // applies to subsequent requests.
@@ -947,11 +962,20 @@ async function serverCommand() {
   // Banked Claude usage-limit resets are armed by the same switch.
   hooks.redeemClaudeResetForPool = (/** @type {Record<string, any>[]} */ accounts, /** @type {{ model?: string|null }} */ opts) => claudeRedeemer.maybeRedeemForPool(accounts, opts);
   hooks.redeemCodexResetForPool = (/** @type {Record<string, any>[]} */ accounts) => redeemer.maybeRedeemForPool(accounts);
+  // The spending strategy's view of each Codex account, for the status payload.
+  // Read-only: nothing reached through it spends a credit.
+  hooks.describeAutoRedeem = (/** @type {Record<string, any>} */ account) => redeemer.describe(account);
   hooks.getStatusExtra = () => ({
+    // The reset-credit spending strategy as it stands, read live like the
+    // switch it qualifies (codex-reset-policy.js).
+    redeemPolicy: redeemer.policyStatus(),
     // Read live from the shared config (not a startup snapshot) so the TUI's
     // blocklist editor shows up in `status` immediately, the same way the
     // per-request gate in server.js picks it up.
     blockedModels: [...(config.blockedModels || [])],
+    // `compactBeforeSwitch` as the request path resolves it, read off the same
+    // live object, with the count of requests it has answered since start.
+    compactBeforeSwitch: compactBeforeSwitchStatus(config.compactBeforeSwitch, accountManager.compactAsks),
     // Per-client usage (proxy.clientKeys) — empty object when unconfigured.
     clients: clientUsage.export(),
     // Per-dimension usage (proxy.usageDimensions) — empty when unconfigured.
@@ -1473,6 +1497,22 @@ async function upsertCodexAccount(requestedName, creds, routing = null, storeRou
 }
 
 async function loginCommand() {
+  if (args.includes('--long-lived')) {
+    if (['--api', '--codex', '--oauth'].some(f => args.includes(f))) {
+      console.error('--long-lived is a Claude subscription login and cannot be combined with --api, --codex or --oauth');
+      process.exit(1);
+    }
+    // Before anything is opened or asked: the token this login returns carries
+    // `user:inference` alone, so the profile that names every other login
+    // cannot be read with it, and the name is all the account is known by.
+    if (!argValue('--name')) {
+      console.error('--long-lived needs --name: its token serves inference only, so the account cannot be named from its profile.');
+      console.error('Usage: teamclaude login --long-lived --name <name>   (the name of an existing account renews that one)');
+      process.exit(1);
+    }
+    await loginOAuthCommand({ pasteOnly: true, longLived: true });
+    return;
+  }
   if (args.includes('--api')) {
     await loginApiCommand();
     return;
@@ -1564,7 +1604,7 @@ async function loginApiCommand() {
   await notifyRunningServer(config);
 }
 
-async function loginOAuthCommand({ pasteOnly = false } = {}) {
+async function loginOAuthCommand({ pasteOnly = false, longLived = false } = {}) {
   const loaded = await loadOrCreateConfig(); // first run: create the file; the save re-reads it
   let name = argValue('--name');
   const { routing, store } = loginRouting(loaded);
@@ -1578,12 +1618,13 @@ async function loginOAuthCommand({ pasteOnly = false } = {}) {
   if (remote) console.log('This looks like a remote session (SSH, or no display): sign in on any device and paste the code back here.\n');
   let creds;
   try {
-    creds = pasteOnly || remote ? await loginOAuthWithPastedCode({ routing }) : await loginOAuth({ routing });
+    creds = pasteOnly || remote ? await loginOAuthWithPastedCode({ routing, longLived }) : await loginOAuth({ routing });
   } catch (err) {
     // sanitizeText: as for Codex, the reason can quote the provider.
     console.error(`OAuth login failed: ${sanitizeText(err?.message || err)}`);
     console.error('');
     console.error('Alternatives:');
+    if (longLived) console.error('  teamclaude login --token An ordinary login, refreshed as it expires');
     console.error('  teamclaude import        Import from existing Claude Code credentials');
     console.error('  teamclaude login --api   Add an API key instead');
     process.exit(1);
@@ -2122,7 +2163,7 @@ async function accountsCommand() {
   // account's own routing when it has one — this is that account's traffic.
   const refreshed = [];
   await Promise.all(config.accounts.map(async (a) => {
-    if (a.type !== 'oauth' || !a.refreshToken) return;
+    if (a.type !== 'oauth' || !a.refreshToken || isLongLived(a)) return;
     if (!isTokenExpiringSoon(a.expiresAt)) return;
     try {
       // Through the callback.net lock when signed in there, as the running
@@ -2162,7 +2203,8 @@ async function accountsCommand() {
   // Fetch profiles in parallel for all OAuth accounts
   const profiles = await Promise.all(
     config.accounts.map(a =>
-      a.type === 'oauth' && a.accessToken ? fetchProfile(a.accessToken, accountRouting(a, localListener(config))) : null
+      // Not a long-lived account: its token cannot read the profile (403).
+      a.type === 'oauth' && a.accessToken && !isLongLived(a) ? fetchProfile(a.accessToken, accountRouting(a, localListener(config))) : null
     )
   );
 
@@ -2244,7 +2286,9 @@ async function accountsCommand() {
     // OAuth account
     const hasProfile = p && !p.error;
     const tier = hasProfile ? (p.hasClaudeMax ? 'Max' : p.hasClaudePro ? 'Pro' : 'subscription') : null;
-    const status = hasProfile ? `Claude ${tier}` : `unknown (${p?.error || 'no token'})`;
+    const status = hasProfile ? `Claude ${tier}`
+      : isLongLived(a) ? 'long-lived token, inference only'
+      : `unknown (${p?.error || 'no token'})`;
     const src = a.source ? `, ${a.source}` : '';
     console.log(`  [${i + 1}] ${a.name} (${status}${src})`);
     if (hasProfile && p.email && p.email !== a.name) console.log(`       Email: ${p.email}`);
@@ -3168,6 +3212,9 @@ Commands:
   import              Import credentials from Claude Code
   login               OAuth login via browser (over SSH: copy/paste, as --token)
   login --token       OAuth login via copy/paste (no local callback; for headless/remote)
+  login --long-lived --name <name>
+                      Copy/paste login for a one-year token, as claude setup-token
+                      makes: inference only, never refreshed, no usage reads
   login --codex       Codex (ChatGPT) login via browser; on a terminal the address
                       the browser lands on can be pasted instead (--no-browser)
   login --api         Add an API key account (a last resort by default:
@@ -3388,10 +3435,16 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
   // refresh token is still good, so a stale token is renewed first and the
   // renewed pair is what gets saved below — `creds` is the set to write.
   const userNamed = !!name;
+  // A long-lived token (long-lived.js) is not asked: the profile endpoint
+  // needs a scope it does not carry and would answer 403. What stands in is
+  // the shape of a profile that could not be read, so the account goes by the
+  // name given, which loginCommand has already required.
+  const longLived = creds.longLived === true;
   // The refresh goes through the callback.net lock when this install is
   // signed in there: the token being imported may be one the store holds, and
   // so one other installs hold too.
-  const identified = await profileForCredentials(creds, routing, {
+  /** @type {{ creds: Record<string, any>, profile: Record<string, any> }} */
+  const identified = longLived ? { creds, profile: { error: 'a long-lived token cannot read its profile', status: null } } : await profileForCredentials(creds, routing, {
     renew: (c) => refreshOutsideProxy({ name: name || 'imported account', type: 'oauth', accessToken: c.accessToken, refreshToken: c.refreshToken, expiresAt: c.expiresAt, refreshTokenExpiresAt: c.refreshTokenExpiresAt }, (o) => refreshAccessToken(c.refreshToken, undefined, routing, o), { force: true })
       .then((t) => t ?? Promise.reject(new Error('token not renewed'))),
   });
@@ -3415,7 +3468,9 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
     process.exit(1);
   }
 
-  if (!profileOk) {
+  if (longLived) {
+    console.log('A long-lived token serves inference only: the account is saved under the name given, with no profile lookup.');
+  } else if (!profileOk) {
     console.error(`Warning: importing named account without profile detection — ${profile?.error ? sanitizeText(profile.error) : 'profile unavailable'}`);
   }
   if (!name && profile?.email) {
@@ -3458,7 +3513,14 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
       // re-login updateAccountEntry spreads incoming over prev, so the routing
       // the entry already had survives instead of being silently cleared.
       ...(routing && storeRouting ? { routing: routingToUrl(routing) } : {}),
+      ...(longLived && { longLived: true }),
     };
+    // No profile was read for a long-lived login, so it states no plan. The
+    // keys are left off rather than written as null: onto an entry of the
+    // same name, what an earlier full login learned about the account stays.
+    if (longLived) {
+      for (const field of ['organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro']) delete (/** @type {Record<string, any>} */ (account))[field];
+    }
     // When the refresh token lapses, if these credentials came with it.
     setRefreshTokenExpiry(account, creds.refreshTokenExpiresAt);
 

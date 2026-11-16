@@ -3,9 +3,19 @@ import { sameIdentity } from './identity.js';
 import { safeLine } from './safe-text.js';
 import { removedAccountIds, addedAccountIds, configIndexFor } from './account-pairing.js';
 import { ensureAccountIds } from './account-id.js';
-import { accountSwitchThreshold, accountAllowsExtraUsage, accountRouting, accountEndsAt } from './account-manager.js';
+import { accountSwitchThreshold, accountAllowsExtraUsage, accountRouting, accountEndsAt, isLongLived } from './account-manager.js';
 import { localListener } from './upstream-proxy.js';
 import { accountCredit } from './api-credit.js';
+
+// A long-lived login sets `longLived` and drops `importFrom` on disk; a config
+// row still holding the old pair would write it back on the next save. Only
+// that login's removal of `importFrom` is mirrored: on a row that is not
+// long-lived the key is left as a reload has always left it.
+/** @param {Record<string, any>} cfgAcct @param {Record<string, any>} diskAcct */
+function mirrorCredentialSource(cfgAcct, diskAcct) {
+  if (diskAcct.longLived === true) cfgAcct.longLived = true; else delete cfgAcct.longLived;
+  if (diskAcct.longLived === true && !diskAcct.importFrom) delete cfgAcct.importFrom;
+}
 
 /**
  * Sync accounts from disk config: add new accounts and refresh credentials
@@ -85,6 +95,8 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
         memConfig.accounts.push(diskAcct);
         ensureAccountIds(memConfig.accounts);
         cfgClaimed.add(memConfig.accounts.length - 1);
+      } else {
+        mirrorCredentialSource(cfgAcct, diskAcct);
       }
       accountManager.addAccount(diskAcct);
       claimed.add(accountManager.accounts.length - 1);
@@ -142,6 +154,7 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     // (an API key, a third-party backend, a Codex login) stays opted out on
     // reload as it was at startup; the warning was makeAccount's to give.
     mgr.allowExtraUsage = accountAllowsExtraUsage(diskAcct);
+    mgr.preferExtraUsage = mgr.allowExtraUsage && diskAcct.preferExtraUsage === true;
     // Same for a per-account routing proxy: it is read per request off this
     // object (server.js forwardRequest, ensureTokenFresh, the prober), so a
     // disk edit or a `teamclaude routing` change takes effect on the very next
@@ -206,11 +219,13 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
       // As written, not as parsed: the entry keeps the operator's own text.
       if (diskAcct.endsAt != null) cfgAcct.endsAt = diskAcct.endsAt; else delete cfgAcct.endsAt;
       if (diskAcct.allowExtraUsage === true) cfgAcct.allowExtraUsage = true; else delete cfgAcct.allowExtraUsage;
+      if (diskAcct.preferExtraUsage === true) cfgAcct.preferExtraUsage = true; else delete cfgAcct.preferExtraUsage;
       // Both polarities are mirrored, unlike the flags above: `false` is the
       // side of this key that does something, so a stale mirror of either value
       // would win the save stencil's spread and undo the disk edit.
       if (typeof diskAcct.autoRedeemReset === 'boolean') cfgAcct.autoRedeemReset = diskAcct.autoRedeemReset;
       else delete cfgAcct.autoRedeemReset;
+      mirrorCredentialSource(cfgAcct, diskAcct);
     }
     // Pick up enable/disable toggles; re-enabling clears a stuck error state.
     const wantDisabled = !!diskAcct.disabled;
@@ -238,14 +253,19 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     if (!freshCred) continue;
 
     if (freshCred.accessToken) {
-      const changed = mgr.credential !== freshCred.accessToken ||
-        // The manager keeps a missing refresh token as null, the disk entry as undefined.
-        (mgr.refreshToken || null) !== (freshCred.refreshToken || null);
+      // Only a login writes `longLived`, so a change to it is a newer credential
+      // whatever the expiries say: a year-long token outlasts any ordinary one.
+      const wantLongLived = isLongLived(diskAcct);
+      const modeChanged = mgr.longLived !== wantLongLived;
+      const changed = modeChanged || mgr.credential !== freshCred.accessToken ||
+        (mgr.refreshToken || null) !== (wantLongLived ? null : freshCred.refreshToken || null);
       // Don't overwrite in-memory credentials with staler ones from disk
       // (e.g. after a TUI import updated the AM before saveConfig wrote to disk)
-      const diskIsStaler = freshCred.expiresAt && mgr.expiresAt &&
+      const diskIsStaler = !modeChanged && freshCred.expiresAt && mgr.expiresAt &&
         freshCred.expiresAt < mgr.expiresAt;
       if (changed && !diskIsStaler) {
+        mgr.longLived = wantLongLived;
+        if (wantLongLived) mgr.refreshToken = null;
         accountManager.updateAccountTokens(mgr.index, freshCred);
         console.log(`[TeamClaude] Refreshed credentials for "${safeLine(mgr.name, 64)}"`);
       }
