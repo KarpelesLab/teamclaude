@@ -78,13 +78,23 @@ function assertPlanPassedThrough(headers) {
 }
 
 // Read a response head off `sock` until the blank line that ends it, however
-// the bytes are split into chunks. A close before that point, or no head within
-// `timeoutMs`, fails with what did arrive instead of hanging the test.
-function readHead(sock, timeoutMs = 5000) {
+// the bytes are split into chunks. A close before that point fails with what
+// did arrive. A head that never comes has no deadline here: the test waits, the
+// runner's timeout fails it, and `signal` (the test's t.signal, which node:test
+// aborts once the test has ended however it ended) destroys the socket, so the
+// wait ends on that close and the caller's teardown runs (test/README.md,
+// "Clean up in `finally`").
+/**
+ * @param {net.Socket} sock
+ * @param {AbortSignal} signal
+ * @returns {Promise<string>}
+ */
+function readHead(sock, signal) {
   return new Promise((resolve, reject) => {
     let text = '';
+    const onAbort = () => sock.destroy();
     const done = (fn, v) => {
-      clearTimeout(timer);
+      signal.removeEventListener('abort', onAbort);
       sock.off('data', onData);
       sock.off('close', onClose);
       fn(v);
@@ -95,9 +105,10 @@ function readHead(sock, timeoutMs = 5000) {
       if (end !== -1) done(resolve, text.slice(0, end + 4));
     };
     const onClose = () => done(reject, new Error(`socket closed before the end of the response head; received ${JSON.stringify(text)}`));
-    const timer = setTimeout(() => done(reject, new Error(`no complete response head within ${timeoutMs} ms; received ${JSON.stringify(text)}`)), timeoutMs);
     sock.on('data', onData);
     sock.on('close', onClose);
+    if (signal.aborted) onAbort();
+    else signal.addEventListener('abort', onAbort, { once: true });
   });
 }
 
@@ -364,7 +375,7 @@ test('relayRaw (POST /v1/oauth/token) with stripOverageHeaders unset forwards ev
   }
 });
 
-test('relayUpgrade: overage headers are dropped from the 101 handshake, others kept', async () => {
+test('relayUpgrade: overage headers are dropped from the 101 handshake, others kept', async (t) => {
   const upstream = http.createServer(() => {});
   const upstreamPort = await listen(upstream);
   upstream.on('upgrade', (req, socket) => {
@@ -388,7 +399,7 @@ test('relayUpgrade: overage headers are dropped from the 101 handshake, others k
       'GET /v1/session_ingress/ws/abc HTTP/1.1\r\nHost: 127.0.0.1\r\n' +
       'Upgrade: websocket\r\nConnection: Upgrade\r\nauthorization: Bearer client-own-token\r\n\r\n',
     );
-    const text = await readHead(client);
+    const text = await readHead(client, t.signal);
     assert.match(text, /101 Switching Protocols/);
     assert.doesNotMatch(text, /overage/i);
     assert.doesNotMatch(text, /upgrade-paths/i);
@@ -422,7 +433,12 @@ function upgradeUpstream(statusLine) {
   return upstream;
 }
 
-async function handshakeThroughProxyServer(statusLine, extraConfig = {}) {
+/**
+ * @param {import('node:test').TestContext} t
+ * @param {string} statusLine
+ * @param {Record<string, unknown>} [extraConfig]
+ */
+async function handshakeThroughProxyServer(t, statusLine, extraConfig = {}) {
   const upstream = upgradeUpstream(statusLine);
   const upstreamPort = await listen(upstream);
   const am = new AccountManager(
@@ -443,7 +459,7 @@ async function handshakeThroughProxyServer(statusLine, extraConfig = {}) {
     );
     // Read until the end of the response head (a 101 keeps the socket open; a
     // refused handshake is followed by a close).
-    return await readHead(client);
+    return await readHead(client, t.signal);
   } finally {
     client.destroy();
     proxy.close();
@@ -453,32 +469,32 @@ async function handshakeThroughProxyServer(statusLine, extraConfig = {}) {
   }
 }
 
-test('createProxyServer upgrade listener: 101 handshake strips overage headers when enabled', async () => {
-  const text = await handshakeThroughProxyServer('101 Switching Protocols', { stripOverageHeaders: true });
+test('createProxyServer upgrade listener: 101 handshake strips overage headers when enabled', async (t) => {
+  const text = await handshakeThroughProxyServer(t, '101 Switching Protocols', { stripOverageHeaders: true });
   assert.match(text, /101 Switching Protocols/);
   assert.doesNotMatch(text, /overage/i);
   assert.doesNotMatch(text, /upgrade-paths/i);
   assert.match(text, /anthropic-ratelimit-unified-5h-status: allowed/);
 });
 
-test('createProxyServer upgrade listener: stripOverageHeaders unset keeps overage headers on the 101', async () => {
-  const text = await handshakeThroughProxyServer('101 Switching Protocols');
+test('createProxyServer upgrade listener: stripOverageHeaders unset keeps overage headers on the 101', async (t) => {
+  const text = await handshakeThroughProxyServer(t, '101 Switching Protocols');
   assert.match(text, /101 Switching Protocols/);
   assert.match(text, /anthropic-ratelimit-unified-overage-disabled-reason: org_level_disabled/);
   assert.match(text, /anthropic-ratelimit-unified-upgrade-paths: extra_usage/);
   assert.match(text, /anthropic-ratelimit-unified-5h-status: allowed/);
 });
 
-test('createProxyServer upgrade listener: a refused handshake (403) strips overage headers, keeps the status header', async () => {
-  const text = await handshakeThroughProxyServer('403 Forbidden', { stripOverageHeaders: true });
+test('createProxyServer upgrade listener: a refused handshake (403) strips overage headers, keeps the status header', async (t) => {
+  const text = await handshakeThroughProxyServer(t, '403 Forbidden', { stripOverageHeaders: true });
   assert.match(text, /^HTTP\/1\.1 403 Forbidden/);
   assert.doesNotMatch(text, /overage/i);
   assert.doesNotMatch(text, /upgrade-paths/i);
   assert.match(text, /anthropic-ratelimit-unified-5h-status: allowed/);
 });
 
-test('createProxyServer upgrade listener: a refused handshake with stripOverageHeaders false keeps overage headers', async () => {
-  const text = await handshakeThroughProxyServer('403 Forbidden', { stripOverageHeaders: false });
+test('createProxyServer upgrade listener: a refused handshake with stripOverageHeaders false keeps overage headers', async (t) => {
+  const text = await handshakeThroughProxyServer(t, '403 Forbidden', { stripOverageHeaders: false });
   assert.match(text, /^HTTP\/1\.1 403 Forbidden/);
   assert.match(text, /anthropic-ratelimit-unified-overage-disabled-reason: org_level_disabled/);
   assert.match(text, /anthropic-ratelimit-unified-5h-status: allowed/);
@@ -567,24 +583,34 @@ test('createProxyServer upgrade listener: a refused handshake whose headers all 
 // the flag to relayUpgrade separately from createProxyServer. These drive a
 // handshake through a real terminated CONNECT tunnel, as
 // mitm-upgrade-host.test.js does, so a dropped argument there fails here.
-// Bounded: a CONNECT reply or TLS handshake that stalls, or a socket that
-// closes first, rejects within `timeoutMs` and destroys both sockets, so the
-// caller's teardown runs instead of waiting on the test timeout.
-function connectThroughProxy(proxyPort, target, caCertPem, timeoutMs = 10_000) {
+// A socket that closes before the handshake finishes rejects and destroys both
+// sockets. A CONNECT reply or TLS handshake that stalls has no deadline: the
+// runner's timeout fails the test, and `signal` (the test's t.signal) then
+// rejects this the same way, so the caller's teardown runs.
+/**
+ * @param {number} proxyPort
+ * @param {string} target
+ * @param {string} caCertPem
+ * @param {AbortSignal} signal
+ * @returns {Promise<tls.TLSSocket>}
+ */
+function connectThroughProxy(proxyPort, target, caCertPem, signal) {
   return new Promise((resolve, reject) => {
     const raw = net.connect(proxyPort, '127.0.0.1');
     /** @type {tls.TLSSocket | null} */
     let sock = null;
     let settled = false;
-    const fail = (err) => {
+    const fail = (/** @type {Error} */ err) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      signal.removeEventListener('abort', onAbort);
       sock?.destroy();
       raw.destroy();
       reject(err);
     };
-    const timer = setTimeout(() => fail(new Error(`CONNECT/TLS setup did not finish within ${timeoutMs} ms`)), timeoutMs);
+    const onAbort = () => fail(new Error('the test ended before the CONNECT/TLS setup finished'));
+    if (signal.aborted) onAbort();
+    else signal.addEventListener('abort', onAbort, { once: true });
     const onClose = () => fail(new Error('socket closed before the TLS handshake finished'));
     raw.once('error', fail);
     raw.once('close', onClose);
@@ -599,7 +625,7 @@ function connectThroughProxy(proxyPort, target, caCertPem, timeoutMs = 10_000) {
       sock = tls.connect({ socket: raw, servername: 'localhost', ca: [caCertPem], ALPNProtocols: ['http/1.1'] }, () => {
         if (settled) return;
         settled = true;
-        clearTimeout(timer);
+        signal.removeEventListener('abort', onAbort);
         raw.removeListener('error', fail);
         raw.removeListener('close', onClose);
         resolve(sock);
@@ -624,7 +650,11 @@ function trackSockets(server) {
   return () => { for (const s of sockets) s.destroy(); };
 }
 
-async function handshakeThroughMitm(extraConfig = {}) {
+/**
+ * @param {import('node:test').TestContext} t
+ * @param {Record<string, unknown>} [extraConfig]
+ */
+async function handshakeThroughMitm(t, extraConfig = {}) {
   const { caCertPem, leafCertPem, leafKeyPem } = generateCertChain('localhost');
   const upstream = upgradeUpstream('101 Switching Protocols');
   const destroyUpstreamSockets = trackSockets(upstream);
@@ -645,14 +675,14 @@ async function handshakeThroughMitm(extraConfig = {}) {
   const proxyPort = await listen(proxy);
   let tlsSock;
   try {
-    tlsSock = await connectThroughProxy(proxyPort, `127.0.0.1:${upPort}`, caCertPem);
+    tlsSock = await connectThroughProxy(proxyPort, `127.0.0.1:${upPort}`, caCertPem, t.signal);
     tlsSock.write(
       'GET /v1/session_ingress/ws/abc HTTP/1.1\r\n' +
       `Host: 127.0.0.1:${upPort}\r\n` +
       'Upgrade: websocket\r\nConnection: Upgrade\r\n' +
       'authorization: Bearer client-own-token\r\n\r\n',
     );
-    return await readHead(tlsSock);
+    return await readHead(tlsSock, t.signal);
   } finally {
     tlsSock?.destroy();
     destroyProxySockets();
@@ -664,16 +694,16 @@ async function handshakeThroughMitm(extraConfig = {}) {
   }
 }
 
-test('MITM upgrade listener: 101 handshake strips overage headers when enabled', { timeout: 30000 }, async () => {
-  const text = await handshakeThroughMitm({ stripOverageHeaders: true });
+test('MITM upgrade listener: 101 handshake strips overage headers when enabled', async (t) => {
+  const text = await handshakeThroughMitm(t, { stripOverageHeaders: true });
   assert.match(text, /101 Switching Protocols/);
   assert.doesNotMatch(text, /overage/i);
   assert.doesNotMatch(text, /upgrade-paths/i);
   assert.match(text, /anthropic-ratelimit-unified-5h-status: allowed/);
 });
 
-test('MITM upgrade listener: stripOverageHeaders unset keeps overage headers on the 101', { timeout: 30000 }, async () => {
-  const text = await handshakeThroughMitm();
+test('MITM upgrade listener: stripOverageHeaders unset keeps overage headers on the 101', async (t) => {
+  const text = await handshakeThroughMitm(t);
   assert.match(text, /101 Switching Protocols/);
   assert.match(text, /anthropic-ratelimit-unified-overage-disabled-reason: org_level_disabled/);
   assert.match(text, /anthropic-ratelimit-unified-upgrade-paths: extra_usage/);
@@ -693,9 +723,15 @@ const SSE_OVERLOADED = { type: 'error', error: { type: 'overloaded_error', messa
 const sseFrame = (e) => `event: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`;
 
 for (const dispatched of [false, true]) {
-  test(`stream failover keeps the stripOverageHeaders value it was dispatched with (${dispatched}), the next request sees the new one`, async () => {
+  test(`stream failover keeps the stripOverageHeaders value it was dispatched with (${dispatched}), the next request sees the new one`, async (t) => {
     /** @type {string[]} */
     const seen = [];
+    // The hop is the peek's verdict on the refusal. The peek also releases an
+    // undecided stream when its hold runs out, so the hold is set past what the
+    // runner lets a test live: a refusal a loaded machine delivers late is
+    // still read, not relayed.
+    process.env.TEAMCLAUDE_STREAM_PEEK_HOLD_MS = String(HOUR);
+    t.after(() => { delete process.env.TEAMCLAUDE_STREAM_PEEK_HOLD_MS; });
     /** @type {{ proxy: {}, stripOverageHeaders: boolean }} */
     const config = { proxy: {}, stripOverageHeaders: dispatched };
     const upstream = http.createServer(async (req, res) => {
@@ -723,7 +759,7 @@ for (const dispatched of [false, true]) {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ model: 'claude-x', messages: [], stream: true }),
-        signal: AbortSignal.timeout(10_000),
+        signal: t.signal, // see the relayRaw Trailer tests
       });
       const body = await res.text();
       return { res, body };

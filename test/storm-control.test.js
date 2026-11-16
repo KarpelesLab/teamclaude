@@ -5,7 +5,18 @@ import { AccountManager } from '../src/account-manager.js';
 function oauth(name, extra = {}) {
   return { name, type: 'oauth', accessToken: 't-' + name, refreshToken: 'r', expiresAt: Date.now() + 3600_000, ...extra };
 }
-const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// The waits in admit() are timers, so the tests that watch one run it on a
+// mocked clock: nothing below waits on the machine. `mockClock` takes over
+// setTimeout and Date for the test (node:test restores them when it ends), and
+// `advance` moves that clock and then lets the admit() the timer woke run up to
+// its next wait. setImmediate is left real for that reason. What an admit()
+// resolved to is read from a variable its `then` sets, after an `advance`,
+// rather than awaited: an admit that wrongly kept waiting would have nothing
+// left to wake it, and a test awaiting it would end with the event loop.
+const mockClock = (t) => t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.now() });
+const settle = () => new Promise(resolve => setImmediate(resolve));
+const advance = async (t, ms) => { t.mock.timers.tick(ms); await settle(); };
 
 test('_rampCap grows linearly during the window and lifts after it', () => {
   const am = new AccountManager([oauth('a')], 0.98, {
@@ -22,7 +33,8 @@ test('_rampCap grows linearly during the window and lifts after it', () => {
   assert.equal(acct.rampStartedAt, null, 'window expiry clears the ramp');
 });
 
-test('admit caps concurrency to a freshly-switched account; release frees a slot', async () => {
+test('admit caps concurrency to a freshly-switched account; release frees a slot', async (t) => {
+  mockClock(t);
   const am = new AccountManager([oauth('a')], 0.98, {
     ramp: { startConc: 1, stepConc: 1, stepMs: 10_000, windowMs: 60_000, pollMs: 5 },
   });
@@ -31,19 +43,28 @@ test('admit caps concurrency to a freshly-switched account; release frees a slot
   assert.equal(await am.admit(0), true);
   assert.equal(am.accounts[0].inFlight, 1);
 
-  // A second request must wait — the cap is 1 and a slot is taken.
+  // A second request must wait — the cap is 1 and a slot is taken. It asks
+  // isAborted before each look at the cap, so `checks` counts those looks: the
+  // cap was read again after every poll below, and refused each time.
   let second = false;
-  const p = am.admit(0).then(() => { second = true; });
-  await sleep(30);
-  assert.equal(second, false, 'second admit blocked by the ramp cap');
+  let checks = 0;
+  am.admit(0, () => { checks++; return false; }).then(() => { second = true; });
+  await settle();
+  for (let polls = 1; polls <= 3; polls++) {
+    await advance(t, 5);
+    assert.equal(checks, polls + 1, 'the waiting admit looked at the cap again after a poll');
+    assert.equal(second, false, 'second admit blocked by the ramp cap');
+  }
+  assert.equal(am.accounts[0].inFlight, 1, 'the blocked admit took no slot');
 
   am.release(0);       // free the slot
-  await p;
+  await advance(t, 5);
   assert.equal(second, true, 'second admit proceeds once a slot frees');
   assert.equal(am.accounts[0].inFlight, 1);
 });
 
-test('admit is fail-open: aborts (returns false) if the client goes away while waiting', async () => {
+test('admit is fail-open: aborts (returns false) if the client goes away while waiting', async (t) => {
+  mockClock(t);
   const am = new AccountManager([oauth('a')], 0.98, {
     ramp: { startConc: 1, stepConc: 1, stepMs: 10_000, windowMs: 60_000, pollMs: 5 },
   });
@@ -51,10 +72,15 @@ test('admit is fail-open: aborts (returns false) if the client goes away while w
   await am.admit(0); // take the only slot
 
   let gone = false;
-  const p = am.admit(0, () => gone); // waits: cap 1, inFlight 1
-  await sleep(20);
+  /** @type {boolean|null} */
+  let admitted = null;
+  am.admit(0, () => gone).then((ok) => { admitted = ok; }); // waits: cap 1, inFlight 1
+  await advance(t, 5);
+  await advance(t, 5);
+  assert.equal(admitted, null, 'the admit is still waiting on the cap while the client is there');
   gone = true;                        // client disconnects
-  assert.equal(await p, false, 'aborted admit returns false, takes no slot');
+  await advance(t, 5);                // the next poll is where it is noticed
+  assert.equal(admitted, false, 'aborted admit returns false, takes no slot');
   assert.equal(am.accounts[0].inFlight, 1, 'no slot leaked to the aborted request');
 });
 
@@ -124,29 +150,41 @@ test('pauseAccount and markRateLimited ignore a non-finite or non-positive durat
   assert.equal(acct.status, 'throttled', 'a real duration still holds');
 });
 
-test('admit holds a request during a pause, then admits once it lifts', async () => {
+test('admit holds a request during a pause, then admits once it lifts', async (t) => {
+  mockClock(t);
   const am = new AccountManager([oauth('a')], 0.98, {
     ramp: { startConc: 10, stepConc: 1, stepMs: 10, windowMs: 60_000, pollMs: 5 },
   });
-  am.accounts[0].pausedUntil = Date.now() + 120; // ~120ms pause
+  am.accounts[0].pausedUntil = Date.now() + 120; // a 120 ms pause, on the mocked clock
 
-  const start = Date.now();
-  const admitted = await am.admit(0);
-  const waited = Date.now() - start;
+  /** @type {boolean|null} */
+  let admitted = null;
+  am.admit(0).then((ok) => { admitted = ok; });
+  // One millisecond at a time, so every wait admit() schedules inside the
+  // pause (pollMs * 4, or what is left of the pause) comes due on the way.
+  for (let ms = 1; ms < 120; ms++) await advance(t, 1);
+  assert.equal(admitted, null, 'admit returned before the pause lifted');
+  assert.equal(am.accounts[0].inFlight, 0, 'no slot is taken during the pause');
 
-  assert.equal(admitted, true);
-  assert.ok(waited >= 100, `admit should wait out the pause, waited ${waited}ms`);
+  await advance(t, 1); // the pause lifts
+  assert.equal(admitted, true, 'admit did not return once the pause lifted');
   assert.equal(am.accounts[0].inFlight, 1);
 });
 
-test('admit aborts (returns false) if the client disconnects during a pause', async () => {
+test('admit aborts (returns false) if the client disconnects during a pause', async (t) => {
+  mockClock(t);
   const am = new AccountManager([oauth('a')], 0.98, { ramp: { pollMs: 5 } });
   am.accounts[0].pausedUntil = Date.now() + 10_000; // long pause
   let gone = false;
-  const p = am.admit(0, () => gone);
-  await sleep(20);
+  /** @type {boolean|null} */
+  let admitted = null;
+  am.admit(0, () => gone).then((ok) => { admitted = ok; });
+  await advance(t, 20); // one wait inside the pause: pollMs * 4
+  await advance(t, 20);
+  assert.equal(admitted, null, 'the admit is still held by the pause while the client is there');
   gone = true;
-  assert.equal(await p, false, 'aborted admit returns false');
+  await advance(t, 20); // noticed at the next re-check, 9940 ms before the pause would lift
+  assert.equal(admitted, false, 'aborted admit returns false');
   assert.equal(am.accounts[0].inFlight, 0, 'no slot taken');
 });
 

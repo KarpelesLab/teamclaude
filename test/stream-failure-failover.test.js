@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer, peekStreamFailure, STREAM_FAILURE_CODES } from '../src/server.js';
+import { gate } from '../test-helpers/gate.js';
 
 // Every failover in forwardRequest keys on the upstream status, and the
 // Responses API does not always use one: it answers 200, opens the SSE stream,
@@ -16,16 +17,27 @@ import { createProxyServer, peekStreamFailure, STREAM_FAILURE_CODES } from '../s
 // tests here drive real HTTP through createProxyServer so that what is pinned
 // is what a client sees: which accounts were spent, and the exact bytes back.
 
-// The hold is wall-clock bounded; a test-sized bound keeps the slow-first-token
-// cases fast. Read per call by the proxy, so setting it here covers every test.
+// The hold is wall-clock bounded, and the proxy reads the bound per call. Most
+// tests here need the peek to reach its verdict, and a hold that ran out first
+// (a loaded machine, a refusal a few hundred milliseconds late) would release
+// the stream undecided and relay the refusal: so for them the hold is longer
+// than the runner lets a test live, and only the verdict or the byte budget
+// ends a peek. The tests about the hold itself shorten it with `shortHold`.
+// Nothing asserts on either number: a test of the hold waits for the headers
+// the release sends, however long that takes.
+const NO_HOLD_MS = 3600_000;
 const HOLD_MS = 200;
-process.env.TEAMCLAUDE_STREAM_PEEK_HOLD_MS = String(HOLD_MS);
+process.env.TEAMCLAUDE_STREAM_PEEK_HOLD_MS = String(NO_HOLD_MS);
+/** For the rest of test `t`, the peek releases an undecided stream after HOLD_MS. */
+function shortHold(t) {
+  process.env.TEAMCLAUDE_STREAM_PEEK_HOLD_MS = String(HOLD_MS);
+  t.after(() => { process.env.TEAMCLAUDE_STREAM_PEEK_HOLD_MS = String(NO_HOLD_MS); });
+}
 
 const HOUR = 3600_000;
 const MODEL = 'gpt-5.6-sol';
 const SID = 'sess-stream-failover';
 const listen = (s) => new Promise(r => s.listen(0, '127.0.0.1', () => r(s.address().port)));
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 // One real Codex turn's usage (see responses-usage.test.js for the arithmetic).
 const WIRE = {
@@ -116,20 +128,36 @@ async function withFleet(t, names, handler, fn, { provider = 'codex' } = {}) {
   await fn({ am, proxyPort, seen, ended });
 }
 
-async function codexPost(port, ended) {
+// `onHeaders` is called once the response's headers have reached the client,
+// and `onBody` with the body read so far after each chunk of it: where a test
+// opens the gates its upstream is held at (test-helpers/gate.js). `signal` ends
+// the request with the test, for a test whose failure is a response that never
+// comes.
+/**
+ * @param {number} port
+ * @param {() => Promise<unknown>} ended
+ * @param {{ onHeaders?: () => void, onBody?: (soFar: string) => void, signal?: AbortSignal }} [watch]
+ */
+async function codexPost(port, ended, { onHeaders, onBody, signal } = {}) {
   const done = ended();
-  const t0 = Date.now();
   const res = await fetch(`http://127.0.0.1:${port}/backend-api/codex/responses`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', 'session-id': SID },
     body: JSON.stringify({ model: MODEL, input: [], stream: true }),
+    signal,
   });
-  const headersAfterMs = Date.now() - t0;
-  const body = await res.text();
+  onHeaders?.();
+  let body = '';
+  const decoder = new TextDecoder();
+  for await (const chunk of /** @type {AsyncIterable<Uint8Array>} */ (/** @type {unknown} */ (res.body))) {
+    body += decoder.decode(chunk, { stream: true });
+    onBody?.(body);
+  }
+  body += decoder.decode();
   // The streaming usage record lands in streamResponse's finally, after the
   // client's last byte, and the session is ended after that.
   await done;
-  return { status: res.status, body, headersAfterMs };
+  return { status: res.status, body };
 }
 
 const byName = (am, name) => am.accounts.find(a => a.name.endsWith(`:${name}`));
@@ -217,18 +245,26 @@ test('failure-shaped text inside the echoed instructions does not trigger a hop'
 // (e) A slow first token is not a failure. The hold expires, the headers go
 // out, and the bytes the peek held are replayed ahead of the rest of the same
 // stream, so the body is unbroken and no sibling is spent.
+//
+// "Slow" is a gate, not a timer: the upstream sends its two envelopes and then
+// nothing until the client has the response's headers. Those envelopes decide
+// nothing and are far under the byte budget, so the hold running out is the
+// only thing that can send the headers while the upstream is silent; a peek
+// that waited for the first token instead would wait on an upstream that is
+// waiting on it, and the test would end on the runner's timeout.
 test('a slow first token releases the stream at the hold and the body is unbroken', async (t) => {
+  shortHold(t);
+  const released = gate(t.signal);
   await withFleet(t, ['one', 'two'], async (acct, res) => {
     sseHead(res);
     res.write(sse(CREATED, IN_PROGRESS));
-    await sleep(HOLD_MS * 3);
+    await released.opened;
     res.end(sse(DELTA, COMPLETED));
   }, async ({ proxyPort, seen, ended }) => {
-    const { status, body, headersAfterMs } = await codexPost(proxyPort, ended);
+    const { status, body } = await codexPost(proxyPort, ended, { signal: t.signal, onHeaders: released.open });
     assert.equal(status, 200);
     assert.equal(seen.length, 1, 'a stream that is merely slow spent no sibling');
     assert.equal(body, sse(CREATED, IN_PROGRESS, DELTA, COMPLETED), 'the held bytes were replayed ahead of the rest');
-    assert.ok(headersAfterMs < HOLD_MS * 3, `headers were held for ${headersAfterMs}ms, past the ${HOLD_MS}ms hold`);
   });
 });
 
@@ -256,17 +292,27 @@ test('a chunk that lands just after the deadline still appears in the replayed b
 });
 
 // The same thing through the proxy: the first chunk after the hold reaches
-// the client, in order, and the stream is still relayed on one account.
+// the client, in order, and the stream is still relayed on one account. The
+// upstream sends that chunk once the client has the headers, which is after
+// the hold ran out with a read still pending, and the last one once the client
+// has read the delta, so the three arrive as three chunks.
 test('bytes arriving right after the hold reach the client in order', async (t) => {
+  shortHold(t);
+  const released = gate(t.signal);
+  const deltaRead = gate(t.signal);
   await withFleet(t, ['one', 'two'], async (acct, res) => {
     sseHead(res);
     res.write(sse(CREATED));
-    await sleep(HOLD_MS + 20);
+    await released.opened;
     res.write(sse(DELTA));
-    await sleep(20);
+    await deltaRead.opened;
     res.end(sse(COMPLETED));
   }, async ({ proxyPort, seen, ended }) => {
-    const { body } = await codexPost(proxyPort, ended);
+    const { body } = await codexPost(proxyPort, ended, {
+      signal: t.signal,
+      onHeaders: released.open,
+      onBody: (soFar) => { if (soFar.endsWith(sse(DELTA))) deltaRead.open(); },
+    });
     assert.equal(seen.length, 1);
     assert.equal(body, sse(CREATED, DELTA, COMPLETED));
   });
@@ -274,7 +320,10 @@ test('bytes arriving right after the hold reach the client in order', async (t) 
 
 // The byte budget is the other bound: an envelope bigger than it is released
 // as-is, whatever follows. A refusal that arrives after the budget is then a
-// relayed stream, which is the cost of not holding an unbounded head.
+// relayed stream, which is the cost of not holding an unbounded head. The
+// refusal is sent once the client has the headers: the hold is not what sent
+// them (it outlasts the test), so the budget did, and the refusal is a chunk
+// the peek never read.
 test('a stream past the byte budget is released untouched', async (t) => {
   process.env.TEAMCLAUDE_STREAM_PEEK_BUDGET_BYTES = '64';
   // Through t.after as well: on Node 24 and later a test that fails on its
@@ -283,13 +332,14 @@ test('a stream past the byte budget is released untouched', async (t) => {
   // bytes.
   t.after(() => { delete process.env.TEAMCLAUDE_STREAM_PEEK_BUDGET_BYTES; });
   try {
+    const released = gate(t.signal);
     await withFleet(t, ['one', 'two'], async (acct, res) => {
       sseHead(res);
       res.write(sse(CREATED));   // well over 64 bytes on its own
-      await sleep(30);
+      await released.opened;
       res.end(sse(OVERLOADED, FAILED));
     }, async ({ proxyPort, seen, ended }) => {
-      const { body } = await codexPost(proxyPort, ended);
+      const { body } = await codexPost(proxyPort, ended, { signal: t.signal, onHeaders: released.open });
       assert.equal(seen.length, 1, 'past the budget the peek judges nothing');
       assert.equal(body, sse(CREATED, OVERLOADED, FAILED));
     });
