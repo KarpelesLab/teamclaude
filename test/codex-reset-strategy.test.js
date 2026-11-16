@@ -409,6 +409,15 @@ test('a redemption whose answer was lost is charged to the cohort the account wa
   assert.equal(redeemer.ledger[0].cohort, Math.floor(before / DAY));
 });
 
+test('a consume whose answer was lost comes back from the walk as uncertain', async () => {
+  const { am, redeemer, calls } = harness({ days: [3], code: () => ({ error: 'socket hang up' }) });
+  const result = await redeemer.maybeRedeemForPool(am.accounts);
+  assert.equal(result.redeemed, false);
+  assert.equal(result.uncertain, true);
+  assert.match(result.reason, /it may still have been spent/);
+  assert.deepEqual(calls.consume, ['a']);
+});
+
 // ── the status payload ──────────────────────────────────────────────────────
 
 test('describe answers for a Codex row and null for any other', () => {

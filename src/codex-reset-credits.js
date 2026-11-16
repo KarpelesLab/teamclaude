@@ -706,7 +706,9 @@ export class ResetCreditRedeemer {
     for (const { account } of ordered) {
       const state = this._stateFor(account);
       const result = await this._decide(account, state, rows.get(account) || [], now, deadline);
-      if (result.redeemed) return result;
+      // A lost answer is returned as it came, `uncertain` and all: it armed
+      // the fleet hold, so the walk would end here anyway.
+      if (result.redeemed || result.uncertain) return result;
       reason = result.reason;
       // Two things end the walk rather than move it on to the next account: a
       // fleet hold, armed by an attempt that may have spent something — walking
