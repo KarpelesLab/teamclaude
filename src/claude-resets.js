@@ -277,7 +277,9 @@ export class ClaudeResetRedeemer {
     this.state = new WeakMap();
     /** @type {Promise<ClaudeRedeemResult>|null} */
     this.inFlight = null;
-    /** @type {string|null} the _modelKey the attempt in flight was made for */
+    /** @type {string|null} the model the attempt in flight was made for */
+    this.inFlightModel = null;
+    /** @type {string|null} */
     this.inFlightKey = null;
     // The account an attempt's answer is about, when it is about one (a reset
     // that landed, or `available`); see maybeRedeemForPool.
@@ -347,8 +349,9 @@ export class ClaudeResetRedeemer {
    * where that bucket is the shared weekly and some account has learned a
    * scoped bucket for the family, the one way a family gates beside it.
    * Whether an account is parked for one such request says nothing about a
-   * request with another key, so the passes that turn on it, and an attempt
-   * in flight, are kept by this key. Bounded, unlike the model name a client
+   * request with another key, so the passes that turn on it are kept by this
+   * key, and an attempt in flight is matched on it as a refusal joins and
+   * again once the attempt has run. Bounded, unlike the model name a client
    * sends.
    *
    * @param {string|null} model
@@ -416,26 +419,35 @@ export class ClaudeResetRedeemer {
     if (this.config?.autoRedeemResets !== true) return { redeemed: false, reason: 'auto-redeem is switched off' };
     if (!accounts?.length) return { redeemed: false, reason: 'no candidate accounts' };
     if (this.manualInFlight) return { redeemed: false, reason: 'a manual reset is in progress' };
-    const key = this._modelKey(model);
     if (this.inFlight) {
       // Concurrent refusals with the same key are one decision about the
-      // fleet, so they share one attempt. A refusal with another key waits for
-      // it instead: that attempt judged other readings, and its passes say
+      // fleet, so they share one attempt. This refusal's key has to match the
+      // one the attempt started with, and the two have to match again once it
+      // has run: its reads can teach the fleet the scoped bucket that sets two
+      // models apart, and one that runs out or is dropped while it walks can
+      // make alike two keys its passes kept apart. Only a bucket learned while
+      // the attempt runs and gone again before it ends (run out and swept, or
+      // dropped by a later read) is missed. A refusal with another key waits
+      // for it instead: that attempt judged other readings, and its passes say
       // nothing about this one. Attempts still never overlap, so one dry pool
       // costs one reset; a reset that landed answers this refusal too. An
       // answer about one account (a reset that landed, or `available`) serves
       // only a refusal that was offered that account, though: the offer
       // follows the request's route and the key does not. Any other refusal
       // makes its own attempt.
-      const sameKey = this.inFlightKey === key;
+      const joined = this.inFlightModel; // the attempt clears it as it ends
+      const keyedAlike = this.inFlightKey === this._modelKey(model);
       const earlier = await this.inFlight;
+      const sameKey = keyedAlike && this._modelKey(joined) === this._modelKey(model);
       const about = this.answeredFor.get(earlier);
       const offered = about != null && accounts.includes(about);
       if (sameKey ? (!about || offered) : (earlier.redeemed && offered)) return earlier;
       return this.maybeRedeemForPool(accounts, { model });
     }
-    const attempt = this._attempt(accounts, model).finally(() => { this.inFlight = null; this.inFlightKey = null; });
+    const key = this._modelKey(model);
+    const attempt = this._attempt(accounts, model).finally(() => { this.inFlight = null; this.inFlightModel = null; this.inFlightKey = null; });
     this.inFlight = attempt;
+    this.inFlightModel = model;
     this.inFlightKey = key;
     return attempt;
   }
@@ -548,8 +560,6 @@ export class ClaudeResetRedeemer {
     const name = safeLine(account.name, 64);
     const state = this._stateFor(account);
     const now = this.now();
-    // The passes below that turn on the model are kept for this key alone.
-    const key = this._modelKey(model);
     const refused = await this._freshToken(account, deadline);
     if (refused) return { redeemed: false, account: name, reason: refused };
     const left = () => Math.max(1, deadline - this.now());
@@ -561,6 +571,10 @@ export class ClaudeResetRedeemer {
     // The status read carries the account's quota as of now, so the manager
     // judges on that and not on a reading that may have gone stale.
     if (read.usage && !read.usage.error) this.am.applyUsageData?.(account.index, read.usage);
+    // The passes below that turn on the model are kept for this key alone. It
+    // is taken after the read, which can teach the fleet a scoped bucket that
+    // gives the model a key of its own.
+    const key = this._modelKey(model);
     // Stale enough that it can serve this request after all: the pool is not
     // dry, so the walk ends without spending and the server selects again.
     if (this.am.unavailableReason?.(account, model) === null) {

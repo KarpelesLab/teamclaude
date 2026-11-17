@@ -721,6 +721,112 @@ test('refusals judged on the same readings share a pass and an attempt, whatever
   assert.equal(routed.calls.status, 1);
 });
 
+// No account has learned a scoped Opus weekly yet, so Opus and Haiku start
+// with one key. The walk's own status read then reports Opus's weekly spent
+// beside the shared one: Opus is parked on a reading no grant is known to
+// clear, Haiku on the shared weekly alone, which the weekly reset clears.
+function scopedFirstSeen() {
+  const h = parkedHarness({ quota: { unified7d: 0.99 } });
+  const scopedWeekly = { opus: { utilization: 0.99, resetAt: Date.now() + 3 * DAY } };
+  const read = h.redeemer.statusFn;
+  h.redeemer.statusFn = async account => {
+    const r = await read(account);
+    return h.calls.claim.length ? r : { ...r, usage: { ...r.usage, scopedWeekly } };
+  };
+  assert.equal(h.am.accounts[0].quota.scopedWeekly?.opus, undefined);
+  return h;
+}
+
+test('a scoped bucket first seen in the walk\'s own read keys the pass it decides', async () => {
+  const { am, redeemer, calls } = scopedFirstSeen();
+  assert.equal((await redeemer.maybeRedeemForPool(am.accounts, { model: OPUS })).reason, 'no reset is known to clear its scopedWeekly reading');
+  assert.ok(am.accounts[0].quota.scopedWeekly.opus, 'the read taught the fleet the scoped bucket');
+  const haiku = await redeemer.maybeRedeemForPool(am.accounts, { model: 'claude-haiku-4-5' });
+  assert.equal(haiku.redeemed, true, haiku.reason);
+  assert.deepEqual(calls.claim, ['a']);
+});
+
+test('a refusal that joins an attempt is matched on the key the attempt\'s reads give the attempt\'s model', async () => {
+  // The Haiku refusal joins the Opus attempt on the key both had before the
+  // read, and does not take the decline the read made Opus's own.
+  const { am, redeemer, calls } = scopedFirstSeen();
+  const [o, h] = await Promise.all([OPUS, 'claude-haiku-4-5'].map(model => redeemer.maybeRedeemForPool(am.accounts, { model })));
+  assert.equal(o.reason, 'no reset is known to clear its scopedWeekly reading');
+  assert.equal(h.redeemed, true, h.reason);
+  assert.deepEqual(calls.claim, ['a']);
+});
+
+test('a refusal that joins an attempt is matched on the key the attempt\'s reads give the refusal\'s own model', async () => {
+  // The other way round: an Opus refusal joins a Haiku attempt. That walk's
+  // read of a teaches the fleet a scoped Opus weekly and shows a can serve
+  // Haiku after all, but not Opus, which a's scoped weekly parks; b, parked
+  // on the shared weekly alone, is Opus's to redeem.
+  const { am, redeemer, calls } = parkedHarness({ accounts: [oauth('a'), oauth('b')], quota: { unified7d: 0.99 } });
+  const [a] = am.accounts;
+  a.quota.unified7dReset = Date.now() + 5 * DAY;
+  const scopedWeekly = { opus: { utilization: 0.99, resetAt: Date.now() + 3 * DAY } };
+  const read = redeemer.statusFn;
+  redeemer.statusFn = async account => {
+    const r = await read(account);
+    return account === a && !calls.claim.length ? { ...r, usage: { ...r.usage, sevenDay: { utilization: 0.5 }, scopedWeekly } } : r;
+  };
+  const [haiku, opus] = await Promise.all(['claude-haiku-4-5', OPUS].map(model => redeemer.maybeRedeemForPool(am.accounts, { model })));
+  assert.equal(haiku.available, true); assert.equal(haiku.account, 'a');
+  assert.notEqual(am.unavailableReason(a, OPUS), null, 'a cannot serve Opus');
+  assert.equal(opus.redeemed, true, opus.reason); assert.equal(opus.account, 'b');
+  assert.deepEqual(calls.claim, ['b']);
+});
+
+test('a refusal keyed apart from the attempt it joins does not take its decline once an expiry makes the keys alike', async t => {
+  // a has learned a scoped Opus weekly, which runs out while the Opus walk
+  // reads b, and another request's selection sweeps it. The walk passed a
+  // over on that bucket and b on its Fable-only reset; Haiku, parked on a's
+  // shared weekly alone, is served by a's weekly reset.
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  const { am, redeemer, calls } = parkedHarness({ accounts: [oauth('a'), oauth('b')], quota: { unified7d: 0.99 } });
+  const [a, b] = am.accounts;
+  Object.assign(a.quota, { unified7dReset: Date.now() + 5 * DAY, scopedWeekly: { opus: { utilization: 0.99, resetAt: Date.now() + 5_000 } } });
+  const read = redeemer.statusFn;
+  let swept = false;
+  redeemer.statusFn = async account => {
+    if (account === b && !swept) { swept = true; t.mock.timers.tick(10_000); am.refreshExpiredQuotas(); }
+    const r = await read(account);
+    return account === b ? { ...r, reset: parseResetStatus(grantBlock([fableGrant], NOT_WALLED)) } : r;
+  };
+  const [opus, haiku] = await Promise.all([OPUS, 'claude-haiku-4-5'].map(model => redeemer.maybeRedeemForPool(am.accounts, { model })));
+  assert.equal(opus.reason, 'its reset does not clear seven_day');
+  assert.equal(a.quota.scopedWeekly.opus, undefined, 'the bucket ran out during the attempt');
+  assert.equal(haiku.redeemed, true, haiku.reason);
+  assert.deepEqual(calls.claim, ['a']);
+});
+
+test('a refusal that joins once an expiry has made the keys alike does not take a decline made on the bucket that ran out', async t => {
+  // As above, but the Haiku refusal arrives after a's scoped Opus weekly ran
+  // out: its own selection sweeps the reading, and only then does it join.
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  const { am, redeemer, calls } = parkedHarness({ accounts: [oauth('a'), oauth('b')], quota: { unified7d: 0.99 } });
+  const [a, b] = am.accounts;
+  Object.assign(a.quota, { unified7dReset: Date.now() + 5 * DAY, scopedWeekly: { opus: { utilization: 0.99, resetAt: Date.now() + 5_000 } } });
+  const read = redeemer.statusFn;
+  let late = null;
+  redeemer.statusFn = async account => {
+    if (account === b && !late) {
+      t.mock.timers.tick(10_000);
+      am.refreshExpiredQuotas('claude-haiku-4-5', new Set());
+      assert.equal(a.quota.scopedWeekly.opus, undefined, 'the bucket ran out before the refusal joined');
+      late = redeemer.maybeRedeemForPool(am.accounts, { model: 'claude-haiku-4-5' });
+    }
+    const r = await read(account);
+    return account === b ? { ...r, reset: parseResetStatus(grantBlock([fableGrant], NOT_WALLED)) } : r;
+  };
+  const opus = await redeemer.maybeRedeemForPool(am.accounts, { model: OPUS });
+  assert.equal(opus.reason, 'its reset does not clear seven_day');
+  assert.ok(late, 'the Haiku refusal joined while the attempt ran');
+  const haiku = await late;
+  assert.equal(haiku.redeemed, true, haiku.reason);
+  assert.deepEqual(calls.claim, ['a']);
+});
+
 // The budget has to bind on the token refresh too: ensureTokenFresh takes no
 // timeout, and a refusal waiting on this attempt is held as long as it runs.
 test('a token refresh that outlives the attempt\'s budget is left behind, not waited out', async t => {
