@@ -881,6 +881,77 @@ test('a removal waiting for the lock writes nothing once the account is back her
   assert.equal(tombstoneOf(store.byKey(key).Data), null);
 });
 
+// A long-lived login is never stored (isSyncable), so it brings an account back
+// on this install only, and the other installs keep it removed (docs/accounts.md,
+// "A sign-in brings it back"). That holds whether the removal's tombstone landed
+// at once or waited for a lock another install held: a long-lived sign-in of the
+// account, made while its removal is pending, does not end it.
+/**
+ * Home removes its long-lived `a`, which carries the identity office's ordinary
+ * `a` is stored under, and signs it in again with `login --long-lived`: once
+ * the removal has landed with the lock free (`free`), or while it waits for the
+ * lock another install holds, at its first re-check (`waiting`) or in its first
+ * timed pause (`retry`). Resolves with what the removal wrote, whether the row
+ * holds a tombstone, how many accounts office's next pass evicts, and what home
+ * holds after a pass of its own.
+ * @param {'free'|'waiting'|'retry'} lock
+ */
+async function longLivedReloginAfterRemoval(lock) {
+  const store = makeStore();
+  const key = syncKeyFor(claude('a'));
+  const office = setup([claude('a')], { store });
+  await office.sync.sync();
+  const home = setup([claude('a', { accessToken: 'at-a-year', refreshToken: undefined, longLived: true, expiresAt: T0 + 300 * 24 * H })], { store });
+  await home.sync.sync();
+  const id = store.byKey(key).User_Credential__;
+  let held = lock !== 'free';
+  home.sync.api = async (method, path, ...rest) => {
+    if (held && path === `User/Credential/${id}:lock`) throw Object.assign(new Error('Credential is locked'), { token: 'error_credential_locked' });
+    return store.api(method, path, ...rest);
+  };
+  // As `login --long-lived` does it: its own sync is asked to store the
+  // sign-in (it stores nothing), then the reload adds the entry here.
+  const relogin = async () => {
+    const entry = claude('a', { accessToken: 'at-a-year-2', refreshToken: undefined, longLived: true, expiresAt: store.now() + 365 * 24 * H });
+    const cli = new CredentialSync({ accountManager: /** @type {any} */ ({ accounts: [] }), addAccount: () => null, api: store.api, isSignedIn: async () => true, session: async () => 'session-1', now: store.now, log: () => {}, sleep: async (ms) => store.tick(ms) });
+    assert.equal(await cli.storeSignIn(entry), false);
+    home.am.addAccount(entry);
+    held = false;
+  };
+  home.sync.sleep = async (ms) => {
+    if (held && ((lock === 'waiting' && ms === 5000) || (lock === 'retry' && ms === 60_000))) await relogin();
+    store.tick(ms);
+  };
+  home.am.removeAccount(0);
+  const written = await home.settled();
+  if (lock === 'free') await relogin();
+  // A pass once the removal has landed: in the waiting cases the reload the
+  // login asks for runs its pass before that, while the removal still waits,
+  // and this is the next one. It skips a long-lived account before any
+  // tombstone check, so the re-login stays.
+  await home.sync.sync('reload');
+  return {
+    written,
+    tombstoned: tombstoneOf(store.byKey(key).Data) != null,
+    evicted: (await office.sync.sync()).evicted,
+    here: home.am.accounts.map((a) => `${a.name}${a.longLived ? ' (long-lived)' : ''}`),
+  };
+}
+
+const BACK_HERE_ONLY = { written: [true], tombstoned: true, evicted: 1, here: ['a (long-lived)'] };
+
+test('a long-lived re-login after its removal landed brings the account back here only, and the other installs remove it', async () => {
+  assert.deepEqual(await longLivedReloginAfterRemoval('free'), BACK_HERE_ONLY);
+});
+
+test('a long-lived re-login made while its removal waits for the lock does not end it: the outcome is the one with the lock free', async () => {
+  assert.deepEqual(await longLivedReloginAfterRemoval('waiting'), BACK_HERE_ONLY);
+});
+
+test('a long-lived re-login made before its removal\'s first timed retry does not end it: the outcome is the one with the lock free', async () => {
+  assert.deepEqual(await longLivedReloginAfterRemoval('retry'), BACK_HERE_ONLY);
+});
+
 test('a removal settled during a retry pause takes no lock when it wakes', async () => {
   const store = makeStore();
   const key = syncKeyFor(claude('b'));

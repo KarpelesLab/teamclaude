@@ -36,8 +36,10 @@
 // its row (`{"_deleted": "<time>"}`), written under the row's lock so that a
 // renewal another install is making under it stores its token first. Every
 // other install's next pass removes the account. An explicit sign-in (`login`,
-// `import`) replaces the tombstone and brings the account back everywhere; the
-// other ways it can come back follow.
+// `import`) replaces the tombstone and brings the account back everywhere; a
+// long-lived login (`login --long-lived`) is never stored, so it brings the
+// account back on the install it was made on only. The other ways it can come
+// back follow.
 //
 // A refresh does not write over a tombstone it reads. One made under the lock
 // does not meet a removal in between, as long as its write lands within the
@@ -1028,8 +1030,10 @@ export class CredentialSync {
    * Write a pending removal's tombstone. Settled once it is written, and when
    * there is nothing to write: no row (or the row gone since it was read), a
    * tombstone there already, a sign-in here since (storeSignIn), or the
-   * account back on this install. Given up on, and settled, when it is older
-   * than REMOVAL_PENDING_MAX_MS or under another callback.net session than the
+   * account back on this install as one the sync carries (_backHere): a
+   * long-lived login of it is not, and the tombstone lands as it would have
+   * at once. Given up on, and settled, when it is older than
+   * REMOVAL_PENDING_MAX_MS or under another callback.net session than the
    * removal is tied to (each checked on entry, and again with the lock held,
    * just before the write), and when this install is signed out of
    * callback.net. Left pending, to be tried again, when the store cannot be
@@ -1099,8 +1103,10 @@ export class CredentialSync {
 
   /**
    * An explicit sign-in (`login`, `import`): the row takes these tokens
-   * whatever it held, a tombstone included — this is the one thing that brings
-   * a removed account back.
+   * whatever it held, a tombstone included, which is how a removed account is
+   * brought back everywhere (the file header names the other ways it can come
+   * back). Not `login --long-lived`, which is never stored: for an entry the
+   * sync does not carry, nothing is written and this resolves false.
    * @param {Record<string, any>} entry  the config entry, tokens included
    * @returns {Promise<boolean>} whether the store was written
    */

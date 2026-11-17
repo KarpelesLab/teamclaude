@@ -80,8 +80,10 @@ function standaloneCredentialSync() {
 
 /**
  * An explicit sign-in (`login`, `import`): store the entry's tokens, over a
- * tombstone included, when this install is signed in to callback.net. Never
- * fatal — the account is in the config either way, and its next renewal stores it.
+ * tombstone included, when this install is signed in to callback.net. Not
+ * `login --long-lived`, which is never stored (storeSignIn resolves false).
+ * Never fatal — the account is in the config either way, and an ordinary
+ * sign-in's next renewal stores it.
  * @param {Record<string, any>} entry
  */
 async function recordSignInWithCallback(entry) {
