@@ -705,6 +705,22 @@ export class ResetCreditRedeemer {
     if (policy.maxShare < 1) ordered.sort((a, b) => byExhaustion(a.account, b.account));
     for (const { account } of ordered) {
       const state = this._stateFor(account);
+      // The share cap again, over the accounts as they stand now: a refresh
+      // token upstream rejects during the reads above leaves its account in
+      // the error state, and so out of the cohort the other accounts are
+      // counted in (see _members), and the verdict asked before them can
+      // allow a slot the cohort no longer has. Only while the fleet switch is
+      // on: switched off during the reads, it leaves every account out of
+      // _members(), and the cap would hold accounts back with its own reason
+      // where _decide answers that the switch is off.
+      if (policy.maxShare < 1 && this._armed()) {
+        const share = shareCapVerdict({ account, members: this._members(), ledger: this.ledger, maxShare: policy.maxShare, now });
+        if (!share.ok) {
+          reason = /** @type {string} */ (share.reason);
+          this._logSkip(account, state, reason, now);
+          continue;
+        }
+      }
       const result = await this._decide(account, state, rows.get(account) || [], now, deadline);
       // A lost answer is returned as it came, `uncertain` and all: it armed
       // the fleet hold, so the walk would end here anyway.

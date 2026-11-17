@@ -230,6 +230,121 @@ test('an account waiting for a sign-in does not widen its cohort either', async 
   assert.equal(calls.consume.length, 1);
 });
 
+/**
+ * From here on upstream refuses every Codex refresh token, as a sign-in
+ * elsewhere makes it do, and answers a credit read on an expired access token
+ * with a 401. `account`'s token is expired, so the next read of its rows
+ * refreshes it, and the refused refresh puts it in the error state.
+ */
+function refuseRefreshOf(am, redeemer, account) {
+  am._codexRefreshFn = async () => { throw Object.assign(new Error('Codex token refresh failed (400): invalid_grant'), { status: 400 }); };
+  account.expiresAt = Date.now() - 1000;
+  const details = redeemer.detailsFn;
+  redeemer.detailsFn = async (read, opts) => (read.expiresAt < Date.now() ? { error: 'HTTP 401', status: 401 } : details(read, opts));
+}
+
+test('an account a refused refresh puts in the error state during the reads leaves its cohort before the walk spends', async () => {
+  // Three accounts reset on one UTC day and a has redeemed: a half share of
+  // three allows two. The next refusal offers b and c, and upstream refuses
+  // c's refresh token while the rows are read, which puts c in the error
+  // state a cohort leaves out. Half of the two left is one, already used.
+  for (const order of [['b', 'c'], ['c', 'b']]) {
+    const { am, redeemer, calls, log } = harness({ days: [3, 3, 3], config: { autoRedeemResets: true, autoRedeemMaxShare: 0.5 }, caughtUp: false });
+    let clock = Date.now();
+    sameUtcDay(am.accounts, 3, clock);
+    redeemer.now = () => clock;
+    const [a, , c] = am.accounts;
+    assert.equal((await redeemer.maybeRedeemForPool([a])).redeemed, true);
+    clock += 7 * 60 * 60 * 1000;
+    refuseRefreshOf(am, redeemer, c);
+    const result = await redeemer.maybeRedeemForPool(order.map(name => am.accounts.find(account => account.name === name)));
+    assert.equal(c.status, 'error', `${order}: the refused refresh put c in the error state`);
+    assert.equal(result.redeemed, false, order.join());
+    assert.match(result.reason, /cohort of 2 already had 1 redeemed, the 50% share cap allows 1/, order.join());
+    assert.deepEqual(calls.consume, ['a'], order.join());
+    assert.ok(log.some(line => /"b" skipped — its reset cohort of 2 already had 1 redeemed/.test(line)), order.join());
+  }
+});
+
+test('an account the share cap holds back after the reads does not end the walk: one alone on a later day is still spent', async () => {
+  // As above, and d resets alone two days later, a cohort of one that allows
+  // one. b is the most exhausted, so the walk asks it first; c has left the
+  // cohort by then, the cap holds b back, and the walk moves on to d.
+  for (const order of [['b', 'c', 'd'], ['c', 'b', 'd']]) {
+    const { am, redeemer, calls } = harness({ days: [3, 3, 3, 5], config: { autoRedeemResets: true, autoRedeemMaxShare: 0.5 }, caughtUp: false });
+    let clock = Date.now();
+    sameUtcDay(am.accounts.slice(0, 3), 3, clock);
+    redeemer.now = () => clock;
+    const [a, b, c] = am.accounts;
+    assert.equal((await redeemer.maybeRedeemForPool([a])).redeemed, true);
+    clock += 7 * 60 * 60 * 1000;
+    b.quota.unified7d = 1.3;
+    refuseRefreshOf(am, redeemer, c);
+    const result = await redeemer.maybeRedeemForPool(order.map(name => am.accounts.find(account => account.name === name)));
+    assert.equal(c.status, 'error', `${order}: the refused refresh put c in the error state`);
+    assert.equal(result.redeemed, true, order.join());
+    assert.deepEqual(calls.consume, ['a', 'd'], order.join());
+  }
+});
+
+test('the fleet switch turned off during the reads is the reason the walk gives, not the share cap', async () => {
+  // No account changes: the switch is turned off while c's rows are read,
+  // which leaves every account out of the members. The walk says the switch
+  // is off, and logs no share-cap skip for an account the cap never held
+  // back.
+  const config = { autoRedeemResets: true, autoRedeemMaxShare: 0.5 };
+  const { am, redeemer, calls, log } = harness({ days: [3, 3, 3], config, caughtUp: false });
+  let clock = Date.now();
+  sameUtcDay(am.accounts, 3, clock);
+  redeemer.now = () => clock;
+  const [a, b, c] = am.accounts;
+  assert.equal((await redeemer.maybeRedeemForPool([a])).redeemed, true);
+  clock += 7 * 60 * 60 * 1000;
+  const details = redeemer.detailsFn;
+  redeemer.detailsFn = async (read, opts) => {
+    if (read === c) config.autoRedeemResets = false;
+    return details(read, opts);
+  };
+  const result = await redeemer.maybeRedeemForPool([b, c]);
+  assert.equal(result.redeemed, false);
+  assert.equal(result.reason, 'auto-redeem is switched off');
+  assert.deepEqual(calls.consume, ['a']);
+  assert.deepEqual(log.filter(line => /skipped/.test(line)), []);
+});
+
+test('the share cap is asked again before each decision: an account the walk leaves in the error state is out of the next one\'s cohort', async () => {
+  // a, b and c reset on one UTC day and a has redeemed: one slot is left. c
+  // is the most exhausted, so it is decided first. Once its rows are read its
+  // token is inside the five minutes before expiry, so the consume refreshes
+  // it, upstream rejects the refresh token, and the consume answers that no
+  // credit was there. The walk moves on to b with c in the error state: half
+  // of the two left is one, already used.
+  const { am, redeemer, calls, log } = harness({
+    days: [3, 3, 3], config: { autoRedeemResets: true, autoRedeemMaxShare: 0.5 }, caughtUp: false,
+    code: name => (name === 'c' ? { code: 'no_credit', windowsReset: 0, credit: null } : { code: 'reset', windowsReset: 1, credit: null }),
+  });
+  let clock = Date.now();
+  sameUtcDay(am.accounts, 3, clock);
+  redeemer.now = () => clock;
+  const [a, b, c] = am.accounts;
+  assert.equal((await redeemer.maybeRedeemForPool([a])).redeemed, true);
+  clock += 7 * 60 * 60 * 1000;
+  c.quota.unified7d = 1.3;
+  am._codexRefreshFn = async () => { throw Object.assign(new Error('Codex token refresh failed (400): invalid_grant'), { status: 400 }); };
+  const details = redeemer.detailsFn;
+  redeemer.detailsFn = async (read, opts) => {
+    const rows = await details(read, opts);
+    if (read === c) c.expiresAt = Date.now() + 60_000;
+    return rows;
+  };
+  const result = await redeemer.maybeRedeemForPool([b, c]);
+  assert.equal(c.status, 'error', 'the consume\'s refresh put c in the error state');
+  assert.deepEqual(calls.consume, ['a', 'c']);
+  assert.equal(result.redeemed, false);
+  assert.match(result.reason, /cohort of 2 already had 1 redeemed, the 50% share cap allows 1/);
+  assert.ok(log.some(line => /"b" skipped — its reset cohort of 2 already had 1 redeemed/.test(line)));
+});
+
 test('a throttled account of the same day still counts in its cohort: a refusal offers it', async () => {
   const { am, redeemer, calls } = harness({ days: [3, 3, 3], config: { autoRedeemResets: true, autoRedeemMaxShare: 0.5 }, caughtUp: false });
   let clock = Date.now();

@@ -649,7 +649,10 @@ account, and again at most every ten minutes while it stands:
 `[TeamClaude] Codex rate-limit reset on "<name>" skipped — <reason>`.
 The caps are asked before any account's credit rows are read, since a read
 costs a token refresh and a request, so a line for a cap can name an account
-that turns out to hold no credit.
+that turns out to hold no credit. The share cap is asked again after the
+reads: a refresh token upstream rejects during them leaves its account
+waiting for a sign-in, and so out of the cohort the other accounts are
+counted in.
 
 While `autoRedeemResets` is on, `teamclaude status` prints a `Redeem` line
 under each Codex account — `armed` or `exempt — <reason>`, and what a credit
