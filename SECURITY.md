@@ -35,8 +35,9 @@ Treat any other copy with caution. In particular:
 
 - **Do not** download and run "TeamClaude" archives (`.zip`, etc.) linked from
   third-party repositories or READMEs. TeamClaude is distributed via npm and the
-  canonical GitHub repository only — it is never shipped as a downloadable
-  binary archive.
+  canonical GitHub repository only. The only binaries are the Windows installer
+  and portable exe on that repository's releases; the portable exe has a
+  `.sha256` to check it against. It is never shipped as a binary archive.
 - Install with `npm install -g @karpeleslab/teamclaude` and verify the package
   scope is `@karpeleslab`.
 - Be suspicious of any fork that instructs you to extract an archive and then

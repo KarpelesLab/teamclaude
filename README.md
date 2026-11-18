@@ -47,7 +47,7 @@ A git checkout never updates itself. Use `git pull` to update it.
 
 **Other ways to run it:**
 
-- **Windows:** download `TeamClaude-Setup-<version>.exe` from the [releases page](https://github.com/KarpelesLab/teamclaude/releases), run it, and set everything up in the dashboard it opens. It needs no Node.js, npm or Docker. See [docs/windows.md](docs/windows.md).
+- **Windows:** download `TeamClaude-Setup-<version>.exe` (an installer) or `TeamClaude-<version>-portable.exe` (one file, no install, with a `.sha256` to check it) from the [releases page](https://github.com/KarpelesLab/teamclaude/releases), run it, and set everything up in the dashboard it opens. It needs no Node.js, npm or Docker. See [docs/windows.md](docs/windows.md).
 - **Docker:** `ghcr.io/karpeleslab/teamclaude`. See [Running in a container](docs/usage.md#running-in-a-container). If you build it with `docker compose` from a checkout, `scripts/redeploy.sh` pulls, rebuilds and restarts it in one command, and rolls back if the new build is unhealthy. `teamclaude update compose install`, run on the host from that checkout, does the same on a schedule. See [Updating a compose deployment](docs/usage.md#updating-a-compose-deployment-in-one-command).
 - **Nix:** a flake with NixOS and Home Manager modules. See [nix/README.md](nix/README.md).
 - **As a background service:** `teamclaude service install` starts the proxy at login and restarts it if it stops (systemd on Linux, a LaunchAgent on macOS).
@@ -245,7 +245,7 @@ Step by step: [docs/routing.md](docs/routing.md#request-lifecycle).
 | --- | --- |
 | [Accounts](docs/accounts.md) | Signing in from the CLI or dashboard, API keys, several organisations, Codex accounts, Grok accounts, third-party backends, export/import, account sync (your own machines or callback.net), per-account proxies, signing in over SSH |
 | [Usage](docs/usage.md) | The server and terminal UI, running Claude Code, the web dashboard, linked instances, the MCP endpoint, every command, logging, Docker |
-| [Windows](docs/windows.md) | The Windows installer: install, first run, starting at sign-in, stopping, files, updates, uninstall |
+| [Windows](docs/windows.md) | The Windows installer and portable exe: install or unpack, first run, starting at sign-in, stopping, files, updates, uninstall |
 | [VS Code](docs/vscode.md) | The Claude Code extension for VS Code through the proxy: settings, a check, updates |
 | [Routing](docs/routing.md) | How accounts are chosen, the distribution modes, model routes, pinning, the prompt cache |
 | [Quota](docs/quota.md) | How quota is read, probing, keep-warm, thresholds, spending caps, extra usage, holding |
@@ -269,7 +269,7 @@ The dashboard already uses the TeamRouter name. You don't need to change anythin
 
 ## Security
 
-The only official sources are [github.com/KarpelesLab/teamclaude](https://github.com/KarpelesLab/teamclaude) and the [`@karpeleslab/teamclaude`](https://www.npmjs.com/package/@karpeleslab/teamclaude) npm package. It is **never** distributed as a downloadable binary or `.zip`, so don't run one that claims to be it. To report a problem, see [SECURITY.md](SECURITY.md).
+The only official sources are [github.com/KarpelesLab/teamclaude](https://github.com/KarpelesLab/teamclaude) and the [`@karpeleslab/teamclaude`](https://www.npmjs.com/package/@karpeleslab/teamclaude) npm package. The only binaries are the Windows installer and portable exe attached to the releases of that repository. Check the portable exe against its `.sha256`. Don't run any other binary or `.zip` that claims to be TeamClaude. To report a problem, see [SECURITY.md](SECURITY.md).
 
 ## Scope
 
