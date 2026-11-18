@@ -90,7 +90,7 @@ test('a reset seen while off is not replayed when it is turned back on', () => {
 // a's reset. Requests pinned to `a` (a pin bypasses selection) are what bring
 // its readings in. Every reload re-reads the setting, so the startup value is
 // asserted before the first one.
-test('the server applies switchOnSessionReset at startup and on reload', async () => {
+test('the server applies switchOnSessionReset at startup and on reload', async t => {
   const seen = [];
   const at = ms => String(Math.floor(ms / 1000));
   const upstream = http.createServer((req, res) => {
@@ -126,6 +126,9 @@ test('the server applies switchOnSessionReset at startup and on reload', async (
       const res = await fetch(`http://127.0.0.1:${running.port}${path}`, {
         method: 'POST', headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ model: OPUS, max_tokens: 1, messages: [] }),
+        // A request or reload that never answers ends with the test, so the
+        // `finally` still stops the server and closes the stub (test/README.md).
+        signal: t.signal,
       });
       assert.equal(res.status, 200, await res.text());
     };
