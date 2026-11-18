@@ -461,6 +461,61 @@ test('an Anthropic overloaded_error as the first event hops once', async (t) => 
   }, { provider: 'anthropic' });
 });
 
+// The hop detours this one request, as the 429 and 5xx hops do
+// (hop-keeps-cursor.test.js): the fleet stays on the account it was on, and the
+// next request starts there.
+test('a stream-failure hop leaves the cursor where it was', async (t) => {
+  const OVERLOADED_ERROR = { type: 'error', error: { type: 'overloaded_error', message: 'Overloaded' } };
+  let refused = false;
+  await withFleet(t, ['one', 'two'], (acct, res) => {
+    sseHead(res);
+    if (acct === 'one' && !refused) { refused = true; return res.end(sse(OVERLOADED_ERROR)); }
+    res.end(sse(MESSAGE_START, TEXT_DELTA, MESSAGE_STOP));
+  }, async ({ proxyPort, seen }) => {
+    const send = async () => {
+      const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'claude-x', messages: [], stream: true }),
+      });
+      await res.text();
+      return res.status;
+    };
+    assert.equal(await send(), 200);
+    assert.deepEqual(seen, ['one', 'two']);
+    assert.equal(await send(), 200);
+    assert.equal(seen[2], 'one', 'the hop moved the fleet onto the account it detoured to');
+  }, { provider: 'anthropic' });
+});
+
+// The same as the 5xx hop (hop-keeps-cursor.test.js): the hop's account is
+// removed before the attempt it names, here at the hop's own log line, in the
+// field while the stream's first events are read. Held by index, the hop went
+// to the disabled account that slid into its place (removed while the events
+// were read, it read -1, and the client was told every account was at its
+// quota). Picked again, four serves.
+test('a stream-failure hop whose account is removed is picked again, and the cursor stays', async (t) => {
+  const OVERLOADED_ERROR = { type: 'error', error: { type: 'overloaded_error', message: 'Overloaded' } };
+  await withFleet(t, ['one', 'two', 'three', 'four'], (acct, res) => {
+    sseHead(res);
+    if (acct === 'one') return res.end(sse(OVERLOADED_ERROR));
+    res.end(sse(MESSAGE_START, TEXT_DELTA, MESSAGE_STOP));
+  }, async ({ am, proxyPort, seen }) => {
+    am.accounts[2].disabled = true;
+    t.mock.method(console, 'log', (...args) => {
+      if (/failing over once to "claude:two"/.test(String(args[0]))) am.removeAccount(am.accounts.indexOf(byName(am, 'two')));
+    });
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-x', messages: [], stream: true }),
+    });
+    const body = await res.text();
+    assert.equal(res.status, 200);
+    assert.deepEqual(seen, ['one', 'four']);
+    assert.equal(body, sse(MESSAGE_START, TEXT_DELTA, MESSAGE_STOP));
+    assert.equal(am.accounts[am.currentIndex], byName(am, 'one'), 'the detour moved the fleet');
+  }, { provider: 'anthropic' });
+});
+
 // ---------------------------------------------------------------- headerless
 
 // The ChatGPT backend can answer a Codex stream with no Content-Type at all

@@ -4180,13 +4180,30 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // Taken before the walk, which can move the observation, and a request cannot
   // confirm the stay its own selection began. A pinned request bypasses
   // selection, so it consults no observation and is no evidence about a rest.
-  // A failover hop names its destination up front (ctx.hopTo, set by the 429
-  // and 5xx hops below) and is one attempt long: consumed here so the attempt
-  // after it, if any, selects normally. Like a pin it bypasses selection, so it
-  // is no evidence about a rest either.
-  const hopTo = ctx.hopTo ?? null;
+  // A failover hop names its destination up front (ctx.hopTo, set by the 429,
+  // 5xx and stream-failure hops below and by the retry that stays on the
+  // account a hop landed on) and is one attempt long: consumed here so the
+  // attempt after it, if any, selects normally. Like a pin it bypasses
+  // selection, so it is no evidence about a rest either.
+  // The destination is the account itself, and the 5xx and stream-failure hops
+  // pick it before a wait (discarding the failed body, reading the stream's
+  // first events): an account removed meanwhile reads index -1
+  // (removeAccount). The hop is still a detour, so it is picked again the same
+  // way: under this request's own exclusions, and never onto an account inside
+  // its own 429 pause, as at the hop sites below. With nowhere left the request
+  // ends as one with no account does. Selecting normally would walk the fleet
+  // cursor off the account the detour went around (#286).
+  const hop = ctx.hopTo ?? null;
   ctx.hopTo = null;
-  const restingGen = ctx.pinnedIndex == null && hopTo == null
+  let hopTo = hop;
+  if (hop != null && hop.index < 0) {
+    const again = accountManager.pickAlternate(new Set([...indicesOf(ctx.tried), ...(ctx.rolledOff || [])]), ctx.model, ctx.advisorModel, ctx.provider);
+    hopTo = again && !accountManager.isPaused(again.index) ? again : null;
+    console.log(hopTo
+      ? `[TeamClaude] "${safeLine(hop.name, 64)}" was removed before the hop reached it — failing over once to "${safeLine(hopTo.name, 64)}" instead`
+      : `[TeamClaude] "${safeLine(hop.name, 64)}" was removed before the hop reached it — no other account can take it now`);
+  }
+  const restingGen = ctx.pinnedIndex == null && hop == null
     ? accountManager.observedGeneration(ctx.pinKey, ctx.model)
     : null;
 
@@ -4242,8 +4259,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // The hop's destination was picked by pickAlternate against this request's
   // own exclusions, and is taken as-is: re-selecting here would walk the fleet
   // cursor onto it, which is exactly the move a detour must not make (#286).
-  const account = hopTo != null
-    ? accountManager.accounts[hopTo]
+  const account = hop != null
+    ? hopTo
     : ctx.pinnedIndex != null
       ? (pinned && !pinnedWrongProvider && !accountManager.capBars(pinned, ctx.model, ctx.advisorModel) ? pinned : null)
       : accountManager.getActiveAccount(
@@ -4938,7 +4955,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
           // Whether the two accounts leave from one address: what the
           // "IP-scoped" reading of a second 429 below rests on.
           ctx.rateLimitHopSharedExit = !routed && !alt.routing;
-          ctx.hopTo = alt.index;
+          ctx.hopTo = alt;
           ctx.tried.add(account);
           console.log(`[TeamClaude] Rate-limit 429 on "${account.name}" — failing over once to idle account "${alt.name}"`);
           if (clientGone(res)) { ctx.abandoned = true; return; }
@@ -4964,7 +4981,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         // (#286), and `route` keeps its egress, since the wait is the only
         // variable being tested. A fresh IP is a different hypothesis and the sx
         // retry below still owns it: when it is armed it goes first, for free,
-        // and this retry takes the attempt after it.
+        // and this retry takes the attempt after it. The one exception: when
+        // that account is removed during the wait there is no retry, and its
+        // refusal goes back to the client.
         //
         // ctx.requestScopedRetried is the SAME flag the no-sibling retry below
         // sets: one headerless-429 wait per request, whichever of the two spends
@@ -4985,8 +5004,14 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
             + (refusal ? ` (${safeLine(refusal)})` : ''));
           await waitForRetry(retryDelayMs, ctx.signal);
           if (clientGone(res)) { ctx.abandoned = true; return; }
-          ctx.hopTo = account.index;
-          return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+          // An account removed during the wait (index -1, removeAccount) takes
+          // its retry with it. Not onto a third account, as above: the refusal
+          // it gave goes back to the client below.
+          if (account.index >= 0) {
+            ctx.hopTo = account;
+            return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+          }
+          console.log(`[TeamClaude] "${safeLine(account.name, 64)}" was removed during the wait — no retry`);
         }
         console.log(`[TeamClaude] 429 followed the request onto "${account.name}" with no rate-limit headers — it is about the request, not the accounts; returning it to the client`
           + (refusal ? ` (${safeLine(refusal)})` : ''));
@@ -5082,7 +5107,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       if (alt && !accountManager.isPaused(alt.index)) {
         await upstreamRes.body?.cancel();
         ctx.serverErrorHopped = true;
-        ctx.hopTo = alt.index;
+        ctx.hopTo = alt;
         ctx.tried.add(account);
         console.log(`[TeamClaude] Upstream ${upstreamRes.status} on "${account.name}" — failing over once to "${alt.name}"`);
         if (clientGone(res)) { ctx.abandoned = true; return; }
@@ -5271,7 +5296,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         if (peeked.failureCode && !accountManager.isPaused(alt.index)) {
           await peeked.cancel();
           ctx.streamFailureHopped = true;
-          ctx.hopTo = alt.index;
+          ctx.hopTo = alt;
           ctx.tried.add(account);
           console.log(`[TeamClaude] Stream failed inside a ${upstreamRes.status} on "${account.name}" (${peeked.failureCode}) — failing over once to "${alt.name}"`);
           if (clientGone(res)) { ctx.abandoned = true; return; }

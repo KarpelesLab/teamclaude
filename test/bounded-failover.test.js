@@ -249,6 +249,56 @@ test('isPaused reports the rate-limit pause selection does not model', () => {
   assert.equal(am.isPaused(1), false);
 });
 
+// A hop picked again because its account left (server.js, at the attempt it
+// names) is picked under the same exclusions as the first pick: never onto the
+// account a rollover moved this request off. a's window rolls, the request is
+// moved to b, b answers 529, the hop picks c, and c is removed at the hop's own
+// log line. The one account left is a, which the rollover ruled out, so there
+// is nowhere to go and the request is not sent there.
+test('a 5xx hop picked again after its account left keeps off the rolled-off account', async t => {
+  const H = 3600_000;
+  const seen = [];
+  const upstream = http.createServer((req, res) => {
+    req.resume();
+    const token = tokenOf(req);
+    seen.push(token);
+    if (token === 't-b') {
+      res.writeHead(529, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'overloaded_error', message: 'Overloaded' } }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(['a', 'b', 'c'].map(n => (
+    { name: n, type: 'oauth', accessToken: `t-${n}`, refreshToken: 'r', expiresAt: Date.now() + H }
+  )), 0.98, { expiryRouting: { enabled: true, preempt: true } });
+  am.accounts.forEach((acct, i) => {
+    acct.quota.unified5h = 0.1;
+    acct.quota.unified7d = 0.4;
+    acct.quota.unified7dReset = Date.now() + (10 + i * 10) * H;
+    acct.probing = false;
+  });
+  am.selectActiveAccount();
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const proxyPort = await listen(proxy);
+  try {
+    assert.equal((await post(proxyPort)).status, 200);
+    assert.deepEqual(seen, ['t-a'], 'the fixture must start on a');
+    am.accounts[0].quota.unified7dReset = Date.now() + 500 * H;   // a's window rolls
+    t.mock.method(console, 'log', (...args) => {
+      if (/failing over once to "c"/.test(String(args[0]))) am.removeAccount(am.accounts.findIndex(a => a.name === 'c'));
+    });
+    const { status } = await post(proxyPort);
+    assert.deepEqual(seen.slice(1), ['t-b'], 'the hop was sent to the account the rollover moved this request off');
+    assert.notEqual(status, 200);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
 // The failover hop must not undo a routing decision made one step earlier.
 //
 // Expiry routing preempts traffic off an account whose weekly window just
