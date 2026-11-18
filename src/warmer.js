@@ -287,8 +287,14 @@ export class Warmer {
     // A routing cooldown is not checked: it lasts 30 seconds, a warm-up through a
     // proxy that has recovered succeeds, and one through a proxy still down fails
     // as the request that armed it did, arming it again for 30 seconds.
+    // Asked on the account manager's clock, not this warmer's: the manager
+    // writes the cooldown with Date.now(), rotation reads it with Date.now(),
+    // and a read that finds it over clears it. Asked on an injected clock
+    // running ahead, the warmer cleared a cooldown rotation still held and
+    // sent the warm-up into it; on one running behind, it skipped an account
+    // rotation had already taken back.
     const am = /** @type {import('./account-manager.js').AccountManager} */ (this.am);
-    if (am.isEntitlementDenied(account.index, now)) return false;
+    if (am.isEntitlementDenied(account.index)) return false;
     const reset = account.quota?.unified5hReset;
     return !(reset && now < reset); // a future reset ⇒ session already running
   }

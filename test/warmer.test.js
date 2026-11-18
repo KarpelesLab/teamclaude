@@ -101,6 +101,30 @@ test('an account whose entitlement cooldown has ended is warmed again', async ()
   assert.equal(spawn.calls.length, 1);
 });
 
+// The account manager writes the cooldown on its own clock (Date.now) and reads
+// it on that clock too, clearing it once it reads it as over. The warmer's clock
+// is its own (injected here, as the schedule tests do), and asking the cooldown
+// on it cleared a cooldown rotation still held, or kept one rotation had ended.
+for (const [what, skewMs, ended, warmed] of [
+  ['ahead of', 10 * 60_000, false, 0],
+  ['behind', -10 * 60_000, true, 1],
+]) {
+  test(`a warmer whose clock runs ${what} the account manager's reads the entitlement cooldown on the manager's clock`, async () => {
+    const am = new AccountManager([oauth('denied')], 0.98);
+    const until = am.markEntitlementDenied(0, { seconds: 300 });
+    if (ended) am.accounts[0].entitlementDeniedUntil = Date.now() - 1;
+    const spawn = fakeSpawner();
+    const log = console.log;
+    console.log = () => {};
+    try { await makeWarmer(am, spawn, { nowFn: () => Date.now() + skewMs }).warmAll(); } finally { console.log = log; }
+    assert.equal(spawn.calls.length, warmed);
+    if (!ended) {
+      assert.equal(am.accounts[0].entitlementDeniedUntil, until, 'the cooldown rotation holds is left in place');
+      assert.equal(am.isEntitlementDenied(0), true);
+    }
+  });
+}
+
 // ── spawn spec ───────────────────────────────────────────────────────────────
 
 test('the spawn invocation is a minimal non-interactive claude pinned to the account', async () => {
@@ -395,9 +419,9 @@ test('a rolling slot defers an account until just after its near-future reset', 
 // The cooldown is asked about when the warm-up would be sent, not when the slot
 // is scheduled: a rolling slot still defers an account in a cooldown, and the
 // deferred warm-up asks again when it fires.
-for (const [what, cooldownMs, warmed] of [
-  ['has ended', 20_000, true],
-  ['is still running', 10 * 60_000, false],
+for (const [what, ended, warmed] of [
+  ['has ended', true, true],
+  ['is still running', false, false],
 ]) {
   test(`a rolling slot defers an account in its entitlement cooldown, and warms it only if the cooldown ${what}`, async () => {
     const am = new AccountManager([oauth('near'), oauth('idle')], 0.98);
@@ -418,12 +442,15 @@ for (const [what, cooldownMs, warmed] of [
     warmer.start();
 
     now = Date.parse('2030-09-01T07:30:00.001Z');
-    am.accounts[0].entitlementDeniedUntil = now + cooldownMs; // on the warmer's clock
+    // On the account manager's clock, as a refused request writes it, not on the
+    // warmer's injected one: the cooldown is the manager's to time.
+    am.markEntitlementDenied(0, { seconds: 600 });
     await timers[0].fn();
     const deferred = timers.find(timer => timer.delay === 70_000);
     assert.ok(deferred, 'the near-reset account is still deferred until reset + 10s');
 
     now = Date.parse('2030-09-01T07:31:10.001Z');
+    if (ended) am.accounts[0].entitlementDeniedUntil = Date.now() - 1;
     const log = console.log;
     console.log = () => {};
     try { await deferred.fn(); } finally { console.log = log; }
