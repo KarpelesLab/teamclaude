@@ -4045,6 +4045,24 @@ function refusalMessage(refused, statuses, holds) {
 }
 
 /**
+ * The answer to a pin whose account has been removed while the request waited:
+ * the one the listener gives a pin that names no account (ctx.unknownPin, the
+ * 404 of the pin's form). Waiting brings the account back no more than it does
+ * there, and no other account may serve the pin.
+ * @param {import('node:http').ServerResponse} res
+ * @param {Record<string, any>} ctx
+ */
+function respondPinGone(res, ctx) {
+  ctx.status = 404;
+  ctx.account = `(unknown pin: "${ctx.unknownPin.label}")`;
+  if (clientGone(res)) { ctx.abandoned = true; return; }
+  if (res.headersSent) return;
+  ctx.delivered = true;   // an answer, as the listener's own 404 is
+  res.writeHead(404, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: ctx.unknownPin.message } }));
+}
+
+/**
  * The answer when the accounts a request reached all held an expired token that
  * could not be renewed. 503 with the Retry-After of the hold on renewing its
  * token when there is one, else a short one: the renewal may go through on the
@@ -4233,19 +4251,12 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // this request waited renumbers the rest in place; its index is read again
   // here, for this attempt. It is -1 once the pinned account itself has left,
   // and the pin then names no account: it is answered at once as the listener
-  // answers such a pin, with the unknown-pin 404 (ctx.unknownPin). Waiting
-  // brings nothing back, and no other account may serve it.
+  // answers such a pin, with the unknown-pin 404 (respondPinGone). The same
+  // check follows two of the attempt's three waits below: its token refresh and
+  // its admission. The third, the per-origin socket queue upstreamFetch waits
+  // in, is not followed by one.
   if (ctx.pinnedAccount) ctx.pinnedIndex = ctx.pinnedAccount.index;
-  if (ctx.pinnedIndex != null && ctx.pinnedIndex < 0) {
-    ctx.status = 404;
-    ctx.account = `(unknown pin: "${ctx.unknownPin.label}")`;
-    ctx.delivered = true;   // an answer, as the listener's own 404 is
-    if (!res.headersSent && !clientGone(res)) {
-      res.writeHead(404, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: ctx.unknownPin.message } }));
-    }
-    return;
-  }
+  if (ctx.pinnedIndex != null && ctx.pinnedIndex < 0) return respondPinGone(res, ctx);
   advancePinPastBilling(ctx, accountManager);
   const pinned = ctx.pinnedIndex != null && !ctx.tried.has(accountManager.accounts[ctx.pinnedIndex])
     ? accountManager.accounts[ctx.pinnedIndex]
@@ -4516,6 +4527,10 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
 
   // Refresh OAuth token if needed
   await accountManager.ensureTokenFresh(account.index);
+  // A pinned account removed during the refresh is a pin that names no account,
+  // as at the top of the attempt: answered here, before its token is looked at,
+  // and so before anything is sent.
+  if (ctx.pinnedIndex != null && account.index < 0) return respondPinGone(res, ctx);
   if (account.status === 'error' && retryCount < maxRetries) {
     ctx.tried.add(account);
     return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
@@ -4659,6 +4674,12 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // is paused or ramping, which is exactly when clients give up, so leaving it
     // unmarked clustered false positives where the signal is read hardest.
     if (!await accountManager.admit(account.index, () => clientGone(res))) { ctx.abandoned = true; return; }
+    // And one removed during the wait for admission, before anything is sent.
+    // admit() stops waiting the moment it sees the account has left, and takes
+    // no slot then. A slot it took just before the removal stays counted on
+    // that account, which admission never reads once it has left, so there is
+    // nothing to give back (release, by index, would find no account).
+    if (ctx.pinnedIndex != null && account.index < 0) return respondPinGone(res, ctx);
     accountManager.beginActivity(account.index);
     activityOpened = true;
     // This request may have selected the account before another in-flight request

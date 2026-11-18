@@ -223,8 +223,10 @@ test('a /tc-acct/ pin with a malformed escape is answered, not left hanging', as
 // the tokens in `revoked` and 200 to any other. `send` sends a request pinned
 // to beta in the pin's `form`: the path prefix, TC_ACCT (the listener a pinned
 // MITM tunnel feeds, which carries the pin as forcedPin) or an operator session
-// pin.
-async function withRemoval({ onStart = null, onRefresh = null, revoked = [], form = 'path' }, run) {
+// pin; or, with `form` 'unpinned', with no pin at all. `betaExpiresAt` sets
+// when beta's token expires; `onAdmit` runs as the request enters admission
+// (admit), before its wait there resumes.
+async function withRemoval({ onStart = null, onRefresh = null, onAdmit = null, revoked = [], form = 'path', betaExpiresAt = null }, run) {
   const seen = [];
   const upstream = http.createServer((req, res) => {
     req.resume();
@@ -239,12 +241,16 @@ async function withRemoval({ onStart = null, onRefresh = null, revoked = [], for
     res.end(JSON.stringify({ ok: true }));
   });
   const upstreamPort = await listen(upstream);
-  const am = new AccountManager([oauth('alpha'), oauth('beta'), oauth('gamma')], 0.98, {
+  const am = new AccountManager([oauth('alpha'), { ...oauth('beta'), ...(betaExpiresAt != null ? { expiresAt: betaExpiresAt } : {}) }, oauth('gamma')], 0.98, {
     refreshFn: async () => {
       onRefresh?.(am);
       return { accessToken: 't-renewed', refreshToken: 'r2', expiresAt: Date.now() + 3600_000 };
     },
   });
+  if (onAdmit) {
+    const admit = am.admit.bind(am);
+    am.admit = (index, isAborted) => { const admitted = admit(index, isAborted); onAdmit(am); return admitted; };
+  }
   if (form === 'session') am.sessionPins.set('sess-pin', 'beta');
   const config = { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` };
   const hooks = { onRequestStart: () => onStart?.(am) };
@@ -258,7 +264,7 @@ async function withRemoval({ onStart = null, onRefresh = null, revoked = [], for
     body: JSON.stringify({ model: 'x', messages: [] }),
   });
   try {
-    return await run({ send, seen });
+    return await run({ am, send, seen });
   } finally {
     proxy.closeAllConnections();
     proxy.close();
@@ -290,11 +296,12 @@ test('a pinned request keeps its account when another is removed while it is in 
 // The pinned account itself leaves. Nothing else may serve the pin and waiting
 // will not bring the account back, so the request is answered as a pin that
 // names no account is: the unknown-pin 404, in each of the pin's forms.
-for (const [form, message] of [
+const PIN_GONE = [
   ['path', 'Unknown account pin "beta"'],
   ['TC_ACCT', 'Unknown account pin "beta" (from TC_ACCT)'],
   ['session', 'Unknown account pin "beta" (session pin; clear it with: teamclaude switch --session --clear)'],
-]) {
+];
+for (const [form, message] of PIN_GONE) {
   test(`a pinned request whose account is removed while it is in flight is answered 404 (${form})`, async () => {
     await withRemoval({ form, revoked: ['t-beta'], onRefresh: am => removeNamed(am, 'beta') }, async ({ send, seen }) => {
       const res = await send();
@@ -305,3 +312,189 @@ for (const [form, message] of [
     });
   });
 }
+
+// The same 404 when the pinned account leaves during the attempt's other waits:
+// its ordinary token refresh (beta's token has expired, and the refresh that
+// renews it is where beta is removed) and its wait for admission. Before, the
+// first ended on the expired-token 503 and the second sent beta's credential
+// upstream after beta had left.
+for (const [form, message] of PIN_GONE) {
+  test(`a pinned request whose account is removed during its token refresh is answered 404 (${form})`, async () => {
+    await withRemoval({ form, betaExpiresAt: Date.now() - 3600_000, onRefresh: am => removeNamed(am, 'beta') }, async ({ send, seen }) => {
+      const res = await send();
+      const body = await res.json();
+      assert.equal(res.status, 404);
+      assert.deepEqual(body.error, { type: 'not_found_error', message });
+      assert.deepEqual(seen, []);
+    });
+  });
+
+  test(`a pinned request whose account is removed while it waits for admission is answered 404 (${form})`, async () => {
+    await withRemoval({ form, onAdmit: am => removeNamed(am, 'beta') }, async ({ send, seen }) => {
+      const res = await send();
+      const body = await res.json();
+      assert.equal(res.status, 404);
+      assert.deepEqual(body.error, { type: 'not_found_error', message });
+      assert.deepEqual(seen, [], "the credential of an account that left was sent upstream");
+    });
+  });
+}
+
+// A token still valid but inside the refresh margin is refreshed too, and a
+// removal there sent beta's credential upstream after beta had left.
+test('a pinned request whose account is removed during the refresh of a still-valid token is not sent', async () => {
+  await withRemoval({ betaExpiresAt: Date.now() + 30_000, onRefresh: am => removeNamed(am, 'beta') }, async ({ send, seen }) => {
+    const res = await send();
+    await res.text();
+    assert.equal(res.status, 404);
+    assert.deepEqual(seen, [], "the credential of an account that left was sent upstream");
+  });
+});
+
+// An unpinned request is not a pin: its account removed during the same
+// refresh leaves it to fail over as an expired token does, onto gamma.
+test('an unpinned request whose account is removed during its token refresh is served by another', async () => {
+  await withRemoval({ form: 'unpinned', betaExpiresAt: Date.now() - 3600_000, onRefresh: am => removeNamed(am, 'beta') }, async ({ am, send, seen }) => {
+    am.currentIndex = 1;
+    const res = await send();
+    await res.text();
+    assert.equal(res.status, 200);
+    assert.deepEqual(seen, ['t-gamma']);
+  });
+});
+
+// Removed while the request waits out beta's rate-limit pause in admission:
+// admit() stops waiting as soon as it comes back round, takes no slot, and the
+// pin is answered. It used to sit out the whole pause first (an hour here, so
+// the old wait ends only on the runner's timeout).
+test('a pinned request whose account is removed during a pause in admission is answered 404 without waiting it out', async () => {
+  let paused = null;
+  await withRemoval({ onAdmit: am => removeNamed(am, 'beta') }, async ({ am, send, seen }) => {
+    paused = am.accounts[1];
+    am.pauseAccount(1, 3600);
+    const res = await send();
+    await res.text();
+    assert.equal(res.status, 404);
+    assert.deepEqual(seen, []);
+    assert.equal(paused.inFlight, 0, 'admission took a slot on the account that left');
+  });
+});
+
+// Requests waiting on beta's ramp cap when beta is removed (storm control: one
+// at a time, and the cap does not step within the test) stop waiting and are
+// answered, and none of them leaves a count behind on beta: the one that was
+// admitted before the removal is the only one counted there.
+test('requests waiting on a removed account\'s ramp are answered at once, taking no slot', async t => {
+  const seen = [];
+  let releaseFirst = () => {};
+  const firstHeld = new Promise(resolve => { releaseFirst = resolve; });
+  let firstArrived = () => {};
+  const firstIn = new Promise(resolve => { firstArrived = resolve; });
+  const upstream = http.createServer(async (req, res) => {
+    req.resume();
+    seen.push(String(req.headers.authorization || '').replace(/^Bearer /, ''));
+    if (seen.length === 1) { firstArrived(); await firstHeld; }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager([oauth('alpha'), oauth('beta'), oauth('gamma')], 0.98, {
+    ramp: { enabled: true, startConc: 1, stepConc: 1, stepMs: 3_600_000, windowMs: 3_600_000, pollMs: 20 },
+  });
+  const beta = am.accounts[1];
+  beta.rampStartedAt = Date.now();
+  let calls = 0;
+  let waiting = () => {};
+  const bothWaiting = new Promise(resolve => { waiting = resolve; });
+  const admit = am.admit.bind(am);
+  am.admit = (index, isAborted) => { const admitted = admit(index, isAborted); if (am.accounts[index] === beta && ++calls === 3) waiting(); return admitted; };
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const proxyPort = await listen(proxy);
+  t.after(() => { releaseFirst(); proxy.closeAllConnections(); proxy.close(); upstream.closeAllConnections(); upstream.close(); });
+  const url = `http://127.0.0.1:${proxyPort}/tc-acct/beta/v1/messages`;
+  const first = post(url, t.signal);
+  await firstIn;
+  const later = [post(url, t.signal), post(url, t.signal)];
+  await bothWaiting;
+  removeNamed(am, 'beta');
+  const answers = await Promise.all(later.map(async p => { const res = await p; await res.text(); return res.status; }));
+  assert.deepEqual(answers, [404, 404]);
+  assert.equal(beta.inFlight, 1, 'a request waiting on the ramp took a slot on the account that left');
+  releaseFirst();
+  const firstRes = await first;
+  await firstRes.text();
+  assert.deepEqual(seen, ['t-beta']);
+});
+
+// The client leaves during the refresh in which beta is removed: the request is
+// abandoned, not delivered, as the file's other answers count a gone client.
+test('a pin whose account is removed as its client leaves is recorded as abandoned', async t => {
+  const upstream = http.createServer((req, res) => { req.resume(); res.writeHead(200); res.end('{}'); });
+  const upstreamPort = await listen(upstream);
+  const client = new AbortController();
+  let socketClosed = () => {};
+  const closed = new Promise(resolve => { socketClosed = resolve; });
+  let am;
+  am = new AccountManager([oauth('alpha'), { ...oauth('beta'), expiresAt: Date.now() - 3600_000 }, oauth('gamma')], 0.98, {
+    refreshFn: async () => {
+      removeNamed(am, 'beta');
+      client.abort();
+      await closed;
+      return { accessToken: 't-renewed', refreshToken: 'r2', expiresAt: Date.now() + 3600_000 };
+    },
+  });
+  const outcomes = [];
+  const endSession = am.endSession.bind(am);
+  am.endSession = (key, outcome) => { outcomes.push(outcome); return endSession(key, outcome); };
+  let ended = () => {};
+  const rowWritten = new Promise(resolve => { ended = resolve; });
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` }, { onRequestEnd: () => ended() });
+  proxy.on('connection', socket => socket.on('close', () => socketClosed()));
+  const proxyPort = await listen(proxy);
+  t.after(() => { proxy.closeAllConnections(); proxy.close(); upstream.close(); });
+  await fetch(`http://127.0.0.1:${proxyPort}/tc-acct/beta/v1/messages`, {
+    method: 'POST', signal: client.signal,
+    headers: { 'content-type': 'application/json', 'x-claude-code-session-id': 'sess-gone' },
+    body: JSON.stringify({ model: 'x', messages: [] }),
+  }).catch(() => {});
+  await rowWritten;
+  assert.deepEqual(outcomes, [null], 'a request whose client had gone was counted as delivered');
+});
+
+// The slot a removed pin's request took stays where it was taken. gamma serves a
+// request held upstream; a request pinned to beta is admitted and beta removed
+// at once: gamma, which now sits at beta's old index, keeps its own slot.
+test('a pin whose account is removed after admission leaves the other accounts\' slots alone', async t => {
+  const seen = [];
+  let releaseGamma = () => {};
+  const gammaHeld = new Promise(resolve => { releaseGamma = resolve; });
+  let gammaArrived = () => {};
+  const gammaIn = new Promise(resolve => { gammaArrived = resolve; });
+  const upstream = http.createServer(async (req, res) => {
+    req.resume();
+    const token = String(req.headers.authorization || '').replace(/^Bearer /, '');
+    seen.push(token);
+    if (token === 't-gamma') { gammaArrived(); await gammaHeld; }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager([oauth('alpha'), oauth('beta'), oauth('gamma')], 0.98);
+  const [, beta, gamma] = am.accounts;
+  const admit = am.admit.bind(am);
+  am.admit = (index, isAborted) => { const admitted = admit(index, isAborted); if (am.accounts[index] === beta) removeNamed(am, 'beta'); return admitted; };
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const proxyPort = await listen(proxy);
+  t.after(() => { releaseGamma(); proxy.closeAllConnections(); proxy.close(); upstream.closeAllConnections(); upstream.close(); });
+  const toGamma = post(`http://127.0.0.1:${proxyPort}/tc-acct/gamma/v1/messages`, t.signal);
+  await gammaIn;
+  const res = await post(`http://127.0.0.1:${proxyPort}/tc-acct/beta/v1/messages`, t.signal);
+  await res.text();
+  assert.equal(res.status, 404);
+  assert.equal(gamma.inFlight, 1, "the 404 gave back gamma's slot while gamma's request was still out");
+  releaseGamma();
+  const gammaRes = await toGamma;
+  await gammaRes.text();
+  assert.equal(gamma.inFlight, 0);
+  assert.deepEqual(seen, ['t-gamma']);
+});

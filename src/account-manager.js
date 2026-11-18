@@ -1525,6 +1525,10 @@ export class AccountManager {
     if (!account) return true;
     while (true) {
       if (isAborted?.()) return false;
+      // Removed while this request waited (removeAccount leaves it at -1): there
+      // is nothing left to wait for, so stop at once and take no slot. The
+      // caller sees the account has left and does not send.
+      if (account.index < 0) return true;
       const now = Date.now();
       // Rate-limit pause: hold new requests off this account until the window
       // passes instead of flooding it (which would deepen the 429). Not a
