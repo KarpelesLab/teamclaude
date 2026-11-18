@@ -46,8 +46,10 @@ import { rememberResetReading, resetReading, RESET_CLAIM_TTL_MS, RESET_READ_FLOO
  * @property {string[]} [cleared]
  */
 
-/** @param {Record<string, any>} account */
-function oauthAccount(account) {
+/** Whether resets apply to the account at all: an OAuth Claude account
+ * (not a third-party backend) or a Codex account.
+ * @param {Record<string, any>} account */
+export function oauthAccount(account) {
   const provider = providerOf(account);
   return !!account && account.type === 'oauth'
     && (provider === 'codex' || (provider === DEFAULT_PROVIDER && !account.upstream));
