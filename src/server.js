@@ -1749,16 +1749,19 @@ function advancePinPastBilling(ctx, accountManager) {
   const from = accountManager.accounts[ctx.pinnedIndex];
   if (from?.type !== 'apikey') return;
   while (ctx.pinChain.length) {
-    const i = ctx.pinChain.shift();
-    const next = accountManager.accounts[i];
-    if (next?.type !== 'apikey' || providerOf(next) !== providerOf(from)
-        || accountManager.isBillingRejected(i) || accountManager.capBars(next, ctx.model, ctx.advisorModel)) continue;
+    // The list holds the accounts themselves, as the pin does (see the
+    // listener): one removed since the pin was resolved reads -1 and is passed
+    // over.
+    const next = ctx.pinChain.shift();
+    if (next.index < 0 || next.type !== 'apikey' || providerOf(next) !== providerOf(from)
+        || accountManager.isBillingRejected(next.index) || accountManager.capBars(next, ctx.model, ctx.advisorModel)) continue;
     // Named once per refusal, next to markBillingRejected's line; a request that
     // only passes a cooling account by is not worth a line each.
     if (ctx.tried.has(from)) {
       console.error(`[TeamClaude] Pinned account "${safeLine(from.name, 64)}" refused for billing; this request moves to "${safeLine(next.name, 64)}", the next account its pin names`);
     }
-    ctx.pinnedIndex = i;
+    ctx.pinnedAccount = next;
+    ctx.pinnedIndex = next.index;
     return;
   }
 }
@@ -2181,6 +2184,11 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // one account, bypassing rotation. Used by the keep-warm scheduler and for
       // manual per-account testing. The prefix is stripped before forwarding.
       let pinnedIndex = null;
+      // What a pin that names no account is answered (the 404s below), kept for
+      // the whole request: the account it names can be removed while the
+      // request waits, and forwardRequest then answers the pin the same way.
+      /** @type {{ label: string, message: string }|null} */
+      let unknownPin = null;
       // The accounts after the first that a pin naming several lists, in order
       // (resolvePinList); empty for a pin that names one.
       /** @type {number[]} */
@@ -2207,15 +2215,16 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         const pins = token == null ? null : resolvePinList(accountManager, token);
         pinnedIndex = pins?.[0] ?? null;
         pinChain = pins?.slice(1) ?? [];
+        // Client-supplied and already percent-decoded, so this is the one
+        // value on the path that can carry raw control bytes.
+        const shown = safeLine(token ?? raw);
+        unknownPin = { label: shown, message: `Unknown account pin "${shown}"` };
         if (pinnedIndex == null) {
-          // Client-supplied and already percent-decoded, so this is the one
-          // value on the path that can carry raw control bytes.
-          const shown = safeLine(token ?? raw);
           const reqId = ++lastRequestId;
           const sessionId = clientSessionId(req.headers);
-          if (!hideActivity) hooks.onRequestEnd?.(reqId, { callerRequestId: callerId, method: req.method, path: req.url, account: `(unknown pin: "${shown}")`, status: 404, model: null, sessionId, pinned: false });
+          if (!hideActivity) hooks.onRequestEnd?.(reqId, { callerRequestId: callerId, method: req.method, path: req.url, account: `(unknown pin: "${unknownPin.label}")`, status: 404, model: null, sessionId, pinned: false });
           res.writeHead(404, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: `Unknown account pin "${shown}"` } }));
+          res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: unknownPin.message } }));
           recordEarlyOutcome(accountManager, { sessionId }, req.url, true);
           return;
         }
@@ -2270,12 +2279,13 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         const pins = resolvePinList(accountManager, forcedPin);
         pinnedIndex = pins?.[0] ?? null;
         pinChain = pins?.slice(1) ?? [];
+        unknownPin = { label: safeLine(forcedPin), message: `Unknown account pin "${forcedPin}" (from TC_ACCT)` };
         if (pinnedIndex == null) {
           const reqId = ++lastRequestId;
           const sessionId = clientSessionId(req.headers);
-          if (!hideActivity) hooks.onRequestEnd?.(reqId, { callerRequestId: callerId, method: req.method, path: req.url, account: `(unknown pin: "${safeLine(forcedPin)}")`, status: 404, model: null, sessionId, pinned: false });
+          if (!hideActivity) hooks.onRequestEnd?.(reqId, { callerRequestId: callerId, method: req.method, path: req.url, account: `(unknown pin: "${unknownPin.label}")`, status: 404, model: null, sessionId, pinned: false });
           res.writeHead(404, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: `Unknown account pin "${forcedPin}" (from TC_ACCT)` } }));
+          res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: unknownPin.message } }));
           recordEarlyOutcome(accountManager, { sessionId }, req.url, true);
           return;
         }
@@ -2292,16 +2302,25 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         const sessionPin = /** @type {any} */ (accountManager).sessionPins?.get(sessionId) ?? null;
         if (sessionPin != null) {
           pinnedIndex = resolveAccountPin(accountManager, sessionPin);
+          unknownPin = { label: safeLine(sessionPin), message: `Unknown account pin "${sessionPin}" (session pin; clear it with: teamclaude switch --session --clear)` };
           if (pinnedIndex == null) {
             const reqId = ++lastRequestId;
-            if (!hideActivity) hooks.onRequestEnd?.(reqId, { callerRequestId: callerId, method: req.method, path: req.url, account: `(unknown pin: "${safeLine(sessionPin)}")`, status: 404, model: null, sessionId, pinned: false });
+            if (!hideActivity) hooks.onRequestEnd?.(reqId, { callerRequestId: callerId, method: req.method, path: req.url, account: `(unknown pin: "${unknownPin.label}")`, status: 404, model: null, sessionId, pinned: false });
             res.writeHead(404, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: `Unknown account pin "${sessionPin}" (session pin; clear it with: teamclaude switch --session --clear)` } }));
+            res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: unknownPin.message } }));
             recordEarlyOutcome(accountManager, { sessionId }, req.url, true);
             return;
           }
         }
       }
+
+      // From here the pin is held as the accounts themselves, not their places
+      // in the list. The request waits from here on (for its body, then in
+      // forwardRequest for a refresh, upstream or a hold), and an account
+      // removed meanwhile renumbers the rest in place (removeAccount): an index
+      // resolved above would then name whichever account slid into it.
+      const pinnedAccount = pinnedIndex == null ? null : /** @type {any} */ (accountManager).accounts[pinnedIndex];
+      const pinChainAccounts = pinChain.map(i => /** @type {any} */ (accountManager).accounts[i]);
 
       const reqId = ++lastRequestId;
       // Claude Code tags each session's requests with this header (present on
@@ -2461,7 +2480,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // stripOverage, synthesizeQuota and poolQuota are sampled once here, at dispatch:
       // retries and holds of this request keep them, and a reload applies to
       // subsequent requests. `tried` collects accounts, not indices (indicesOf).
-      const ctx = { account: null, callerRequestId: callerId, status: null, attempt: 0, tried: new Set(), reauthed: new Set(), model, advisorModel, streamRequested: parseRequestStream(body), fleetMessageThreads: config?.messageThreads === true, pinnedIndex, pinChain, provider, holdBudgetMs: holdMs, pinKey, onMessage, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, stripOverage: shouldStripOverageHeaders(config), synthesizeQuota: shouldSynthesizeQuotaHeaders(config), poolQuota: shouldPoolQuotaHeaders(config), logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config), cacheUsage: /** @type {Record<string, any>|null} */ (null), errorType: /** @type {string|null} */ (null), usage };
+      const ctx = { account: null, callerRequestId: callerId, status: null, attempt: 0, tried: new Set(), reauthed: new Set(), model, advisorModel, streamRequested: parseRequestStream(body), fleetMessageThreads: config?.messageThreads === true, pinnedIndex, pinnedAccount, unknownPin, pinChain: pinChainAccounts, provider, holdBudgetMs: holdMs, pinKey, onMessage, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, stripOverage: shouldStripOverageHeaders(config), synthesizeQuota: shouldSynthesizeQuotaHeaders(config), poolQuota: shouldPoolQuotaHeaders(config), logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config), cacheUsage: /** @type {Record<string, any>|null} */ (null), errorType: /** @type {string|null} */ (null), usage };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request.
@@ -4187,6 +4206,23 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // billing: once upstream billing has refused the account it is on (the
   // billing check below starts its cooldown and comes back here), the request
   // goes to the next one listed.
+  // The pin is held as the account (ctx.pinnedAccount), since one removed while
+  // this request waited renumbers the rest in place; its index is read again
+  // here, for this attempt. It is -1 once the pinned account itself has left,
+  // and the pin then names no account: it is answered at once as the listener
+  // answers such a pin, with the unknown-pin 404 (ctx.unknownPin). Waiting
+  // brings nothing back, and no other account may serve it.
+  if (ctx.pinnedAccount) ctx.pinnedIndex = ctx.pinnedAccount.index;
+  if (ctx.pinnedIndex != null && ctx.pinnedIndex < 0) {
+    ctx.status = 404;
+    ctx.account = `(unknown pin: "${ctx.unknownPin.label}")`;
+    ctx.delivered = true;   // an answer, as the listener's own 404 is
+    if (!res.headersSent && !clientGone(res)) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: ctx.unknownPin.message } }));
+    }
+    return;
+  }
   advancePinPastBilling(ctx, accountManager);
   const pinned = ctx.pinnedIndex != null && !ctx.tried.has(accountManager.accounts[ctx.pinnedIndex])
     ? accountManager.accounts[ctx.pinnedIndex]

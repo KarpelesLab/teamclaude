@@ -187,6 +187,62 @@ for (const [skipped, label] of [
   });
 }
 
+// Removing an account renumbers the rest in place (removeAccount), and the
+// first account's round trip is a wait like any other. The list was held as
+// indices, so the walk read whichever accounts then sat in those places: here
+// the request was sent to y, an account its pin does not name.
+const removingOnFirst = (box, name) => (req, res) => {
+  const key = req.headers['x-api-key'] || req.headers.authorization;
+  if (key !== 'key-a') return json(res, 200, { ok: true, key });
+  box.am.removeAccount(box.am.accounts.findIndex(a => a.name === name));
+  json(res, 400, LOW_CREDIT);
+};
+
+test('a list pin moves to the next listed account when another is removed during the refused request', async () => {
+  const box = {};
+  await withPin([plan, credit('x'), credit('a'), credit('y'), credit('b')], 'a,b', removingOnFirst(box, 'x'), async ({ am, seen, post }) => {
+    box.am = am;
+    assert.deepEqual(await post(), served('key-b'));
+    assert.deepEqual(seen, ['key-a', 'key-b']);
+  });
+});
+
+// A listed account removed meanwhile is passed over like one that cannot take
+// the request.
+test('a list pin passes over a listed account removed during the refused request', async () => {
+  const box = {};
+  await withPin([plan, credit('a'), credit('x'), credit('b')], 'a,x,b', removingOnFirst(box, 'x'), async ({ am, seen, post }) => {
+    box.am = am;
+    assert.deepEqual(await post(), served('key-b'));
+    assert.deepEqual(seen, ['key-a', 'key-b']);
+  });
+});
+
+// The move holds for the rest of the request: an answer after it is the answer
+// of the account moved to. b refuses the key, and the request ends on that
+// refusal, not on a's billing.
+test('after a billing move the request ends on the account it moved to', async () => {
+  const forbidden = { type: 'error', error: { type: 'permission_error', message: 'Request not allowed' } };
+  await withPin([plan, credit('a'), credit('b')], 'a,b', (req, res) => {
+    if (req.headers['x-api-key'] === 'key-a') return json(res, 400, LOW_CREDIT);
+    json(res, 403, forbidden);
+  }, async ({ seen, post }) => {
+    const { status, body } = await post();
+    assert.equal(status, 502, `answered ${status}: ${JSON.stringify(body)}`);
+    assert.equal(body.error.type, 'proxy_error');
+    assert.deepEqual(seen, ['key-a', 'key-b']);
+  });
+});
+
+// The first account in the fleet sits at index 0, a listed account like any
+// other (one that has left reads -1).
+test('a list pin moves to a listed account that is first in the fleet', async () => {
+  await withPin([credit('b'), plan, credit('a')], 'a,b', billing(new Set(['key-a'])), async ({ seen, post }) => {
+    assert.deepEqual(await post(), served('key-b'));
+    assert.deepEqual(seen, ['key-a', 'key-b']);
+  });
+});
+
 test('only a billing refusal moves along the list: another 400 goes to the client', async () => {
   const invalid = { type: 'error', error: { type: 'invalid_request_error', message: 'messages: field required' } };
   await withPin([plan, credit('a'), credit('b')], 'a,b', (_req, res) => json(res, 400, invalid), async ({ seen, post }) => {

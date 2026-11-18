@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { AccountManager } from '../src/account-manager.js';
-import { createProxyServer, resolveAccountPin } from '../src/server.js';
+import { createProxyServer, createProxyRequestListener, resolveAccountPin } from '../src/server.js';
 
 function listen(server) {
   return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
@@ -211,3 +211,97 @@ test('a /tc-acct/ pin with a malformed escape is answered, not left hanging', as
     assert.equal(seen.length, 0, 'an unresolvable pin reached upstream');
   });
 });
+
+// ── a pin across an account removal ─────────────────────────────────────────
+
+// Removing an account renumbers the rest of the fleet in place (removeAccount),
+// and a pinned request can be waiting when it happens: for its body, for a
+// refresh, for upstream. The pin was held as an index, so the request was sent
+// to whichever account had slid into its account's place. `onStart` runs at
+// onRequestStart, after the pin is resolved and before the body is read;
+// `onRefresh` inside the forced refresh a 401 starts. Upstream answers 401 to
+// the tokens in `revoked` and 200 to any other. `send` sends a request pinned
+// to beta in the pin's `form`: the path prefix, TC_ACCT (the listener a pinned
+// MITM tunnel feeds, which carries the pin as forcedPin) or an operator session
+// pin.
+async function withRemoval({ onStart = null, onRefresh = null, revoked = [], form = 'path' }, run) {
+  const seen = [];
+  const upstream = http.createServer((req, res) => {
+    req.resume();
+    const token = String(req.headers.authorization || '').replace(/^Bearer /, '');
+    seen.push(token);
+    if (revoked.includes(token)) {
+      res.writeHead(401, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'authentication_error', message: 'OAuth access token has been revoked' } }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager([oauth('alpha'), oauth('beta'), oauth('gamma')], 0.98, {
+    refreshFn: async () => {
+      onRefresh?.(am);
+      return { accessToken: 't-renewed', refreshToken: 'r2', expiresAt: Date.now() + 3600_000 };
+    },
+  });
+  if (form === 'session') am.sessionPins.set('sess-pin', 'beta');
+  const config = { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` };
+  const hooks = { onRequestStart: () => onStart?.(am) };
+  const proxy = form === 'TC_ACCT'
+    ? http.createServer(createProxyRequestListener({ accountManager: am, upstream: config.upstream, config, hooks, forcedPin: 'beta' }))
+    : createProxyServer(am, config, hooks);
+  const proxyPort = await listen(proxy);
+  const send = () => fetch(`http://127.0.0.1:${proxyPort}${form === 'path' ? '/tc-acct/beta' : ''}/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...(form === 'session' ? { 'x-claude-code-session-id': 'sess-pin' } : {}) },
+    body: JSON.stringify({ model: 'x', messages: [] }),
+  });
+  try {
+    return await run({ send, seen });
+  } finally {
+    proxy.closeAllConnections();
+    proxy.close();
+    upstream.closeAllConnections();
+    upstream.close();
+  }
+}
+
+const removeNamed = (am, name) => am.removeAccount(am.accounts.findIndex(a => a.name === name));
+
+test('a pinned request keeps its account when another is removed before it is forwarded', async () => {
+  await withRemoval({ onStart: am => removeNamed(am, 'alpha') }, async ({ send, seen }) => {
+    const res = await send();
+    await res.text();
+    assert.equal(res.status, 200);
+    assert.deepEqual(seen, ['t-beta'], 'the pin went to the account that took its place');
+  });
+});
+
+test('a pinned request keeps its account when another is removed while it is in flight', async () => {
+  await withRemoval({ revoked: ['t-beta'], onRefresh: am => removeNamed(am, 'alpha') }, async ({ send, seen }) => {
+    const res = await send();
+    await res.text();
+    assert.equal(res.status, 200);
+    assert.deepEqual(seen, ['t-beta', 't-renewed'], 'the retry after the refresh went to another account');
+  });
+});
+
+// The pinned account itself leaves. Nothing else may serve the pin and waiting
+// will not bring the account back, so the request is answered as a pin that
+// names no account is: the unknown-pin 404, in each of the pin's forms.
+for (const [form, message] of [
+  ['path', 'Unknown account pin "beta"'],
+  ['TC_ACCT', 'Unknown account pin "beta" (from TC_ACCT)'],
+  ['session', 'Unknown account pin "beta" (session pin; clear it with: teamclaude switch --session --clear)'],
+]) {
+  test(`a pinned request whose account is removed while it is in flight is answered 404 (${form})`, async () => {
+    await withRemoval({ form, revoked: ['t-beta'], onRefresh: am => removeNamed(am, 'beta') }, async ({ send, seen }) => {
+      const res = await send();
+      const body = await res.json();
+      assert.equal(res.status, 404);
+      assert.deepEqual(body.error, { type: 'not_found_error', message });
+      assert.deepEqual(seen, ['t-beta'], 'the request went to another account once its own had left');
+    });
+  });
+}
