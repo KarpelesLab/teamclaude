@@ -12,10 +12,14 @@ import { closedPort } from '../test-helpers/spawn-server.js';
 const cliPath = fileURLToPath(new URL('../src/index.js', import.meta.url));
 const pexec = promisify(execFile);
 
+/** A server reply: a bare pid stands for a server that does not say its version. */
+const srv = (pid, version = null) => (pid == null ? null : { pid, version });
+
 /** A probe that answers each call with the next value, then the last one forever. */
 function answers(...values) {
   let calls = 0;
-  const probe = async () => values[Math.min(calls++, values.length - 1)];
+  const replies = values.map(v => (typeof v === 'number' ? srv(v) : v));
+  const probe = async () => replies[Math.min(calls++, replies.length - 1)];
   return { probe, calls: () => calls };
 }
 
@@ -38,7 +42,7 @@ test('a proxy that is already up is not started again; its dashboard is opened',
   const f = fakes();
   const { probe } = answers(111);
   const res = await launchDesktop({ ...base, probe, start: () => { f.starts.push(1); return { pid: 1, exited: () => null }; }, openUrl: f.openUrl, sleep: f.sleep, now: f.now });
-  assert.deepEqual(res, { url: 'http://127.0.0.1:4100/teamclaude/dashboard', pid: 111, started: false });
+  assert.deepEqual(res, { url: 'http://127.0.0.1:4100/teamclaude/dashboard', pid: 111, started: false, replaced: null });
   assert.equal(f.starts.length, 0);
   assert.deepEqual(f.opened, ['http://127.0.0.1:4100/teamclaude/dashboard']);
   // desktop exits right after, so the opener must be waited for (on Windows
@@ -50,7 +54,7 @@ test('a stopped proxy is started, waited for until it answers with its own pid, 
   const f = fakes();
   const { probe } = answers(null, null, null, 222);
   const res = await launchDesktop({ ...base, probe, start: logFile => { f.starts.push(logFile); return { pid: 222, exited: () => null }; }, openUrl: f.openUrl, sleep: f.sleep, now: f.now });
-  assert.deepEqual(res, { url: 'http://127.0.0.1:4100/teamclaude/dashboard', pid: 222, started: true });
+  assert.deepEqual(res, { url: 'http://127.0.0.1:4100/teamclaude/dashboard', pid: 222, started: true, replaced: null });
   assert.deepEqual(f.starts, ['/logs/teamclaude.log']);
   assert.equal(f.opened.length, 1);
 });
@@ -68,10 +72,10 @@ test('another server answering while the child still runs is not taken for it', 
   // A second launch's server comes up first; ours then loses the port and
   // exits, and only after that is the other one the server to open.
   let probes = 0;
-  const probe = async () => (probes++ === 0 ? null : 999);
+  const probe = async () => (probes++ === 0 ? null : srv(999));
   const exited = () => (probes >= 3 ? 'exit code 1' : null);
   const res = await launchDesktop({ ...base, probe, start: () => ({ pid: 444, exited }), openUrl: f.openUrl, sleep: f.sleep, now: f.now });
-  assert.deepEqual(res, { url: 'http://127.0.0.1:4100/teamclaude/dashboard', pid: 999, started: false });
+  assert.deepEqual(res, { url: 'http://127.0.0.1:4100/teamclaude/dashboard', pid: 999, started: false, replaced: null });
   assert.equal(probes, 4, 'kept waiting while the child was alive');
   assert.equal(f.opened.length, 1);
 });
@@ -98,9 +102,93 @@ test('a child that never answers fails once the wait runs out, naming the log', 
   assert.deepEqual(f.opened, []);
 });
 
+test('an older proxy already up is stopped, and this version started in its place', async () => {
+  const f = fakes();
+  const stopped = [];
+  // The old one answers, then is gone once stopped, then ours answers.
+  const { probe } = answers(srv(111, '1.1.26'), srv(111, '1.1.26'), null, srv(222, '1.1.27'));
+  const res = await launchDesktop({ ...base, version: '1.1.27', probe, stop: pid => { stopped.push(pid); }, start: () => { f.starts.push(1); return { pid: 222, exited: () => null }; }, openUrl: f.openUrl, sleep: f.sleep, now: f.now });
+  assert.deepEqual(stopped, [111]);
+  assert.equal(f.starts.length, 1);
+  assert.deepEqual(res, { url: 'http://127.0.0.1:4100/teamclaude/dashboard', pid: 222, started: true, replaced: { pid: 111, version: '1.1.26' } });
+  assert.equal(f.opened.length, 1);
+});
+
+test('a proxy of the same or a newer version, or one that does not say, is left running', async () => {
+  for (const running of ['1.1.27', '1.1.30', null]) {
+    const f = fakes();
+    const { probe } = answers(srv(111, running));
+    const res = await launchDesktop({ ...base, version: '1.1.27', probe, stop: () => { throw new Error('must not stop it'); }, start: () => { throw new Error('must not start'); }, openUrl: f.openUrl, sleep: f.sleep, now: f.now });
+    assert.equal(res.pid, 111, `running ${running}`);
+    assert.equal(res.replaced, null);
+  }
+});
+
+test('without its own version, desktop replaces nothing', async () => {
+  const f = fakes();
+  const { probe } = answers(srv(111, '0.0.1'));
+  const res = await launchDesktop({ ...base, probe, stop: () => { throw new Error('must not stop it'); }, openUrl: f.openUrl, sleep: f.sleep, now: f.now });
+  assert.equal(res.pid, 111);
+});
+
+test('an older proxy that cannot be stopped is reported, and nothing is opened', async () => {
+  const f = fakes();
+  const { probe } = answers(srv(111, '1.1.26'));
+  const denied = () => { throw Object.assign(new Error('operation not permitted'), { code: 'EPERM' }); };
+  await assert.rejects(
+    launchDesktop({ ...base, version: '1.1.27', probe, stop: denied, openUrl: f.openUrl, sleep: f.sleep, now: f.now }),
+    /older TeamClaude \(1\.1\.26, pid 111\) is running on port 4100, and it could not be stopped \(operation not permitted\)/,
+  );
+  assert.deepEqual(f.opened, []);
+});
+
+test('an older proxy that already exited before it was stopped is not an error', async () => {
+  const f = fakes();
+  const { probe } = answers(srv(111, '1.1.26'), null, srv(222, '1.1.27'));
+  const gone = () => { throw Object.assign(new Error('no such process'), { code: 'ESRCH' }); };
+  const res = await launchDesktop({ ...base, version: '1.1.27', probe, stop: gone, start: () => ({ pid: 222, exited: () => null }), openUrl: f.openUrl, sleep: f.sleep, now: f.now });
+  assert.equal(res.started, true);
+});
+
+test('an older proxy put straight back by a service is reported instead of opened', async () => {
+  const f = fakes();
+  // Stopped, then a new pid of the same old version takes the port.
+  const { probe } = answers(srv(111, '1.1.26'), srv(333, '1.1.26'));
+  await assert.rejects(
+    launchDesktop({ ...base, version: '1.1.27', probe, stop: () => {}, start: () => { throw new Error('must not start'); }, openUrl: f.openUrl, sleep: f.sleep, now: f.now }),
+    /older TeamClaude \(1\.1\.26, pid 333\) keeps running on port 4100.*teamclaude service uninstall/,
+  );
+  assert.deepEqual(f.opened, []);
+});
+
+test('an older proxy that wins the port back from the started copy is reported', async () => {
+  const f = fakes();
+  let probes = 0;
+  // Old one answers; stopped and gone; our child starts, loses the port to
+  // the old version coming back, and exits.
+  const replies = [srv(111, '1.1.26'), null, null, srv(333, '1.1.26')];
+  const probe = async () => replies[Math.min(probes++, replies.length - 1)];
+  const exited = () => (probes >= 3 ? 'exit code 1' : null);
+  await assert.rejects(
+    launchDesktop({ ...base, version: '1.1.27', probe, stop: () => {}, start: () => ({ pid: 222, exited }), openUrl: f.openUrl, sleep: f.sleep, now: f.now }),
+    /keeps running on port 4100/,
+  );
+  assert.deepEqual(f.opened, []);
+});
+
+test('an older proxy that does not stop in time is reported', async () => {
+  const f = fakes();
+  const { probe } = answers(srv(111, '1.1.26'));
+  await assert.rejects(
+    launchDesktop({ ...base, version: '1.1.27', timeoutMs: 20_000, probe, stop: () => {}, openUrl: f.openUrl, sleep: f.sleep, now: f.now }),
+    /did not stop within 20 s/,
+  );
+  assert.equal(f.now(), 20_000);
+});
+
 test('an IPv6 bind is bracketed in the dashboard address', async () => {
   const f = fakes();
-  const res = await launchDesktop({ ...base, host: '::1', probe: async () => 1, openUrl: f.openUrl, sleep: f.sleep, now: f.now });
+  const res = await launchDesktop({ ...base, host: '::1', probe: async () => srv(1), openUrl: f.openUrl, sleep: f.sleep, now: f.now });
   assert.equal(res.url, 'http://[::1]:4100/teamclaude/dashboard');
 });
 

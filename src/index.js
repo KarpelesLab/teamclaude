@@ -2320,9 +2320,11 @@ async function desktopCommand() {
   const host = (bound === '0.0.0.0' || bound === '::') ? '127.0.0.1' : bound;
   const logFile = logPath();
   try {
-    const { url, pid, started } = await launchDesktop({
+    const { url, pid, started, replaced } = await launchDesktop({
       host, port: config.proxy.port, apiKey: config.proxy.apiKey, logFile, open: !args.includes('--no-open'),
+      version: currentVersion(),
     });
+    if (replaced) console.log(`Stopped an older proxy (${replaced.version}, pid ${replaced.pid}) to run ${currentVersion()} in its place.`);
     console.log(started ? `Started the proxy (pid ${pid}). Log: ${logFile}` : `The proxy is already running (pid ${pid}).`);
     console.log(`Dashboard: ${url}`);
   } catch (err) {
