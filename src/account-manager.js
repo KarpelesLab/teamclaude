@@ -225,7 +225,7 @@ const underOne = v => v != null && v < 1;
  *
  * @typedef {object} CodexLearnedQuota
  * @property {string} [planType]  the Codex subscription tier
- * @property {{available: number, applicable: number|null, seenAt: number, expiresAt?: number|null}} [resetCredits]  free rate-limit reset credits (Codex) or banked usage-limit resets (Claude) held, when that was last seen, and when the soonest one lapses where the provider says
+ * @property {{available: number, applicable: number|null, seenAt: number, expiresAt?: number|null, fable?: number, fableExpiresAt?: number|null}} [resetCredits]  free rate-limit reset credits (Codex) or banked usage-limit resets (Claude) held, when that was last seen, and when the soonest one lapses where the provider says (for Claude, the general and the Fable resets each dated apart)
  * @property {Record<string, {name: string, utilization: number, resetAt: number|null, seenAt: number}>} [codexModelBuckets]  model-scoped weekly buckets, keyed by slug
  * @property {Record<string, string>} [codexModelLimits]  which limit each model was last metered on, from `x-codex-active-limit`: a `codexModelBuckets` slug, or the name upstream gives the account-wide limit
  */

@@ -673,7 +673,10 @@ the Fable weekly and leaves the shared weekly at 80%. It is worth the most on an
 account whose Fable weekly is spent. The usage payload's `weekly_scoped_shares`
 says how much of the weekly Fable has used. The surfaces count the two kinds
 apart: `FR3` on the TUI row (`RC1 FR2` for an account holding both), and
-"Fable resets" on the `Reset` line and the dashboard badge.
+"Fable resets" on the `Reset` line and the dashboard badge. The two kinds lapse
+on their own dates (the October resets in December, the Fable ones in March),
+so an account holding both shows each date beside its kind, and one kind past
+its date drops out while the other stays.
 
 A bucket the account cannot serve from right now is marked on its own bar:
 `⊘Wk` in place of `Wk`, `⊘F` in place of `F7`, `⊘S` in place of `S7`. Only a
