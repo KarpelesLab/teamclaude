@@ -308,6 +308,13 @@ export class Warmer {
    *  @param {number} [now]
    *  @returns {string|null} */
   _warmSkipReason(account, now = this.nowFn()) {
+    const am = /** @type {import('./account-manager.js').AccountManager} */ (this.am);
+    // Not one removed from the fleet since it was picked (a removal leaves it at
+    // index -1). Its warm-up pin then names no account, or resolves to another
+    // one - one sharing its accountUuid while its orgUuid is not known yet, or
+    // one whose name, without its org suffix, is its name - and the warm-up is
+    // spent there.
+    if (am.accounts[account.index] !== account) return 'account removed';
     if (!this._isWarmCandidate(account)) return 'no longer eligible';
     // Nor while the account sits out an entitlement cooldown (an OAuth policy
     // 403). A warm-up is pinned, so nothing in the listener holds it back, and
@@ -326,7 +333,6 @@ export class Warmer {
     // running ahead, the warmer cleared a cooldown rotation still held and
     // sent the warm-up into it; on one running behind, it skipped an account
     // rotation had already taken back.
-    const am = /** @type {import('./account-manager.js').AccountManager} */ (this.am);
     if (am.isEntitlementDenied(account.index)) return 'entitlement cooldown';
     const reset = account.quota?.unified5hReset;
     if (reset && now < reset) return '5h window already running'; // a future reset ⇒ session already running

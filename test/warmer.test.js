@@ -912,6 +912,14 @@ for (const [what, names, opts, act, expected] of [
     w.am.accounts[0].disabled = true;
     await w.deferred[0].fn();
   }, dropLine('near', 'no longer eligible')],
+  // Removed in-process (the MCP remove_account does no reload, so nothing
+  // cancels the delayed warm-up): its pin could resolve to another account.
+  ['its account was removed', ['near'], {}, async (w) => {
+    const log = console.log;
+    console.log = () => {};
+    try { w.am.removeAccount(0); } finally { console.log = log; }
+    await w.deferred[0].fn();
+  }, dropLine('near', 'account removed')],
   ['its timer fired a minute late', ['near'], {}, async (w) => {
     w.clock.now = AFTER_ITS_MINUTE;
     await w.deferred[0].fn();
@@ -1152,6 +1160,40 @@ test('a reload that changes the schedule drops its delayed warm-ups as reconfigu
   const w = await delayedWarmups(['first', 'second']);
   w.warmer.reloadSchedule({ ...w.schedule, anchorResetAt: '2030-09-02T12:30:00.000Z' });
   assert.deepEqual(w.dropped(), [dropLine('first', 'keep-warm reconfigured'), dropLine('second', 'keep-warm reconfigured')]);
+});
+
+// The sweep picks its targets when it starts; one removed before its turn is
+// not warmed, since its pin could resolve to another account.
+test('an account removed while a sweep is running is not warmed', async () => {
+  const s = await heldSlot(ROLLING);
+  const log = console.log;
+  console.log = () => {};
+  try { s.warmer.am.removeAccount(1); } finally { console.log = log; }
+  s.release();
+  await s.slot;
+  assert.deepEqual(s.sent(), ['first']);
+});
+
+// Guards on the removal check: an account after the removed one is renumbered
+// in place, so it is still the manager's at its new index, and still warmed.
+test('an account renumbered by an earlier removal mid-sweep is still warmed', async () => {
+  const s = await heldSlot(ROLLING);
+  const log = console.log;
+  console.log = () => {};
+  try { s.warmer.am.removeAccount(0); } finally { console.log = log; }
+  s.release();
+  await s.slot;
+  assert.deepEqual(s.sent(), ['first', 'second']);
+});
+
+test('a delayed warm-up of an account renumbered by an earlier removal still goes out', async () => {
+  const w = await delayedWarmups(['first', 'second']);
+  const log = console.log;
+  console.log = () => {};
+  try { w.am.removeAccount(0); } finally { console.log = log; }
+  for (const timer of w.deferred) await timer.fn();
+  assert.deepEqual(w.sent(), ['second']);
+  assert.deepEqual(w.dropped(), [dropLine('first', 'account removed')]);
 });
 
 // A bad hand edit still fails the reload and leaves the schedule running.
