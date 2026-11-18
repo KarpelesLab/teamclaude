@@ -5,7 +5,8 @@ name: Publish
 # what is already on npm, so it only publishes when CI passed AND the version
 # is new — merging any other PR is a no-op. Publishing is idempotent:
 # re-running on the same version simply skips. The GitHub release it creates
-# gets the Windows installer (TeamClaude-Setup-<version>.exe) attached.
+# gets the Windows installer (TeamClaude-Setup-<version>.exe) and the portable
+# exe (TeamClaude-<version>-portable.exe and its .sha256) attached.
 #
 # Authentication uses npm Trusted Publishing (OIDC) — no long-lived NPM_TOKEN.
 # npm mints a short-lived credential from the GitHub OIDC token at publish time,
@@ -164,11 +165,11 @@ jobs:
             echo "created=true" >> "$GITHUB_OUTPUT"
           fi
 
-  # The Windows installer for the release just created, built from the same
-  # commit. A job of its own so that the apt packages it needs never run
-  # beside the npm publishing credentials.
+  # The Windows installer and portable exe for the release just created, built
+  # from the same commit. A job of its own so that the apt packages it needs
+  # never run beside the npm publishing credentials.
   windows-installer:
-    name: attach the Windows installer
+    name: attach the Windows installer and portable exe
     needs: publish
     if: needs.publish.outputs.released == 'true'
     runs-on: ubuntu-latest
@@ -200,3 +201,10 @@ jobs:
           GH_REPO: ${{ github.repository }}
           VERSION: ${{ needs.publish.outputs.version }}
         run: gh release upload "v${VERSION}" "dist/TeamClaude-Setup-${VERSION}.exe" --clobber
+
+      - name: Upload the portable exe to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.publish.outputs.version }}
+        run: gh release upload "v${VERSION}" "dist/TeamClaude-${VERSION}-portable.exe" "dist/TeamClaude-${VERSION}-portable.exe.sha256" --clobber

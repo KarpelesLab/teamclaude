@@ -244,6 +244,14 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+      - name: Upload the portable exe
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-portable
+          path: dist/TeamClaude-*-portable.exe*
+          if-no-files-found: error
+          retention-days: 14
+
   # The installer on real Windows, run the way a person runs it but silently:
   # install, start the proxy through TeamClaude.exe on a throwaway config,
   # load the dashboard, stop it, uninstall, and check what is left behind.
@@ -337,6 +345,117 @@ jobs:
           if (Test-Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\TeamClaude') { throw 'The uninstall entry is still there' }
           if (-not (Test-Path $env:TEAMCLAUDE_CONFIG)) { throw 'The uninstaller removed the config' }
           'Uninstalled; the config was kept.'
+
+  # The portable exe on real Windows, run the way a person runs it from
+  # Downloads: check it against its .sha256, start it on a throwaway config
+  # (the first run unpacks to %LOCALAPPDATA%), look at the dashboard in a
+  # browser, run it again to see it neither unpacks nor starts a second proxy,
+  # and stop it.
+  windows-portable-smoke:
+    name: windows portable exe smoke test
+    needs: windows-installer
+    runs-on: windows-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Download the portable exe
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: windows-portable
+          path: portable
+
+      - name: Verify the checksum
+        run: |
+          $exe = Get-ChildItem portable\TeamClaude-*-portable.exe | Select-Object -First 1
+          $line = (Get-Content "$($exe.FullName).sha256" -Raw).Trim()
+          $expected = $line -split '\s+'
+          if ($expected.Count -ne 2 -or $expected[1] -ne $exe.Name) { throw "The .sha256 does not name $($exe.Name): $line" }
+          $actual = (Get-FileHash -Algorithm SHA256 $exe.FullName).Hash.ToLower()
+          if ($actual -ne $expected[0]) { throw "SHA-256 is $actual, the .sha256 says $($expected[0])" }
+          "$($exe.Name) matches its .sha256 ($actual)"
+          "PORTABLE_EXE=$($exe.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "PORTABLE_VERSION=$($exe.Name -replace '^TeamClaude-(.+)-portable\.exe$', '$1')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Start the proxy through the portable exe
+        run: |
+          $cfgDir = Join-Path $env:RUNNER_TEMP 'tc-config'
+          New-Item -ItemType Directory -Path $cfgDir | Out-Null
+          $cfg = Join-Path $cfgDir 'teamclaude.json'
+          Set-Content -Path $cfg -Encoding ascii -Value '{"proxy":{"port":3478},"upstreamProxy":false,"autoUpdate":false}'
+          "TEAMCLAUDE_CONFIG=$cfg" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "TEAMROUTER_CONFIG=$cfg" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $env:TEAMCLAUDE_CONFIG = $cfg
+          $env:TEAMROUTER_CONFIG = $cfg
+          $log = Join-Path $env:LOCALAPPDATA 'TeamClaude\teamclaude.log'
+          $root = Join-Path $env:LOCALAPPDATA "TeamClaude\portable\$env:PORTABLE_VERSION"
+          # Two first runs at once, as from a double-click repeated while the
+          # first unpack is still going. WaitForExit, not -Wait: PowerShell's
+          # -Wait also waits for the proxy the launcher leaves running.
+          $runs = 1..2 | ForEach-Object { Start-Process -FilePath $env:PORTABLE_EXE -ArgumentList '--no-open' -PassThru }
+          foreach ($p in $runs) {
+            $null = $p.Handle
+            if (-not $p.WaitForExit(180000)) { Get-Content $log -ErrorAction SilentlyContinue; throw 'The portable exe did not return' }
+            if ($p.ExitCode -ne 0) { Get-Content $log -ErrorAction SilentlyContinue; throw "The portable exe exited $($p.ExitCode)" }
+          }
+          if (-not (Test-Path (Join-Path $root 'ready'))) { throw "No ready file in $root" }
+          $left = Get-ChildItem (Split-Path $root) -Filter '*.unpack-*' -ErrorAction SilentlyContinue
+          if ($left) { throw "Unpack folders left behind: $($left.Name -join ', ')" }
+          $procs = @(Get-Process -Name teamclaude-node -ErrorAction SilentlyContinue)
+          if ($procs.Count -ne 1) { throw "Expected one proxy, found $($procs.Count)" }
+          $status = Invoke-RestMethod -Uri 'http://127.0.0.1:3478/teamclaude/status'
+          $proc = Get-Process -Id $status.server.pid
+          if ($proc.ProcessName -ne 'teamclaude-node') { throw "Status came from $($proc.ProcessName)" }
+          if (-not $proc.Path.StartsWith((Join-Path $env:LOCALAPPDATA 'TeamClaude\portable\'), [System.StringComparison]::OrdinalIgnoreCase)) { throw "The proxy runs from $($proc.Path)" }
+          "Proxy $($status.server.version) answered from pid $($status.server.pid) ($($proc.Path))"
+          $page = Invoke-WebRequest -Uri 'http://127.0.0.1:3478/teamclaude/dashboard' -UseBasicParsing
+          if ($page.StatusCode -ne 200 -or $page.Content -notmatch '<title>TeamRouter</title>') { throw 'The dashboard did not load' }
+          if (-not (Test-Path $log)) { throw "No log at $log" }
+          Get-Content $log
+          "PROXY_PID=$($status.server.pid)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "READY_FILE=$(Join-Path $root 'ready')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "READY_TIME=$((Get-Item (Join-Path $root 'ready')).LastWriteTimeUtc.Ticks)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Screenshot the dashboard in Edge
+        run: |
+          $edge = Join-Path ${env:ProgramFiles(x86)} 'Microsoft\Edge\Application\msedge.exe'
+          if (-not (Test-Path $edge)) { $edge = Join-Path $env:ProgramFiles 'Microsoft\Edge\Application\msedge.exe' }
+          if (-not (Test-Path $edge)) { throw 'Edge is not installed' }
+          $png = Join-Path $env:RUNNER_TEMP 'portable-dashboard.png'
+          $edgeData = Join-Path $env:RUNNER_TEMP 'edge-profile'
+          $p = Start-Process -FilePath $edge -PassThru -ArgumentList '--headless=new', '--disable-gpu', '--no-first-run', "--user-data-dir=$edgeData", '--window-size=1280,900', "--screenshot=$png", 'http://127.0.0.1:3478/teamclaude/dashboard'
+          $null = $p.Handle
+          if (-not $p.WaitForExit(120000)) { $p.Kill(); throw 'Edge did not finish the screenshot' }
+          if (-not (Test-Path $png) -or (Get-Item $png).Length -lt 10000) { throw 'No usable screenshot was written' }
+          "Screenshot: $((Get-Item $png).Length) bytes"
+
+      - name: Upload the screenshot
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-portable-screenshot
+          path: ${{ runner.temp }}/portable-dashboard.png
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Run the portable exe again while the proxy is up
+        run: |
+          $p = Start-Process -FilePath $env:PORTABLE_EXE -ArgumentList '--no-open' -PassThru
+          $null = $p.Handle
+          if (-not $p.WaitForExit(90000)) { throw 'The second run did not return' }
+          if ($p.ExitCode -ne 0) { throw "The second run exited $($p.ExitCode)" }
+          $status = Invoke-RestMethod -Uri 'http://127.0.0.1:3478/teamclaude/status'
+          if ("$($status.server.pid)" -ne $env:PROXY_PID) { throw "A second proxy started: pid $($status.server.pid), was $env:PROXY_PID" }
+          if ((Get-Item $env:READY_FILE).LastWriteTimeUtc.Ticks -ne [long]$env:READY_TIME) { throw 'The second run unpacked again' }
+          'Same proxy, nothing unpacked again.'
+
+      - name: Stop the proxy through the portable exe --stop
+        run: |
+          $p = Start-Process -FilePath $env:PORTABLE_EXE -ArgumentList '--stop' -PassThru
+          $null = $p.Handle
+          if (-not $p.WaitForExit(60000)) { throw 'The portable exe --stop did not return' }
+          for ($i = 0; $i -lt 20 -and (Get-Process -Name teamclaude-node -ErrorAction SilentlyContinue); $i++) { Start-Sleep -Milliseconds 500 }
+          if (Get-Process -Name teamclaude-node -ErrorAction SilentlyContinue) { throw 'The proxy is still running' }
 
   # Every commit in the history, scanned for anything that looks like a
   # credential. CONTRIBUTING.md forbids tokens, account ids and emails in the
@@ -447,7 +566,7 @@ jobs:
   # required job did not succeed (so it is never silently "skipped").
   test:
     name: test
-    needs: [node, package, container, windows-installer, windows-smoke, secrets, workflows, links, nix]
+    needs: [node, package, container, windows-installer, windows-smoke, windows-portable-smoke, secrets, workflows, links, nix]
     if: always()
     runs-on: ubuntu-latest
     steps:
