@@ -185,7 +185,7 @@ export class Warmer {
     this.scheduleStatus = null;
     this.intervalMs = intervalMs;
     if (this.timer) { this.clearTimeoutFn(this.timer); this.timer = null; }
-    this._clearDeferredWarmups();
+    this._clearDeferredWarmups('keep-warm reconfigured');
     this._abort?.abort();
 
     if (intervalMs > 0) {
@@ -210,7 +210,7 @@ export class Warmer {
     this.intervalMs = 0;
     this.schedule = schedule;
     if (this.timer) { this.clearTimeoutFn(this.timer); this.timer = null; }
-    this._clearDeferredWarmups();
+    this._clearDeferredWarmups('keep-warm reconfigured');
     this._abort?.abort();
     if (!schedule) {
       this.scheduleStatus = null;
@@ -248,7 +248,7 @@ export class Warmer {
     this._scheduleGeneration += 1;
     this._stopped = true;
     if (this.timer) { this.clearTimeoutFn(this.timer); this.timer = null; }
-    this._clearDeferredWarmups();
+    this._clearDeferredWarmups('keep-warm stopped');
     this.nextRunAt = null;
     // Cancel an in-flight sweep and kill any child it spawned, so shutdown /
     // `warmup off` doesn't block on a running warm-up or orphan a `claude`.
@@ -275,7 +275,19 @@ export class Warmer {
   }
 
   _isWarmTarget(account, now = this.nowFn()) {
-    if (!this._isWarmCandidate(account)) return false;
+    return this._warmSkipReason(account, now) === null;
+  }
+
+  /** Why `account` is not a warm target now, or null when it is one. `now`
+   *  times the 5h reset; the cooldown is asked on the account manager's clock
+   *  (see below). The reasons are worded for the line that drops a delayed
+   *  warm-up: an account is delayed only while it is eligible, so "no longer"
+   *  holds there.
+   *  @param {Record<string, any>} account
+   *  @param {number} [now]
+   *  @returns {string|null} */
+  _warmSkipReason(account, now = this.nowFn()) {
+    if (!this._isWarmCandidate(account)) return 'no longer eligible';
     // Nor while the account sits out an entitlement cooldown (an OAuth policy
     // 403). A warm-up is pinned, so nothing in the listener holds it back, and
     // its refusal counts as a new denial: warming stepped the very cooldown it
@@ -294,9 +306,10 @@ export class Warmer {
     // sent the warm-up into it; on one running behind, it skipped an account
     // rotation had already taken back.
     const am = /** @type {import('./account-manager.js').AccountManager} */ (this.am);
-    if (am.isEntitlementDenied(account.index)) return false;
+    if (am.isEntitlementDenied(account.index)) return 'entitlement cooldown';
     const reset = account.quota?.unified5hReset;
-    return !(reset && now < reset); // a future reset ⇒ session already running
+    if (reset && now < reset) return '5h window already running'; // a future reset ⇒ session already running
+    return null;
   }
 
   /** Warm every eligible account once. Overlapping cycles are skipped. Sequential
@@ -327,6 +340,10 @@ export class Warmer {
     }
   }
 
+  /** Warm `targets` one at a time. Resolves true once a warm-up went out to one
+   *  of them, or warmAccount recorded why it could not (a rejected refresh, a
+   *  failed spawn); false when it stood down for every one with nothing
+   *  recorded, which a delayed warm-up reports in the log. */
   async _warmTargets(targets, {
     generation = this._scheduleGeneration,
     waitForRunning = false,
@@ -346,6 +363,7 @@ export class Warmer {
     const abort = this._abort = new AbortController();
     this.lastRunStartedAt = Date.now();
     if (this.intervalMs > 0) this.nextRunAt = this.lastRunStartedAt + this.intervalMs;
+    let warmed = false;
     try {
       for (const account of targets) {
         const canContinue = () => generation === this._scheduleGeneration
@@ -354,14 +372,14 @@ export class Warmer {
         if (abort.signal.aborted || !canContinue()) break;
         const isStillEligible = () => this._isWarmTarget(account);
         if (!isStillEligible()) continue;
-        await this.warmAccount(
+        if (await this.warmAccount(
           account,
           abort.signal,
           canContinue,
           isStillEligible,
-        );
+        )) warmed = true;
       }
-      return true;
+      return warmed;
     } finally {
       this.lastRunFinishedAt = Date.now();
       this._running = false;
@@ -377,31 +395,69 @@ export class Warmer {
     const delay = Math.max(0, runAt - this.nowFn());
     const timer = this.setTimeoutFn(async () => {
       if (this._deferredWarmups.get(account) === timer) this._deferredWarmups.delete(account);
+      // The reconfiguration or stop that moved the generation on also cancelled
+      // this timer and logged the drop (_clearDeferredWarmups): only a timer that
+      // cancel did not stop gets here.
       if (generation !== this._scheduleGeneration || this._stopped || this.schedule?.mode !== 'rolling') return;
       const remaining = runAt - this.nowFn();
       if (remaining > 0) {
         this._deferWarmAccount(account, runAt, generation);
         return;
       }
+      // The "delaying" line promised this warm-up, so each way it ends unsent
+      // says why in the log: here, and when the run stands down with nothing
+      // recorded - behind another warm-up, or during the token refresh.
       const deadline = runAt + SCHEDULE_TIMER_GRACE_MS;
-      if (this.nowFn() >= deadline) return;
-      if (!this._isWarmTarget(account)) return;
-      await this._warmTargets([account], {
+      const reason = this._deferredDropReason(account, generation, deadline);
+      if (reason) {
+        this._logDroppedDeferral(account, reason);
+        return;
+      }
+      if (await this._warmTargets([account], {
         generation,
         waitForRunning: true,
         deadline,
-      });
+      })) return;
+      this._logDroppedDeferral(account,
+        this._deferredDropReason(account, generation, deadline) || 'no longer a warm target');
     }, delay);
     this._deferredWarmups.set(account, timer);
     timer.unref?.();
     this.log(`[TeamClaude] Keep-warm delaying "${account.name}" until ${new Date(runAt).toISOString()} (5h reset within 2m)`);
   }
 
-  _clearDeferredWarmups() {
-    for (const timer of this._deferredWarmups.values()) this.clearTimeoutFn(timer);
+  /** Why a delayed warm-up of `account` cannot go out now, or null when it can.
+   *  The checks _warmTargets and warmAccount stand down on, in their order, so
+   *  after a run that stood down the first one failing is the one it stopped on.
+   *  @param {Record<string, any>} account
+   *  @param {number} generation  the schedule generation it was delayed under
+   *  @param {number} deadline  the last moment it may still go out
+   *  @returns {string|null} */
+  _deferredDropReason(account, generation, deadline) {
+    if (this._stopped) return 'keep-warm stopped';
+    if (generation !== this._scheduleGeneration) return 'keep-warm reconfigured';
+    if (this.nowFn() >= deadline) return `not sent by ${new Date(deadline).toISOString()}`;
+    return this._warmSkipReason(account);
+  }
+
+  /** @param {Record<string, any>} account @param {string} reason */
+  _logDroppedDeferral(account, reason) {
+    this.log(`[TeamClaude] Keep-warm dropped the delayed warm-up of "${account.name}" (${reason})`);
+  }
+
+  /** Cancel the delayed warm-ups, logging each as dropped for `reason`.
+   *  @param {string} reason */
+  _clearDeferredWarmups(reason) {
+    for (const [account, timer] of this._deferredWarmups) {
+      this.clearTimeoutFn(timer);
+      this._logDroppedDeferral(account, reason);
+    }
     this._deferredWarmups.clear();
   }
 
+  /** Warm one account. Resolves true when it sent the warm-up or recorded why
+   *  not (a rejected refresh, a failed spawn), false when it stood down with the
+   *  status put back as it was. */
   async warmAccount(account, signal, shouldContinue = () => true, isStillEligible = () => true) {
     const startedAt = Date.now();
     const previousStatus = this.accountStatus.get(account.name);
@@ -411,7 +467,7 @@ export class Warmer {
       if (signal?.aborted || !shouldContinue()) {
         if (previousStatus) this.accountStatus.set(account.name, previousStatus);
         else this.accountStatus.delete(account.name);
-        return;
+        return false;
       }
       if (account.status === 'error') {
         const finishedAt = Date.now();
@@ -420,12 +476,12 @@ export class Warmer {
           error: 'token refresh rejected; re-login required',
           startedAt, finishedAt, durationMs: finishedAt - startedAt,
         });
-        return;
+        return true;
       }
       if (!isStillEligible()) {
         if (previousStatus) this.accountStatus.set(account.name, previousStatus);
         else this.accountStatus.delete(account.name);
-        return;
+        return false;
       }
       const code = await this.spawnFn(this._spawnSpec(account, signal));
       const finishedAt = Date.now();
@@ -434,6 +490,7 @@ export class Warmer {
         error: code === 0 ? null : `claude exited ${code}`,
         startedAt, finishedAt, durationMs: finishedAt - startedAt,
       });
+      return true;
     } catch (err) {
       const finishedAt = Date.now();
       this._record(account, {
@@ -441,6 +498,7 @@ export class Warmer {
         error: err?.message || String(err),
         startedAt, finishedAt, durationMs: finishedAt - startedAt,
       });
+      return true;
     }
   }
 
