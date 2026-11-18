@@ -1045,6 +1045,125 @@ test('a delayed warm-up whose spawn fails records the error and logs no drop', a
   assert.equal(w.warmer.getStatus().accounts[0].status, 'error');
 });
 
+// A config reload re-reads the whole file whatever changed in it, and hands the
+// warmer the schedule it found (index.js). One that left the schedule as it was
+// must leave keep-warm running; one that changed it reschedules, as before.
+const ROLLING = { mode: 'rolling', resetTime: '15:30', timezone: 'Europe/Moscow', anchorResetAt: '2030-09-01T12:30:00.000Z' };
+const DAILY = { resetTime: '15:30', timezone: 'Europe/Moscow' };
+
+// Both schedules warm at 07:30Z on 2030-09-01. The slot's sweep over two idle
+// accounts is held on its first spawn until `release()`.
+async function heldSlot(schedule) {
+  const am = new AccountManager([oauth('first'), oauth('second')], 0.98);
+  am.ensureTokenFresh = async () => {};
+  const clock = { now: Date.parse('2030-09-01T07:29:00.000Z') };
+  let release = () => {};
+  const held = new Promise(resolve => { release = resolve; });
+  let reach = () => {};
+  const reached = new Promise(resolve => { reach = resolve; });
+  const spawn = async (spec) => {
+    spawn.calls.push(spec);
+    if (spawn.calls.length === 1) { reach(); await held; }
+    return 0;
+  };
+  spawn.calls = [];
+  const timers = [];
+  const warmer = makeWarmer(am, spawn, {
+    schedule,
+    nowFn: () => clock.now,
+    setTimeoutFn: (fn, delay) => {
+      const timer = { fn, delay, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeoutFn: () => {},
+  });
+  warmer.start();
+  clock.now = Date.parse('2030-09-01T07:30:00.001Z');
+  const slot = timers[0].fn();
+  await reached;
+  const sent = () => spawn.calls.map(call => call.env.ANTHROPIC_BASE_URL.split('/').at(-1));
+  return { warmer, release, slot, sent, inFlight: spawn.calls[0].signal };
+}
+
+for (const [what, schedule, reloaded] of [
+  ['the same rolling schedule', ROLLING, { ...ROLLING }],
+  ['the same daily schedule', DAILY, { ...DAILY }],
+  ['the same daily schedule, its mode spelled null', DAILY, { ...DAILY, mode: null }],
+]) {
+  test(`a reload with ${what} leaves the running sweep alone`, async () => {
+    const s = await heldSlot(schedule);
+    s.warmer.reloadSchedule(reloaded);
+    assert.equal(s.inFlight.aborted, false, 'the warm-up in flight is not killed');
+    s.release();
+    await s.slot;
+    assert.deepEqual(s.sent(), ['first', 'second'], 'the rest of the sweep still goes out');
+  });
+}
+
+test('a reload with the same schedule leaves the delayed warm-ups alone', async () => {
+  const w = await delayedWarmups(['first', 'second']);
+  w.warmer.reloadSchedule({ ...w.schedule });
+  for (const timer of w.deferred) await timer.fn();
+  assert.deepEqual(w.dropped(), []);
+  assert.deepEqual(w.sent(), ['first', 'second']);
+});
+
+// Off or in interval mode there is no schedule to compare with, so it is armed.
+test('a reload that brings a schedule to a warmer without one arms it', async () => {
+  const am = new AccountManager([oauth('a')], 0.98);
+  const now = Date.parse('2030-09-01T07:29:00.000Z');
+  const timers = [];
+  const warmer = makeWarmer(am, fakeSpawner(), {
+    nowFn: () => now,
+    setTimeoutFn: (fn, delay) => {
+      const timer = { fn, delay, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeoutFn: () => {},
+  });
+  warmer.start();
+  warmer.reloadSchedule(ROLLING);
+  assert.equal(warmer.getStatus().mode, 'rolling');
+  assert.equal(warmer.getStatus().nextWarmupAt, '2030-09-01T07:30:00.000Z');
+  assert.equal(timers.length, 1);
+});
+
+// Guards: a schedule that differs in any field still reschedules. The mode
+// alone: the rolling fields kept, read as a daily schedule.
+for (const [field, schedule, changed] of [
+  ['mode', ROLLING, { ...ROLLING, mode: undefined }],
+  ['anchor', ROLLING, { ...ROLLING, anchorResetAt: '2030-09-02T12:30:00.000Z' }],
+  ['reset time', DAILY, { ...DAILY, resetTime: '16:30' }],
+  ['timezone', DAILY, { ...DAILY, timezone: 'Europe/Istanbul' }],
+]) {
+  test(`a reload that changes the schedule's ${field} reschedules it`, async () => {
+    const s = await heldSlot(schedule);
+    s.warmer.reloadSchedule(changed);
+    assert.equal(s.inFlight.aborted, true, 'the old schedule\'s sweep is cut short');
+    assert.equal(s.warmer.schedule, changed);
+    s.release();
+    await s.slot;
+  });
+}
+
+test('a reload that changes the schedule drops its delayed warm-ups as reconfigured', async () => {
+  const w = await delayedWarmups(['first', 'second']);
+  w.warmer.reloadSchedule({ ...w.schedule, anchorResetAt: '2030-09-02T12:30:00.000Z' });
+  assert.deepEqual(w.dropped(), [dropLine('first', 'keep-warm reconfigured'), dropLine('second', 'keep-warm reconfigured')]);
+});
+
+// A bad hand edit still fails the reload and leaves the schedule running.
+test('a reload with an invalid schedule throws and keeps the running one', async () => {
+  const s = await heldSlot(ROLLING);
+  assert.throws(() => s.warmer.reloadSchedule({ ...ROLLING, timezone: 'Moscow' }), /invalid IANA timezone/);
+  assert.equal(s.inFlight.aborted, false);
+  assert.equal(s.warmer.schedule, ROLLING);
+  s.release();
+  await s.slot;
+});
+
 test('a late rolling timer skips to the next five-hour lattice point', async () => {
   const am = new AccountManager([oauth('a')], 0.98);
   const spawn = fakeSpawner();

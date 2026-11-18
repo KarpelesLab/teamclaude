@@ -748,7 +748,9 @@ async function serverCommand() {
       if (diskSchedule) {
         // Validate and arm before publishing the disk value to live readers. A
         // bad hand edit leaves the prior schedule intact and makes reload fail.
-        warmer.rescheduleSchedule(diskSchedule);
+        // An unchanged schedule keeps running, as an unchanged interval does
+        // below (reloadSchedule).
+        warmer.reloadSchedule(diskSchedule);
         config.warmupSchedule = diskSchedule;
         config.warmupSeconds = 0;
       } else if (config.warmupSchedule || ms !== warmer.intervalMs) {

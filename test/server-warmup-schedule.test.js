@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnServer } from '../test-helpers/spawn-server.js';
+import { createRollingWarmupSchedule } from '../src/warmup-schedule.js';
 
 // The warm-up schedule, end to end through the real server: restored from the
 // config at startup, exposed through /teamclaude/quota, and replaced live by the
@@ -116,6 +117,41 @@ test('an invalid schedule reload preserves the live schedule and quota endpoint'
     assert.equal(res.status, 200);
     assert.equal(body.warmup.timezone, 'Europe/Moscow');
     assert.equal(body.warmup.resetTime, '15:30');
+  } finally {
+    await s.cleanup();
+  }
+});
+
+// Every reload re-reads the whole file, whatever changed in it. One that leaves
+// the schedule as it is must not reschedule it: that would cut a warm-up sweep
+// short and drop the warm-ups it delayed. The warmer logs "Keep-warm scheduled
+// for" each time it arms a schedule, so after a reload of the file as it was and
+// one that moves the anchor, the line is there twice: at startup and for the
+// change. The second reload's own line, read off the warmer's status, is what
+// the test waits for; the output is one ordered stream, so a line from the
+// first reload would already be in it. The anchor is the one `warmup rolling`
+// would save six hours from now: no slot comes due during the test, and the
+// next warm-up stays well under the longest delay setTimeout takes (about 24.8
+// days), past which the timer fires at once and re-arms, logging the line
+// each time.
+test('a reload that leaves the schedule as it is does not reschedule it', async () => {
+  const schedule = createRollingWarmupSchedule({ resetTime: '15:30', timezone: 'Europe/Moscow' }, Date.now() + 6 * 60 * 60 * 1000);
+  const moved = new Date(Date.parse(schedule.anchorResetAt) + 24 * 60 * 60 * 1000).toISOString();
+  const s = await serverWith({ warmupSchedule: schedule }, 'teamclaude-schedule-same-');
+  try {
+    const headers = { 'x-api-key': 'tc-test' };
+    const reload = () => fetch(`http://127.0.0.1:${s.port}/teamclaude/reload`, { method: 'POST', headers });
+    assert.equal((await reload()).status, 200);
+    await writeFile(s.configPath, JSON.stringify({ ...s.config, warmupSchedule: { ...schedule, anchorResetAt: moved } }));
+    assert.equal((await reload()).status, 200);
+    const status = await (await fetch(`http://127.0.0.1:${s.port}/teamclaude/status`, { headers })).json();
+    const changed = `Keep-warm scheduled for ${status.warm.nextWarmupAt}`;
+    await new Promise(resolve => {
+      const check = () => { if (s.output().includes(changed)) { s.child.stdout.off('data', check); resolve(undefined); } };
+      s.child.stdout.on('data', check);
+      check();
+    });
+    assert.equal(s.output().split('Keep-warm scheduled for').length - 1, 2, s.output());
   } finally {
     await s.cleanup();
   }

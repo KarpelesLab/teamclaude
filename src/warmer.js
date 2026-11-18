@@ -32,6 +32,10 @@ import {
 
 const SCHEDULE_TIMER_GRACE_MS = 60_000;
 
+// What a stored schedule is: createRollingWarmupSchedule writes these four, a
+// daily schedule the middle two, and resolveWarmupSchedule reads nothing else.
+const SCHEDULE_FIELDS = ['mode', 'resetTime', 'timezone', 'anchorResetAt'];
+
 // Names a `claude` binary can have. On Windows the PATH entry is usually
 // npm's `.cmd` shim; the native installer writes `claude.exe`.
 /** @param {string} platform @returns {string[]} */
@@ -218,6 +222,23 @@ export class Warmer {
       return;
     }
     this._armSchedule(generation, scheduleStatus);
+  }
+
+  /** The schedule a config reload read. Every reload re-reads the whole file -
+   *  after a priority, cordon, threshold or MCP setting change too - so one that
+   *  left the schedule as it is must leave it running: rescheduling would abort
+   *  the warm-up in flight, skip the rest of that sweep and drop the warm-ups it
+   *  delayed, for a change that never touched keep-warm. A schedule that differs
+   *  in any of its fields is armed as rescheduleSchedule does. Validated either
+   *  way, so a reload never takes a schedule rescheduleSchedule would refuse.
+   *  @param {Record<string, any>} schedule */
+  reloadSchedule(schedule) {
+    const current = /** @type {Record<string, any>|null} */ (this.schedule);
+    if (current && SCHEDULE_FIELDS.every(field => (schedule[field] ?? null) === (current[field] ?? null))) {
+      resolveWarmupSchedule(schedule, this.nowFn());
+      return;
+    }
+    this.rescheduleSchedule(schedule);
   }
 
   _armSchedule(generation, scheduleStatus = null) {
