@@ -5,6 +5,7 @@ import { createProxyServer } from '../src/server.js';
 import { ClaudeResetRedeemer, parseResetStatus } from '../src/claude-resets.js';
 import { ResetCreditRedeemer } from '../src/codex-reset-credits.js';
 import { createResetActions } from '../src/reset-actions.js';
+import { rememberResetReading } from '../src/reset-readings.js';
 
 // GET /teamclaude/resets, POST /teamclaude/resets/read and
 // /teamclaude/resets/redeem are the control-plane form of the TUI's resets
@@ -94,6 +95,8 @@ test('the list is the cached reading of every OAuth Claude and Codex account, wi
         { account: 'alice@example.com', provider: 'claude', details: DETAILS, readableAt: until },
         { account: 'carol@example.com', provider: 'codex', details: null, readableAt: null },
       ],
+      // bob's API key still serves, so nothing is worth a reset.
+      advice: { action: 'wait', why: 'no-candidate', dryAt: null },
     });
     assert.deepEqual(calls.read, [], 'listing must never send a reset read');
   });
@@ -240,6 +243,32 @@ test('the routes drive the real reset actions end to end', async () => {
     assert.deepEqual(claims, [['alice@example.com', 'g-weekly']]);
   } finally {
     console.log = orig;
+    proxy.close();
+  }
+});
+
+// The advice is computed from what the proxy holds: eligibility from the
+// account manager, the grant from the cached reading.
+test('a dry pool advises spending the cached grant on the account that stays out longest', async () => {
+  const at = Date.now();
+  const raw = { eligible: true, at_limit: true, exhausted: ['seven_day'], next_grant_id: 'g-weekly', grants: [
+    { id: 'g-weekly', label: 'Weekly reset', resets_total: 1, resets_left: 1, usable_now: true, paused: false,
+      clears: ['five_hour', 'seven_day'], ends_at: new Date(at + 20 * 24 * 3600_000).toISOString() }] };
+  const am = new AccountManager([{ ...ACCTS[0], name: 'early@example.com' }, { ...ACCTS[0], name: 'late@example.com' }], 0.98);
+  am.accounts.forEach((a, i) => {
+    Object.assign(a.quota, { unified7d: 1, unified7dReset: at + (1 + 2 * i) * 24 * 3600_000, unified7dSeenAt: at });
+    rememberResetReading(a, 'claude', { reset: parseResetStatus(raw) });
+  });
+  const { actions } = stubActions();
+  const proxy = createProxyServer(am, CONFIG, { resetActions: actions });
+  const port = await listen(proxy);
+  try {
+    const { advice } = await (await get(port)).json();
+    assert.equal(advice.action, 'spend');
+    assert.equal(advice.why, 'dry');
+    assert.equal(advice.account, 'late@example.com');
+    assert.equal(advice.grantId, 'g-weekly');
+  } finally {
     proxy.close();
   }
 });

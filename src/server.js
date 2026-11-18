@@ -26,6 +26,9 @@ import { resolveCompactBeforeSwitch, decideCompactBeforeSwitch, promptTooLongBod
 import { isRoutingFailure, describeRouting } from './account-routing.js';
 import { safeLine } from './safe-text.js';
 import { oauthAccount as holdsResets } from './reset-actions.js';
+import { adviseResets } from './reset-advice.js';
+import { resetReading } from './reset-readings.js';
+import { quotaTier } from './quota-summary.js';
 import { upstreamErrorType } from './error-type.js';
 import { forwardRefusal, guardedLookup, FORBIDDEN_FORWARD } from './forward-target.js';
 import { renderDashboardHtml, dashboardCsp } from './dashboard.js';
@@ -1199,6 +1202,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
                 account: a.name, provider: providerOf(a) === 'codex' ? 'codex' : 'claude',
                 details: actions.cached(a) ?? null, readableAt: readableAt(a),
               })),
+            advice: resetAdvice(accountManager),
           });
           return;
         }
@@ -1720,6 +1724,31 @@ async function readControlBody(req, limit = 64 * 1024) {
     chunks.push(chunk);
   }
   return Buffer.concat(chunks).toString('utf8');
+}
+
+/**
+ * The reset advice for GET /teamclaude/resets, from what the proxy already
+ * holds: each Claude account's eligibility, its last reset reading and the
+ * fleet forecast. Never a request upstream.
+ * @param {any} accountManager
+ */
+function resetAdvice(accountManager) {
+  const now = Date.now();
+  const accounts = (accountManager.accounts || []).flatMap((/** @type {Record<string, any>} */ a, /** @type {number} */ i) => {
+    if (providerOf(a) !== DEFAULT_PROVIDER) return [];
+    return [{
+      name: a.name,
+      serving: accountManager.eligibility(i).eligible,
+      spendable: holdsResets(a) && !a.disabled && !a.cordoned && a.longLived !== true && !!a.orgUuid,
+      weight: quotaTier(a).weight,
+      weeklyResetAt: Number.isFinite(a.quota?.unified7dReset) ? a.quota.unified7dReset : null,
+      reset: resetReading(a)?.reset ?? null,
+    }];
+  });
+  if (!accounts.length) return null;
+  let forecast = null;
+  try { forecast = accountManager.fleetForecastStatus?.(now) ?? null; } catch { forecast = null; }
+  return adviseResets({ accounts, forecast, now });
 }
 
 /**

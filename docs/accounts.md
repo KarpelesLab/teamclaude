@@ -783,6 +783,29 @@ other control mutation.
 The account is named as for `teamclaude switch`. Grant ids come from the list
 and stay in memory only, like the panel's.
 
+The list also carries `advice`: which Claude reset to spend by hand, if any,
+worked out from what the proxy already holds (eligibility, the cached
+readings, the [fleet forecast](quota.md)) and never from a new request. It
+only advises; nothing is spent without a redeem call.
+
+- `"action": "wait"`, `"why": "headroom"` while an account still serves and the
+  forecast puts no dry spell within 30 minutes. `candidate` names the reset a
+  dry spell would take and `recheckAt` when the advice turns, on the forecast.
+- `"action": "spend"`, `"why": "dry"` (no Claude account serves) or
+  `"soon-dry"` (the forecast puts it within 30 minutes), with `account`,
+  `grantId`, `kind`, `backAt` and `gainMs`. The account is the one a reset gives
+  the most: the latest weekly reset of its own, scaled by plan weight when every
+  candidate has one. The grant is the one auto-redeem would choose there: the
+  cheapest kind that clears every exhausted limit, then the soonest expiry.
+- `"action": "spend"`, `"why": "expiring"` when a grant lapses within a day on an
+  account that stays out past its expiry: waiting would lose it.
+- `"why": "no-candidate"` when no reset would bring an account back: none
+  read, eligible, usable, out on a weekly limit, or out for 30 minutes more.
+
+An account counts only if a claim would be allowed (OAuth, not disabled or
+cordoned, with an organization) and a weekly limit is what keeps it out; a
+five-hour wall lifts on its own.
+
 ### Spending a Claude reset automatically
 
 With [`autoRedeemResets`](configuration.md) on — the same switch, and the same
