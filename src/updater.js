@@ -4,8 +4,8 @@
 //   - a git checkout (a `.git` at the package root) is a dev tree — never touched;
 //   - a pnpm install is pointed at pnpm, since npm cannot update it;
 //   - a local dependency / npx copy is left alone (we only notify);
-//   - the Windows installer's copy has no npm, so it is pointed at the
-//     GitHub releases page for the next installer.
+//   - a Windows bundle (the installer or the portable exe) has no npm, so it is
+//     pointed at the GitHub releases page for the next version.
 // Checks hit the npm registry at most once a day (cached in a small file next to
 // the config), so the overwhelmingly common invocation does zero network I/O.
 // Disable entirely with TEAMCLAUDE_DISABLE_AUTOUPDATE=1 or config.autoUpdate=false.
@@ -141,13 +141,13 @@ export function updateCommandFor(kind) {
 
 /**
  * What to tell the operator to do about a newer version of a copy installed
- * as `kind`. The Windows installer's copy is replaced by running the next
- * installer, which nothing here downloads or runs.
+ * as `kind`. A Windows bundle (installer or portable exe) is replaced by
+ * downloading the next release's file, which nothing here downloads or runs.
  * @param {string} kind
  */
 export function updateAdvice(kind) {
   return kind === 'bundle'
-    ? `Download the new installer from ${RELEASES_URL}`
+    ? `Download the new version from ${RELEASES_URL}`
     : `Run: ${updateCommandFor(kind)}`;
 }
 
