@@ -272,11 +272,33 @@ for (const [c1Ends, c2Ends, expected] of [[12, 24, 'codex-c1'], [24, 12, 'codex-
     weekly(am, 2, 0.3, 6 * 24);
     Object.assign(am.accounts[2].quota, { unified5h: 0.5, unified5hReset: START - 1000 }); // codex-c2's five-hour window rolls
     logged(() => { am._setCurrent(am.accounts[1]); am._setCurrent(am.accounts[0]); });
-    logged(() => am.refreshExpiredQuotas()); // a poll
+    const lines = logged(() => am.refreshExpiredQuotas()); // a poll
     assert.equal(am.accounts[am.currentIndex].name, 'claude-a1', 'a Codex roll moved the shared cursor');
     assert.equal(am.accounts[am.currentIndexFor('codex')].name, expected);
+    // Both weeklies reset in six days: codex-c2's deadline is its end time, and
+    // that decided it.
+    assert.deepEqual(lines.filter(l => /sooner/.test(l)), expected === 'codex-c2'
+      ? ['[TeamClaude] Account "codex-c2" session quota reset and it ends sooner — its provider\'s traffic switches to it'] : []);
   });
 }
+
+test('the session-reset switch says which clock decided it', t => {
+  freezeClock(t);
+  const build = (extra, hours) => {
+    const am = new AccountManager([oauth('current'), oauth('reset', extra)], 0.98);
+    weekly(am, 0, 0.1, 50);
+    weekly(am, 1, 0.1, hours);
+    return am;
+  };
+  // Its weekly resets before the current account's: the line it always had.
+  const plain = build({}, 20);
+  assert.deepEqual(logged(() => plain._switchOnSessionReset([plain.accounts[1]], OPUS)),
+    ['[TeamClaude] Account "reset" session quota reset and weekly expires sooner — switching to it']);
+  // Its weekly resets after the current account's, and it ends before it.
+  const ending = build({ endsAt: START + 5 * H }, 100);
+  assert.deepEqual(logged(() => ending._switchOnSessionReset([ending.accounts[1]], OPUS)),
+    ['[TeamClaude] Account "reset" session quota reset and it ends sooner — switching to it']);
+});
 
 test('priority still wins over a sooner end time', t => {
   freezeClock(t);

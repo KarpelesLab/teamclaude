@@ -4354,13 +4354,14 @@ export class AccountManager {
 
   /**
    * The session-reset switch (_switchOnSessionReset), on by default. When an
-   * account's 5-hour window resets and its weekly window lapses sooner than the
-   * current account's, the cursor moves to it even though the current account
-   * is healthy, and every conversation behind the cursor loses its prompt
-   * cache. Off, the reset only returns the account to rotation: traffic stays
-   * where it is until rotation has to pick. Only a literal `false` turns it off,
-   * so a hand-edited `"false"` keeps today's behaviour. Applied live on config
-   * reload.
+   * account's 5-hour window resets and its deadline (its weekly reset, or its
+   * end time when that comes first; see _deadline) is sooner than the current
+   * account's, its provider's cursor moves to it even though the current
+   * account is healthy, and every conversation behind that cursor loses its
+   * prompt cache. Off, the reset only returns the account to rotation: traffic
+   * stays where it is until rotation has to pick. Only a literal `false` turns
+   * it off, so a hand-edited `"false"` keeps today's behaviour. Applied live on
+   * config reload.
    * @param {boolean} enabled
    */
   setSwitchOnSessionReset(enabled) {
@@ -5536,9 +5537,10 @@ export class AccountManager {
    * the view instantly rather than waiting for the next request.
    *
    * When an account's session quota resets, it may have become the better
-   * choice — switch to it if its weekly limit expires sooner than the current
-   * account's (and it still has weekly quota), so we spend the quota closest to
-   * refreshing first.
+   * choice — switch to it if its deadline (its weekly reset, or its end time
+   * when that comes first; see _deadline) is sooner than the current account's
+   * (and it still has weekly quota), so we spend the quota closest to expiring
+   * first.
    */
   /**
    * Clear windows whose reset has passed, WITHOUT the session-reset switch.
@@ -5618,8 +5620,9 @@ export class AccountManager {
 
   /**
    * Given accounts whose session quota just reset, switch to the one whose
-   * weekly limit expires soonest — but only if that is sooner than the current
-   * account's weekly limit and the account still has weekly quota to spend.
+   * deadline is soonest (its weekly reset, or its end time when that comes
+   * first; see _deadline) — but only if that is sooner than the current
+   * account's deadline and the account still has weekly quota to spend.
    *
    * `incumbent` is set only by the provider split below, on a poll or with the
    * cursor on a manual choice: the account another provider's traffic starts
@@ -5710,17 +5713,18 @@ export class AccountManager {
       }
       return;
     }
-    // Need a known weekly reset on the current account to compare against;
-    // if it is unknown we are still probing it, so leave it alone. Read through
-    // the ranking so the account is compared on the window that governs THIS
-    // request; with the knob off that is the shared weekly.
+    // Need a known deadline on the current account to compare against; if it
+    // is unknown we are still probing it, so leave it alone. Read through the
+    // ranking so the account is compared on the window that governs THIS
+    // request (with the knob off, the shared weekly), or on its end time when
+    // that comes first.
     const currentReset = current && this._rankingReset(current, model);
     if (!current || currentReset == null) return;
 
-    // Only accounts whose weekly expires sooner than the current one's are
-    // candidates: the "and weekly expires sooner" half of what this function is
-    // for. Kept separate from the ranking, so the ranking can change without
-    // moving the trigger.
+    // Only accounts whose deadline is sooner than the current one's are
+    // candidates: the "and weekly expires sooner" (or "it ends sooner") half of
+    // what this function is for. Kept separate from the ranking, so the ranking
+    // can change without moving the trigger.
     const eligible = [];
     for (const acc of candidates) {
       if (acc.index === current.index) continue;
@@ -5737,9 +5741,9 @@ export class AccountManager {
       if (!this._isAvailable(acc, model, advisorModel)) continue; // enough session & weekly quota left
       // Don't demote to a lower-priority (higher value) account on a reset.
       if ((acc.priority || 0) > (current.priority || 0)) continue;
-      const weekly = this._rankingReset(acc, model);
-      if (weekly == null) continue; // need a known weekly to compare
-      if (weekly < currentReset) eligible.push(acc);
+      const deadline = this._rankingReset(acc, model);
+      if (deadline == null) continue; // need a known deadline to compare
+      if (deadline < currentReset) eligible.push(acc);
     }
     if (!eligible.length) return;
 
@@ -5797,12 +5801,15 @@ export class AccountManager {
     // that got us here, and with expiry routing off every rank is absent and
     // equal, so this cannot fire at all.
     if (rankOf.get(best.index) > rankOf.get(current.index)) return;
+    // Say which clock decided it, as eligibility() does: an account taken for
+    // its end time is not explained by a weekly reset that comes later.
+    const why = this._rankingReset(best, model) === best.endsAt ? 'it ends sooner' : 'weekly expires sooner';
     // Another provider's account, on a poll or while the cursor holds a manual
     // choice: move only that provider's cursor, so its next walk starts there.
     if (incumbent) {
       this.providerCursors.set(providerOf(best), best.index);
       this._beginRamp(best);
-      console.log(`[TeamClaude] Account "${best.name}" session quota reset and weekly expires sooner — its provider's traffic switches to it`);
+      console.log(`[TeamClaude] Account "${best.name}" session quota reset and ${why} — its provider's traffic switches to it`);
       return;
     }
     // Aiming, like every other cursor move: the reading was taken before this
@@ -5810,7 +5817,7 @@ export class AccountManager {
     // failed back onto the same account still finds the roll waiting.
     this._setCurrent(best);
     this._beginRamp(best);
-    console.log(`[TeamClaude] Account "${best.name}" session quota reset and weekly expires sooner — switching to it`);
+    console.log(`[TeamClaude] Account "${best.name}" session quota reset and ${why} — switching to it`);
   }
 
   /**
