@@ -254,6 +254,30 @@ test('the session-reset switch compares deadlines', t => {
   assert.equal(ending.currentIndex, 1);
 });
 
+// A poll sees every provider's resets. A Codex roll is weighed against the
+// Codex cursor's deadline, never against the Claude account the shared cursor
+// rests on: measured against that one, an account ending in a day took the
+// Codex cursor off one ending in 12 hours, the opposite of draining the one
+// that ends first. Both orderings.
+for (const [c1Ends, c2Ends, expected] of [[12, 24, 'codex-c1'], [24, 12, 'codex-c2']]) {
+  test(`a poll weighs a Codex roll against the Codex cursor's deadline (cursor ends in ${c1Ends}h, candidate in ${c2Ends}h)`, t => {
+    freezeClock(t);
+    const am = new AccountManager([
+      oauth('claude-a1', { accountUuid: 'u1' }),
+      oauth('codex-c1', { provider: 'codex', accountId: 'i1', endsAt: START + c1Ends * H }),
+      oauth('codex-c2', { provider: 'codex', accountId: 'i2', endsAt: START + c2Ends * H }),
+    ], 0.98);
+    weekly(am, 0, 0.3, 5 * 24);
+    weekly(am, 1, 0.3, 6 * 24);
+    weekly(am, 2, 0.3, 6 * 24);
+    Object.assign(am.accounts[2].quota, { unified5h: 0.5, unified5hReset: START - 1000 }); // codex-c2's five-hour window rolls
+    logged(() => { am._setCurrent(am.accounts[1]); am._setCurrent(am.accounts[0]); });
+    logged(() => am.refreshExpiredQuotas()); // a poll
+    assert.equal(am.accounts[am.currentIndex].name, 'claude-a1', 'a Codex roll moved the shared cursor');
+    assert.equal(am.accounts[am.currentIndexFor('codex')].name, expected);
+  });
+}
+
 test('priority still wins over a sooner end time', t => {
   freezeClock(t);
   for (const opts of [{}, { preferSoonestWeeklyReset: true }, { expiryRouting: { enabled: true } }, { distributeSessions: true }]) {
