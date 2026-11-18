@@ -1755,7 +1755,7 @@ function advancePinPastBilling(ctx, accountManager) {
         || accountManager.isBillingRejected(i) || accountManager.capBars(next, ctx.model, ctx.advisorModel)) continue;
     // Named once per refusal, next to markBillingRejected's line; a request that
     // only passes a cooling account by is not worth a line each.
-    if (ctx.tried.has(ctx.pinnedIndex)) {
+    if (ctx.tried.has(from)) {
       console.error(`[TeamClaude] Pinned account "${safeLine(from.name, 64)}" refused for billing; this request moves to "${safeLine(next.name, 64)}", the next account its pin names`);
     }
     ctx.pinnedIndex = i;
@@ -2460,7 +2460,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
 
       // stripOverage, synthesizeQuota and poolQuota are sampled once here, at dispatch:
       // retries and holds of this request keep them, and a reload applies to
-      // subsequent requests.
+      // subsequent requests. `tried` collects accounts, not indices (indicesOf).
       const ctx = { account: null, callerRequestId: callerId, status: null, attempt: 0, tried: new Set(), reauthed: new Set(), model, advisorModel, streamRequested: parseRequestStream(body), fleetMessageThreads: config?.messageThreads === true, pinnedIndex, pinChain, provider, holdBudgetMs: holdMs, pinKey, onMessage, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, stripOverage: shouldStripOverageHeaders(config), synthesizeQuota: shouldSynthesizeQuotaHeaders(config), poolQuota: shouldPoolQuotaHeaders(config), logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config), cacheUsage: /** @type {Record<string, any>|null} */ (null), errorType: /** @type {string|null} */ (null), usage };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
@@ -2762,16 +2762,28 @@ function waitForRetry(ms, signal) {
 // still unavailable by its own state is skipped by selection regardless.
 /**
  * @param {Record<string, any>} ctx
- * @param {import('./account-manager.js').AccountManager} accountManager
  */
-function forgetRecoverableFailures(ctx, accountManager) {
-  for (const i of [...ctx.tried]) {
-    const account = accountManager.accounts[i];
+function forgetRecoverableFailures(ctx) {
+  for (const account of [...ctx.tried]) {
     // By account (recordRefusal): a same-named account that was only out of
     // quota is exactly what the wait is for.
     if (ctx.refusedAccounts?.has(account) || ctx.unrenewedAccounts?.has(account)) continue;
-    ctx.tried.delete(i);
+    ctx.tried.delete(account);
   }
+}
+
+// ctx.tried holds the accounts themselves, not their places in the list: a
+// removal renumbers the fleet in place while a request waits (on upstream, a
+// token refresh, a hold), and an index taken before the wait then names
+// whichever account slid into it (removeAccount). The manager's selection
+// takes indices, so they are read off the accounts at the moment it is asked.
+// An account that has left reads -1, which names none.
+/**
+ * @param {Iterable<Record<string, any>>} accounts
+ * @returns {Set<number>}
+ */
+function indicesOf(accounts) {
+  return new Set(Array.from(accounts, a => a.index));
 }
 
 // Upstream refused this account's credential, or the account itself: a 400 that
@@ -4176,7 +4188,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // billing check below starts its cooldown and comes back here), the request
   // goes to the next one listed.
   advancePinPastBilling(ctx, accountManager);
-  const pinned = ctx.pinnedIndex != null && !ctx.tried.has(ctx.pinnedIndex)
+  const pinned = ctx.pinnedIndex != null && !ctx.tried.has(accountManager.accounts[ctx.pinnedIndex])
     ? accountManager.accounts[ctx.pinnedIndex]
     : null;
   // What this attempt's selection decided beyond which account it returned.
@@ -4199,7 +4211,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     : ctx.pinnedIndex != null
       ? (pinned && !pinnedWrongProvider && !accountManager.capBars(pinned, ctx.model, ctx.advisorModel) ? pinned : null)
       : accountManager.getActiveAccount(
-        ctx.tried, ctx.model, ctx.advisorModel, ctx.pinKey, ctx.provider, selection,
+        indicesOf(ctx.tried), ctx.model, ctx.advisorModel, ctx.pinKey, ctx.provider, selection,
       );
   // Accounts a rollover deliberately routed this request away from. Request-
   // scoped: the decision belongs to the request, not to one attempt of it.
@@ -4244,8 +4256,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // renewed, and nothing else was tried: say that, not a refusal or a quota.
     // Matched by account (recordRefusal).
     const unrenewed = ctx.unrenewedAccounts;
-    if (unrenewed?.size && [...ctx.tried].every(i => unrenewed.has(accountManager.accounts[i]))
-        && (ctx.pinnedIndex != null || (counted.size > 0 && [...counted].every(a => ctx.tried.has(a.index))))) {
+    if (unrenewed?.size && [...ctx.tried].every(a => unrenewed.has(a))
+        && (ctx.pinnedIndex != null || (counted.size > 0 && [...counted].every(a => ctx.tried.has(a))))) {
       return respondUnrenewed(res, ctx);
     }
     if (reachable.length && reachable.every(a => accountManager.unavailableReason(a, ctx.model) === 'billing')) {
@@ -4350,7 +4362,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     const clears = resetProvider === 'codex' ? RESET_CLEARS : CLAUDE_RESET_CLEARS;
     const resettable = redeemHook && !ctx.resetRedeemTried
       ? accountManager.accounts.filter((/** @type {Record<string, any>} */ a) =>
-        providerOf(a) === resetProvider && !ctx.tried.has(a.index)
+        providerOf(a) === resetProvider && !ctx.tried.has(a)
         // A third-party backend is an Anthropic-shaped account with no Anthropic
         // reset to spend; Codex rows never carry one, so the test is Claude's alone.
         && !(resetProvider === DEFAULT_PROVIDER && a.upstream)
@@ -4402,7 +4414,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       console.log(`[TeamClaude] All accounts exhausted — holding connection, retry in ${Math.ceil(waitMs / 1000)}s (${Math.ceil(ctx.holdBudgetMs / 1000)}s budget left)`);
       await waitForRetry(waitMs, ctx.signal);
       if (clientGone(res)) { ctx.abandoned = true; return; }
-      forgetRecoverableFailures(ctx, accountManager);
+      forgetRecoverableFailures(ctx);
       // A hold is a new attempt, not one more failover: the hops spent before
       // it are not spent on the retry, or a retry still answered 429 would be
       // returned with the budget unspent. The hold budget bounds the loop.
@@ -4415,7 +4427,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       console.log(`[TeamClaude] All accounts exhausted — waiting ${retryAfter}s before retry`);
       await waitForRetry(retryAfter * 1000, ctx.signal);
       if (clientGone(res)) { ctx.abandoned = true; return; }
-      forgetRecoverableFailures(ctx, accountManager);
+      forgetRecoverableFailures(ctx);
       return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
     }
     res.writeHead(429, {
@@ -4444,7 +4456,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // Refresh OAuth token if needed
   await accountManager.ensureTokenFresh(account.index);
   if (account.status === 'error' && retryCount < maxRetries) {
-    ctx.tried.add(account.index);
+    ctx.tried.add(account);
     return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
   }
   // The token has expired and the refresh did not replace it: the coordinator
@@ -4456,7 +4468,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // By account (recordRefusal); the name is only printed.
     (ctx.unrenewedAccounts ??= new Set()).add(account);
     (ctx.unrenewed ??= new Set()).add(account.name);
-    ctx.tried.add(account.index);
+    ctx.tried.add(account);
     console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}": token expired and not renewed; not sending it upstream`);
     if (ctx.pinnedIndex == null && retryCount < maxRetries) {
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
@@ -4468,7 +4480,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // way, up to a full connect timeout later, so move on now. A pin still
   // targets exactly the account it names.
   if (ctx.pinnedIndex == null && retryCount < maxRetries && accountManager.isRoutingDown(account.index)) {
-    ctx.tried.add(account.index);
+    ctx.tried.add(account);
     return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
   }
 
@@ -4594,7 +4606,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // backlog. Explicit caller pins still target exactly the requested account.
     if (ctx.pinnedIndex == null && retryCount < maxRetries && accountManager.isEntitlementDenied(account.index)) {
       accountManager.release(account.index, { successful: false });
-      ctx.tried.add(account.index);
+      ctx.tried.add(account);
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
     }
     // Same for a cap: a reading that arrived while this request waited can have
@@ -4607,12 +4619,12 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     if (accountManager.capBars(account, ctx.model, ctx.advisorModel)
         || (ctx.pinnedIndex == null && account.status === 'error')) {
       accountManager.release(account.index, { successful: false });
-      ctx.tried.add(account.index);
+      ctx.tried.add(account);
       return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
     }
     if (ctx.pinnedIndex == null && accountManager.isBillingRejected(account.index)) {
       accountManager.release(account.index, { successful: false });
-      ctx.tried.add(account.index);
+      ctx.tried.add(account);
       return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
     }
     // One attempt per upstream send, counted here: after admission, so a queued
@@ -4666,7 +4678,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       if (inspected.billingError) {
         await upstreamBody?.cancel();
         accountManager.markBillingRejected(account.index);
-        ctx.tried.add(account.index);
+        ctx.tried.add(account);
         if (clientGone(res)) { ctx.abandoned = true; return; }
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
       }
@@ -4803,7 +4815,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
           console.log(`[TeamClaude] Quota rejection (429) on "${account.name}"${spent} — throttling ${hold}s${later} and switching account`);
           accountManager.markRateLimited(account.index, hold);
         }
-        ctx.tried.add(account.index);
+        ctx.tried.add(account);
         if (clientGone(res)) { ctx.abandoned = true; return; }
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
       }
@@ -4882,7 +4894,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         // pickAlternate, not getActiveAccount: the hop detours THIS request and
         // must leave the fleet cursor where it is (#286).
         const alt = accountManager.pickAlternate(
-          new Set([...ctx.tried, ...(ctx.rolledOff || []), account.index]),
+          new Set([...indicesOf(ctx.tried), ...(ctx.rolledOff || []), account.index]),
           ctx.model, ctx.advisorModel, ctx.provider,
         );
         if (alt && !accountManager.isPaused(alt.index)) {
@@ -4891,7 +4903,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
           // "IP-scoped" reading of a second 429 below rests on.
           ctx.rateLimitHopSharedExit = !routed && !alt.routing;
           ctx.hopTo = alt.index;
-          ctx.tried.add(account.index);
+          ctx.tried.add(account);
           console.log(`[TeamClaude] Rate-limit 429 on "${account.name}" — failing over once to idle account "${alt.name}"`);
           if (clientGone(res)) { ctx.abandoned = true; return; }
           return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
@@ -5028,14 +5040,14 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     if (ctx.pinnedIndex == null && upstreamRes.status >= 500 && !res.headersSent && !ctx.serverErrorHopped && retryCount < maxRetries) {
       // Same exclusion as the 429 hop, and the same cursor-preserving pick.
       const alt = accountManager.pickAlternate(
-        new Set([...ctx.tried, ...(ctx.rolledOff || []), account.index]),
+        new Set([...indicesOf(ctx.tried), ...(ctx.rolledOff || []), account.index]),
         ctx.model, ctx.advisorModel, ctx.provider,
       );
       if (alt && !accountManager.isPaused(alt.index)) {
         await upstreamRes.body?.cancel();
         ctx.serverErrorHopped = true;
         ctx.hopTo = alt.index;
-        ctx.tried.add(account.index);
+        ctx.tried.add(account);
         console.log(`[TeamClaude] Upstream ${upstreamRes.status} on "${account.name}" — failing over once to "${alt.name}"`);
         if (clientGone(res)) { ctx.abandoned = true; return; }
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
@@ -5061,7 +5073,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         await rest.cancel();
         accountManager.markRefused(account, refusal);
         recordRefusal(ctx, account, 400);
-        ctx.tried.add(account.index);
+        ctx.tried.add(account);
         console.error(`[TeamClaude] 400 on "${safeLine(account.name, 64)}"; upstream refused the account (${refusal.code}), failing over`);
         if (clientGone(res)) { ctx.abandoned = true; return; }
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
@@ -5077,7 +5089,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         const until = accountManager.markModelDenied(account.index, ctx.model,
           { detail: upstreamErrorMessage(peeked), epoch: modelDenialEpoch });
         ctx.modelUnsupported = { body: peeked, contentType: upstreamRes.headers.get('content-type') };
-        ctx.tried.add(account.index);
+        ctx.tried.add(account);
         console.error(`[TeamClaude] 400 on "${safeLine(account.name, 64)}"; its ChatGPT plan does not serve ${safeLine(ctx.model, 64)}, out of rotation for that model${until ? ` until ${new Date(until).toISOString()}` : ''}, failing over`);
         if (clientGone(res)) { ctx.abandoned = true; return; }
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
@@ -5125,7 +5137,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       if (verification) (ctx.verificationHold ??= new Map()).set(account, verification.url);
       recordRefusal(ctx, account, 403);
       if (entitlementDenied) (ctx.entitlementDeniedAccounts ??= new Set()).add(account);
-      ctx.tried.add(account.index);
+      ctx.tried.add(account);
       const denials = account.entitlementDenial?.count || 0;
       const cooldown = deniedUntil
         ? `; OAuth entitlement cooldown until ${new Date(deniedUntil).toISOString()}${denials > 1 ? `, ${denials} in a row` : ''}`
@@ -5183,7 +5195,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
           : 'upstream rejected its token (401) and it has no refresh token');
       }
       recordRefusal(ctx, account, 401);
-      ctx.tried.add(account.index);
+      ctx.tried.add(account);
       console.error(`[TeamClaude] 401 on "${safeLine(account.name, 64)}"; failing over to another account`);
       if (clientGone(res)) { ctx.abandoned = true; return; }
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
@@ -5214,7 +5226,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     if (ctx.pinnedIndex == null && isStreaming && upstreamRes.status < 400 && upstreamBody && !res.headersSent
         && !ctx.streamFailureHopped && retryCount < maxRetries) {
       const alt = accountManager.pickAlternate(
-        new Set([...ctx.tried, ...(ctx.rolledOff || []), account.index]),
+        new Set([...indicesOf(ctx.tried), ...(ctx.rolledOff || []), account.index]),
         ctx.model, ctx.advisorModel, ctx.provider,
       );
       if (alt && !accountManager.isPaused(alt.index)) {
@@ -5224,7 +5236,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
           await peeked.cancel();
           ctx.streamFailureHopped = true;
           ctx.hopTo = alt.index;
-          ctx.tried.add(account.index);
+          ctx.tried.add(account);
           console.log(`[TeamClaude] Stream failed inside a ${upstreamRes.status} on "${account.name}" (${peeked.failureCode}) — failing over once to "${alt.name}"`);
           if (clientGone(res)) { ctx.abandoned = true; return; }
           return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
@@ -5448,7 +5460,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     const hostOf = (u) => { try { return new URL(u).hostname; } catch { return u; } };
     const thisHost = hostOf(account.upstream || upstream);
     const otherHostAvailable = ctx.pinnedIndex != null || accountManager.accounts.some(a =>
-      a.index !== account.index && !ctx.tried.has(a.index) &&
+      a.index !== account.index && !ctx.tried.has(a) &&
       hostOf(a.upstream || upstream) !== thisHost &&
       accountManager._isAvailable(a, ctx.model));
     const isTransient = isTransientUpstreamError(err, { otherHostAvailable });
@@ -5471,7 +5483,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // a healthy account from rotation until a credential change). Instead skip
     // it for the rest of THIS request only and fail over to another account.
     if (retryCount < maxRetries && !res.headersSent) {
-      ctx.tried.add(account.index);
+      ctx.tried.add(account);
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
     }
     ctx.status = 502;

@@ -183,6 +183,36 @@ test('a refusal reported inside a 200 stream hops once to a sibling', async (t) 
   });
 });
 
+// The hop never lands on an account the request already tried. one answers a
+// rate-limit 429 (paused, and in what the request tried, but still available),
+// the request hops to two, and two's stream fails: the stream hop's best sibling
+// would be one, so it goes to three, which ranks below both.
+test('a stream-failure hop never lands on an account the request already tried', async (t) => {
+  const OVERLOADED_ERROR = { type: 'error', error: { type: 'overloaded_error', message: 'Overloaded' } };
+  let oneRefused = false;
+  await withFleet(t, ['one', 'two', 'three'], (acct, res) => {
+    if (acct === 'one' && !oneRefused) {
+      oneRefused = true;
+      res.writeHead(429, { 'content-type': 'application/json', 'retry-after': '30', 'anthropic-ratelimit-requests-remaining': '0' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'slow down' } }));
+      return;
+    }
+    sseHead(res);
+    if (acct === 'two') return res.end(sse(OVERLOADED_ERROR));
+    res.end(sse(MESSAGE_START, TEXT_DELTA, MESSAGE_STOP));
+  }, async ({ am, proxyPort, seen }) => {
+    byName(am, 'three').priority = 1;
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-x', messages: [], stream: true }),
+    });
+    const body = await res.text();
+    assert.equal(res.status, 200);
+    assert.deepEqual(seen, ['one', 'two', 'three']);
+    assert.equal(body, sse(MESSAGE_START, TEXT_DELTA, MESSAGE_STOP), "three's stream reaches the client");
+  }, { provider: 'anthropic' });
+});
+
 // (b) One hop, not a walk of the fleet: a second account refusing the same way
 // is the provider talking, and every further attempt would only spend another
 // account's cache to learn it. The last stream is relayed as upstream sent it.

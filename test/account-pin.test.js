@@ -146,6 +146,39 @@ test('a normal (unpinned) request still rotates as before', async () => {
   });
 });
 
+// A pinned account in error (a credential upstream refused, with no refresh
+// token to renew it by) is never sent the request. The request records it as
+// tried and is answered on the next attempt; recorded as anything the next
+// attempt does not recognise, the pin was tried again on every attempt until
+// the retry budget ran out, and then sent.
+test('a request pinned to an account in error is answered without reaching upstream', async () => {
+  const seen = [];
+  const upstream = http.createServer((req, res) => {
+    req.resume();
+    seen.push(req.headers.authorization);
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager([
+    { name: 'alpha', type: 'oauth', accessToken: 't-alpha', expiresAt: Date.now() + 3600_000 },
+    oauth('beta'),
+  ], 0.98, { refreshFn: async () => { throw new Error('no refresh'); } });
+  am.accounts[0].status = 'error';
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const proxyPort = await listen(proxy);
+  try {
+    const res = await post(`http://127.0.0.1:${proxyPort}/tc-acct/alpha/v1/messages`);
+    const body = await res.json();
+    assert.equal(res.status, 429);
+    assert.match(body.error.message, /^Pinned account is unavailable/);
+    assert.deepEqual(seen, [], 'the pinned account in error was sent the request');
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
 // The escaping of a `/tc-acct/` segment is the CLIENT's, so a malformed one is
 // an ordinary bad request rather than something the proxy should choke on:
 // decodeURIComponent throws URIError on '%', '%zz' and a truncated '%E0%A4'.

@@ -132,6 +132,40 @@ test('persistent 401 terminates instead of looping', async () => {
   }
 });
 
+// The same, as the sends go: a 401 that comes back after the forced refresh
+// takes the account out of the rest of the request. Recorded as anything the
+// next attempt does not recognise, the account was selected again and sent the
+// request without end, as the third send here (awaited as an event) shows.
+test('a 401 that survives the forced refresh is the last send to that account in the request', async () => {
+  const seen = [];
+  let third = () => {};
+  const sentAgain = new Promise(resolve => { third = resolve; });
+  const upstream = http.createServer((req, res) => {
+    req.resume();
+    seen.push((req.headers.authorization || '').replace(/^Bearer /, ''));
+    if (seen.length === 3) third('sent a third time');
+    res.writeHead(401, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ type: 'error', error: { type: 'authentication_error', message: 'OAuth access token has been revoked' } }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(
+    [{ name: 'a', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + HOUR }],
+    0.98,
+    { refreshFn: async () => ({ accessToken: 't1', refreshToken: 'r', expiresAt: Date.now() + HOUR }) },
+  );
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const proxyPort = await listen(proxy);
+  try {
+    assert.equal(await Promise.race([post(proxyPort), sentAgain]), 502);
+    assert.deepEqual(seen, ['t', 't1']);
+  } finally {
+    proxy.closeAllConnections();
+    proxy.close();
+    upstream.closeAllConnections();
+    upstream.close();
+  }
+});
+
 // An API-key account has no refresh token, so retrying a 401 at once would
 // just burn a round trip. Nothing here can repair the key, so the account also
 // leaves rotation instead of being picked again by the next request (#412) —

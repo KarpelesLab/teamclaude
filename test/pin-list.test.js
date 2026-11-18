@@ -113,6 +113,17 @@ test('a list pin moves a billing-refused request to the next listed API-key acco
   });
 });
 
+// The move is named once, beside the refusal, by the request that was refused.
+test('a billing move is named once in the log, from the account refused to the one moved to', async t => {
+  const lines = [];
+  t.mock.method(console, 'error', (...args) => { lines.push(String(args[0])); });
+  await withPin([plan, credit('a'), credit('b')], 'a,b', billing(new Set(['key-a'])), async ({ post }) => {
+    assert.deepEqual(await post(), served('key-b'));
+  });
+  assert.deepEqual(lines.filter(l => l.includes('refused for billing; this request moves')),
+    ['[TeamClaude] Pinned account "a" refused for billing; this request moves to "b", the next account its pin names']);
+});
+
 test('later requests skip listed accounts while their billing cooldown lasts, then try them again', async () => {
   const depleted = new Set(['key-a', 'key-b']);
   await withPin([plan, credit('a'), credit('b'), credit('c')], 'a,b,c', billing(depleted), async ({ am, seen, post }) => {

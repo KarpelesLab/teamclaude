@@ -58,6 +58,104 @@ test('a rate-limit 429 fails over once to an idle sibling', async () => {
   });
 });
 
+// Never onto an account already tried. a refuses the credential (a 403 fails
+// the request over and leaves a in rotation), then b answers a rate-limit 429:
+// the only idle sibling is a, which this request has tried, so there is no hop
+// and b's 429 goes to the client.
+test('a rate-limit hop never lands on an account the request already tried', async () => {
+  await withFleet((req, res) => {
+    if (tokenOf(req) === 't-a') {
+      res.writeHead(403, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'permission_error', message: 'Request not allowed' } }));
+      return;
+    }
+    res.writeHead(429, { 'retry-after': '300', 'content-type': 'application/json' });
+    res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error' } }));
+  }, async ({ proxyPort, seen }) => {
+    const { status } = await post(proxyPort);
+    assert.deepEqual(seen, ['t-a', 't-b'], 'the hop went back to the account that refused');
+    assert.equal(status, 429);
+  });
+});
+
+// The account a hop went around is tried for the rest of the request too: the
+// hop's destination b refuses its credential, and the request fails over to c,
+// not back to a, the fleet's current account, which would answer as before.
+for (const [what, status, headers] of [
+  ['a rate-limit 429', 429, { 'retry-after': '1' }],
+  ['a 529', 529, {}],
+]) {
+  test(`after a hop on ${what} the account it went around is not tried again`, async () => {
+    const seen = [];
+    const upstream = http.createServer((req, res) => {
+      req.resume();
+      const token = tokenOf(req);
+      seen.push(token);
+      if (token === 't-a') {
+        res.writeHead(status, { 'content-type': 'application/json', ...headers });
+        res.end(JSON.stringify({ type: 'error', error: { type: status === 429 ? 'rate_limit_error' : 'overloaded_error' } }));
+        return;
+      }
+      if (token === 't-b') {
+        res.writeHead(403, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ type: 'error', error: { type: 'permission_error', message: 'Request not allowed' } }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    });
+    const upstreamPort = await listen(upstream);
+    const am = new AccountManager([...accounts(),
+      { name: 'c', type: 'oauth', accessToken: 't-c', refreshToken: 'r', expiresAt: Date.now() + HOUR },
+    ], 0.98, { refreshFn: async () => { throw new Error('no refresh'); } });
+    const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` });
+    const proxyPort = await listen(proxy);
+    try {
+      const { status: got } = await post(proxyPort);
+      assert.equal(got, 200);
+      assert.deepEqual(seen, ['t-a', 't-b', 't-c']);
+    } finally { proxy.close(); upstream.close(); }
+  });
+}
+
+// The same for the 5xx hop. a answers a rate-limit 429 (it is paused, and in
+// what the request tried, but still available), the request hops to b, and b
+// answers 529: the 5xx hop's best sibling would be a, which this request has
+// tried, so it goes to c, which ranks below both.
+test('a 5xx hop never lands on an account the request already tried', async () => {
+  const seen = [];
+  let aRefused = false;
+  const upstream = http.createServer((req, res) => {
+    req.resume();
+    const token = tokenOf(req);
+    seen.push(token);
+    if (token === 't-a' && !aRefused) {
+      aRefused = true;
+      res.writeHead(429, { 'content-type': 'application/json', 'retry-after': '30', 'anthropic-ratelimit-requests-remaining': '0' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'slow down' } }));
+      return;
+    }
+    if (token === 't-b') {
+      res.writeHead(529, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'overloaded_error', message: 'Overloaded' } }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager([...accounts(),
+    { name: 'c', type: 'oauth', accessToken: 't-c', refreshToken: 'r', expiresAt: Date.now() + HOUR, priority: 1 },
+  ], 0.98, { refreshFn: async () => { throw new Error('no refresh'); } });
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const proxyPort = await listen(proxy);
+  try {
+    const { status } = await post(proxyPort);
+    assert.equal(status, 200);
+    assert.deepEqual(seen, ['t-a', 't-b', 't-c']);
+  } finally { proxy.close(); upstream.close(); }
+});
+
 // #165: a headerless 429 — no anthropic-ratelimit-* at all — is the same shape.
 test('a headerless 429 fails over rather than retrying the same account', async () => {
   await withFleet((req, res) => {
