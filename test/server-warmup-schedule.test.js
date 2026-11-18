@@ -133,22 +133,28 @@ test('an invalid schedule reload preserves the live schedule and quota endpoint'
 // would save six hours from now: no slot comes due during the test, and the
 // next warm-up stays well under the longest delay setTimeout takes (about 24.8
 // days), past which the timer fires at once and re-arms, logging the line
-// each time.
-test('a reload that leaves the schedule as it is does not reschedule it', async () => {
+// each time. The wait for that line, and the requests, end with the test
+// (t.signal): a line that never comes then fails the test at its timeout and
+// the finally still stops the server, where an unending wait would keep the
+// file from exiting (test/README.md, "Clean up in finally").
+test('a reload that leaves the schedule as it is does not reschedule it', async (t) => {
   const schedule = createRollingWarmupSchedule({ resetTime: '15:30', timezone: 'Europe/Moscow' }, Date.now() + 6 * 60 * 60 * 1000);
   const moved = new Date(Date.parse(schedule.anchorResetAt) + 24 * 60 * 60 * 1000).toISOString();
   const s = await serverWith({ warmupSchedule: schedule }, 'teamclaude-schedule-same-');
   try {
     const headers = { 'x-api-key': 'tc-test' };
-    const reload = () => fetch(`http://127.0.0.1:${s.port}/teamclaude/reload`, { method: 'POST', headers });
+    const reload = () => fetch(`http://127.0.0.1:${s.port}/teamclaude/reload`, { method: 'POST', headers, signal: t.signal });
     assert.equal((await reload()).status, 200);
     await writeFile(s.configPath, JSON.stringify({ ...s.config, warmupSchedule: { ...schedule, anchorResetAt: moved } }));
     assert.equal((await reload()).status, 200);
-    const status = await (await fetch(`http://127.0.0.1:${s.port}/teamclaude/status`, { headers })).json();
+    const status = await (await fetch(`http://127.0.0.1:${s.port}/teamclaude/status`, { headers, signal: t.signal })).json();
     const changed = `Keep-warm scheduled for ${status.warm.nextWarmupAt}`;
-    await new Promise(resolve => {
-      const check = () => { if (s.output().includes(changed)) { s.child.stdout.off('data', check); resolve(undefined); } };
+    await new Promise((resolve, reject) => {
+      const stop = () => { s.child.stdout.off('data', check); t.signal.removeEventListener('abort', abort); };
+      const check = () => { if (s.output().includes(changed)) { stop(); resolve(undefined); } };
+      const abort = () => { stop(); reject(t.signal.reason); };
       s.child.stdout.on('data', check);
+      t.signal.addEventListener('abort', abort, { once: true });
       check();
     });
     assert.equal(s.output().split('Keep-warm scheduled for').length - 1, 2, s.output());
