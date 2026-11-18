@@ -1,6 +1,14 @@
-# Windows installer
+# Windows installer and portable exe
 
-On Windows you can install TeamClaude with one installer. You do not need Node.js, npm, Docker or a terminal. You set everything up in the web dashboard.
+On Windows you can install TeamClaude with one installer, or run it from a single portable file. You do not need Node.js, npm, Docker or a terminal. You set everything up in the web dashboard.
+
+Each release on the [releases page](https://github.com/KarpelesLab/teamclaude/releases) has these Windows files:
+
+| File | What it is |
+|---|---|
+| `TeamClaude-Setup-<version>.exe` | The installer. See [Install](#install). |
+| `TeamClaude-<version>-portable.exe` | One file that runs with no installer. See [Portable exe](#portable-exe). |
+| `TeamClaude-<version>-portable.exe.sha256` | The checksum of the portable exe. |
 
 ## Install
 
@@ -34,19 +42,38 @@ If the proxy cannot start, a message box says why and names the log file.
 
 Start **Stop TeamClaude** from the Start Menu. It ends the proxy. Your tools cannot reach it until you start **TeamClaude** again.
 
+## Portable exe
+
+The portable exe is the same program as one file. There is no installer and nothing else to download.
+
+1. Download `TeamClaude-<version>-portable.exe` and `TeamClaude-<version>-portable.exe.sha256` from the newest release.
+2. Check the file. In PowerShell, run `Get-FileHash .\TeamClaude-<version>-portable.exe -Algorithm SHA256`. The hash it prints must equal the one in the `.sha256` file, ignoring upper and lower case.
+3. Run the exe. It is not code-signed, so Windows SmartScreen may say "Windows protected your PC". Click **More info**, then **Run anyway**.
+
+The first run unpacks the program to `%LOCALAPPDATA%\TeamClaude\portable\<version>`. You see no window for a few seconds. Then the dashboard opens in your browser, and you carry on as in [First run](#first-run). Later runs skip the unpacking.
+
+To stop the proxy, run `TeamClaude-<version>-portable.exe --stop`.
+
+The portable exe adds no Start Menu folder, no sign-in entry and no entry in **Apps and features**. It uses the same settings file as the installer, so your accounts are there if you have used either before.
+
+To update, stop the running proxy with `--stop`, then run the newer exe. If the old proxy is still running, the newer exe only opens its dashboard. Each version unpacks to a folder of its own. Once you have stopped that version's proxy, you can delete its folder.
+
+Only one proxy runs on a port. If you start a second copy, portable or installed, it opens the dashboard of the one that is running. **Stop** ends whichever one is running.
+
 ## Files
 
 | What | Where |
 |---|---|
 | Settings and signed-in accounts | `%USERPROFILE%\.config\teamclaude.json` |
 | Proxy log | `%LOCALAPPDATA%\TeamClaude\teamclaude.log` |
-| Program | `%LOCALAPPDATA%\Programs\TeamClaude` |
+| Program (installer) | `%LOCALAPPDATA%\Programs\TeamClaude` |
+| Program (portable exe) | `%LOCALAPPDATA%\TeamClaude\portable\<version>` |
 
 The settings file holds your sign-in tokens. Do not share it. Every setting is described in [Configuration](configuration.md).
 
 ## Update
 
-TeamClaude checks for a new version at most once a day. When one is out, the log says so and points to the releases page. It does not download or install anything by itself. To update, download the new installer and run it. It stops the running proxy, replaces the program, and keeps your settings and accounts.
+TeamClaude checks for a new version at most once a day. When one is out, the log says so and points to the releases page. It does not download or install anything by itself. To update, download the new installer and run it. It stops the running proxy, replaces the program, and keeps your settings and accounts. For the portable exe, download the newer exe instead (see [Portable exe](#portable-exe)).
 
 ## Uninstall
 

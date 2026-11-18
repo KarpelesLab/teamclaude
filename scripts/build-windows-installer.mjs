@@ -1,6 +1,11 @@
 #!/usr/bin/env node
-// Build dist/TeamClaude-Setup-<version>.exe, the Windows installer that needs
-// no Node, npm or Docker on the machine it runs on.
+// Build the Windows files of a release, none of which needs Node, npm or
+// Docker on the machine it runs on:
+//
+//   dist/TeamClaude-Setup-<version>.exe              the installer
+//   dist/TeamClaude-<version>-portable.exe           one exe, no installer
+//   dist/TeamClaude-<version>-portable.exe.sha256    its checksum, in
+//                                                    `sha256sum -c` format
 //
 //   node scripts/build-windows-installer.mjs
 //
@@ -8,7 +13,9 @@
 // on Linux; nothing here needs Windows. It downloads the pinned Node release
 // for win-x64 into a cache, refuses it unless its SHA-256 matches the pin,
 // stages node.exe as teamclaude-node.exe beside src/ and package.json, then
-// compiles packaging/windows/launcher.nsi and installer.nsi.
+// compiles packaging/windows/launcher.nsi (twice: for the installer, and with
+// -DPORTABLE for the portable exe) and installer.nsi. All three files come from
+// the same staged tree.
 //
 // The Node pin comes from https://nodejs.org/dist/index.json (newest v24 LTS)
 // and the hash from https://nodejs.org/dist/v<version>/SHASUMS256.txt. Bump
@@ -18,7 +25,7 @@ import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { cp, copyFile, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const NODE_VERSION = '24.22.2';
@@ -88,8 +95,8 @@ await rename(join(stage, 'node', 'node.exe'), join(stage, 'node', 'teamclaude-no
 
 await cp(join(root, 'src'), join(stage, 'app', 'src'), { recursive: true });
 await copyFile(join(root, 'package.json'), join(stage, 'app', 'package.json'));
-// Read by src/updater.js: this copy updates through a new installer, not npm.
-await writeFile(join(stage, 'app', 'windows-bundle'), `Installed by TeamClaude-Setup-${version}.exe. Updates come from https://github.com/KarpelesLab/teamclaude/releases\r\n`);
+// Read by src/updater.js: this copy updates through a new download, not npm.
+await writeFile(join(stage, 'app', 'windows-bundle'), `Windows bundle of TeamClaude ${version} (installer or portable exe). Updates come from https://github.com/KarpelesLab/teamclaude/releases\r\n`);
 // The licence page shows the file as is, and a bare LF is no line break there.
 const license = await readFile(join(root, 'LICENSE'), 'utf8');
 await writeFile(join(stage, 'LICENSE.txt'), license.replace(/\r?\n/g, '\r\n'));
@@ -100,5 +107,12 @@ run('makensis', ['-V2', ...defines, `-DOUTFILE=${join(stage, 'TeamClaude.exe')}`
 const setup = join(dist, `TeamClaude-Setup-${version}.exe`);
 run('makensis', ['-V2', ...defines, `-DOUTFILE=${setup}`, join(packaging, 'installer.nsi')]);
 
-const { size } = await stat(setup);
-console.log(`Built ${setup} (${(size / 1024 / 1024).toFixed(1)} MB) with Node ${NODE_VERSION}`);
+const portable = join(dist, `TeamClaude-${version}-portable.exe`);
+run('makensis', ['-V2', ...defines, '-DPORTABLE', `-DOUTFILE=${portable}`, join(packaging, 'launcher.nsi')]);
+// Two spaces and no path: `sha256sum -c` run from dist/ finds the exe by name.
+await writeFile(`${portable}.sha256`, `${await sha256(portable)}  ${basename(portable)}\n`);
+
+for (const file of [setup, portable]) {
+  const { size } = await stat(file);
+  console.log(`Built ${file} (${(size / 1024 / 1024).toFixed(1)} MB) with Node ${NODE_VERSION}`);
+}

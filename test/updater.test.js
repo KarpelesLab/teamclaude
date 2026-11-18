@@ -268,7 +268,7 @@ test('autoUpdate points the Windows installer copy at the releases page and inst
     });
     assert.equal(res.notified, true);
     assert.equal(installed, 0);
-    assert.deepEqual(logs, [`[TeamClaude] Update available: 1.0.0 → 2.0.0. Download the new installer from ${RELEASES_URL}`]);
+    assert.deepEqual(logs, [`[TeamClaude] Update available: 1.0.0 → 2.0.0. Download the new version from ${RELEASES_URL}`]);
     assert.equal(RELEASES_URL, 'https://github.com/KarpelesLab/teamclaude/releases');
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
@@ -276,7 +276,7 @@ test('autoUpdate points the Windows installer copy at the releases page and inst
 test('updateAdvice names the command for npm and pnpm copies and the releases page for the installer', () => {
   assert.equal(updateAdvice('local'), 'Run: teamclaude update');
   assert.equal(updateAdvice('pnpm'), `Run: pnpm add -g ${PKG_NAME}@latest`);
-  assert.equal(updateAdvice('bundle'), `Download the new installer from ${RELEASES_URL}`);
+  assert.equal(updateAdvice('bundle'), `Download the new version from ${RELEASES_URL}`);
 });
 
 // `sudo teamclaude server` would otherwise run `npm install -g` as root every
