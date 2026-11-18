@@ -303,3 +303,41 @@ test('a 401 inside a kept 403\'s hold still forces a renewal of a refresh token 
     upstream.close();
   }
 });
+
+// The forced refresh is one per account per request, and the record of it was
+// kept by index. A removal renumbers the rest of the fleet in place
+// (removeAccount), so with x removed during a's refresh the record named b by
+// the time it was read: a took a second re-auth, b's own 401 was given none,
+// and the request ended 502. y never serves; it keeps the retry budget (one
+// attempt per account) from running out before b is reached.
+test('a removal during a forced refresh leaves each account its own one re-auth', async () => {
+  const { server: upstream, seen } = revokingUpstream(new Set(['b2']));
+  const upstreamPort = await listen(upstream);
+
+  const refreshed = [];
+  let am;
+  const oauth = (name, extra = {}) => ({ name, type: 'oauth', accessToken: name, refreshToken: `r${name}`, expiresAt: Date.now() + HOUR, ...extra });
+  am = new AccountManager(
+    [oauth('x', { disabled: true }), oauth('a'), oauth('b'), oauth('y', { disabled: true })],
+    0.98,
+    {
+      refreshFn: async (rt) => {
+        refreshed.push(rt);
+        if (rt === 'ra') am.removeAccount(0);   // x goes: a becomes 0, b becomes 1
+        const name = rt.slice(1);
+        return { accessToken: `${name}2`, refreshToken: `r${name}2`, expiresAt: Date.now() + HOUR };
+      },
+    },
+  );
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const proxyPort = await listen(proxy);
+
+  try {
+    assert.equal(await post(proxyPort), 200);
+    assert.deepEqual(refreshed, ['ra', 'rb'], 'each account is forced to refresh once');
+    assert.deepEqual(seen, ['a', 'a2', 'b', 'b2']);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});

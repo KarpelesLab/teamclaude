@@ -361,6 +361,61 @@ test('a rate-limit hop does not land back on the account a rollover moved off', 
   }
 });
 
+// The same exclusion across a removal. The accounts a rollover moved the request
+// off were kept by index, and removing an account renumbers the rest in place
+// (removeAccount): with x removed while b holds the request, the record of a
+// named b, and the hop went back to a. x never serves; it sits first so that
+// its removal moves both.
+test('a rate-limit hop does not land back on the rolled-off account when another is removed meanwhile', async () => {
+  const H = 3600_000;
+  const seen = [];
+  let am;
+  const upstream = http.createServer((req, res) => {
+    const token = tokenOf(req);
+    seen.push(token);
+    if (token === 't-b') {
+      am.removeAccount(0);   // x goes: a becomes 0, b becomes 1
+      res.writeHead(429, { 'retry-after': '300', 'content-type': 'application/json' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error' } }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true }));
+  });
+  const upstreamPort = await listen(upstream);
+
+  am = new AccountManager([
+    { name: 'x', type: 'oauth', accessToken: 't-x', refreshToken: 'r', expiresAt: Date.now() + H, disabled: true },
+    { name: 'a', type: 'oauth', accessToken: 't-a', refreshToken: 'r', expiresAt: Date.now() + H },
+    { name: 'b', type: 'oauth', accessToken: 't-b', refreshToken: 'r', expiresAt: Date.now() + H },
+  ], 0.98, { expiryRouting: { enabled: true, preempt: true } });
+  am.accounts.forEach((acct, i) => {
+    acct.quota.unified5h = 0.1;
+    acct.quota.unified7d = 0.4;
+    acct.quota.unified7dReset = Date.now() + (10 + i * 10) * H;
+    acct.probing = false;
+  });
+  am.selectActiveAccount();
+
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const proxyPort = await listen(proxy);
+
+  try {
+    assert.equal((await post(proxyPort)).status, 200);
+    assert.deepEqual(seen, ['t-a'], 'the fixture must start on a');
+    am.accounts[1].quota.unified7dReset = Date.now() + 500 * H;   // a's window rolls
+
+    const before = seen.length;
+    const { status } = await post(proxyPort);
+    const chain = seen.slice(before);
+    assert.deepEqual(chain, ['t-b'], `the hop returned to the rolled-off account: ${chain.join(', ')}`);
+    assert.equal(status, 429, 'with nowhere else to hop, b\'s 429 goes to the client');
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
 // A pinned request (TC_ACCT, /tc-acct/, a session pin) names the one account the
 // client asked for, and docs/routing.md promises it never fails over: a rate
 // limit, a 5xx or a stream failure is handled as for any pin to one account. The

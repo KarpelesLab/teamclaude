@@ -2479,7 +2479,8 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
 
       // stripOverage, synthesizeQuota and poolQuota are sampled once here, at dispatch:
       // retries and holds of this request keep them, and a reload applies to
-      // subsequent requests. `tried` collects accounts, not indices (indicesOf).
+      // subsequent requests. `tried` and `reauthed` collect accounts, not
+      // indices (indicesOf).
       const ctx = { account: null, callerRequestId: callerId, status: null, attempt: 0, tried: new Set(), reauthed: new Set(), model, advisorModel, streamRequested: parseRequestStream(body), fleetMessageThreads: config?.messageThreads === true, pinnedIndex, pinnedAccount, unknownPin, pinChain: pinChainAccounts, provider, holdBudgetMs: holdMs, pinKey, onMessage, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, stripOverage: shouldStripOverageHeaders(config), synthesizeQuota: shouldSynthesizeQuotaHeaders(config), poolQuota: shouldPoolQuotaHeaders(config), logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config), cacheUsage: /** @type {Record<string, any>|null} */ (null), errorType: /** @type {string|null} */ (null), usage };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
@@ -2791,12 +2792,17 @@ function forgetRecoverableFailures(ctx) {
   }
 }
 
-// ctx.tried holds the accounts themselves, not their places in the list: a
-// removal renumbers the fleet in place while a request waits (on upstream, a
-// token refresh, a hold), and an index taken before the wait then names
-// whichever account slid into it (removeAccount). The manager's selection
-// takes indices, so they are read off the accounts at the moment it is asked.
-// An account that has left reads -1, which names none.
+// ctx.tried, ctx.rolledOff and ctx.reauthed hold the accounts themselves, not
+// their places in the list: a removal renumbers the fleet in place while a
+// request waits (on upstream, a token refresh, a hold), and an index taken
+// before the wait then names whichever account slid into it (removeAccount).
+// Selection and the hops take indices, so those of `tried` and `rolledOff` are
+// read off the accounts here, at the moment the manager is asked; `reauthed` is
+// only ever asked whether it holds an account. An account that has left reads
+// -1, which names none. It stays in the set, as its old index did before the
+// accounts were held: selection also reads the set's size (only a first
+// attempt, which excludes nothing, speaks for the fleet), and a request that
+// tried an account since removed is still past its first attempt.
 /**
  * @param {Iterable<Record<string, any>>} accounts
  * @returns {Set<number>}
@@ -4197,7 +4203,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   ctx.hopTo = null;
   let hopTo = hop;
   if (hop != null && hop.index < 0) {
-    const again = accountManager.pickAlternate(new Set([...indicesOf(ctx.tried), ...(ctx.rolledOff || [])]), ctx.model, ctx.advisorModel, ctx.provider);
+    const again = accountManager.pickAlternate(indicesOf([...ctx.tried, ...(ctx.rolledOff || [])]), ctx.model, ctx.advisorModel, ctx.provider);
     hopTo = again && !accountManager.isPaused(again.index) ? again : null;
     console.log(hopTo
       ? `[TeamClaude] "${safeLine(hop.name, 64)}" was removed before the hop reached it — failing over once to "${safeLine(hopTo.name, 64)}" instead`
@@ -4268,9 +4274,11 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       );
   // Accounts a rollover deliberately routed this request away from. Request-
   // scoped: the decision belongs to the request, not to one attempt of it.
+  // Kept as the accounts, as `tried` is (indicesOf): the hops that read them
+  // come after an upstream round trip.
   if (selection.rolledOff) {
     ctx.rolledOff ??= new Set();
-    for (const i of selection.rolledOff) ctx.rolledOff.add(i);
+    for (const i of selection.rolledOff) ctx.rolledOff.add(accountManager.accounts[i]);
   }
   if (pinnedWrongProvider && !res.headersSent && !clientGone(res)) {
     // Named plainly: a pin that cannot serve is a configuration mistake, and the
@@ -4947,7 +4955,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         // pickAlternate, not getActiveAccount: the hop detours THIS request and
         // must leave the fleet cursor where it is (#286).
         const alt = accountManager.pickAlternate(
-          new Set([...indicesOf(ctx.tried), ...(ctx.rolledOff || []), account.index]),
+          indicesOf([...ctx.tried, ...(ctx.rolledOff || []), account]),
           ctx.model, ctx.advisorModel, ctx.provider,
         );
         if (alt && !accountManager.isPaused(alt.index)) {
@@ -5101,7 +5109,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     if (ctx.pinnedIndex == null && upstreamRes.status >= 500 && !res.headersSent && !ctx.serverErrorHopped && retryCount < maxRetries) {
       // Same exclusion as the 429 hop, and the same cursor-preserving pick.
       const alt = accountManager.pickAlternate(
-        new Set([...indicesOf(ctx.tried), ...(ctx.rolledOff || []), account.index]),
+        indicesOf([...ctx.tried, ...(ctx.rolledOff || []), account]),
         ctx.model, ctx.advisorModel, ctx.provider,
       );
       if (alt && !accountManager.isPaused(alt.index)) {
@@ -5222,8 +5230,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // per account per request, so a genuinely dead credential does not loop: a
     // 401 that comes back goes to the branch below.
     if (upstreamRes.status === 401 && account.type === 'oauth' && account.refreshToken
-        && retryCount < maxRetries && !ctx.reauthed.has(account.index)) {
-      ctx.reauthed.add(account.index);
+        && retryCount < maxRetries && !ctx.reauthed.has(account)) {
+      ctx.reauthed.add(account);
       await upstreamRes.body?.cancel();
       console.log(`[TeamClaude] 401 on "${account.name}" — token rejected; forcing refresh and retrying`);
       await accountManager.ensureTokenFresh(account.index, true);
@@ -5287,7 +5295,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     if (ctx.pinnedIndex == null && isStreaming && upstreamRes.status < 400 && upstreamBody && !res.headersSent
         && !ctx.streamFailureHopped && retryCount < maxRetries) {
       const alt = accountManager.pickAlternate(
-        new Set([...indicesOf(ctx.tried), ...(ctx.rolledOff || []), account.index]),
+        indicesOf([...ctx.tried, ...(ctx.rolledOff || []), account]),
         ctx.model, ctx.advisorModel, ctx.provider,
       );
       if (alt && !accountManager.isPaused(alt.index)) {
