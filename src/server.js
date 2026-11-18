@@ -5407,7 +5407,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       const l = getLog();
       const bw = l ? l.bodyWriter('RESPONSE BODY (streamed)', contentType) : null;
       try {
-        ({ failed: streamFailed } = await streamResponse(held?.body ?? upstreamBody, res, account.index, accountManager, bw, ctx.onUsage, ctx.pinKey, ctx.model, ctx.onMessage, (/** @type {Record<string, any>} */ u) => { ctx.cacheUsage = u; bookUsageTotals(ctx.usage, u); }, isStreaming));
+        ({ failed: streamFailed } = await streamResponse(held?.body ?? upstreamBody, res, account, accountManager, bw, ctx.onUsage, ctx.pinKey, ctx.model, ctx.onMessage, (/** @type {Record<string, any>} */ u) => { ctx.cacheUsage = u; bookUsageTotals(ctx.usage, u); }, isStreaming));
         // Reached only when the stream completed. A stream that dies upstream
         // throws out of streamResponse, so it never marks itself delivered —
         // which is the failure the token counters cannot see, since a stream
@@ -5672,6 +5672,13 @@ export function bookUsageTotals(totals, usage) {
  * file).
  * `onTotals` is told the usage that was booked, once the stream ends.
  *
+ * `account` is the serving account itself, not its index. A stream can run for
+ * minutes, an account removed meanwhile renumbers the rest in place
+ * (removeAccount), and an index taken when the stream began would then book its
+ * figures to whichever account slid into the slot. Each figure is booked by the
+ * index the account has when it arrives: -1 once it has left, which books
+ * nothing to any account.
+ *
  * Resolves to what the stream said about itself: `failed` names the first
  * `error` or `response.failed` event it carried (its code, or the event type
  * when it names none), and is null for a stream that reported no failure. A
@@ -5679,7 +5686,7 @@ export function bookUsageTotals(totals, usage) {
  * nothing, and the caller's success bookkeeping needs to know the difference.
  * @returns {Promise<{ failed: string|null }>}
  */
-export async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter, onUsage = null, pinKey = null, model = null, onMessage = null, /** @type {((usage: Record<string, any>) => void)|null} */ onTotals = null, scanUsage = true) {
+export async function streamResponse(webStream, res, account, accountManager, bodyWriter, onUsage = null, pinKey = null, model = null, onMessage = null, /** @type {((usage: Record<string, any>) => void)|null} */ onTotals = null, scanUsage = true) {
   const reader = webStream.getReader();
   // A client that leaves while upstream is silent must not hold the pending
   // read — and with it the upstream socket and its admission permit — until
@@ -5702,7 +5709,7 @@ export async function streamResponse(webStream, res, accountIndex, accountManage
   const responsesTurn = { settled: false };
   /** @type {{ failed: string|null }} */
   const outcome = { failed: null };
-  const usage = scanUsage ? createSseLineScanner(line => parseSSEDataLine(line, accountIndex, accountManager, onUsage, merged, responsesTurn, onMessage, outcome)) : null;
+  const usage = scanUsage ? createSseLineScanner(line => parseSSEDataLine(line, account, accountManager, onUsage, merged, responsesTurn, onMessage, outcome)) : null;
 
   try {
     while (true) {
@@ -5769,7 +5776,7 @@ export async function streamResponse(webStream, res, accountIndex, accountManage
     // all (a ping and some text deltas, or an upstream error after the headers),
     // and recording those would report an observation that never happened.
     if (Object.keys(merged).length) {
-      accountManager.recordTokenUsage(accountIndex, pinKey, model, merged);
+      accountManager.recordTokenUsage(account.index, pinKey, model, merged);
       onTotals?.(merged);
     }
     // Cancel upstream reader to stop consuming data nobody needs (and, on the
@@ -5861,7 +5868,7 @@ export function createSseLineScanner(onLine, maxChars = SSE_MAX_LINE_CHARS) {
 // is an event for this purpose, and the scanner above never has to hold more.
 /**
  * @param {string} line
- * @param {number} accountIndex
+ * @param {Record<string, any>} account  the serving account; its index is read at each booking (streamResponse)
  * @param {any} accountManager
  * @param {((inputTokens: number, outputTokens: number) => void)|null} [onUsage]
  * @param {Record<string, any>|null} [merged]
@@ -5869,7 +5876,7 @@ export function createSseLineScanner(onLine, maxChars = SSE_MAX_LINE_CHARS) {
  * @param {((messageId: string) => void)|null} [onMessage] told the id `message_start` names
  * @param {{failed: string|null}|null} [outcome] this stream's first reported failure, set once
  */
-function parseSSEDataLine(line, accountIndex, accountManager, onUsage = null, merged = null, responsesTurn = null, onMessage = null, outcome = null) {
+function parseSSEDataLine(line, account, accountManager, onUsage = null, merged = null, responsesTurn = null, onMessage = null, outcome = null) {
   if (!line.startsWith('data: ')) return;
 
   try {
@@ -5882,11 +5889,11 @@ function parseSSEDataLine(line, accountIndex, accountManager, onUsage = null, me
     }
     if (data.type === 'message_start' && typeof data.message?.id === 'string') onMessage?.(data.message.id);
     if (data.type === 'message_start' && data.message?.usage) {
-      accountManager.updateUsage(accountIndex, data.message.usage.input_tokens, 0);
+      accountManager.updateUsage(account.index, data.message.usage.input_tokens, 0);
       onUsage?.(data.message.usage.input_tokens || 0, 0);
       if (merged) Object.assign(merged, data.message.usage);
     } else if (data.type === 'message_delta' && data.usage) {
-      accountManager.updateUsage(accountIndex, 0, data.usage.output_tokens);
+      accountManager.updateUsage(account.index, 0, data.usage.output_tokens);
       onUsage?.(0, data.usage.output_tokens || 0);
       if (merged) Object.assign(merged, data.usage);
     } else if (!responsesTurn?.settled) {
@@ -5899,7 +5906,7 @@ function parseSSEDataLine(line, accountIndex, accountManager, onUsage = null, me
       const usage = responsesEventUsage(data);
       if (usage) {
         if (responsesTurn) responsesTurn.settled = true;
-        accountManager.updateUsage(accountIndex, usage.input_tokens, usage.output_tokens);
+        accountManager.updateUsage(account.index, usage.input_tokens, usage.output_tokens);
         onUsage?.(usage.input_tokens, usage.output_tokens);
         if (merged) Object.assign(merged, usage);
       }
