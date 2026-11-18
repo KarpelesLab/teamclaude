@@ -4359,9 +4359,11 @@ export class AccountManager {
    * account's, its provider's cursor moves to it even though the current
    * account is healthy, and every conversation behind that cursor loses its
    * prompt cache. Off, the reset only returns the account to rotation: traffic
-   * stays where it is until rotation has to pick. Only a literal `false` turns
-   * it off, so a hand-edited `"false"` keeps today's behaviour. Applied live on
-   * config reload.
+   * stays where it is until rotation has to pick, unless
+   * preferSoonestWeeklyReset is on, which moves traffic to the account with
+   * the soonest deadline as soon as it can serve again. Only a literal `false`
+   * turns it off, so a hand-edited `"false"` keeps today's behaviour. Applied
+   * live on config reload.
    * @param {boolean} enabled
    */
   setSwitchOnSessionReset(enabled) {
