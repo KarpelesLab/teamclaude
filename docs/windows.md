@@ -34,7 +34,7 @@ The installer does not change your `PATH`.
 2. On the **Clients** page, use the **Connect your tools** card to point Claude Code, Codex or Grok Build at the proxy. **Connect all** connects every tool it finds. You can do the same from a terminal with `teamclaude connect`.
 3. Start your tools as usual. Their requests now go through TeamClaude.
 
-To open the dashboard again later, start **TeamClaude** from the Start Menu. If the proxy is already running, this only opens the dashboard. If it is not running, it starts the proxy first.
+To open the dashboard again later, start **TeamClaude** from the Start Menu. If the proxy is already running, this only opens the dashboard. If it is not running, it starts the proxy first. If the proxy that is running is an older version, for example one left running by an earlier install, it is stopped and this version starts in its place.
 
 If the proxy cannot start, a message box says why and names the log file.
 
@@ -56,7 +56,7 @@ To stop the proxy, run `TeamClaude-<version>-portable.exe --stop`.
 
 The portable exe adds no Start Menu folder, no sign-in entry and no entry in **Apps and features**. It uses the same settings file as the installer, so your accounts are there if you have used either before.
 
-To update, stop the running proxy with `--stop`, then run the newer exe. If the old proxy is still running, the newer exe only opens its dashboard. Each version unpacks to a folder of its own. Once you have stopped that version's proxy, you can delete its folder.
+To update, run the newer exe. If the old version's proxy is still running, the newer exe stops it and starts itself in its place. Each version unpacks to a folder of its own. Once you have stopped that version's proxy, you can delete its folder.
 
 Only one proxy runs on a port. If you start a second copy, portable or installed, it opens the dashboard of the one that is running. **Stop** ends whichever one is running.
 
