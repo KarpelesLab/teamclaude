@@ -235,14 +235,54 @@ test('a pinned account held back by its usage cap answers 429 without a reset to
 
 test('a pinned throttled account names its real reset to a T3-style reader', async () => {
   await withFleet((_name, _req, res) => reject(res), async ({ am, post }) => {
+    const sent = Date.now();
     const res = await post('/tc-acct/a/v1/messages');
+    const answered = Date.now();
     assert.equal(res.status, 429);
     const until = am.accounts[0].rateLimitedUntil;
     assert.equal(res.headers.get(UNIFIED_STATUS), 'rejected');
     assert.equal(Number(res.headers.get(UNIFIED_RESET)), Math.ceil(until / 1000));
     const wait = resetAfterSeconds((await res.json()).error.message);
-    assert.ok(Math.abs(wait - Math.ceil((until - Date.now()) / 1000)) <= 1, String(wait));
+    assert.ok(wait >= Math.ceil((until - answered) / 1000) && wait <= Math.ceil((until - sent) / 1000), String(wait));
   });
+});
+
+test('a TeamClaude behind another one recovers when the advertised reset passes', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  const COOLDOWN = 600;
+  let limited = true;
+  const api = http.createServer((req, res) => {
+    req.resume();
+    if (limited) return reject(res, { 'retry-after': String(COOLDOWN) });
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"ok":true}');
+  });
+  let inner;
+  let outer;
+  try {
+    const innerAm = new AccountManager([{ name: 'x', type: 'apikey', apiKey: 'x' }], 0.98);
+    inner = createProxyServer(innerAm, { upstream: `http://127.0.0.1:${await listen(api)}`, upstreamProxy: false });
+    const outerAm = new AccountManager([{ name: 'chain', type: 'apikey', apiKey: 'chain' }], 0.98);
+    outer = createProxyServer(outerAm, { upstream: `http://127.0.0.1:${await listen(inner)}`, upstreamProxy: false });
+    const port = await listen(outer);
+    const post = () => fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-sonnet-test', messages: [] }),
+    });
+    const refused = await post();
+    assert.equal(refused.status, 429);
+    await refused.arrayBuffer();
+
+    limited = false;
+    t.mock.timers.tick((COOLDOWN + 1) * 1000);
+    for (const attempt of ['first', 'second']) {
+      const res = await post();
+      assert.equal(res.status, 200, `${attempt} request after the reset is served`);
+      await res.arrayBuffer();
+    }
+  } finally {
+    for (const s of [outer, inner, api]) { s?.closeAllConnections(); s?.close(); }
+  }
 });
 
 test('a pool with no eligible account answers 429 without a reset to wait for', async () => {
