@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { forecastFleet, measureRates, STEP_MS, MIN_HISTORY_MS, WEEKLY_PERIOD_MS, FIVE_HOUR_PERIOD_MS } from '../src/fleet-forecast.js';
+import { forecastFleet, fleetTimeline, measureRates, MIN_HISTORY_MS, WEEKLY_PERIOD_MS, FIVE_HOUR_PERIOD_MS, BUSIER_LOAD_FACTOR } from '../src/fleet-forecast.js';
 import { FORECAST_HORIZON_MS } from '../src/forecast.js';
 import { fleetForecastText, renderStatus } from '../src/status-renderer.js';
 import { renderDashboardHtml } from '../src/dashboard.js';
@@ -45,7 +45,7 @@ function history({ hours, weeklyPerHour = () => 0, fiveHourPerHour = 0, weeklySt
 }
 
 const flat = rate => () => rate;
-const near = (actual, expected, msg) => assert.ok(Math.abs(actual - expected) <= STEP_MS, `${msg || ''} ${new Date(actual).toISOString()} vs ${new Date(expected).toISOString()}`);
+const near = (actual, expected, msg) => assert.ok(Math.abs(actual - expected) <= 1000, `${msg || ''} ${new Date(actual).toISOString()} vs ${new Date(expected).toISOString()}`);
 
 // ── when it has no answer ─────────────────────────────────────────────────
 
@@ -99,11 +99,9 @@ test('the headroom of the whole fleet is spent, and the first reset brings it ba
   assert.equal(f.firstBackAt, NOW + 4 * DAY);
 });
 
-test('spend goes to the fullest open account first, as rotation does', () => {
-  // account-b is fuller and resets late; account-a resets in two hours. Filling
-  // b first leaves a to restart from zero after its reset: 0.8h on b, a's
-  // 0.12 until its reset, then 0.98 from zero, out at 11.8h. Filling a first
-  // would spend b's 0.08 last and run out 48 minutes later.
+test('spend is shared until an account is full, then the rest carry it', () => {
+  // At 5% an hour each, b's 0.08 lasts 1.6h and a reaches 0.58; a alone then
+  // takes 10% an hour to 0.62 at its reset, and 0.98 from zero: out at 11.8h.
   const series = { 'account-a': history({ hours: 72, weeklyPerHour: flat(0.1) }) };
   const accounts = [
     { id: 'account-a', weekly: 0.5, weeklyResetAt: NOW + 2 * HOUR },
@@ -301,4 +299,100 @@ test('spend after a reset counts even when the sample at the reset had the bucke
   const r = measureRates({ 'account-a': cleared }, NOW);
   assert.ok(r);
   assert.ok(Math.abs(r.fiveHourPerMs * HOUR - 0.3) < 1e-9, String(r.fiveHourPerMs * HOUR));
+});
+
+// ── plans of different size ───────────────────────────────────────────────
+
+test('spend is weighed by plan: a 20x account\'s week fills a 5x one four times as fast', () => {
+  const series = { big: history({ hours: 72, weeklyPerHour: flat(0.01) }), small: history({ hours: 72 }) };
+  const accounts = [
+    { id: 'big', weekly: 0.98, weeklyResetAt: NOW + 6 * DAY, weight: 20 },
+    { id: 'small', weekly: 0.5, weeklyResetAt: NOW + 5 * DAY, weight: 5 },
+  ];
+  const thresholds = { big: TH, small: TH };
+  // 1% an hour of the 20x account is 4% an hour of the 5x one: 0.48 in 12h.
+  const f = forecastFleet({ series, accounts, thresholds, now: NOW });
+  assert.ok(f);
+  near(f.allOutAt, NOW + 12 * HOUR);
+  // A plan it cannot tell leaves every account at weight 1, as before.
+  const unknown = forecastFleet({ series, accounts: accounts.map(a => (a.id === 'small' ? { ...a, weight: null } : a)), thresholds, now: NOW });
+  assert.ok(unknown);
+  near(unknown.allOutAt, NOW + 48 * HOUR);
+});
+
+// ── exact times ───────────────────────────────────────────────────────────
+
+test('an outage of three minutes between two five-minute marks is still found', () => {
+  // a fills 61 minutes out, b is back at 64: a step that looked every five
+  // minutes saw a open at :60 and b back at :65, and never an empty pool.
+  const series = { a: history({ hours: 72, weeklyPerHour: flat(0.01) }), b: history({ hours: 72 }) };
+  const accounts = [
+    { id: 'a', weekly: 0.98 - 0.01 * 61 / 60, weeklyResetAt: NOW + 5 * DAY },
+    { id: 'b', weekly: 0.99, weeklyResetAt: NOW + 64 * MIN },
+  ];
+  const f = forecastFleet({ series, accounts, thresholds: { a: TH, b: TH }, now: NOW });
+  assert.ok(f);
+  near(f.allOutAt, NOW + 61 * MIN);
+  assert.equal(f.firstBackAt, NOW + 64 * MIN);
+});
+
+// ── the timeline ──────────────────────────────────────────────────────────
+
+test('the timeline gives each account\'s state changes and the pool\'s outages for a week', () => {
+  const series = { 'account-a': history({ hours: 72, weeklyPerHour: flat(0.01) }) };
+  const input = { series, accounts: [{ id: 'account-a', weekly: 0.5, weeklyResetAt: NOW + 4 * DAY }], thresholds: { 'account-a': TH }, now: NOW };
+  const tl = fleetTimeline(input);
+  assert.ok(tl);
+  assert.equal(tl.from, NOW);
+  assert.equal(tl.to, NOW + WEEKLY_PERIOD_MS);
+  const states = tl.accounts['account-a'];
+  assert.deepEqual(states.map(x => ({ ...x, at: Math.round((x.at - NOW) / HOUR) })), [
+    { at: 0, usable: true, bucket: null },
+    { at: 48, usable: false, bucket: 'weekly' },
+    { at: 96, usable: true, bucket: null },
+  ]);
+  assert.equal(tl.outages.length, 1);
+  near(tl.outages[0].from, NOW + 48 * HOUR);
+  assert.equal(tl.outages[0].to, NOW + 4 * DAY);
+  // The same fleet a quarter busier runs out a fifth sooner.
+  const busier = fleetTimeline({ ...input, loadFactor: BUSIER_LOAD_FACTOR });
+  assert.ok(busier);
+  near(busier.outages[0].from, NOW + 48 * HOUR / 1.25);
+  const stuck = fleetTimeline({ ...input, accounts: [{ id: 'account-a', weekly: 0.99, weeklyResetAt: NOW + 6 * DAY }] });
+  assert.ok(stuck);
+  assert.deepEqual(stuck.outages, [{ from: NOW, to: NOW + 6 * DAY }]);
+  // A blocked account whose reset is unknown is not back within the week.
+  const unknown = fleetTimeline({ ...input, accounts: [{ id: 'account-a', weekly: 0.99 }] });
+  assert.ok(unknown);
+  assert.deepEqual(unknown.outages, [{ from: NOW, to: null }]);
+});
+
+test('the timeline answers when nothing runs out, and is null without enough history', () => {
+  const idle = { 'account-a': history({ hours: 72 }) };
+  const tl = fleetTimeline({ series: idle, accounts: [{ id: 'account-a', weekly: 0.5, weeklyResetAt: NOW + 5 * DAY }], thresholds: { 'account-a': TH }, now: NOW });
+  assert.ok(tl);
+  assert.deepEqual(tl.outages, []);
+  assert.deepEqual(tl.accounts['account-a'], [{ at: NOW, usable: true, bucket: null }]);
+  const short = { 'account-a': history({ hours: 47, weeklyPerHour: flat(0.05) }) };
+  assert.equal(fleetTimeline({ series: short, accounts: [{ id: 'account-a', weekly: 0.5 }], thresholds: {}, now: NOW }), null);
+});
+
+test('spend is shared by plan size, so a 20x and a 5x account fill together', () => {
+  // 1% an hour of the 20x account is 0.2 of a size-1 week an hour, shared 20:5:
+  // both rise 0.8% an hour and reach 0.98 from 0.5 in 60 hours.
+  const series = { big: history({ hours: 72, weeklyPerHour: flat(0.01) }), small: history({ hours: 72 }) };
+  const accounts = [
+    { id: 'big', weekly: 0.5, weeklyResetAt: NOW + 6 * DAY, weight: 20 },
+    { id: 'small', weekly: 0.5, weeklyResetAt: NOW + 6 * DAY, weight: 5 },
+  ];
+  const tl = fleetTimeline({ series, accounts, thresholds: { big: TH, small: TH }, now: NOW });
+  assert.ok(tl);
+  for (const id of ['big', 'small']) {
+    const [, out, back] = tl.accounts[id];
+    near(out.at, NOW + 60 * HOUR, id);
+    assert.equal(out.usable, false);
+    assert.equal(back.at, NOW + 6 * DAY);
+  }
+  near(tl.outages[0].from, NOW + 60 * HOUR);
+  assert.equal(tl.outages[0].to, NOW + 6 * DAY);
 });
