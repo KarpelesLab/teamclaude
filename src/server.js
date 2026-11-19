@@ -4877,6 +4877,36 @@ export function exhaustedDetails(candidates, retryAfter, resetAt) {
   };
 }
 
+/**
+ * The reset of a usage-limit 429 in the two forms a client reads one from:
+ * `anthropic-ratelimit-unified-status: rejected` with
+ * `anthropic-ratelimit-unified-reset` (epoch seconds), the shape of
+ * Anthropic's own usage-limit refusal, and a "(reset after 2h13m5s)" suffix
+ * for the message, which Claude Code copies into its "API Error:" result.
+ * T3 Code reads either one to resume a thread at the reset. Both are empty
+ * when `resetAt` is null: a reader would resume at a reset that does not
+ * exist, such as the untimed fallback or the pinned path's five-second retry.
+ *
+ * @param {number|null} resetAt absolute epoch ms of the real reset, or null
+ * @param {number} [now]
+ * @returns {{ headers: Record<string, string>, suffix: string }}
+ */
+export function resetSignal(resetAt, now = Date.now()) {
+  if (resetAt == null || !(resetAt > now)) return { headers: {}, suffix: '' };
+  const total = Math.ceil((resetAt - now) / 1000);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  const wait = h ? `${h}h${m}m${s}s` : m ? `${m}m${s}s` : `${s}s`;
+  return {
+    headers: {
+      'anthropic-ratelimit-unified-status': 'rejected',
+      'anthropic-ratelimit-unified-reset': String(Math.ceil(resetAt / 1000)),
+    },
+    suffix: ` (reset after ${wait})`,
+  };
+}
+
 // ── A refusal reported inside a 200 stream ───────────────────────────────────
 //
 // Every failover in forwardRequest keys on the upstream status, and the
@@ -5476,18 +5506,21 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       ctx.status = 429;
       ctx.account = '(pinned account unavailable)';
       const pinnedAccount = accountManager.accounts[ctx.pinnedIndex];
-      const resetAt = pinnedAccount?.status === 'throttled'
-        ? computeResetAt(accountManager, [pinnedAccount], ctx.model) : Date.now() + 5000;
+      const wait = pinnedAccount?.status === 'throttled'
+        ? retryWait(accountManager, [pinnedAccount], ctx.model) : null;
+      const resetAt = wait ? wait.resetAt ?? Date.now() + wait.seconds * 1000 : Date.now() + 5000;
       const reset = new Date(resetAt).toISOString();
+      const signal = resetSignal(wait?.resetAt ?? null);
       if (!res.headersSent) {
         res.writeHead(429, {
           'Content-Type': 'application/json',
           'retry-after': String(Math.max(1, Math.ceil((resetAt - Date.now()) / 1000))),
           'anthropic-ratelimit-reset-requests': reset,
+          ...signal.headers,
         });
         res.end(JSON.stringify({
           type: 'error',
-          error: { type: 'rate_limit_error', message: `Pinned account is unavailable (rate-limited, errored, or already tried). Next account resets at ${reset}.` },
+          error: { type: 'rate_limit_error', message: `Pinned account is unavailable (rate-limited, errored, or already tried). Next account resets at ${reset}.${signal.suffix}` },
         }));
       }
       return;
@@ -5593,18 +5626,20 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     }
     accountManager.events?.add({ kind: 'rotation', type: 'exhausted', provider: ctx.provider ?? null, reason: 'all_exhausted', message: `All accounts exhausted: answered 429, retry after ${retryAfter}s` });
     const enabledCandidates = candidates.filter(a => !a.disabled);
+    const signal = resetSignal(wait.resetAt);
     res.writeHead(429, {
       'Content-Type': 'application/json',
       'retry-after': String(retryAfter),
       'anthropic-ratelimit-reset-requests': new Date(resetAt).toISOString(),
+      ...signal.headers,
     });
     res.end(JSON.stringify({
       type: 'error',
       error: {
         type: 'rate_limit_error',
-        message: enabledCandidates.length > 0 && enabledCandidates.every(a => a.status === 'throttled')
+        message: (enabledCandidates.length > 0 && enabledCandidates.every(a => a.status === 'throttled')
           ? `All accounts reached usage limits. Next account resets at ${new Date(resetAt).toISOString()}.`
-          : exhaustedMessage(candidates, ctx.model, retryAfter),
+          : exhaustedMessage(candidates, ctx.model, retryAfter)) + signal.suffix,
         details: exhaustedDetails(candidates, retryAfter, wait.resetAt),
       },
     }));
@@ -7391,20 +7426,6 @@ const UNTIMED_RETRY_AFTER_SECONDS = 60;
  */
 export function computeRetryAfter(accountManager, candidates, model = null) {
   return retryWait(accountManager, candidates, model).seconds;
-}
-
-/**
- * The absolute reset behind `computeRetryAfter`, for the
- * `anthropic-ratelimit-reset-requests` header: the soonest account's own clock,
- * or the untimed fallback's seconds from now.
- * @param {import('./account-manager.js').AccountManager} accountManager
- * @param {Record<string, any>[]} candidates
- * @param {string|null|undefined} model
- * @returns {number}  epoch ms
- */
-function computeResetAt(accountManager, candidates, model) {
-  const wait = retryWait(accountManager, candidates, model);
-  return wait.resetAt ?? Date.now() + wait.seconds * 1000;
 }
 
 /**

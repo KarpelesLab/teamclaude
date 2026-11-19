@@ -71,7 +71,20 @@ When the eligible pool is exhausted, the proxy returns a standard Anthropic
 eligible account to recover, after all of that account's blocking windows clear.
 If every enabled candidate is on cooldown, the message is
 `All accounts reached usage limits. Next account resets at <TIMESTAMP>.`
-An explicit account pin uses that account's reset. A surfaced per-minute throttle
+An explicit account pin uses that account's reset.
+
+When that reset is a real clock (an account on a timed cooldown), the 429 also
+carries it in the two forms Claude Code and T3 Code read. The headers are
+`anthropic-ratelimit-unified-status: rejected` and
+`anthropic-ratelimit-unified-reset` (epoch seconds), the shape of Anthropic's
+own usage-limit refusal. The message gets a `(reset after 2h13m5s)` suffix,
+which Claude Code copies into its `API Error:` result, so T3 Code can resume
+the thread at the reset. Neither appears when no reset is known: a dead
+credential, an untimed block, no eligible account, or a pinned account that is
+unavailable for a reason other than a cooldown, which is told to retry in five
+seconds. Claude Code 2.1.328 logged in with an API key or
+`ANTHROPIC_AUTH_TOKEN` does not turn these headers into a `rate_limit_event`,
+so for those logins the message suffix is what carries the reset. A surfaced per-minute throttle
 also includes both headers; request-scoped model refusals keep their existing
 backoff behavior. Clients that understand these reset headers can schedule a
 retry instead of asking for a manual restart.
