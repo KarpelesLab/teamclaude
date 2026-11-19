@@ -86,7 +86,8 @@ seconds. Claude Code 2.1.328 logged in with an API key or
 `ANTHROPIC_AUTH_TOKEN` does not turn these headers into a `rate_limit_event`,
 so for those logins the message suffix is what carries the reset. A TeamClaude
 that sits behind another one drops the stored `rejected` verdict when that
-`anthropic-ratelimit-unified-reset` passes. A surfaced per-minute throttle
+`anthropic-ratelimit-unified-reset` passes, or sooner when a revalidation probe
+on that account succeeds. A surfaced per-minute throttle
 also includes both headers; request-scoped model refusals keep their existing
 backoff behavior. Clients that understand these reset headers can schedule a
 retry instead of asking for a manual restart.

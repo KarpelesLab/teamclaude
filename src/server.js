@@ -5928,7 +5928,15 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // Any non-429 response is live proof a rate-limit hold no longer binds —
     // this is what lets a revalidation probe (a throttled account selected by
     // _selectProbe) clear its own hold and return the fleet to service.
-    if (upstreamRes.status !== 429) accountManager.clearRateLimited(account.index);
+    // The same proof lifts a stored `rejected` verdict when the response states
+    // none of its own, as a TeamClaude upstream's reply does after its own
+    // all-exhausted 429 (Anthropic's always states one, read above).
+    if (upstreamRes.status !== 429) {
+      if (account.status === 'throttled' && !rateLimitHeaders['anthropic-ratelimit-unified-status']) {
+        accountManager.clearUpstreamRejected(account.index);
+      }
+      accountManager.clearRateLimited(account.index);
+    }
 
     // Other 429s retain their established classification: quota rejection
     // rotates, while a transient throttle pauses and retries.
