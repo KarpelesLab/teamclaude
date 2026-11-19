@@ -20,6 +20,7 @@ import {
   orgKey,
   matchAccounts,
   findUpsertTarget,
+  codexLoginTarget,
   updateAccountEntry,
   canUpsertOAuthAccount,
   isTokenRejection,
@@ -1469,11 +1470,10 @@ async function upsertCodexAccount(requestedName, creds, routing = null, storeRou
     // When the refresh token lapses, if these credentials came with it.
     setRefreshTokenExpiry(account, creds.refreshTokenExpiresAt);
 
-    // Identity for a Codex account is its ChatGPT account id and user id; fall
-    // back to the display name when upstream did not supply one.
-    const idx = config.accounts.findIndex(a => (
-      a.provider === 'codex' && (sameIdentity(a, account) || a.name === account.name)
-    ));
+    // By ChatGPT account and user id, not by the email the login is named
+    // after: one person's Personal plan and Business workspace share it.
+    const target = codexLoginTarget(config.accounts, account, { userNamed: !!requestedName, planType: creds.planType });
+    const idx = target.index;
     if (idx >= 0) {
       const prev = config.accounts[idx];
       config.accounts[idx] = { ...prev, ...account, name: prev.name };
@@ -1485,9 +1485,12 @@ async function upsertCodexAccount(requestedName, creds, routing = null, storeRou
       console.log(`Updated account "${prev.name}"`);
       if (!storeRouting) noteUnusedRouting(prev, routing);
     } else {
+      account.name = target.name;
       config.accounts.push(account);
       outcome = { action: 'added', name: account.name };
-      console.log(`Added account "${account.name}"${creds.planType ? ` (${creds.planType})` : ''}`);
+      // The plan once, when the name does not already carry it; it is a token claim.
+      const plan = creds.planType && !account.name.endsWith(`(${creds.planType})`) ? ` (${sanitizeText(creds.planType)})` : '';
+      console.log(`Added account "${account.name}"${plan}`);
     }
     signedIn = config.accounts[idx >= 0 ? idx : config.accounts.length - 1];
   });
