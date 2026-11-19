@@ -247,9 +247,13 @@ test('a pinned throttled account names its real reset to a T3-style reader', asy
   });
 });
 
-test('a TeamClaude behind another one recovers when the advertised reset passes', async t => {
+const CHAIN_COOLDOWN = 600;
+for (const [when, elapsedMs] of [
+  ['when the advertised reset passes', (CHAIN_COOLDOWN + 1) * 1000],
+  ['when a revalidation probe succeeds before the advertised reset', 120_001],
+]) test(`a TeamClaude behind another one recovers ${when}`, async t => {
   t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
-  const COOLDOWN = 600;
+  const COOLDOWN = CHAIN_COOLDOWN;
   let limited = true;
   const api = http.createServer((req, res) => {
     req.resume();
@@ -274,10 +278,10 @@ test('a TeamClaude behind another one recovers when the advertised reset passes'
     await refused.arrayBuffer();
 
     limited = false;
-    t.mock.timers.tick((COOLDOWN + 1) * 1000);
+    t.mock.timers.tick(elapsedMs);
     for (const attempt of ['first', 'second']) {
       const res = await post();
-      assert.equal(res.status, 200, `${attempt} request after the reset is served`);
+      assert.equal(res.status, 200, `${attempt} request after recovery is served`);
       await res.arrayBuffer();
     }
   } finally {
