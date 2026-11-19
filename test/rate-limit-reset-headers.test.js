@@ -11,6 +11,23 @@ test.afterEach(() => resetUpstreamProxy());
 
 const HOUR = 3600_000;
 const RESET = 'anthropic-ratelimit-reset-requests';
+const UNIFIED_STATUS = 'anthropic-ratelimit-unified-status';
+const UNIFIED_RESET = 'anthropic-ratelimit-unified-reset';
+// T3 Code's own pattern for a reset inside a Claude Code "API Error:" result.
+const T3_RESET_AFTER = /\(reset after (?:(\d+)h ?)?(?:(\d+)m ?)?(?:(\d+)s)?\)/;
+
+/** The seconds a T3-style reader takes from the message, or null when it finds none. */
+function resetAfterSeconds(message) {
+  const m = T3_RESET_AFTER.exec(message);
+  return m ? Number(m[1] ?? 0) * 3600 + Number(m[2] ?? 0) * 60 + Number(m[3] ?? 0) : null;
+}
+
+/** A 429 that names no reset to wait for must not look like one that does. */
+function assertNoResetSignal(res, message) {
+  assert.equal(res.headers.get(UNIFIED_STATUS), null);
+  assert.equal(res.headers.get(UNIFIED_RESET), null);
+  assert.equal(resetAfterSeconds(message), null, message);
+}
 
 /** Bind an isolated listener without choosing a potentially occupied port. */
 function listen(server) {
@@ -60,10 +77,14 @@ async function assertExhausted(res, am, diagnostic) {
   assert.ok(Math.abs(Date.parse(reset) - earliest) < 10, 'the earliest account reset is advertised');
   assert.ok(Number.isInteger(retry) && retry >= 1);
   assert.ok(Math.abs(retry - Math.ceil((Date.parse(reset) - Date.now()) / 1000)) <= 1);
+  assert.equal(res.headers.get(UNIFIED_STATUS), 'rejected');
+  assert.equal(Number(res.headers.get(UNIFIED_RESET)), Math.ceil(Date.parse(reset) / 1000));
   const body = await res.json();
+  const wait = resetAfterSeconds(body.error.message);
+  assert.ok(Math.abs(wait - retry) <= 1, `${body.error.message} names the retry-after wait`);
   assert.deepEqual(body, {
     type: 'error',
-    error: { type: 'rate_limit_error', message: `All accounts reached usage limits. Next account resets at ${reset}.`, details: body.error?.details },
+    error: { type: 'rate_limit_error', message: `All accounts reached usage limits. Next account resets at ${reset}. (reset after ${body.error.message.match(/\(reset after (\S+)\)/)?.[1]})`, details: body.error?.details },
   });
   assert.equal(body.error.details.error_code, 'pool_exhausted');
   assert.equal(body.error.details.resets_at, reset, 'the details name the reset the header advertises');
@@ -196,6 +217,43 @@ test('manual account pins do not leak to another account', async () => {
       JSON.stringify({ headers: Object.fromEntries(res.headers), accounts: am.accounts.map(a => ({ index: a.index, until: a.rateLimitedUntil })) }));
     assert.match((await res.json()).error.message, /Next account resets at/);
     assert.deepEqual(seen, ['a']);
+  });
+});
+
+test('a pinned account held back by its usage cap answers 429 without a reset to wait for', async () => {
+  await withFleet((_name, _req, res) => reject(res), async ({ am, post, seen }) => {
+    am.accounts[0].maxUsage = 0.5;
+    Object.assign(am.accounts[0].quota, { unified7d: 0.9, unified7dReset: Date.now() + 86_400_000 });
+    const res = await post('/tc-acct/a/v1/messages');
+    assert.equal(res.status, 429);
+    const { message } = (await res.json()).error;
+    assert.match(message, /Pinned account is unavailable/);
+    assertNoResetSignal(res, message);
+    assert.deepEqual(seen, []);
+  });
+});
+
+test('a pinned throttled account names its real reset to a T3-style reader', async () => {
+  await withFleet((_name, _req, res) => reject(res), async ({ am, post }) => {
+    const res = await post('/tc-acct/a/v1/messages');
+    assert.equal(res.status, 429);
+    const until = am.accounts[0].rateLimitedUntil;
+    assert.equal(res.headers.get(UNIFIED_STATUS), 'rejected');
+    assert.equal(Number(res.headers.get(UNIFIED_RESET)), Math.ceil(until / 1000));
+    const wait = resetAfterSeconds((await res.json()).error.message);
+    assert.ok(Math.abs(wait - Math.ceil((until - Date.now()) / 1000)) <= 1, String(wait));
+  });
+});
+
+test('a pool with no eligible account answers 429 without a reset to wait for', async () => {
+  await withFleet((_name, _req, res) => reject(res), async ({ am, post, seen }) => {
+    for (const a of am.accounts) a.disabled = true;
+    const res = await post();
+    assert.equal(res.status, 429);
+    const { message, details } = (await res.json()).error;
+    assert.equal(details.resets_at, null);
+    assertNoResetSignal(res, message);
+    assert.deepEqual(seen, []);
   });
 });
 
