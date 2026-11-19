@@ -84,7 +84,9 @@ credential, an untimed block, no eligible account, or a pinned account that is
 unavailable for a reason other than a cooldown, which is told to retry in five
 seconds. Claude Code 2.1.328 logged in with an API key or
 `ANTHROPIC_AUTH_TOKEN` does not turn these headers into a `rate_limit_event`,
-so for those logins the message suffix is what carries the reset. A surfaced per-minute throttle
+so for those logins the message suffix is what carries the reset. A TeamClaude
+that sits behind another one drops the stored `rejected` verdict when that
+`anthropic-ratelimit-unified-reset` passes. A surfaced per-minute throttle
 also includes both headers; request-scoped model refusals keep their existing
 backoff behavior. Clients that understand these reset headers can schedule a
 retry instead of asking for a manual restart.

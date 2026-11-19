@@ -208,7 +208,7 @@ const PERSISTED_QUOTA_FIELDS = [
   'unified5hReset', 'unified7dReset', 'unified7dSonnetReset', 'unified7dFableReset',
   'unified5hSeenAt', 'unified7dSeenAt',
   'unified7dSonnetSeenAt', 'unified7dFableSeenAt',
-  'unifiedStatus', 'unifiedStatusSeenAt',
+  'unifiedStatus', 'unifiedStatusSeenAt', 'unifiedStatusUntil',
   'tokensLimit', 'tokensRemaining', 'requestsLimit', 'requestsRemaining', 'resetsAt',
   'scopedWeekly',
   // Codex free rate-limit reset credits and Claude banked usage-limit resets,
@@ -384,6 +384,7 @@ function emptyQuota() {
     // /teamclaude/quota (quota-summary.js).
     backend: null,
     unifiedStatusSeenAt: null,  // ms timestamp of the response that reported it
+    unifiedStatusUntil: /** @type {number|null} */ (null), // the `unified-reset` a `rejected` verdict named, ms
     // Every model-scoped weekly bucket the usage endpoint named, keyed by its
     // own display_name (lowercased): { fable: { utilization, resetAt }, ... }.
     // Upstream owns this list and it changes, so it is learned rather than
@@ -5441,11 +5442,16 @@ export class AccountManager {
     // weekly bucket above, but that window can be a week out. Acting on a
     // `rejected` that old would bar an account whose quota reset hours ago, so
     // the signal expires on its own and the local buckets decide from there.
+    // A verdict that named its own reset lapses there too: a TeamClaude
+    // upstream's all-exhausted 429 states one, and no window reading backs it
+    // for the sweeps above to expire.
     if (q.unifiedStatus != null) {
       if (!q.unifiedStatusSeenAt) q.unifiedStatusSeenAt = now;
-      else if (now >= q.unifiedStatusSeenAt + this.statusStaleMs) {
+      else if (now >= q.unifiedStatusSeenAt + this.statusStaleMs
+        || (q.unifiedStatusUntil != null && now >= q.unifiedStatusUntil)) {
         q.unifiedStatus = null;
         q.unifiedStatusSeenAt = null;
+        q.unifiedStatusUntil = null;
         changed = true;
       }
     }
@@ -6500,6 +6506,8 @@ export class AccountManager {
       // header-derived string.
       account.quota.unifiedStatus = uStatus === 'rejected' && sharedSaidAllowed ? 'allowed' : safeLine(uStatus, 32);
       account.quota.unifiedStatusSeenAt = Date.now();
+      account.quota.unifiedStatusUntil = account.quota.unifiedStatus === 'rejected'
+        ? resetHeaderMs(headers['anthropic-ratelimit-unified-reset']) : null;
     }
 
     // Standard rate limits (API key accounts)
