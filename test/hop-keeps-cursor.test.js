@@ -87,6 +87,118 @@ test('a 5xx hop leaves the cursor where it was, and the next request goes back t
   });
 });
 
+// The same detour onto the first account in the list: its index is 0, a
+// destination like any other (a hop's account that has left reads -1), so it is
+// taken as it is and never picked again as though it had left.
+test('a 5xx hop onto the first account in the list is a detour like any other', async t => {
+  const lines = [];
+  t.mock.method(console, 'log', (...args) => { lines.push(String(args[0])); });
+  let refused = false;
+  await withFleet((req, res) => {
+    if (tokenOf(req) === 't-b' && !refused) {
+      refused = true;
+      res.writeHead(529, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'overloaded_error', message: 'Overloaded' } }));
+      return;
+    }
+    ok(res);
+  }, async ({ am, proxyPort, seen }) => {
+    am.currentIndex = 1;
+    const { status } = await post(proxyPort);
+    assert.equal(status, 200);
+    assert.deepEqual(seen, ['t-b', 't-a']);
+    assert.equal(am.currentIndex, 1, 'the detour onto a moved the fleet');
+    assert.deepEqual(lines.filter(l => l.includes('was removed before the hop reached it')), [],
+      'a live destination at index 0 was taken for one that had left');
+  });
+});
+
+// The hop's account is removed before the attempt it names (here at the hop's
+// own log line; in the field while the failed body is discarded). Removing an
+// account renumbers the rest in place (removeAccount). Held by index, the hop
+// then went to whichever account slid into its place, here x, which is
+// disabled; removed during the discard it read -1 instead, and the client was
+// told every account was at its quota. It is a detour still, so it is picked
+// again: d serves, and the fleet stays.
+test('a 5xx hop whose account is removed is picked again, and the cursor stays', async t => {
+  const seen = [];
+  const upstream = http.createServer((req, res) => {
+    req.resume();
+    seen.push(tokenOf(req));
+    if (tokenOf(req) === 't-a') {
+      res.writeHead(529, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'overloaded_error', message: 'Overloaded' } }));
+      return;
+    }
+    ok(res);
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager([...accounts(),
+    { name: 'x', type: 'oauth', accessToken: 't-x', refreshToken: 'r', expiresAt: Date.now() + HOUR, disabled: true },
+    { name: 'd', type: 'oauth', accessToken: 't-d', refreshToken: 'r', expiresAt: Date.now() + HOUR },
+  ], 0.98, { refreshFn: async () => { throw new Error('no refresh'); } });
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const proxyPort = await listen(proxy);
+  t.mock.method(console, 'log', (...args) => {
+    if (/failing over once to "b"/.test(String(args[0]))) am.removeAccount(am.accounts.findIndex(a => a.name === 'b'));
+  });
+  try {
+    const { status } = await post(proxyPort);
+    assert.equal(status, 200);
+    assert.deepEqual(seen, ['t-a', 't-d']);
+    assert.equal(am.accounts[am.currentIndex].name, 'a', 'the detour moved the fleet');
+  } finally { proxy.close(); upstream.close(); }
+});
+
+// The second pick keeps the hop sites' rule: never onto an account inside its
+// own 429 pause. c is paused and ranks below b, so the hop picks b, and b is
+// removed at the hop's own log line, which leaves c alone. The request is not
+// sent there (it would wait out the pause in admission) and is answered as one
+// with no account is: the no-account branch's 429, as before this change. The
+// second pick's own log line says which way it went, so the test reads that
+// first rather than waiting out c's pause.
+test('a 5xx hop picked again never lands on an account inside its 429 pause', async t => {
+  const seen = [];
+  const upstream = http.createServer((req, res) => {
+    req.resume();
+    seen.push(tokenOf(req));
+    if (tokenOf(req) === 't-a') {
+      res.writeHead(529, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'overloaded_error', message: 'Overloaded' } }));
+      return;
+    }
+    ok(res);
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager([...accounts(),
+    { name: 'c', type: 'oauth', accessToken: 't-c', refreshToken: 'r', expiresAt: Date.now() + HOUR, priority: 1 },
+  ], 0.98, { refreshFn: async () => { throw new Error('no refresh'); } });
+  am.pauseAccount(2, 60);
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const proxyPort = await listen(proxy);
+  let picked = () => {};
+  const secondPick = new Promise(resolve => { picked = resolve; });
+  t.mock.method(console, 'log', (...args) => {
+    const line = String(args[0]);
+    if (/failing over once to "b"/.test(line)) am.removeAccount(am.accounts.findIndex(a => a.name === 'b'));
+    if (line.includes('"b" was removed before the hop reached it')) picked(line);
+  });
+  try {
+    const answer = fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-x', messages: [] }),
+    }).then(async r => ({ status: r.status, retryAfter: r.headers.get('retry-after'), body: await r.text() }));
+    answer.catch(() => {});
+    const first = await Promise.race([secondPick, answer.then(() => 'answered with no second pick')]);
+    assert.match(first, /— no other account can take it now$/, 'the second pick went to the account inside its 429 pause');
+    const { status, retryAfter } = await answer;
+    assert.equal(status, 429);
+    assert.equal(retryAfter, '60');
+    assert.deepEqual(seen, ['t-a'], 'the request was sent to the account inside its 429 pause');
+    assert.equal(am.accounts[am.currentIndex].name, 'a', 'the fleet cursor moved');
+  } finally { proxy.closeAllConnections(); proxy.close(); upstream.closeAllConnections(); upstream.close(); }
+});
+
 test('pickAlternate names the sibling without touching the cursor or the observation', () => {
   const am = new AccountManager(accounts(), 0.98);
   am.getActiveAccount(null, 'claude-x'); // settle the fleet on `a`

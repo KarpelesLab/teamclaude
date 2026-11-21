@@ -1749,16 +1749,19 @@ function advancePinPastBilling(ctx, accountManager) {
   const from = accountManager.accounts[ctx.pinnedIndex];
   if (from?.type !== 'apikey') return;
   while (ctx.pinChain.length) {
-    const i = ctx.pinChain.shift();
-    const next = accountManager.accounts[i];
-    if (next?.type !== 'apikey' || providerOf(next) !== providerOf(from)
-        || accountManager.isBillingRejected(i) || accountManager.capBars(next, ctx.model, ctx.advisorModel)) continue;
+    // The list holds the accounts themselves, as the pin does (see the
+    // listener): one removed since the pin was resolved reads -1 and is passed
+    // over.
+    const next = ctx.pinChain.shift();
+    if (next.index < 0 || next.type !== 'apikey' || providerOf(next) !== providerOf(from)
+        || accountManager.isBillingRejected(next.index) || accountManager.capBars(next, ctx.model, ctx.advisorModel)) continue;
     // Named once per refusal, next to markBillingRejected's line; a request that
     // only passes a cooling account by is not worth a line each.
-    if (ctx.tried.has(ctx.pinnedIndex)) {
+    if (ctx.tried.has(from)) {
       console.error(`[TeamClaude] Pinned account "${safeLine(from.name, 64)}" refused for billing; this request moves to "${safeLine(next.name, 64)}", the next account its pin names`);
     }
-    ctx.pinnedIndex = i;
+    ctx.pinnedAccount = next;
+    ctx.pinnedIndex = next.index;
     return;
   }
 }
@@ -2181,6 +2184,11 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // one account, bypassing rotation. Used by the keep-warm scheduler and for
       // manual per-account testing. The prefix is stripped before forwarding.
       let pinnedIndex = null;
+      // What a pin that names no account is answered (the 404s below), kept for
+      // the whole request: the account it names can be removed while the
+      // request waits, and forwardRequest then answers the pin the same way.
+      /** @type {{ label: string, message: string }|null} */
+      let unknownPin = null;
       // The accounts after the first that a pin naming several lists, in order
       // (resolvePinList); empty for a pin that names one.
       /** @type {number[]} */
@@ -2207,15 +2215,16 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         const pins = token == null ? null : resolvePinList(accountManager, token);
         pinnedIndex = pins?.[0] ?? null;
         pinChain = pins?.slice(1) ?? [];
+        // Client-supplied and already percent-decoded, so this is the one
+        // value on the path that can carry raw control bytes.
+        const shown = safeLine(token ?? raw);
+        unknownPin = { label: shown, message: `Unknown account pin "${shown}"` };
         if (pinnedIndex == null) {
-          // Client-supplied and already percent-decoded, so this is the one
-          // value on the path that can carry raw control bytes.
-          const shown = safeLine(token ?? raw);
           const reqId = ++lastRequestId;
           const sessionId = clientSessionId(req.headers);
-          if (!hideActivity) hooks.onRequestEnd?.(reqId, { callerRequestId: callerId, method: req.method, path: req.url, account: `(unknown pin: "${shown}")`, status: 404, model: null, sessionId, pinned: false });
+          if (!hideActivity) hooks.onRequestEnd?.(reqId, { callerRequestId: callerId, method: req.method, path: req.url, account: `(unknown pin: "${unknownPin.label}")`, status: 404, model: null, sessionId, pinned: false });
           res.writeHead(404, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: `Unknown account pin "${shown}"` } }));
+          res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: unknownPin.message } }));
           recordEarlyOutcome(accountManager, { sessionId }, req.url, true);
           return;
         }
@@ -2270,12 +2279,13 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         const pins = resolvePinList(accountManager, forcedPin);
         pinnedIndex = pins?.[0] ?? null;
         pinChain = pins?.slice(1) ?? [];
+        unknownPin = { label: safeLine(forcedPin), message: `Unknown account pin "${forcedPin}" (from TC_ACCT)` };
         if (pinnedIndex == null) {
           const reqId = ++lastRequestId;
           const sessionId = clientSessionId(req.headers);
-          if (!hideActivity) hooks.onRequestEnd?.(reqId, { callerRequestId: callerId, method: req.method, path: req.url, account: `(unknown pin: "${safeLine(forcedPin)}")`, status: 404, model: null, sessionId, pinned: false });
+          if (!hideActivity) hooks.onRequestEnd?.(reqId, { callerRequestId: callerId, method: req.method, path: req.url, account: `(unknown pin: "${unknownPin.label}")`, status: 404, model: null, sessionId, pinned: false });
           res.writeHead(404, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: `Unknown account pin "${forcedPin}" (from TC_ACCT)` } }));
+          res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: unknownPin.message } }));
           recordEarlyOutcome(accountManager, { sessionId }, req.url, true);
           return;
         }
@@ -2292,16 +2302,25 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         const sessionPin = /** @type {any} */ (accountManager).sessionPins?.get(sessionId) ?? null;
         if (sessionPin != null) {
           pinnedIndex = resolveAccountPin(accountManager, sessionPin);
+          unknownPin = { label: safeLine(sessionPin), message: `Unknown account pin "${sessionPin}" (session pin; clear it with: teamclaude switch --session --clear)` };
           if (pinnedIndex == null) {
             const reqId = ++lastRequestId;
-            if (!hideActivity) hooks.onRequestEnd?.(reqId, { callerRequestId: callerId, method: req.method, path: req.url, account: `(unknown pin: "${safeLine(sessionPin)}")`, status: 404, model: null, sessionId, pinned: false });
+            if (!hideActivity) hooks.onRequestEnd?.(reqId, { callerRequestId: callerId, method: req.method, path: req.url, account: `(unknown pin: "${unknownPin.label}")`, status: 404, model: null, sessionId, pinned: false });
             res.writeHead(404, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: `Unknown account pin "${sessionPin}" (session pin; clear it with: teamclaude switch --session --clear)` } }));
+            res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: unknownPin.message } }));
             recordEarlyOutcome(accountManager, { sessionId }, req.url, true);
             return;
           }
         }
       }
+
+      // From here the pin is held as the accounts themselves, not their places
+      // in the list. The request waits from here on (for its body, then in
+      // forwardRequest for a refresh, upstream or a hold), and an account
+      // removed meanwhile renumbers the rest in place (removeAccount): an index
+      // resolved above would then name whichever account slid into it.
+      const pinnedAccount = pinnedIndex == null ? null : /** @type {any} */ (accountManager).accounts[pinnedIndex];
+      const pinChainAccounts = pinChain.map(i => /** @type {any} */ (accountManager).accounts[i]);
 
       const reqId = ++lastRequestId;
       // Claude Code tags each session's requests with this header (present on
@@ -2460,8 +2479,9 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
 
       // stripOverage, synthesizeQuota and poolQuota are sampled once here, at dispatch:
       // retries and holds of this request keep them, and a reload applies to
-      // subsequent requests.
-      const ctx = { account: null, callerRequestId: callerId, status: null, attempt: 0, tried: new Set(), reauthed: new Set(), model, advisorModel, streamRequested: parseRequestStream(body), fleetMessageThreads: config?.messageThreads === true, pinnedIndex, pinChain, provider, holdBudgetMs: holdMs, pinKey, onMessage, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, stripOverage: shouldStripOverageHeaders(config), synthesizeQuota: shouldSynthesizeQuotaHeaders(config), poolQuota: shouldPoolQuotaHeaders(config), logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config), cacheUsage: /** @type {Record<string, any>|null} */ (null), errorType: /** @type {string|null} */ (null), usage };
+      // subsequent requests. `tried` and `reauthed` collect accounts, not
+      // indices (indicesOf).
+      const ctx = { account: null, callerRequestId: callerId, status: null, attempt: 0, tried: new Set(), reauthed: new Set(), model, advisorModel, streamRequested: parseRequestStream(body), fleetMessageThreads: config?.messageThreads === true, pinnedIndex, pinnedAccount, unknownPin, pinChain: pinChainAccounts, provider, holdBudgetMs: holdMs, pinKey, onMessage, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, stripOverage: shouldStripOverageHeaders(config), synthesizeQuota: shouldSynthesizeQuotaHeaders(config), poolQuota: shouldPoolQuotaHeaders(config), logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config), cacheUsage: /** @type {Record<string, any>|null} */ (null), errorType: /** @type {string|null} */ (null), usage };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request.
@@ -2762,16 +2782,33 @@ function waitForRetry(ms, signal) {
 // still unavailable by its own state is skipped by selection regardless.
 /**
  * @param {Record<string, any>} ctx
- * @param {import('./account-manager.js').AccountManager} accountManager
  */
-function forgetRecoverableFailures(ctx, accountManager) {
-  for (const i of [...ctx.tried]) {
-    const account = accountManager.accounts[i];
+function forgetRecoverableFailures(ctx) {
+  for (const account of [...ctx.tried]) {
     // By account (recordRefusal): a same-named account that was only out of
     // quota is exactly what the wait is for.
     if (ctx.refusedAccounts?.has(account) || ctx.unrenewedAccounts?.has(account)) continue;
-    ctx.tried.delete(i);
+    ctx.tried.delete(account);
   }
+}
+
+// ctx.tried, ctx.rolledOff and ctx.reauthed hold the accounts themselves, not
+// their places in the list: a removal renumbers the fleet in place while a
+// request waits (on upstream, a token refresh, a hold), and an index taken
+// before the wait then names whichever account slid into it (removeAccount).
+// Selection and the hops take indices, so those of `tried` and `rolledOff` are
+// read off the accounts here, at the moment the manager is asked; `reauthed` is
+// only ever asked whether it holds an account. An account that has left reads
+// -1, which names none. It stays in the set, as its old index did before the
+// accounts were held: selection also reads the set's size (only a first
+// attempt, which excludes nothing, speaks for the fleet), and a request that
+// tried an account since removed is still past its first attempt.
+/**
+ * @param {Iterable<Record<string, any>>} accounts
+ * @returns {Set<number>}
+ */
+function indicesOf(accounts) {
+  return new Set(Array.from(accounts, a => a.index));
 }
 
 // Upstream refused this account's credential, or the account itself: a 400 that
@@ -4008,6 +4045,24 @@ function refusalMessage(refused, statuses, holds) {
 }
 
 /**
+ * The answer to a pin whose account has been removed while the request waited:
+ * the one the listener gives a pin that names no account (ctx.unknownPin, the
+ * 404 of the pin's form). Waiting brings the account back no more than it does
+ * there, and no other account may serve the pin.
+ * @param {import('node:http').ServerResponse} res
+ * @param {Record<string, any>} ctx
+ */
+function respondPinGone(res, ctx) {
+  ctx.status = 404;
+  ctx.account = `(unknown pin: "${ctx.unknownPin.label}")`;
+  if (clientGone(res)) { ctx.abandoned = true; return; }
+  if (res.headersSent) return;
+  ctx.delivered = true;   // an answer, as the listener's own 404 is
+  res.writeHead(404, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: ctx.unknownPin.message } }));
+}
+
+/**
  * The answer when the accounts a request reached all held an expired token that
  * could not be renewed. 503 with the Retry-After of the hold on renewing its
  * token when there is one, else a short one: the renewal may go through on the
@@ -4149,13 +4204,30 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // Taken before the walk, which can move the observation, and a request cannot
   // confirm the stay its own selection began. A pinned request bypasses
   // selection, so it consults no observation and is no evidence about a rest.
-  // A failover hop names its destination up front (ctx.hopTo, set by the 429
-  // and 5xx hops below) and is one attempt long: consumed here so the attempt
-  // after it, if any, selects normally. Like a pin it bypasses selection, so it
-  // is no evidence about a rest either.
-  const hopTo = ctx.hopTo ?? null;
+  // A failover hop names its destination up front (ctx.hopTo, set by the 429,
+  // 5xx and stream-failure hops below and by the retry that stays on the
+  // account a hop landed on) and is one attempt long: consumed here so the
+  // attempt after it, if any, selects normally. Like a pin it bypasses
+  // selection, so it is no evidence about a rest either.
+  // The destination is the account itself, and the 5xx and stream-failure hops
+  // pick it before a wait (discarding the failed body, reading the stream's
+  // first events): an account removed meanwhile reads index -1
+  // (removeAccount). The hop is still a detour, so it is picked again the same
+  // way: under this request's own exclusions, and never onto an account inside
+  // its own 429 pause, as at the hop sites below. With nowhere left the request
+  // ends as one with no account does. Selecting normally would walk the fleet
+  // cursor off the account the detour went around (#286).
+  const hop = ctx.hopTo ?? null;
   ctx.hopTo = null;
-  const restingGen = ctx.pinnedIndex == null && hopTo == null
+  let hopTo = hop;
+  if (hop != null && hop.index < 0) {
+    const again = accountManager.pickAlternate(indicesOf([...ctx.tried, ...(ctx.rolledOff || [])]), ctx.model, ctx.advisorModel, ctx.provider);
+    hopTo = again && !accountManager.isPaused(again.index) ? again : null;
+    console.log(hopTo
+      ? `[TeamClaude] "${safeLine(hop.name, 64)}" was removed before the hop reached it — failing over once to "${safeLine(hopTo.name, 64)}" instead`
+      : `[TeamClaude] "${safeLine(hop.name, 64)}" was removed before the hop reached it — no other account can take it now`);
+  }
+  const restingGen = ctx.pinnedIndex == null && hop == null
     ? accountManager.observedGeneration(ctx.pinKey, ctx.model)
     : null;
 
@@ -4175,8 +4247,18 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // billing: once upstream billing has refused the account it is on (the
   // billing check below starts its cooldown and comes back here), the request
   // goes to the next one listed.
+  // The pin is held as the account (ctx.pinnedAccount), since one removed while
+  // this request waited renumbers the rest in place; its index is read again
+  // here, for this attempt. It is -1 once the pinned account itself has left,
+  // and the pin then names no account: it is answered at once as the listener
+  // answers such a pin, with the unknown-pin 404 (respondPinGone). The same
+  // check follows two of the attempt's three waits below: its token refresh and
+  // its admission. The third, the per-origin socket queue upstreamFetch waits
+  // in, is not followed by one.
+  if (ctx.pinnedAccount) ctx.pinnedIndex = ctx.pinnedAccount.index;
+  if (ctx.pinnedIndex != null && ctx.pinnedIndex < 0) return respondPinGone(res, ctx);
   advancePinPastBilling(ctx, accountManager);
-  const pinned = ctx.pinnedIndex != null && !ctx.tried.has(ctx.pinnedIndex)
+  const pinned = ctx.pinnedIndex != null && !ctx.tried.has(accountManager.accounts[ctx.pinnedIndex])
     ? accountManager.accounts[ctx.pinnedIndex]
     : null;
   // What this attempt's selection decided beyond which account it returned.
@@ -4194,18 +4276,20 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // The hop's destination was picked by pickAlternate against this request's
   // own exclusions, and is taken as-is: re-selecting here would walk the fleet
   // cursor onto it, which is exactly the move a detour must not make (#286).
-  const account = hopTo != null
-    ? accountManager.accounts[hopTo]
+  const account = hop != null
+    ? hopTo
     : ctx.pinnedIndex != null
       ? (pinned && !pinnedWrongProvider && !accountManager.capBars(pinned, ctx.model, ctx.advisorModel) ? pinned : null)
       : accountManager.getActiveAccount(
-        ctx.tried, ctx.model, ctx.advisorModel, ctx.pinKey, ctx.provider, selection,
+        indicesOf(ctx.tried), ctx.model, ctx.advisorModel, ctx.pinKey, ctx.provider, selection,
       );
   // Accounts a rollover deliberately routed this request away from. Request-
   // scoped: the decision belongs to the request, not to one attempt of it.
+  // Kept as the accounts, as `tried` is (indicesOf): the hops that read them
+  // come after an upstream round trip.
   if (selection.rolledOff) {
     ctx.rolledOff ??= new Set();
-    for (const i of selection.rolledOff) ctx.rolledOff.add(i);
+    for (const i of selection.rolledOff) ctx.rolledOff.add(accountManager.accounts[i]);
   }
   if (pinnedWrongProvider && !res.headersSent && !clientGone(res)) {
     // Named plainly: a pin that cannot serve is a configuration mistake, and the
@@ -4244,8 +4328,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // renewed, and nothing else was tried: say that, not a refusal or a quota.
     // Matched by account (recordRefusal).
     const unrenewed = ctx.unrenewedAccounts;
-    if (unrenewed?.size && [...ctx.tried].every(i => unrenewed.has(accountManager.accounts[i]))
-        && (ctx.pinnedIndex != null || (counted.size > 0 && [...counted].every(a => ctx.tried.has(a.index))))) {
+    if (unrenewed?.size && [...ctx.tried].every(a => unrenewed.has(a))
+        && (ctx.pinnedIndex != null || (counted.size > 0 && [...counted].every(a => ctx.tried.has(a))))) {
       return respondUnrenewed(res, ctx);
     }
     if (reachable.length && reachable.every(a => accountManager.unavailableReason(a, ctx.model) === 'billing')) {
@@ -4350,12 +4434,16 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     const clears = resetProvider === 'codex' ? RESET_CLEARS : CLAUDE_RESET_CLEARS;
     const resettable = redeemHook && !ctx.resetRedeemTried
       ? accountManager.accounts.filter((/** @type {Record<string, any>} */ a) =>
-        providerOf(a) === resetProvider && !ctx.tried.has(a.index)
+        providerOf(a) === resetProvider && !ctx.tried.has(a)
         // A third-party backend is an Anthropic-shaped account with no Anthropic
         // reset to spend; Codex rows never carry one, so the test is Claude's alone.
         && !(resetProvider === DEFAULT_PROVIDER && a.upstream)
         // Not a cordoned account: the reset would buy new work it takes none of.
         && !a.cordoned
+        // Nor one the request's model route excludes. unavailableReason names
+        // `quota` ahead of `route`, so such an account can read as resettable,
+        // and a reset there clears windows this request may never use.
+        && accountManager._routeAllows(a, ctx.model)
         && clears.has(accountManager.unavailableReason(a, ctx.model) ?? ''))
       : [];
     if (resettable.length) {
@@ -4363,15 +4451,20 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // but leaves the account unselectable (upstream not yet caught up with its
       // own reset) must cost this request one re-selection, not a loop of them.
       ctx.resetRedeemTried = true;
-      let redeemed = false;
+      let reselect = false;
       try {
         // The model tells the Claude redeemer which weekly bucket parked each
         // account; the Codex one has no use for it.
-        redeemed = !!(await redeemHook?.(resettable, { model: ctx.model }))?.redeemed;
+        const outcome = await redeemHook?.(resettable, { model: ctx.model });
+        // A reset that landed, or a fresh reading that shows an account can
+        // serve after all (the Claude redeemer's `available`): either way the
+        // pool is no longer dry for this request.
+        reselect = !!(outcome?.redeemed || outcome?.available);
       } catch { /* a failed redemption must leave the refusal exactly as it was */ }
-      if (redeemed) {
+      if (reselect) {
         // No upstream attempt was made, so this costs no retry from the budget:
-        // re-select against the account whose windows were just cleared.
+        // re-select against the account whose windows were just cleared or
+        // re-read.
         if (clientGone(res)) { ctx.abandoned = true; return; }
         return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
       }
@@ -4402,7 +4495,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       console.log(`[TeamClaude] All accounts exhausted — holding connection, retry in ${Math.ceil(waitMs / 1000)}s (${Math.ceil(ctx.holdBudgetMs / 1000)}s budget left)`);
       await waitForRetry(waitMs, ctx.signal);
       if (clientGone(res)) { ctx.abandoned = true; return; }
-      forgetRecoverableFailures(ctx, accountManager);
+      forgetRecoverableFailures(ctx);
       // A hold is a new attempt, not one more failover: the hops spent before
       // it are not spent on the retry, or a retry still answered 429 would be
       // returned with the budget unspent. The hold budget bounds the loop.
@@ -4415,7 +4508,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       console.log(`[TeamClaude] All accounts exhausted — waiting ${retryAfter}s before retry`);
       await waitForRetry(retryAfter * 1000, ctx.signal);
       if (clientGone(res)) { ctx.abandoned = true; return; }
-      forgetRecoverableFailures(ctx, accountManager);
+      forgetRecoverableFailures(ctx);
       return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
     }
     res.writeHead(429, {
@@ -4443,8 +4536,18 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
 
   // Refresh OAuth token if needed
   await accountManager.ensureTokenFresh(account.index);
+  // A pinned account removed during the refresh is a pin that names no account,
+  // as at the top of the attempt: answered here, before its token is looked at,
+  // and so before anything is sent. An unpinned request is selected again
+  // instead, with the account that left among those it has tried: nothing was
+  // sent, so the retry budget is not spent.
+  if (account.index < 0) {
+    if (ctx.pinnedIndex != null) return respondPinGone(res, ctx);
+    ctx.tried.add(account);
+    return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
+  }
   if (account.status === 'error' && retryCount < maxRetries) {
-    ctx.tried.add(account.index);
+    ctx.tried.add(account);
     return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
   }
   // The token has expired and the refresh did not replace it: the coordinator
@@ -4456,7 +4559,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // By account (recordRefusal); the name is only printed.
     (ctx.unrenewedAccounts ??= new Set()).add(account);
     (ctx.unrenewed ??= new Set()).add(account.name);
-    ctx.tried.add(account.index);
+    ctx.tried.add(account);
     console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}": token expired and not renewed; not sending it upstream`);
     if (ctx.pinnedIndex == null && retryCount < maxRetries) {
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
@@ -4468,7 +4571,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // way, up to a full connect timeout later, so move on now. A pin still
   // targets exactly the account it names.
   if (ctx.pinnedIndex == null && retryCount < maxRetries && accountManager.isRoutingDown(account.index)) {
-    ctx.tried.add(account.index);
+    ctx.tried.add(account);
     return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
   }
 
@@ -4586,6 +4689,20 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // is paused or ramping, which is exactly when clients give up, so leaving it
     // unmarked clustered false positives where the signal is read hardest.
     if (!await accountManager.admit(account.index, () => clientGone(res))) { ctx.abandoned = true; return; }
+    // And one removed during the wait for admission, before anything is sent.
+    // admit() stops waiting the moment it sees the account has left, and takes
+    // no slot then. A slot it took just before the removal stays counted on
+    // that account, which admission never reads once it has left, so there is
+    // nothing to give back (release, by index, would find no account). An
+    // unpinned request does not send on the account that left either: admit()
+    // let it through at once, past the pause and the ramp it was waiting on,
+    // so every request queued there would go out together on a credential
+    // the operator has just removed. It is selected again, as above.
+    if (account.index < 0) {
+      if (ctx.pinnedIndex != null) return respondPinGone(res, ctx);
+      ctx.tried.add(account);
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
+    }
     accountManager.beginActivity(account.index);
     activityOpened = true;
     // This request may have selected the account before another in-flight request
@@ -4594,7 +4711,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // backlog. Explicit caller pins still target exactly the requested account.
     if (ctx.pinnedIndex == null && retryCount < maxRetries && accountManager.isEntitlementDenied(account.index)) {
       accountManager.release(account.index, { successful: false });
-      ctx.tried.add(account.index);
+      ctx.tried.add(account);
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
     }
     // Same for a cap: a reading that arrived while this request waited can have
@@ -4607,12 +4724,12 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     if (accountManager.capBars(account, ctx.model, ctx.advisorModel)
         || (ctx.pinnedIndex == null && account.status === 'error')) {
       accountManager.release(account.index, { successful: false });
-      ctx.tried.add(account.index);
+      ctx.tried.add(account);
       return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
     }
     if (ctx.pinnedIndex == null && accountManager.isBillingRejected(account.index)) {
       accountManager.release(account.index, { successful: false });
-      ctx.tried.add(account.index);
+      ctx.tried.add(account);
       return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
     }
     // One attempt per upstream send, counted here: after admission, so a queued
@@ -4666,7 +4783,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       if (inspected.billingError) {
         await upstreamBody?.cancel();
         accountManager.markBillingRejected(account.index);
-        ctx.tried.add(account.index);
+        ctx.tried.add(account);
         if (clientGone(res)) { ctx.abandoned = true; return; }
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
       }
@@ -4803,7 +4920,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
           console.log(`[TeamClaude] Quota rejection (429) on "${account.name}"${spent} — throttling ${hold}s${later} and switching account`);
           accountManager.markRateLimited(account.index, hold);
         }
-        ctx.tried.add(account.index);
+        ctx.tried.add(account);
         if (clientGone(res)) { ctx.abandoned = true; return; }
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
       }
@@ -4882,7 +4999,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         // pickAlternate, not getActiveAccount: the hop detours THIS request and
         // must leave the fleet cursor where it is (#286).
         const alt = accountManager.pickAlternate(
-          new Set([...ctx.tried, ...(ctx.rolledOff || []), account.index]),
+          indicesOf([...ctx.tried, ...(ctx.rolledOff || []), account]),
           ctx.model, ctx.advisorModel, ctx.provider,
         );
         if (alt && !accountManager.isPaused(alt.index)) {
@@ -4890,8 +5007,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
           // Whether the two accounts leave from one address: what the
           // "IP-scoped" reading of a second 429 below rests on.
           ctx.rateLimitHopSharedExit = !routed && !alt.routing;
-          ctx.hopTo = alt.index;
-          ctx.tried.add(account.index);
+          ctx.hopTo = alt;
+          ctx.tried.add(account);
           console.log(`[TeamClaude] Rate-limit 429 on "${account.name}" — failing over once to idle account "${alt.name}"`);
           if (clientGone(res)) { ctx.abandoned = true; return; }
           return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
@@ -4916,7 +5033,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         // (#286), and `route` keeps its egress, since the wait is the only
         // variable being tested. A fresh IP is a different hypothesis and the sx
         // retry below still owns it: when it is armed it goes first, for free,
-        // and this retry takes the attempt after it.
+        // and this retry takes the attempt after it. The one exception: when
+        // that account is removed during the wait there is no retry, and its
+        // refusal goes back to the client.
         //
         // ctx.requestScopedRetried is the SAME flag the no-sibling retry below
         // sets: one headerless-429 wait per request, whichever of the two spends
@@ -4937,8 +5056,14 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
             + (refusal ? ` (${safeLine(refusal)})` : ''));
           await waitForRetry(retryDelayMs, ctx.signal);
           if (clientGone(res)) { ctx.abandoned = true; return; }
-          ctx.hopTo = account.index;
-          return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+          // An account removed during the wait (index -1, removeAccount) takes
+          // its retry with it. Not onto a third account, as above: the refusal
+          // it gave goes back to the client below.
+          if (account.index >= 0) {
+            ctx.hopTo = account;
+            return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+          }
+          console.log(`[TeamClaude] "${safeLine(account.name, 64)}" was removed during the wait — no retry`);
         }
         console.log(`[TeamClaude] 429 followed the request onto "${account.name}" with no rate-limit headers — it is about the request, not the accounts; returning it to the client`
           + (refusal ? ` (${safeLine(refusal)})` : ''));
@@ -5028,14 +5153,14 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     if (ctx.pinnedIndex == null && upstreamRes.status >= 500 && !res.headersSent && !ctx.serverErrorHopped && retryCount < maxRetries) {
       // Same exclusion as the 429 hop, and the same cursor-preserving pick.
       const alt = accountManager.pickAlternate(
-        new Set([...ctx.tried, ...(ctx.rolledOff || []), account.index]),
+        indicesOf([...ctx.tried, ...(ctx.rolledOff || []), account]),
         ctx.model, ctx.advisorModel, ctx.provider,
       );
       if (alt && !accountManager.isPaused(alt.index)) {
         await upstreamRes.body?.cancel();
         ctx.serverErrorHopped = true;
-        ctx.hopTo = alt.index;
-        ctx.tried.add(account.index);
+        ctx.hopTo = alt;
+        ctx.tried.add(account);
         console.log(`[TeamClaude] Upstream ${upstreamRes.status} on "${account.name}" — failing over once to "${alt.name}"`);
         if (clientGone(res)) { ctx.abandoned = true; return; }
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
@@ -5061,7 +5186,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         await rest.cancel();
         accountManager.markRefused(account, refusal);
         recordRefusal(ctx, account, 400);
-        ctx.tried.add(account.index);
+        ctx.tried.add(account);
         console.error(`[TeamClaude] 400 on "${safeLine(account.name, 64)}"; upstream refused the account (${refusal.code}), failing over`);
         if (clientGone(res)) { ctx.abandoned = true; return; }
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
@@ -5077,7 +5202,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         const until = accountManager.markModelDenied(account.index, ctx.model,
           { detail: upstreamErrorMessage(peeked), epoch: modelDenialEpoch });
         ctx.modelUnsupported = { body: peeked, contentType: upstreamRes.headers.get('content-type') };
-        ctx.tried.add(account.index);
+        ctx.tried.add(account);
         console.error(`[TeamClaude] 400 on "${safeLine(account.name, 64)}"; its ChatGPT plan does not serve ${safeLine(ctx.model, 64)}, out of rotation for that model${until ? ` until ${new Date(until).toISOString()}` : ''}, failing over`);
         if (clientGone(res)) { ctx.abandoned = true; return; }
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
@@ -5125,7 +5250,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       if (verification) (ctx.verificationHold ??= new Map()).set(account, verification.url);
       recordRefusal(ctx, account, 403);
       if (entitlementDenied) (ctx.entitlementDeniedAccounts ??= new Set()).add(account);
-      ctx.tried.add(account.index);
+      ctx.tried.add(account);
       const denials = account.entitlementDenial?.count || 0;
       const cooldown = deniedUntil
         ? `; OAuth entitlement cooldown until ${new Date(deniedUntil).toISOString()}${denials > 1 ? `, ${denials} in a row` : ''}`
@@ -5149,8 +5274,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // per account per request, so a genuinely dead credential does not loop: a
     // 401 that comes back goes to the branch below.
     if (upstreamRes.status === 401 && account.type === 'oauth' && account.refreshToken
-        && retryCount < maxRetries && !ctx.reauthed.has(account.index)) {
-      ctx.reauthed.add(account.index);
+        && retryCount < maxRetries && !ctx.reauthed.has(account)) {
+      ctx.reauthed.add(account);
       await upstreamRes.body?.cancel();
       console.log(`[TeamClaude] 401 on "${account.name}" — token rejected; forcing refresh and retrying`);
       await accountManager.ensureTokenFresh(account.index, true);
@@ -5183,7 +5308,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
           : 'upstream rejected its token (401) and it has no refresh token');
       }
       recordRefusal(ctx, account, 401);
-      ctx.tried.add(account.index);
+      ctx.tried.add(account);
       console.error(`[TeamClaude] 401 on "${safeLine(account.name, 64)}"; failing over to another account`);
       if (clientGone(res)) { ctx.abandoned = true; return; }
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
@@ -5214,7 +5339,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     if (ctx.pinnedIndex == null && isStreaming && upstreamRes.status < 400 && upstreamBody && !res.headersSent
         && !ctx.streamFailureHopped && retryCount < maxRetries) {
       const alt = accountManager.pickAlternate(
-        new Set([...ctx.tried, ...(ctx.rolledOff || []), account.index]),
+        indicesOf([...ctx.tried, ...(ctx.rolledOff || []), account]),
         ctx.model, ctx.advisorModel, ctx.provider,
       );
       if (alt && !accountManager.isPaused(alt.index)) {
@@ -5223,8 +5348,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         if (peeked.failureCode && !accountManager.isPaused(alt.index)) {
           await peeked.cancel();
           ctx.streamFailureHopped = true;
-          ctx.hopTo = alt.index;
-          ctx.tried.add(account.index);
+          ctx.hopTo = alt;
+          ctx.tried.add(account);
           console.log(`[TeamClaude] Stream failed inside a ${upstreamRes.status} on "${account.name}" (${peeked.failureCode}) — failing over once to "${alt.name}"`);
           if (clientGone(res)) { ctx.abandoned = true; return; }
           return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
@@ -5326,7 +5451,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       const l = getLog();
       const bw = l ? l.bodyWriter('RESPONSE BODY (streamed)', contentType) : null;
       try {
-        ({ failed: streamFailed } = await streamResponse(held?.body ?? upstreamBody, res, account.index, accountManager, bw, ctx.onUsage, ctx.pinKey, ctx.model, ctx.onMessage, (/** @type {Record<string, any>} */ u) => { ctx.cacheUsage = u; bookUsageTotals(ctx.usage, u); }, isStreaming));
+        ({ failed: streamFailed } = await streamResponse(held?.body ?? upstreamBody, res, account, accountManager, bw, ctx.onUsage, ctx.pinKey, ctx.model, ctx.onMessage, (/** @type {Record<string, any>} */ u) => { ctx.cacheUsage = u; bookUsageTotals(ctx.usage, u); }, isStreaming));
         // Reached only when the stream completed. A stream that dies upstream
         // throws out of streamResponse, so it never marks itself delivered —
         // which is the failure the token counters cannot see, since a stream
@@ -5448,7 +5573,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     const hostOf = (u) => { try { return new URL(u).hostname; } catch { return u; } };
     const thisHost = hostOf(account.upstream || upstream);
     const otherHostAvailable = ctx.pinnedIndex != null || accountManager.accounts.some(a =>
-      a.index !== account.index && !ctx.tried.has(a.index) &&
+      a.index !== account.index && !ctx.tried.has(a) &&
       hostOf(a.upstream || upstream) !== thisHost &&
       accountManager._isAvailable(a, ctx.model));
     const isTransient = isTransientUpstreamError(err, { otherHostAvailable });
@@ -5471,7 +5596,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // a healthy account from rotation until a credential change). Instead skip
     // it for the rest of THIS request only and fail over to another account.
     if (retryCount < maxRetries && !res.headersSent) {
-      ctx.tried.add(account.index);
+      ctx.tried.add(account);
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
     }
     ctx.status = 502;
@@ -5591,6 +5716,13 @@ export function bookUsageTotals(totals, usage) {
  * file).
  * `onTotals` is told the usage that was booked, once the stream ends.
  *
+ * `account` is the serving account itself, not its index. A stream can run for
+ * minutes, an account removed meanwhile renumbers the rest in place
+ * (removeAccount), and an index taken when the stream began would then book its
+ * figures to whichever account slid into the slot. Each figure is booked by the
+ * index the account has when it arrives: -1 once it has left, which books
+ * nothing to any account.
+ *
  * Resolves to what the stream said about itself: `failed` names the first
  * `error` or `response.failed` event it carried (its code, or the event type
  * when it names none), and is null for a stream that reported no failure. A
@@ -5598,7 +5730,7 @@ export function bookUsageTotals(totals, usage) {
  * nothing, and the caller's success bookkeeping needs to know the difference.
  * @returns {Promise<{ failed: string|null }>}
  */
-export async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter, onUsage = null, pinKey = null, model = null, onMessage = null, /** @type {((usage: Record<string, any>) => void)|null} */ onTotals = null, scanUsage = true) {
+export async function streamResponse(webStream, res, account, accountManager, bodyWriter, onUsage = null, pinKey = null, model = null, onMessage = null, /** @type {((usage: Record<string, any>) => void)|null} */ onTotals = null, scanUsage = true) {
   const reader = webStream.getReader();
   // A client that leaves while upstream is silent must not hold the pending
   // read — and with it the upstream socket and its admission permit — until
@@ -5621,7 +5753,7 @@ export async function streamResponse(webStream, res, accountIndex, accountManage
   const responsesTurn = { settled: false };
   /** @type {{ failed: string|null }} */
   const outcome = { failed: null };
-  const usage = scanUsage ? createSseLineScanner(line => parseSSEDataLine(line, accountIndex, accountManager, onUsage, merged, responsesTurn, onMessage, outcome)) : null;
+  const usage = scanUsage ? createSseLineScanner(line => parseSSEDataLine(line, account, accountManager, onUsage, merged, responsesTurn, onMessage, outcome)) : null;
 
   try {
     while (true) {
@@ -5688,7 +5820,7 @@ export async function streamResponse(webStream, res, accountIndex, accountManage
     // all (a ping and some text deltas, or an upstream error after the headers),
     // and recording those would report an observation that never happened.
     if (Object.keys(merged).length) {
-      accountManager.recordTokenUsage(accountIndex, pinKey, model, merged);
+      accountManager.recordTokenUsage(account.index, pinKey, model, merged);
       onTotals?.(merged);
     }
     // Cancel upstream reader to stop consuming data nobody needs (and, on the
@@ -5780,7 +5912,7 @@ export function createSseLineScanner(onLine, maxChars = SSE_MAX_LINE_CHARS) {
 // is an event for this purpose, and the scanner above never has to hold more.
 /**
  * @param {string} line
- * @param {number} accountIndex
+ * @param {Record<string, any>} account  the serving account; its index is read at each booking (streamResponse)
  * @param {any} accountManager
  * @param {((inputTokens: number, outputTokens: number) => void)|null} [onUsage]
  * @param {Record<string, any>|null} [merged]
@@ -5788,7 +5920,7 @@ export function createSseLineScanner(onLine, maxChars = SSE_MAX_LINE_CHARS) {
  * @param {((messageId: string) => void)|null} [onMessage] told the id `message_start` names
  * @param {{failed: string|null}|null} [outcome] this stream's first reported failure, set once
  */
-function parseSSEDataLine(line, accountIndex, accountManager, onUsage = null, merged = null, responsesTurn = null, onMessage = null, outcome = null) {
+function parseSSEDataLine(line, account, accountManager, onUsage = null, merged = null, responsesTurn = null, onMessage = null, outcome = null) {
   if (!line.startsWith('data: ')) return;
 
   try {
@@ -5801,11 +5933,11 @@ function parseSSEDataLine(line, accountIndex, accountManager, onUsage = null, me
     }
     if (data.type === 'message_start' && typeof data.message?.id === 'string') onMessage?.(data.message.id);
     if (data.type === 'message_start' && data.message?.usage) {
-      accountManager.updateUsage(accountIndex, data.message.usage.input_tokens, 0);
+      accountManager.updateUsage(account.index, data.message.usage.input_tokens, 0);
       onUsage?.(data.message.usage.input_tokens || 0, 0);
       if (merged) Object.assign(merged, data.message.usage);
     } else if (data.type === 'message_delta' && data.usage) {
-      accountManager.updateUsage(accountIndex, 0, data.usage.output_tokens);
+      accountManager.updateUsage(account.index, 0, data.usage.output_tokens);
       onUsage?.(0, data.usage.output_tokens || 0);
       if (merged) Object.assign(merged, data.usage);
     } else if (!responsesTurn?.settled) {
@@ -5818,7 +5950,7 @@ function parseSSEDataLine(line, accountIndex, accountManager, onUsage = null, me
       const usage = responsesEventUsage(data);
       if (usage) {
         if (responsesTurn) responsesTurn.settled = true;
-        accountManager.updateUsage(accountIndex, usage.input_tokens, usage.output_tokens);
+        accountManager.updateUsage(account.index, usage.input_tokens, usage.output_tokens);
         onUsage?.(usage.input_tokens, usage.output_tokens);
         if (merged) Object.assign(merged, usage);
       }

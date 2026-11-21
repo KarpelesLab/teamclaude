@@ -69,7 +69,9 @@ the wrong server (a `POST /teamclaude/reload` there is a 501). `spawnServer()`
 treats a status reply as readiness only when its `server.pid` is the child's
 own, and respawns on a fresh port when the child lost the race. `closedPort()`
 from the same module is still right for a *dead* upstream, where a port nothing
-listens on is the point.
+listens on is the point. Given `signal: t.signal`, `spawnServer()` stops a child
+that never comes up and rejects once the test has ended (see "Clean up in
+`finally`" below).
 
 The helper lives outside `test/` because node's default test glob is
 `**/test/**/*.js`: anything under this directory is run as a test file.

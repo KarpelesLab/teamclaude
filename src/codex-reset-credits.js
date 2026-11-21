@@ -940,6 +940,8 @@ export class ResetCreditRedeemer {
       this.log(`[TeamClaude] Codex rate-limit reset on "${name}" stopped before redeeming — ${why}`);
       return { redeemed: false, reason: why };
     }
+    // Removed while the attempt read it: a credit spent there serves nothing.
+    if (!this.am.accounts?.includes(account)) return { redeemed: false, reason: 'account is no longer listed' };
 
     return this.redeemGrant(account, verdict.creditId, { deadline, reason: verdict.reason });
   }

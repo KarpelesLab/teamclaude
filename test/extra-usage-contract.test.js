@@ -161,6 +161,29 @@ test('a transient throttle does not restart an exhausted-fleet billing episode',
   { during: { unavailable: 'throttled', billing: true }, selected: 'subscription', ramp: 1, enters: 1, leaves: 0 });
 });
 
+// The other half of docs/quota.md's throttle paragraph: a request that finds
+// no account during the throttle is the fleet unable to serve at all, which
+// ends the episode quietly, so the next pick is announced and ramped afresh.
+test('a request refused during a throttle ends the billing episode, and the next pick starts a new one', t => {
+  const lines = [];
+  t.mock.method(console, 'log', (...args) => lines.push(args.join(' ')));
+  const am = new AccountManager([oauth('subscription', { allowExtraUsage: true })], 0.98);
+  am.accounts[0].quota.unified7d = 1;
+  am._nextProbeAt = Date.now() + 60_000;
+  am.getActiveAccount(null, OPUS);
+  am.accounts[0].rampStartedAt = 1;
+  am.accounts[0].status = 'throttled';
+  am.accounts[0].rateLimitedUntil = Date.now() + 60_000;
+  const during = am.getActiveAccount(null, OPUS);
+  const billing = am.getStatus().accounts[0].onExtraUsage;
+  am.accounts[0].rateLimitedUntil = Date.now() - 1;
+  const selected = am.getActiveAccount(null, OPUS)?.name;
+  assert.deepEqual({ during, billing, selected, rampRestarted: am.accounts[0].rampStartedAt !== 1,
+    enters: lines.filter(line => line.includes('on extra usage')).length,
+    leaves: lines.filter(line => line.includes('leaving extra usage')).length },
+  { during: null, billing: false, selected: 'subscription', rampRestarted: true, enters: 2, leaves: 0 });
+});
+
 test('status ends a manually selected billing episode when its quota recovers', () => {
   const am = new AccountManager([oauth('subscription', { allowExtraUsage: true })], 0.98);
   am._nextProbeAt = Date.now() + 60_000;
