@@ -29,9 +29,18 @@ test('client disconnect cancels a silent upstream immediately, not at idle timeo
 });
 
 // Bring up an HTTP server on an ephemeral port and hand back {server, port}.
-async function listen(handler) {
+// It listens on 127.0.0.1, the address the tests connect to: on the wildcard,
+// another process could bind 127.0.0.1 to the same port on macOS and answer
+// in its place, so that a server built never to answer answers. It is closed
+// in an after hook, which runs however the test ended: a failed assertion
+// skips the rest of the test, and a server left listening keeps the file's
+// process from exiting (see "Clean up in `finally`" in test/README.md). Its
+// connections go first, since these servers may never answer, and close()
+// alone leaves a connection with a request in flight open.
+async function listen(t, handler) {
   const server = http.createServer(handler);
-  server.listen(0);
+  t.after(() => { server.closeAllConnections(); server.close(); });
+  server.listen(0, '127.0.0.1');
   await once(server, 'listening');
   return { server, port: server.address().port };
 }
@@ -39,8 +48,8 @@ async function listen(handler) {
 // A half-dead upstream: it accepts the connection but never sends a response —
 // exactly what a keep-alive socket becomes after the host's network drops and
 // reconnects. Without the headers timeout this hangs until Node's 300s default.
-test('fails fast (does not hang) when upstream never sends headers', async () => {
-  const { server, port } = await listen(() => { /* never respond */ });
+test('fails fast (does not hang) when upstream never sends headers', async (t) => {
+  const { port } = await listen(t, () => { /* never respond */ });
 
   // The error names the budget that fired, which is the proof that the 200 ms
   // watchdog — not Node's 300 s default — ended the wait; how long the
@@ -50,8 +59,6 @@ test('fails fast (does not hang) when upstream never sends headers', async () =>
       { method: 'POST', body: '{}', headersTimeoutMs: 200 }),
     (err) => err.code === 'TEAMCLAUDE_HEADERS_TIMEOUT' && /after 200ms/.test(err.message),
   );
-
-  server.close();
 });
 
 // The mechanism the whole fix rests on: after a hung request the dead socket is
@@ -59,10 +66,10 @@ test('fails fast (does not hang) when upstream never sends headers', async () =>
 // connection and succeeds. Same origin is the point: two ports would be two
 // pools and prove nothing about eviction. We count TCP connections and assert
 // the second request opened a new one rather than reusing the dead keep-alive.
-test('evicts the dead socket and reconnects on the same origin', async () => {
+test('evicts the dead socket and reconnects on the same origin', async (t) => {
   let conns = 0;
   let mode = 'hang';
-  const { server, port } = await listen((req, res) => {
+  const { server, port } = await listen(t, (req, res) => {
     if (mode === 'respond') { res.writeHead(200); res.end('ok'); }
     // else: never respond, simulating a half-dead socket after a network drop
   });
@@ -82,16 +89,14 @@ test('evicts the dead socket and reconnects on the same origin', async () => {
   // reuse of the aborted socket would leave the count at 1 (and hang). undici may
   // open more than one on the abort path, so assert the invariant, not an exact n.
   assert.ok(conns >= 2, `expected a fresh socket after eviction, saw ${conns} connection(s)`);
-
-  server.close();
 });
 
 // The headers deadline is headers-only: once headers arrive it is disarmed, so a
 // body that streams well past the timeout window is NOT cut off (SSE completions
 // run for minutes). Headers here return instantly; the body finishes at ~400ms
 // with a 150ms headers timeout.
-test('does not cut a slow body once headers have arrived', async () => {
-  const { server, port } = await listen(async (req, res) => {
+test('does not cut a slow body once headers have arrived', async (t) => {
+  const { port } = await listen(t, async (req, res) => {
     res.writeHead(200, { 'content-type': 'text/event-stream' });
     res.write('event: ping\n\n');
     await new Promise((r) => setTimeout(r, 400));
@@ -102,8 +107,6 @@ test('does not cut a slow body once headers have arrived', async () => {
   const res = await upstreamFetch(`http://127.0.0.1:${port}/`, { headersTimeoutMs: 150 });
   assert.equal(res.status, 200);
   assert.match(await res.text(), /done/); // full body read, not aborted at 150ms
-
-  server.close();
 });
 
 // Mid-stream recovery (extends the PR): once headers have arrived the headers
@@ -178,21 +181,19 @@ test('the fleet default is two minutes, for any backend with no opinion', () => 
   assert.equal(DEFAULT_HEADERS_TIMEOUT_MS, 120_000);
 });
 
-test('a caller default bounds the head wait when nothing overrides it', async () => {
-  const { server, port } = await listen(() => { /* never respond */ });
+test('a caller default bounds the head wait when nothing overrides it', async (t) => {
+  const { port } = await listen(t, () => { /* never respond */ });
 
   await assert.rejects(
     () => upstreamFetch(`http://127.0.0.1:${port}/`, { defaultHeadersTimeoutMs: 200 }),
     (err) => err.code === 'TEAMCLAUDE_HEADERS_TIMEOUT' && /after 200ms/.test(err.message),
   );
-
-  server.close();
 });
 
 // A per-call timeout is the most specific thing anyone can say about one
 // request, so a caller default must never narrow it.
-test('a per-call headers timeout wins over the caller default', async () => {
-  const { server, port } = await listen(async (req, res) => {
+test('a per-call headers timeout wins over the caller default', async (t) => {
+  const { port } = await listen(t, async (req, res) => {
     await new Promise((r) => setTimeout(r, 200)); // head arrives past the 20ms default
     res.writeHead(200);
     res.end('ok');
@@ -201,17 +202,15 @@ test('a per-call headers timeout wins over the caller default', async () => {
   const res = await upstreamFetch(`http://127.0.0.1:${port}/`, { headersTimeoutMs: 5000, defaultHeadersTimeoutMs: 20 });
   assert.equal(res.status, 200);
   assert.equal(await res.text(), 'ok');
-
-  server.close();
 });
 
 // The env var is the operator's fleet-wide say, so it outranks a default the
 // caller supplied — otherwise a provider default could not be brought back
 // down on a deployment that wants it shorter.
-test('the env override beats the caller default', async () => {
+test('the env override beats the caller default', async (t) => {
   const prev = process.env.TEAMCLAUDE_UPSTREAM_HEADERS_TIMEOUT_MS;
   process.env.TEAMCLAUDE_UPSTREAM_HEADERS_TIMEOUT_MS = '200';
-  const { server, port } = await listen(() => { /* never respond */ });
+  const { port } = await listen(t, () => { /* never respond */ });
   try {
     // 200 from the environment, not the caller's 60 s: the message says which.
     await assert.rejects(
@@ -221,7 +220,6 @@ test('the env override beats the caller default', async () => {
   } finally {
     if (prev === undefined) delete process.env.TEAMCLAUDE_UPSTREAM_HEADERS_TIMEOUT_MS;
     else process.env.TEAMCLAUDE_UPSTREAM_HEADERS_TIMEOUT_MS = prev;
-    server.close();
   }
 });
 
