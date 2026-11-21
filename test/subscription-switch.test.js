@@ -10,7 +10,13 @@ function listen(server) {
 }
 
 for (const weekly of [98, 100]) {
-  test(`an explicit subscription switch serves at ${weekly}% usage with credits enabled`, async () => {
+  // The requests take the test's t.signal. One the proxy never answers waits
+  // with no deadline: the runner's timeout fails the test but does not end that
+  // wait, so the finally would never close the servers, and on Node 24 and
+  // later they would keep the file from ever exiting (test/README.md, "Clean up
+  // in finally"). node:test aborts t.signal once the test has ended, however it
+  // ended: the request rejects then, and the finally runs.
+  test(`an explicit subscription switch serves at ${weekly}% usage with credits enabled`, async (t) => {
     const seen = [];
     const upstream = http.createServer((req, res) => {
       req.resume();
@@ -39,12 +45,14 @@ for (const weekly of [98, 100]) {
       const switched = await fetch(`http://127.0.0.1:${port}/teamclaude/switch`, {
         method: 'POST', headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ account: 'subscriber@example.com' }),
+        signal: t.signal,
       });
       assert.deepEqual(await switched.json(), { ok: true, account: 'subscriber@example.com', eligible: true });
       for (let i = 0; i < 2; i++) {
         const response = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
           method: 'POST', headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ model: 'claude-opus-5', max_tokens: 1, messages: [] }),
+          signal: t.signal,
         });
         assert.deepEqual({ status: response.status, body: await response.json() }, { status: 200, body: { ok: true } });
         const status = am.getStatus();
