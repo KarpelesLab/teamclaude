@@ -701,6 +701,7 @@ async function serverCommand() {
     config.messageThreads = fleetThreads;
     // Read by the TUI on every frame, so a hand edit lands on the next reload.
     config.quotaBarPercent = diskConfig.quotaBarPercent === true;
+    config.quotaBarStretch = diskConfig.quotaBarStretch !== false;
     config.accountSort = ACCOUNT_SORTS.includes(diskConfig.accountSort) ? diskConfig.accountSort : 'arranged';
     // Read by `run`/`env` from disk, but the TUI settings screen shows it live.
     config.defaultClientMode = diskConfig.defaultClientMode === 'base-url' ? 'base-url' : 'mitm';
@@ -818,6 +819,7 @@ async function serverCommand() {
         // the edit never reached disk and was silently undone by the next start.
         if (config.eventLogging != null) diskConfig.eventLogging = config.eventLogging;
         if (config.quotaBarPercent != null) diskConfig.quotaBarPercent = config.quotaBarPercent;
+        if (config.quotaBarStretch != null) diskConfig.quotaBarStretch = config.quotaBarStretch;
         if (config.accountSort != null) diskConfig.accountSort = config.accountSort;
         if (config.defaultClientMode != null) diskConfig.defaultClientMode = config.defaultClientMode;
         if (config.autoRedeemResets != null) diskConfig.autoRedeemResets = config.autoRedeemResets;

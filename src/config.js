@@ -173,6 +173,7 @@ export function createDefaultConfig() {
     persistSessionAffinity: false,
     sessionTitles: { enabled: false, width: 18 },
     quotaBarPercent: false,
+    quotaBarStretch: true,
     probeDisabledAccounts: false,
     accountSort: 'arranged',
     eventLogging: 'hide',
