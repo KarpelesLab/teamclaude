@@ -134,16 +134,31 @@ The burn-rate forecast answers for one account. The fleet forecast ([#550](https
 "fleetForecast": { "allOutAt": 1780000000000, "firstBackAt": 1780014400000, "boundBy": "weekly", "ratePerDay": 1.38 }
 ```
 
-`allOutAt` is the first moment every account is blocked (the current time when they all already are), and `firstBackAt` the first moment after it that one is usable again; both are ms epoch. `boundBy` is the bucket that blocks most of the fleet at `allOutAt`: `weekly` or `5h`. `ratePerDay` is the fleet's measured weekly spend, in shares of one account's week per day (`1.38` uses 138% of a week per day, spread over the accounts).
+`allOutAt` is the first moment every account is blocked (the current time when they all already are), and `firstBackAt` the first moment after it that one is usable again; both are ms epoch. `boundBy` is the bucket that blocks most of the fleet at `allOutAt`: `weekly` or `5h`. `ratePerDay` is the fleet's measured weekly spend, in shares of an average account's week per day (`1.38` uses 138% of a week per day, spread over the accounts).
+
+`fleetTimeline` in the same status is the week ahead from the same simulation:
+
+```json
+"fleetTimeline": {
+  "from": 1780000000000, "to": 1780604800000,
+  "accounts": { "alice": [{ "at": 1780000000000, "usable": true, "bucket": null }, { "at": 1780090000000, "usable": false, "bucket": "weekly" }] },
+  "outages": [{ "from": 1780400000000, "to": 1780401200000 }],
+  "busier": { "loadFactor": 1.25, "outages": [{ "from": 1780300000000, "to": 1780401200000 }] }
+}
+```
+
+`accounts` gives each account's state at `from` and every change after it, keyed by account name; `bucket` names what blocks it. `outages` are the stretches in which no account is usable, `to: null` for one still running at `to`. `busier` repeats the outages with every rate a quarter higher. Unlike `fleetForecast`, it answers when nothing runs out; it is `null` only with no account to forecast or too little history to measure a rate (the first two cases below).
 
 `teamclaude status` and the dashboard show it as one line, only when there is a forecast: `all accounts out in ~31h (weekly), first back 4h later`.
 
-It is `null` until the proxy has 48 hours of samples, `null` when the samples cover too little of a rate window to trust (under 6 hours of the weekly window, or under 1 hour of the last 6 hours), and `null` when nothing runs out within 14 days.
+`fleetForecast` is `null` until the proxy has 48 hours of samples, `null` when the samples cover too little of a rate window to trust (under 6 hours of the weekly window, or under 1 hour of the last 6 hours), and `null` when nothing runs out within 14 days.
 
 How it works. Every 15 minutes the proxy stores one sample per account from the readings it already has: weekly and 5-hour utilization and when each window resets. It makes no extra upstream call, so an account is sampled only once the proxy has read it, from traffic or the [quota probe](#quota-probe). The forecast then simulates the fleet forward from the current readings:
 
 - Each bucket has its own measured rate. The weekly rate is the fleet's summed weekly increase over the last 24 hours, or the last 7 days once the samples cover at least 6 of them, shaped by hour of day (UTC): a flat evening rate carried through the night would call the wall too early. The 5-hour rate is the summed increase over the last 6 hours, flat. Each rate is divided by the time the samples actually cover inside its window, not by the whole window: two samples more than 30 minutes apart are a gap, such as a stopped proxy, and a gap does not count as a quiet fleet.
-- Spend goes to the fullest account still under its [switch thresholds](#switch-threshold), as rotation does, so the order in which accounts fill is the order they would be used.
+- Spend is measured in units of plan size, read from the subscription tier: 1% of a 20x account's week is 4% of a 5x one's. When any account's plan is unknown, every account counts as the same size.
+- Spend is shared among the accounts under their [switch thresholds](#switch-threshold) in proportion to their size, so their utilization rises together, as rotation that spreads sessions keeps it ([`distributeSessions`](routing.md)). With the default routing, which stays on one account until it reaches its threshold, the accounts fill one after another instead: the moment the whole pool is out is the same while no reset falls in between, and a single account's block in `fleetTimeline` comes earlier or later than shown.
+- The simulation steps from one event to the next: an account reaching a threshold, a reset, the hourly rate changing. Times are whole milliseconds, and an outage of a minute is as visible as one of a day.
 - An account is blocked while either bucket is at or over its threshold, and comes back at that bucket's reset. A weekly reset is followed by the next one 7 days later, a 5-hour reset by the next one 5 hours later.
 
 A window reset shows in the samples as a drop, or as an empty reading where the proxy had cleared the window at its reset; a drop is never counted as negative spend, and the first reading of the new window counts in full. The forecast covers Anthropic subscription accounts in rotation. Codex accounts are a separate pool, a disabled account is not in rotation, and an API key meters no window.
