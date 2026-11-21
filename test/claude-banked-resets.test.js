@@ -46,7 +46,7 @@ const grant = over => ({ ...LIVE_BLOCK.grants[0], ...over });
 // ── reading the block ───────────────────────────────────────────────────────
 
 test('the live payload reads as one reset, spendable now, with its expiry', () => {
-  assert.deepEqual(bankedResets(LIVE_BLOCK, NOW), { available: 1, applicable: 1, expiresAt: ENDS, fable: 0 });
+  assert.deepEqual(bankedResets(LIVE_BLOCK, NOW), { available: 1, applicable: 1, expiresAt: ENDS, fable: 0, fableExpiresAt: null });
 });
 
 test('the probe payload carries the reading beside the quota buckets', () => {
@@ -72,9 +72,9 @@ test('a block that says nothing usable is no reading, not zero', () => {
 });
 
 test('an eligible block with no live grant is a real zero', () => {
-  assert.deepEqual(bankedResets({ ...LIVE_BLOCK, grants: [] }, NOW), { available: 0, applicable: 0, expiresAt: null, fable: 0 });
+  assert.deepEqual(bankedResets({ ...LIVE_BLOCK, grants: [] }, NOW), { available: 0, applicable: 0, expiresAt: null, fable: 0, fableExpiresAt: null });
   assert.deepEqual(bankedResets({ ...LIVE_BLOCK, grants: [grant({ resets_left: 0 })] }, NOW),
-    { available: 0, applicable: 0, expiresAt: null, fable: 0 });
+    { available: 0, applicable: 0, expiresAt: null, fable: 0, fableExpiresAt: null });
 });
 
 test('an expired grant is not counted', () => {
@@ -84,15 +84,15 @@ test('an expired grant is not counted', () => {
 
 test('a grant held but not spendable yet counts as held, not applicable', () => {
   assert.deepEqual(bankedResets({ ...LIVE_BLOCK, grants: [grant({ usable_now: false })] }, NOW),
-    { available: 1, applicable: 0, expiresAt: ENDS, fable: 0 });
+    { available: 1, applicable: 0, expiresAt: ENDS, fable: 0, fableExpiresAt: null });
   assert.deepEqual(bankedResets({ ...LIVE_BLOCK, grants: [grant({ paused: true })] }, NOW),
-    { available: 1, applicable: 0, expiresAt: ENDS, fable: 0 });
+    { available: 1, applicable: 0, expiresAt: ENDS, fable: 0, fableExpiresAt: null });
 });
 
 test('several grants sum, and the soonest expiry is the one reported', () => {
   const sooner = '2026-10-10T00:00:00+00:00';
   const r = bankedResets({ ...LIVE_BLOCK, grants: [grant({}), grant({ ends_at: sooner, usable_now: false })] }, NOW);
-  assert.deepEqual(r, { available: 2, applicable: 1, expiresAt: Date.parse(sooner), fable: 0 });
+  assert.deepEqual(r, { available: 2, applicable: 1, expiresAt: Date.parse(sooner), fable: 0, fableExpiresAt: null });
 });
 
 test('malformed or hostile counts cannot reach the display rows', () => {
@@ -225,4 +225,55 @@ test('every surface names Fable resets as such', () => {
   assert.equal(resetCreditTag(quota({ available: 1, fable: 5 }), NOW), 'FR1');
   // Gone with the reading, like the rest.
   assert.equal(resetCreditTag(quota({ fable: 1, expiresAt: NOW - 1 }), NOW), '');
+});
+
+// ── expiry by kind ──────────────────────────────────────────────────────────
+
+// The October general resets and the November Fable resets lapse months apart
+// (Dec 10 and Mar 9 on the live pool, 2026-11-18). One soonest date for both
+// said the Fable ones would go with the general one, and dropped them with it.
+
+test('each kind keeps the soonest expiry of its own grants', () => {
+  const general = grant({});
+  const fableEnds = Date.parse(FABLE_GRANT.ends_at);
+  const mixed = bankedResets({ ...LIVE_BLOCK, grants: [FABLE_GRANT, general] }, NOW);
+  assert.equal(mixed.expiresAt, ENDS);
+  assert.equal(mixed.fableExpiresAt, fableEnds);
+  const fableOnly = bankedResets({ ...LIVE_BLOCK, grants: [FABLE_GRANT] }, NOW);
+  assert.equal(fableOnly.expiresAt, null);
+  assert.equal(fableOnly.fableExpiresAt, fableEnds);
+  assert.equal(bankedResets(LIVE_BLOCK, NOW).fableExpiresAt, null);
+});
+
+test('a reading with both kinds dates each one on every surface', () => {
+  const both = quota({ available: 3, applicable: 3, fable: 2, expiresAt: NOW + 22 * DAY, fableExpiresAt: NOW + 111 * DAY });
+  assert.equal(resetCreditTag(both, NOW), 'RC1 FR2');
+  assert.match(resetCreditLine({ quota: both }, paint, NOW),
+    /Reset\s+1 free rate-limit reset credit \(expires 22d\), 2 Fable resets \(expires 111d\) — as of /);
+  const badges = accountBadges({ name: 'a', provider: 'anthropic', quota: both }, 'a', null, NOW);
+  assert.ok(badges.some(b => /^1 reset credit · expires [^,]+, 2 Fable resets · expires \S/.test(b.text)));
+});
+
+test('one kind lapsing leaves the other on every surface', () => {
+  const generalGone = quota({ available: 3, applicable: 3, fable: 2, expiresAt: NOW - 1, fableExpiresAt: NOW + 111 * DAY });
+  assert.equal(resetCreditTag(generalGone, NOW), 'FR2');
+  assert.match(resetCreditLine({ quota: generalGone }, paint, NOW), /Reset\s+2 Fable resets — expires 111d/);
+  assert.ok(accountBadges({ name: 'a', provider: 'anthropic', quota: generalGone }, 'a', null, NOW)
+    .some(b => /^2 Fable resets · expires /.test(b.text)));
+
+  const fableGone = quota({ available: 3, applicable: 3, fable: 2, expiresAt: NOW + 22 * DAY, fableExpiresAt: NOW - 1 });
+  assert.equal(resetCreditTag(fableGone, NOW), 'RC1');
+  assert.match(resetCreditLine({ quota: fableGone }, paint, NOW), /Reset\s+1 free rate-limit reset credit — expires 22d/);
+
+  const allGone = quota({ available: 3, fable: 2, expiresAt: NOW - 1, fableExpiresAt: NOW - 1 });
+  assert.equal(resetCreditTag(allGone, NOW), '');
+  assert.equal(resetCreditLine({ quota: allGone }, paint, NOW), null);
+});
+
+test('a Fable-only reading dates its resets by the Fable expiry', () => {
+  const fableOnly = quota({ available: 2, applicable: 2, fable: 2, expiresAt: null, fableExpiresAt: NOW + 111 * DAY });
+  assert.equal(resetCreditTag(fableOnly, NOW), 'FR2');
+  assert.match(resetCreditLine({ quota: fableOnly }, paint, NOW), /Reset\s+2 Fable resets — expires 111d/);
+  assert.ok(accountBadges({ name: 'a', provider: 'anthropic', quota: fableOnly }, 'a', null, NOW)
+    .some(b => /^2 Fable resets · expires /.test(b.text)));
 });

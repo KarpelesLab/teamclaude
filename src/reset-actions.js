@@ -297,6 +297,9 @@ export function createResetActions({ accountManager, claudeRedeemer, codexRedeem
       if (!grant) return decline('chosen reset is no longer listed');
       const currentBlock = accountBlock(account) || grant.blocked;
       if (currentBlock) return decline(currentBlock);
+      // Asked again next to the claim: the refresh and the read above are where
+      // a removal (CLI, MCP, a reload) lands, and the claim cannot be undone.
+      if (!listed(account)) return decline('account is no longer listed');
       const result = await redeemer.redeemGrant(account, grantId, { manual: true });
       const verdict = 'result' in result ? result.result : 'code' in result ? result.code : null;
       return {

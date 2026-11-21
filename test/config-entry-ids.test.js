@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, writeFile, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { loadConfig, atomicConfigUpdate, loadConfigPersistingIds } from '../src/config.js';
+import { loadConfig, atomicConfigUpdate, loadConfigPersistingIds, loadConfigEnsuringIds } from '../src/config.js';
 import { spawnServer, closedPort } from '../test-helpers/spawn-server.js';
 
 // A running account finds its config row by entry id when it saves a refreshed
@@ -54,6 +54,25 @@ test('loadConfigPersistingIds leaves a file that already carries every id byte f
     const before = await readFile(path, 'utf8');
     await loadConfigPersistingIds();
     assert.equal(await readFile(path, 'utf8'), before);
+  });
+});
+
+// loadConfigEnsuringIds decides on a read taken without the lock whether there
+// is anything to write. A shared id is as much a missing one as an absent id:
+// both are re-minted in memory, and the file has to carry what memory holds.
+test('loadConfigEnsuringIds writes a fresh id over one that two rows share', async () => {
+  await withConfig({ upstreamProxy: false, accounts: [{ id: 'same', name: 'a', type: 'apikey', apiKey: 'k1' }, { id: 'same', name: 'b', type: 'apikey', apiKey: 'k2' }] }, async (path) => {
+    const ids = (await loadConfigEnsuringIds()).accounts.map((/** @type {any} */ a) => a.id);
+    assert.equal(ids[0], 'same', 'the first keeps its id');
+    assert.notEqual(ids[1], 'same');
+    assert.deepEqual(await idsOn(path), ids, 'the ids handed out are the ones on disk');
+  });
+});
+
+// The copy handed out without the lock is made the way loadConfig makes one.
+test('loadConfigEnsuringIds reads a file with no accounts key as an empty list', async () => {
+  await withConfig({ upstreamProxy: false }, async () => {
+    assert.deepEqual((await loadConfigEnsuringIds()).accounts, []);
   });
 });
 
