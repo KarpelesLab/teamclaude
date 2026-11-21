@@ -225,7 +225,7 @@ const underOne = v => v != null && v < 1;
  *
  * @typedef {object} CodexLearnedQuota
  * @property {string} [planType]  the Codex subscription tier
- * @property {{available: number, applicable: number|null, seenAt: number, expiresAt?: number|null}} [resetCredits]  free rate-limit reset credits (Codex) or banked usage-limit resets (Claude) held, when that was last seen, and when the soonest one lapses where the provider says
+ * @property {{available: number, applicable: number|null, seenAt: number, expiresAt?: number|null, fable?: number, fableExpiresAt?: number|null}} [resetCredits]  free rate-limit reset credits (Codex) or banked usage-limit resets (Claude) held, when that was last seen, and when the soonest one lapses where the provider says (for Claude, the general and the Fable resets each dated apart)
  * @property {Record<string, {name: string, utilization: number, resetAt: number|null, seenAt: number}>} [codexModelBuckets]  model-scoped weekly buckets, keyed by slug
  * @property {Record<string, string>} [codexModelLimits]  which limit each model was last metered on, from `x-codex-active-limit`: a `codexModelBuckets` slug, or the name upstream gives the account-wide limit
  */
@@ -1673,10 +1673,14 @@ export class AccountManager {
     return false;
   }
 
-  /** Public form used by the request path to re-check an account after waiting
-   * in storm-control admission. */
-  isEntitlementDenied(index, now = Date.now()) {
-    return this._entitlementDenied(this.accounts[index], now);
+  /** Public form for the callers outside selection: the request path re-checks
+   * an account after waiting in storm-control admission, and the warmer asks
+   * before it sends a warm-up. Always on this manager's clock (Date.now), the
+   * one markEntitlementDenied writes the cooldown on: a read that finds the
+   * cooldown over also clears it for rotation, so a caller's own clock would
+   * decide the manager's state. */
+  isEntitlementDenied(index) {
+    return this._entitlementDenied(this.accounts[index]);
   }
 
   /** Keep a Codex account out of rotation for one model its ChatGPT plan
@@ -1897,11 +1901,14 @@ export class AccountManager {
     // When every request's provider owns the slot, `borrowed` is always false,
     // the re-seed below never runs, and nothing reads the `providerCursors`
     // entry this method writes. For a provider that does not own the slot the
-    // entry is read twice over: by the re-seed, and by
+    // entry is read three times over: by the re-seed; by
     // `_currentIndexForProvider`, which status's `currentAccounts`,
     // `currentIndexes` and route targets, the TUI's ► in a mixed fleet,
-    // `releasePins` and `_unstrandCursor` go by. It names an account by
-    // position, so removeAccount renumbers it.
+    // `releasePins` and `_unstrandCursor` go by; and by the session-reset
+    // switch on a poll or under a manual choice, which, when the entry names
+    // one of that provider's own accounts, weighs that provider's resets
+    // against it and moves only the entry (`_switchOnSessionReset`). It names
+    // an account by position, so removeAccount renumbers it.
     const owner = providerOf(this.accounts[this.currentIndex]);
     const borrowed = !!this.accounts.length && owner !== provider;
     const saved = this.currentIndex;
@@ -4411,13 +4418,16 @@ export class AccountManager {
 
   /**
    * The session-reset switch (_switchOnSessionReset), on by default. When an
-   * account's 5-hour window resets and its weekly window lapses sooner than the
-   * current account's, the cursor moves to it even though the current account
-   * is healthy, and every conversation behind the cursor loses its prompt
-   * cache. Off, the reset only returns the account to rotation: traffic stays
-   * where it is until rotation has to pick. Only a literal `false` turns it off,
-   * so a hand-edited `"false"` keeps today's behaviour. Applied live on config
-   * reload.
+   * account's 5-hour window resets and its deadline (its weekly reset, or its
+   * end time when that comes first; see _deadline) is sooner than the current
+   * account's, its provider's cursor moves to it even though the current
+   * account is healthy, and every conversation behind that cursor loses its
+   * prompt cache. Off, the reset only returns the account to rotation: traffic
+   * stays where it is until rotation has to pick, unless
+   * preferSoonestWeeklyReset is on, which moves traffic to the account with
+   * the soonest deadline as soon as it can serve again. Only a literal `false`
+   * turns it off, so a hand-edited `"false"` keeps today's behaviour. Applied
+   * live on config reload.
    * @param {boolean} enabled
    */
   setSwitchOnSessionReset(enabled) {
@@ -5593,9 +5603,10 @@ export class AccountManager {
    * the view instantly rather than waiting for the next request.
    *
    * When an account's session quota resets, it may have become the better
-   * choice — switch to it if its weekly limit expires sooner than the current
-   * account's (and it still has weekly quota), so we spend the quota closest to
-   * refreshing first.
+   * choice — switch to it if its deadline (its weekly reset, or its end time
+   * when that comes first; see _deadline) is sooner than the current account's
+   * (and it still has weekly quota), so we spend the quota closest to expiring
+   * first.
    */
   /**
    * Clear windows whose reset has passed, WITHOUT the session-reset switch.
@@ -5636,7 +5647,11 @@ export class AccountManager {
     // applied to its exclusion set. Inside a walk the partition still holds: a
     // request spends only the events its own provider can act on, and the other
     // provider's stay pending for its own next request. A poll or a direct caller
-    // has no walk, and keeps the knob-off behaviour it has always had.
+    // has no walk, and spends every provider's events on sight as it always has;
+    // the switch then weighs each provider's against the account that provider's
+    // traffic is on - its own cursor or, where it has none, the shared cursor's
+    // account when that can serve it - and leaves a provider with none to its
+    // walk (see _switchOnSessionReset).
     const partition = !this.expiryRouting?.enabled && this._selectingProvider != null
       ? this._excludeOtherProviders(null, this._selectingProvider)
       : null;
@@ -5671,38 +5686,71 @@ export class AccountManager {
 
   /**
    * Given accounts whose session quota just reset, switch to the one whose
-   * weekly limit expires soonest — but only if that is sooner than the current
-   * account's weekly limit and the account still has weekly quota to spend.
+   * deadline is soonest (its weekly reset, or its end time when that comes
+   * first; see _deadline) — but only if that is sooner than the current
+   * account's deadline and the account still has weekly quota to spend.
    *
-   * `incumbent` is set only by the manual-choice branch below: the account
-   * another provider's cursor rests on, which that provider's candidates are
-   * weighed against, and whose cursor - not the shared one - the switch moves.
-   * That branch hands no model, advisor model or exclusion set with it.
+   * `incumbent` is set only by the provider split below, on a poll or with the
+   * cursor on a manual choice: the account another provider's traffic starts
+   * from - the account its cursor rests on or, on a poll, the shared cursor's
+   * account (where the shared provider's run left it, or failing that where it
+   * rested before) when it has no cursor of its own - which that provider's
+   * candidates are weighed against; the switch then moves that provider's
+   * cursor, not the shared one. The split hands no model, advisor model or
+   * exclusion set with it. `heldRun` is the split's first run: the shared
+   * cursor's own provider's candidates, with the caller's arguments.
    * @param {any[]} candidates
    * @param {*} [model]
    * @param {*} [exclude]
    * @param {*} [advisorModel]
    * @param {*} [incumbent]
+   * @param {boolean} [heldRun]
    */
-  _switchOnSessionReset(candidates, model = null, exclude = null, advisorModel = null, incumbent = null) {
+  _switchOnSessionReset(candidates, model = null, exclude = null, advisorModel = null, incumbent = null, heldRun = false) {
     const current = incumbent ?? this.accounts[this.currentIndex];
+    // With expiry routing off (the default), a poll - the TUI repaint, GET
+    // /teamclaude/quota, get_quota, startup - spends every provider's resets at
+    // once (with it on, a poll spends none: see refreshExpiredQuotas), and the
+    // shared cursor is one provider's: the provider of the account it rests on.
+    // That provider's run goes first, so every other provider is weighed after
+    // the shared cursor has moved as far as this poll moves it. Another
+    // provider's reset moves that provider's own cursor - the one its next walk
+    // borrows - and never the shared one. Each such provider is weighed against
+    // its OWN incumbent: the account its cursor rests on or, with no cursor of
+    // its own (none yet, or one left on another provider's account), the shared
+    // cursor's account when that can serve it - a shared API key, where that
+    // provider's next walk starts - and failing that the account the shared
+    // cursor rested on before this poll, when that can serve it, which a
+    // request of that provider arriving first would have weighed it against.
+    // That fallback is not taken while selectActiveAccount runs: there the
+    // shared cursor has not been placed yet (it is the constructor's index 0,
+    // which no traffic rests on), and the start is picked after the poll. Its
+    // reset, priority and rank are what a candidate has to beat, never an
+    // account of a different fleet. Weighed in one field with the shared
+    // cursor's account, a Codex account resetting in two days took the shared
+    // cursor from a Claude account resetting in five, and the Codex cursor with
+    // it, off a Codex account resetting in one. A provider with none of these
+    // has no incumbent to compare against and is left to its walk, as an
+    // unknown reset below leaves the current account alone: that walk starts
+    // from an account it cannot be sent to, and picks on merit.
+    // A request's walk is not split, except under a manual choice (below): it
+    // weighs its candidates against the slot it walks from. That slot can be
+    // another provider's account (any walk of a provider with no cursor of its
+    // own), and the candidates can include an API key that reads as another
+    // provider's, so on a request a Codex reset can still be weighed against a
+    // Claude account.
     // A manual choice outranks the automatic rankings for its own provider's
     // traffic (docs/usage.md), and moving onto a sooner-resetting account is one
     // of them - the line _preemptedBy draws for priority; like it, this one
     // leaves availability to the request walk, which moves off a choice that can
     // no longer serve. So with the cursor on the choice, the switch takes no
-    // candidate of the choice's provider and never moves the shared cursor.
-    // Without that it moved the cursor off the operator's pick, and _setCurrent
-    // dropped the choice with it: on a request, and with expiry routing off on
-    // every poll too (the TUI repaint, GET /teamclaude/quota, get_quota).
-    // A poll sees every provider's resets, and another provider's still moves
-    // that provider's own cursor - the one its next walk borrows. Each such
-    // provider is weighed against its OWN incumbent, the account that cursor
-    // rests on: its reset, priority and rank are what a candidate has to beat,
-    // never the choice's, which belongs to a different fleet. A provider with
-    // no cursor of its own (none yet, or one left on another provider's
-    // account) has no incumbent to compare against and is left to its walk,
-    // as an unknown reset below leaves the current account alone.
+    // candidate of the choice's provider and never moves the shared cursor, on
+    // a request as on a poll; another provider's candidates are split off as
+    // above, and fall back to the shared cursor's account on a poll only (a
+    // request that brings such a provider's reset with no cursor for it spends
+    // the reset unacted on). Without that it moved the cursor off the
+    // operator's pick, and _setCurrent dropped the choice with it: on a
+    // request, and with expiry routing off on every poll too.
     // Handed no model, advisor model or exclusion set: that cursor serves
     // every request of its provider behind this one, so moving it is a
     // decision for the whole cursor, never narrowed by one request's model or
@@ -5713,27 +5761,36 @@ export class AccountManager {
     // band over the accounts a Claude route admits. (Its exclusion set changes
     // nothing: the candidates it brings were already filtered by its exclusion
     // set and model.)
-    if (!incumbent && current && this._isManualChoice(current)) {
+    const manual = !incumbent && this._isManualChoice(current);
+    const poll = this._selectingProvider == null;
+    if (!incumbent && !heldRun && current && (manual || poll)) {
       const held = providerOf(current);
+      if (!manual) this._switchOnSessionReset(candidates.filter(acc => providerOf(acc) === held), model, exclude, advisorModel, null, true);
+      const shared = this.accounts[this.currentIndex];
       for (const provider of new Set(candidates.map(providerOf))) {
         if (provider === held) continue;
-        const own = this.accounts[this.providerCursors.get(provider) ?? -1];
-        if (!own || providerOf(own) !== provider) continue;
+        let own = this.accounts[this.providerCursors.get(provider) ?? -1];
+        if (!own || providerOf(own) !== provider) {
+          own = !poll || this._startingUp ? null
+            : canServeProvider(shared, provider) ? shared : canServeProvider(current, provider) ? current : null;
+        }
+        if (!own) continue;
         this._switchOnSessionReset(candidates.filter(acc => providerOf(acc) === provider), null, null, null, own);
       }
       return;
     }
-    // Need a known weekly reset on the current account to compare against;
-    // if it is unknown we are still probing it, so leave it alone. Read through
-    // the ranking so the account is compared on the window that governs THIS
-    // request; with the knob off that is the shared weekly.
+    // Need a known deadline on the current account to compare against; if it
+    // is unknown we are still probing it, so leave it alone. Read through the
+    // ranking so the account is compared on the window that governs THIS
+    // request (with the knob off, the shared weekly), or on its end time when
+    // that comes first.
     const currentReset = current && this._rankingReset(current, model);
     if (!current || currentReset == null) return;
 
-    // Only accounts whose weekly expires sooner than the current one's are
-    // candidates: the "and weekly expires sooner" half of what this function is
-    // for. Kept separate from the ranking, so the ranking can change without
-    // moving the trigger.
+    // Only accounts whose deadline is sooner than the current one's are
+    // candidates: the "and weekly expires sooner" (or "it ends sooner") half of
+    // what this function is for. Kept separate from the ranking, so the ranking
+    // can change without moving the trigger.
     const eligible = [];
     for (const acc of candidates) {
       if (acc.index === current.index) continue;
@@ -5750,9 +5807,9 @@ export class AccountManager {
       if (!this._isAvailable(acc, model, advisorModel)) continue; // enough session & weekly quota left
       // Don't demote to a lower-priority (higher value) account on a reset.
       if ((acc.priority || 0) > (current.priority || 0)) continue;
-      const weekly = this._rankingReset(acc, model);
-      if (weekly == null) continue; // need a known weekly to compare
-      if (weekly < currentReset) eligible.push(acc);
+      const deadline = this._rankingReset(acc, model);
+      if (deadline == null) continue; // need a known deadline to compare
+      if (deadline < currentReset) eligible.push(acc);
     }
     if (!eligible.length) return;
 
@@ -5798,7 +5855,11 @@ export class AccountManager {
     // direct caller has none and means the default fleet. Kept inside the `&&`
     // rather than hoisted, so the knob-off path evaluates none of it.
     // Another provider's cursor serves that provider's fleet, so its band is
-    // drawn over that partition.
+    // drawn over that partition, its incumbent's. An incumbent that is the
+    // shared cursor's API key, a fallback only a poll takes, reads as Claude's:
+    // the band is then Claude's, a Codex `best` is not in it, and the run
+    // returns. With expiry routing on a poll spends no reset, so only a direct
+    // caller reaches the band with one.
     if (this.expiryRouting.enabled && !this._bandedCandidates(
       this._excludeOtherProviders(null, incumbent ? providerOf(incumbent) : (this._selectingProvider || DEFAULT_PROVIDER)),
       model, advisorModel).includes(best)) return;
@@ -5806,12 +5867,15 @@ export class AccountManager {
     // that got us here, and with expiry routing off every rank is absent and
     // equal, so this cannot fire at all.
     if (rankOf.get(best.index) > rankOf.get(current.index)) return;
-    // Another provider's account while the cursor holds a manual choice: move
-    // only that provider's cursor, so its next walk starts there.
+    // Say which clock decided it, as eligibility() does: an account taken for
+    // its end time is not explained by a weekly reset that comes later.
+    const why = this._rankingReset(best, model) === best.endsAt ? 'it ends sooner' : 'weekly expires sooner';
+    // Another provider's account, on a poll or while the cursor holds a manual
+    // choice: move only that provider's cursor, so its next walk starts there.
     if (incumbent) {
       this.providerCursors.set(providerOf(best), best.index);
       this._beginRamp(best);
-      console.log(`[TeamClaude] Account "${best.name}" session quota reset and weekly expires sooner — its provider's traffic switches to it`);
+      console.log(`[TeamClaude] Account "${best.name}" session quota reset and ${why} — its provider's traffic switches to it`);
       return;
     }
     // Aiming, like every other cursor move: the reading was taken before this
@@ -5819,7 +5883,7 @@ export class AccountManager {
     // failed back onto the same account still finds the roll waiting.
     this._setCurrent(best);
     this._beginRamp(best);
-    console.log(`[TeamClaude] Account "${best.name}" session quota reset and weekly expires sooner — switching to it`);
+    console.log(`[TeamClaude] Account "${best.name}" session quota reset and ${why} — switching to it`);
   }
 
   /**
@@ -5876,8 +5940,11 @@ export class AccountManager {
    * The readings that hold `account` out of rotation for `model`, when the
    * switch threshold on a WEEKLY reading is what holds it. Null when it is
    * serving, when something other than the threshold bars it (disabled, a cap,
-   * a hold, an error: whatever unavailableReason reports ahead of `quota`), or
-   * when only its 5-hour, token or request reading is over.
+   * an error: whatever unavailableReason reports ahead of `quota`), or when
+   * only its 5-hour, token or request reading is over. A rate-limit hold is the
+   * exception: the proxy usually learns of upstream's 5-hour wall from the 429
+   * that arms one, and a reset lifts the hold too (the redeemer clears it), so
+   * the readings behind the hold decide whether the account stays out.
    *
    * For the reset redeemer (#685): selection stops using an account at its
    * threshold, so a busy fleet parks every account just short of upstream's own
@@ -5894,7 +5961,8 @@ export class AccountManager {
    * @returns {string[]|null}
    */
   weeklyParkedBuckets(account, model = null) {
-    if (this.unavailableReason(account, model) !== 'quota') return null;
+    const reason = this.unavailableReason(account, model);
+    if (reason !== 'quota' && !(reason === 'throttled' && this._isNearQuota(account, model))) return null;
     const q = account.quota;
     const key = this._weeklyBucketFor(model);
     const threshold = this.thresholdFor(key, account);
@@ -6032,7 +6100,16 @@ export class AccountManager {
    * available (the server still starts; requests 429 until a window resets).
    */
   selectActiveAccount() {
-    this.refreshExpiredQuotas(); // drop any restored windows that already expired
+    // Drop any restored windows that already expired. The shared cursor has
+    // not been placed yet (it is the constructor's index 0, which no traffic
+    // rests on), so the session-reset switch takes no account as another
+    // provider's incumbent for it (see _switchOnSessionReset).
+    this._startingUp = true;
+    try {
+      this.refreshExpiredQuotas();
+    } finally {
+      this._startingUp = false;
+    }
     const best = this._pickBestAvailable();
     if (!best) return this.accounts[this.currentIndex] || null;
     this._setCurrent(best);
