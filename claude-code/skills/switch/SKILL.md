@@ -14,7 +14,7 @@ Arguments: $ARGUMENTS
 
 Never move the session without the user's answer.
 
-If arguments are given, they are one account name, or any part of a name that only one account contains, spaces included. Run `teamclaude switch --session --to '$ARGUMENTS'`, keeping the single quotes so the whole name is one word (write a `'` inside the name as `'\''`). Do nothing else.
+If arguments are given, they are one account name, spaces included. Run `teamclaude switch --session --to '$ARGUMENTS'`, keeping the single quotes so the whole name is one word (write a `'` inside the name as `'\''`). Do nothing else.
 
 If no arguments are given, show the account, per-account usage and advice above. If that output is empty, run `teamclaude switch --session` with the shell tool and use its output. Then ask the user to choose one:
 
