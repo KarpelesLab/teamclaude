@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import http from 'node:http';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
 import { ClaudeResetRedeemer, parseResetStatus } from '../src/claude-resets.js';
@@ -35,13 +36,14 @@ const DETAILS = { provider: 'claude', error: null, seenAt: 1, stale: false, retr
     endsAt: null, next: true, blocked: null, warnings: [] }] };
 
 function stubActions({ cached = () => DETAILS, window = () => ({ readAt: null, until: 0 }), read = async () => DETAILS, redeem } = {}) {
-  const calls = { cached: [], read: [], redeem: [] };
+  const calls = { cached: [], read: [], redeem: [], opts: [] };
   const actions = {
     cached: account => { calls.cached.push(account.name); return cached(account); },
     readWindow: account => window(account),
     read: async account => { calls.read.push(account.name); return read(account); },
-    redeem: async (account, grantId) => {
+    redeem: async (account, grantId, opts) => {
       calls.redeem.push([account.name, grantId]);
+      calls.opts.push(opts);
       return redeem ? redeem(account, grantId)
         : { redeemed: true, uncertain: false, message: `Manually redeemed a claude reset on "${account.name}" (reset)`, result: 'reset', resetsLeft: 0, cleared: ['seven_day'] };
     },
@@ -49,9 +51,9 @@ function stubActions({ cached = () => DETAILS, window = () => ({ readAt: null, u
   return { actions, calls };
 }
 
-async function withServer(hooks, fn) {
+async function withServer(hooks, fn, config = CONFIG) {
   const am = new AccountManager(ACCTS.map(a => ({ ...a })), 0.98);
-  const proxy = createProxyServer(am, CONFIG, hooks);
+  const proxy = createProxyServer(am, config, hooks);
   const port = await listen(proxy);
   const logs = [];
   const orig = console.log;
@@ -204,6 +206,43 @@ test('a cross-origin page cannot spend a reset', async () => {
   });
 });
 
+// With no proxy key the gate admits every caller, so the routes hold the
+// MCP endpoint's line themselves: this machine only, and a Host that names
+// it (a rebound page is same-origin to its browser and passes the gate above).
+test('a key-less proxy serves the resets routes to this machine only', async () => {
+  const { actions, calls } = stubActions();
+  const keyless = { proxy: {}, upstream: CONFIG.upstream };
+  // fetch() refuses to set Host, so these drive http.request.
+  const send = (port, method, path, headers) => new Promise((resolve, reject) => {
+    const req = http.request({ host: '127.0.0.1', port, path, method, headers: { 'content-type': 'application/json', ...headers } }, (res) => {
+      res.resume();
+      res.on('end', () => resolve(res.statusCode));
+    });
+    req.on('error', reject);
+    req.end(method === 'POST' ? JSON.stringify({ account: 'alice@example.com', grantId: 'g-weekly' }) : undefined);
+  });
+  await withServer({ resetActions: actions }, async (port) => {
+    const local = { host: `127.0.0.1:${port}` };
+    assert.equal(await send(port, 'POST', '/teamclaude/resets/redeem', { host: 'attacker.example' }), 403);
+    assert.equal(await send(port, 'POST', '/teamclaude/resets/redeem', { ...local, 'x-forwarded-for': '203.0.113.9' }), 403);
+    assert.equal(await send(port, 'GET', '/teamclaude/resets', { host: 'attacker.example' }), 403);
+    assert.deepEqual(calls.redeem, []);
+    assert.deepEqual(calls.cached, []);
+    assert.equal(await send(port, 'POST', '/teamclaude/resets/redeem', local), 200);
+    assert.deepEqual(calls.redeem, [['alice@example.com', 'g-weekly']]);
+  }, keyless);
+});
+
+test('redeem refuses during the hold unless the body says force', async () => {
+  const { actions, calls } = stubActions();
+  await withServer({ resetActions: actions }, async (port) => {
+    await post(port, '/teamclaude/resets/redeem', { account: 'alice@example.com', grantId: 'g-weekly' });
+    await post(port, '/teamclaude/resets/redeem', { account: 'alice@example.com', grantId: 'g-weekly', force: 'yes' });
+    await post(port, '/teamclaude/resets/redeem', { account: 'alice@example.com', grantId: 'g-weekly', force: true });
+    assert.deepEqual(calls.opts, [{ refuseWhileHeld: true }, { refuseWhileHeld: true }, { refuseWhileHeld: false }]);
+  });
+});
+
 // The hook the server is given is reset-actions.js itself (index.js): one
 // pass through the real module, with the network stubbed at the redeemer,
 // pins the shape the routes rely on.
@@ -237,6 +276,12 @@ test('the routes drive the real reset actions end to end', async () => {
     const spent = await post(port, '/teamclaude/resets/redeem', { account: 'alice@example.com', grantId: 'g-weekly' });
     assert.equal(spent.status, 200);
     assert.equal((await spent.json()).redeemed, true);
+    assert.deepEqual(claims, [['alice@example.com', 'g-weekly']]);
+    // The same POST again, as a caller that lost the answer would send it:
+    // the hold the claim armed refuses it, and nothing more is claimed.
+    const again = await post(port, '/teamclaude/resets/redeem', { account: 'alice@example.com', grantId: 'g-weekly' });
+    assert.equal(again.status, 409);
+    assert.match((await again.json()).error, /"force": true/);
     assert.deepEqual(claims, [['alice@example.com', 'g-weekly']]);
   } finally {
     console.log = orig;

@@ -813,6 +813,13 @@ other control mutation.
   A spend answers `200` with `resetsLeft` and `cleared`, a refusal `409` with
   the reason, and a claim with no verdict `502` with `"uncertain": true` (it
   may have been spent; read again to learn). Every outcome is logged.
+  For an hour after a claim that landed or may have landed (the hold the
+  panel shows as a warning), the route refuses another with `409`, so a
+  request retried after a lost answer does not spend twice; `"force": true`
+  in the body spends anyway.
+
+With no `proxy.apiKey` set, the three routes answer only requests from this
+machine that name it in `Host`, as the MCP endpoint does.
 
 The account is named as for `teamclaude switch`. Grant ids come from the list
 and stay in memory only, like the panel's.

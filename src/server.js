@@ -1187,6 +1187,13 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         const actions = hooks.resetActions;
         if (!actions) { reply(501, { ok: false, error: 'resets not supported' }); return; }
         if (req.tcClient) { reply(403, { ok: false, error: 'a client key cannot read resets' }); return; }
+        // With no proxy key at all the gate above admits every caller, from
+        // any address and whatever Host it names (a rebound page is
+        // same-origin to its browser). That is tolerable for forwarding, not
+        // for routes that hand out spend handles and spend them: as for the
+        // MCP endpoint, a key-less proxy serves these to this machine only.
+        const keyless = keylessMcpRefusal(req.headers, req.socket.remoteAddress, config.proxy, boundHost(), 'the resets routes');
+        if (keyless) { reply(403, { ok: false, error: keyless }); return; }
         const readableAt = (/** @type {Record<string, any>} */ account) => {
           const until = actions.readWindow(account)?.until;
           return Number.isFinite(until) && until > Date.now() ? until : null;
@@ -1224,7 +1231,10 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           reply(200, { ok: true, account: account.name, read: wait == null, details: details ?? null, readableAt: wait == null ? readableAt(account) : wait });
           return;
         }
-        const result = await actions.redeem(account, body.grantId);
+        // Nobody reads a warning here, so the hold a recent claim armed is a
+        // refusal unless the caller says otherwise: a POST retried because its
+        // answer was lost would spend a second reset of a grant holding two.
+        const result = await actions.redeem(account, body.grantId, { refuseWhileHeld: body.force !== true });
         // The TUI logs this line to its activity pane; headless mode tees
         // console.log to the activity log, so the spend leaves the same trace.
         console.log(`[TeamClaude] ${result.message}`);
