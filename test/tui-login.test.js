@@ -115,6 +115,28 @@ test('login: one browser flow at a time', async () => {
   assert.equal(tui._loggingIn, null);
 });
 
+// The sign-in `l` runs is the ordinary one. On a long-lived row it turned the
+// account into a refreshing one (its entry kept ids) or added the account it
+// signed in as beside it (its entry had only a name); the row's own remedy is
+// the long-lived login, which is where `l` points instead.
+test('login: a long-lived account is not signed in from here, and the line names its own login', async () => {
+  let calls = 0;
+  const tui = makeTUI({
+    accounts: [
+      { name: 'ok@example.com', index: 0, type: 'oauth', status: 'active', credential: 't' },
+      { name: 'year', index: 1, type: 'oauth', status: 'error', credential: 't', longLived: true },
+    ],
+    loginAccount: async () => { calls++; return { action: 'updated', name: 'year' }; },
+  });
+  tui._key('l');
+  assert.equal(tui.am.accounts[tui.selIdx].name, 'year');
+  tui._key('enter');
+  await new Promise(r => setImmediate(r));
+  assert.equal(calls, 0);
+  assert.ok(logged(tui).some(m => m.includes('"year" holds a long-lived token') && m.includes('teamclaude login --long-lived --name "year"')), logged(tui).join('\n'));
+  assert.notEqual(tui.mode, 'login', 'no login panel was opened');
+});
+
 test('login: an API-key account has nothing to sign in to', async () => {
   let calls = 0;
   const tui = makeTUI({ loginAccount: async () => { calls++; return {}; } });

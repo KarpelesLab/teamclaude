@@ -19,6 +19,7 @@ import {
   orgKey,
   matchAccounts,
   findUpsertTarget,
+  apiKeyNamed,
   codexLoginTarget,
   updateAccountEntry,
   canUpsertOAuthAccount,
@@ -80,8 +81,10 @@ function standaloneCredentialSync() {
 
 /**
  * An explicit sign-in (`login`, `import`): store the entry's tokens, over a
- * tombstone included, when this install is signed in to callback.net. Never
- * fatal — the account is in the config either way, and its next renewal stores it.
+ * tombstone included, when this install is signed in to callback.net. Not
+ * `login --long-lived`, which is never stored (storeSignIn resolves false).
+ * Never fatal — the account is in the config either way, and an ordinary
+ * sign-in's next renewal stores it.
  * @param {Record<string, any>} entry
  */
 async function recordSignInWithCallback(entry) {
@@ -1053,6 +1056,8 @@ async function serverCommand() {
   // Shared with the listener (drain.js): POST /teamclaude/drain flips it, and a graceful
   // shutdown waits on the same in-flight count.
   const drain = createDrainState();
+  // The resets routes: the same reads and claims as the TUI's resets panel.
+  hooks.resetActions = resetActions;
   const server = createProxyServer(accountManager, config, hooks, sx, clientUsage, dimensionUsage, { bindHost, drain, usageStore });
   // Said once, at start: a value that is set but cannot turn the drain on would otherwise
   // leave SIGTERM stopping at once with nothing to say why.
@@ -1244,6 +1249,7 @@ async function importCommand() {
   // applied) before anything reaches the network. The list is not written back
   // from this copy — upsertOAuthAccount re-reads the file when it saves.
   const config = await loadOrCreateConfig();
+  refuseApiKeyName(config);
 
   let name = argValue('--name');
   const jsonStr = argValue('--json');
@@ -1287,6 +1293,35 @@ async function importCommand() {
 }
 
 // ── login ───────────────────────────────────────────────────
+
+/**
+ * Why a login or import is not saved under an API-key account's name (see
+ * apiKeyNamed), and what to do. The `--name` advice is for the command line;
+ * the TUI's sign-in takes no name.
+ * @param {string} name
+ * @param {boolean} cli
+ */
+function apiKeyNameRefusal(name, cli) {
+  return `"${name}" already names an API-key account: ${cli ? 'sign in under another --name, or ' : ''}remove or rename that account first`;
+}
+
+/**
+ * Exit when `--name` names an API-key account and no Claude OAuth one, before
+ * anything is opened, read or renewed. The save would refuse that name
+ * (upsertOAuthAccount), but only after the sign-in, or the renewal an import's
+ * stale token needs, had been spent, and their token would be dropped. With a
+ * Claude OAuth account of that name, the login may well be its own, and goes
+ * ahead. A Codex account of that name is no such reason: a Claude login is
+ * never a Codex account's (sameIdentity tells the providers apart).
+ * @param {Record<string, any>} config
+ */
+function refuseApiKeyName(config) {
+  const name = argValue('--name');
+  const accounts = config?.accounts || [];
+  if (!name || accounts.some((/** @type {any} */ a) => a?.type === 'oauth' && providerOf(a) === 'anthropic' && a.name === name) || !apiKeyNamed(accounts, name)) return;
+  console.error(apiKeyNameRefusal(name, true));
+  process.exit(1);
+}
 
 /**
  * The --routing flag: the account's own egress proxy URL
@@ -1520,10 +1555,11 @@ async function loginCommand() {
     }
     // Before anything is opened or asked: the token this login returns carries
     // `user:inference` alone, so the profile that names every other login
-    // cannot be read with it, and the name is all the account is known by.
+    // cannot be read with it. The name is what the account is known by, with
+    // the account its token answer names, when it names one (upsertOAuthAccount).
     if (!argValue('--name')) {
       console.error('--long-lived needs --name: its token serves inference only, so the account cannot be named from its profile.');
-      console.error('Usage: teamclaude login --long-lived --name <name>   (the name of an existing account renews that one)');
+      console.error('Usage: teamclaude login --long-lived --name <name>   (an existing account\'s name renews it, unless the token was signed in as another account)');
       process.exit(1);
     }
     await loginOAuthCommand({ pasteOnly: true, longLived: true });
@@ -1622,6 +1658,7 @@ async function loginApiCommand() {
 
 async function loginOAuthCommand({ pasteOnly = false, longLived = false } = {}) {
   const loaded = await loadOrCreateConfig(); // first run: create the file; the save re-reads it
+  refuseApiKeyName(loaded);
   let name = argValue('--name');
   const { routing, store } = loginRouting(loaded);
   await requireWorkingRouting(routing, upstreamFor({ type: 'oauth' }, loaded.upstream));
@@ -3481,7 +3518,8 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
   // A long-lived token (long-lived.js) is not asked: the profile endpoint
   // needs a scope it does not carry and would answer 403. What stands in is
   // the shape of a profile that could not be read, so the account goes by the
-  // name given, which loginCommand has already required.
+  // name given, which loginCommand has already required, and by the account
+  // its sign-in's token response named, when it named one (startOAuthLogin).
   const longLived = creds.longLived === true;
   // The refresh goes through the callback.net lock when this install is
   // signed in there: the token being imported may be one the store holds, and
@@ -3511,9 +3549,7 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
     process.exit(1);
   }
 
-  if (longLived) {
-    console.log('A long-lived token serves inference only: the account is saved under the name given, with no profile lookup.');
-  } else if (!profileOk) {
+  if (!longLived && !profileOk) {
     console.error(`Warning: importing named account without profile detection — ${profile?.error ? sanitizeText(profile.error) : 'profile unavailable'}`);
   }
   if (!name && profile?.email) {
@@ -3533,6 +3569,9 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
   let outcome = { action: 'added', name: name || '' };
   /** @type {Record<string, any>|null} */
   let signedIn = null;
+  // Another entry holding the name a long-lived login was given with --name,
+  // when the login was saved onto a different one (see below).
+  let namesake = false;
   const config = await atomicConfigUpdate(config => {
     if (!name) {
       const n = config.accounts.filter(a => a.name.startsWith('account-')).length + 1;
@@ -3543,7 +3582,10 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
       name,
       type: 'oauth',
       source,
-      ...oauthIdentityFields(profile),
+      // A long-lived login's is what its token response named: as a profile
+      // does for any other login, it decides which entry this is, so a token
+      // signed in as another account is not saved under this one's ids.
+      ...oauthIdentityFields(longLived ? creds : profile),
       organizationType: profile?.organizationType || null,
       rateLimitTier: profile?.rateLimitTier || creds.rateLimitTier || null,
       seatTier: profile?.seatTier || null,
@@ -3559,8 +3601,8 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
       ...(longLived && { longLived: true }),
     };
     // No profile was read for a long-lived login, so it states no plan. The
-    // keys are left off rather than written as null: onto an entry of the
-    // same name, what an earlier full login learned about the account stays.
+    // keys are left off rather than written as null: onto the entry it
+    // updates, what an earlier full login learned about the account stays.
     if (longLived) {
       for (const field of ['organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro']) delete (/** @type {Record<string, any>} */ (account))[field];
     }
@@ -3582,10 +3624,19 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
       // came with (the login response, the credential file), or dropped.
       setRefreshTokenExpiry(config.accounts[idx], creds.refreshTokenExpiresAt);
       outcome = { action: 'updated', name: prev.name };
+      namesake = longLived && userNamed && prev.name !== name && config.accounts.some((/** @type {Record<string, any>} */ a, /** @type {number} */ i) => i !== idx && a.name === name);
       if (storeRouting && !routing) delete config.accounts[idx].routing; // --routing none
       console.log(`Updated account "${prev.name}"`);
       if (!storeRouting) noteUnusedRouting(prev, routing);
     } else {
+      // Not under the name it was given, or its profile's email, when an
+      // API-key account holds that name (apiKeyNamed). A --name of one was
+      // refused before anything was spent (refuseApiKeyName); this catches a
+      // name known only now (a profile's email, or a sign-in as another
+      // account than the OAuth entry of that name), whose token is then
+      // dropped. The " (org)" name a second organization gets below is not
+      // checked. Thrown, the update is abandoned and nothing is written.
+      if (apiKeyNamed(config.accounts, account.name)) throw new ConfigOpError(apiKeyNameRefusal(account.name, fatal));
       // New org for this person: if another entry shares the accountUuid, the bare
       // email name would collide — disambiguate both with " (org)".
       if (!userNamed && account.accountUuid) {
@@ -3604,7 +3655,20 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
       console.log(`Added account "${account.name}"`);
     }
     signedIn = config.accounts[idx >= 0 ? idx : config.accounts.length - 1];
+  }).catch((/** @type {any} */ err) => {
+    // A refusal above; the TUI's login reports it as its failure.
+    if (!(err instanceof ConfigOpError) || !fatal) throw err;
+    console.error(err.message);
+    process.exit(1);
   });
+  // Said once the entry is known: one that already holds the account the
+  // token answer named is renewed under its own name, not the one given.
+  if (longLived) console.log(`A long-lived token serves inference only: saved as "${outcome.name}", with no profile lookup.`);
+  // A renewal meant for the entry named with --name that the token answer
+  // placed on another one: the named entry keeps its old token, which lapses.
+  if (namesake) {
+    console.log(`"${sanitizeText(name)}" was left as it is: this token is for the account "${sanitizeText(outcome.name)}" already holds. If "${sanitizeText(name)}" was an earlier long-lived login of the same account, remove it with: teamclaude remove ${JSON.stringify(sanitizeText(name))}`);
+  }
   console.log(`Saved to ${getConfigPath()}`);
   // Before the server is told: its reload pass would otherwise read a tombstone
   // for an account that was just signed in again and remove it.

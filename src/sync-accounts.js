@@ -160,6 +160,10 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     // Backfill org identity and pick up renames/priority onto the running
     // account (e.g. after disk-side org disambiguation or a `priority` change).
     if (diskAcct.orgUuid && !mgr.orgUuid) mgr.orgUuid = diskAcct.orgUuid;
+    // The account id too: a long-lived login learns it from its token answer,
+    // onto an entry that had none, and a removal made in the running server
+    // (the TUI, the MCP endpoint) is recorded under it.
+    if (diskAcct.accountUuid && !mgr.accountUuid) mgr.accountUuid = diskAcct.accountUuid;
     if (diskAcct.orgName && !mgr.orgName) mgr.orgName = diskAcct.orgName;
     for (const field of /** @type {const} */ (['organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro'])) {
       if (diskAcct[field] != null) mgr[field] = diskAcct[field];

@@ -36,8 +36,10 @@
 // its row (`{"_deleted": "<time>"}`), written under the row's lock so that a
 // renewal another install is making under it stores its token first. Every
 // other install's next pass removes the account. An explicit sign-in (`login`,
-// `import`) replaces the tombstone and brings the account back everywhere; the
-// other ways it can come back follow.
+// `import`) replaces the tombstone and brings the account back everywhere; a
+// long-lived login (`login --long-lived`) is never stored, so it brings the
+// account back on the install it was made on only. The other ways it can come
+// back follow.
 //
 // A refresh does not write over a tombstone it reads. One made under the lock
 // does not meet a removal in between, as long as its write lands within the
@@ -190,6 +192,17 @@ export function syncKeyFor(a) {
   const provider = providerOf(a);
   if (provider === 'codex') return `${KEY_PREFIX}codex.${segment(a.accountId)}`;
   return `${KEY_PREFIX}anthropic.${segment(a.accountUuid)}.${segment(a.orgUuid || a.orgName || 'org')}`;
+}
+
+/**
+ * The key a removal of an account is recorded under: its store key, or, for a
+ * long-lived account, which the sync does not carry, the key its identity
+ * would have (see onAccountRemoved). Null when it has no identity to key one.
+ * @param {Record<string, any>} a
+ * @returns {string|null}
+ */
+function removalKeyFor(a) {
+  return syncKeyFor(isLongLived(a) ? { ...a, longLived: false } : a);
 }
 
 /**
@@ -708,6 +721,43 @@ export class CredentialSync {
   }
 
   /**
+   * The row stored under `key`, as last seen, else from a fresh list; null
+   * when the store has none.
+   *
+   * Where a long-lived account's removal is written (see onAccountRemoved).
+   * Such an account has no store key of its own, and the identity scan
+   * _rowFor falls back to takes an organization one side does not know for a
+   * match: an entry with an account UUID and no organization would match
+   * every organization's row of that person, and whichever was listed first
+   * would be removed everywhere. Its removal goes only into the row its
+   * identity's key names.
+   * @param {string} key
+   * @returns {Promise<Row|null>}
+   */
+  async _rowByKey(key) {
+    const seen = this.rows.get(key);
+    if (seen) return seen;
+    this.rows = await this._list();
+    return this.rows.get(key) ?? null;
+  }
+
+  /**
+   * A long-lived account's removal found no row under its own key, and is
+   * given up on. Said only when the store holds rows this account kept from
+   * being added here (sameIdentity, as the pass matches them) and no account
+   * still here does: with it gone, the next pass adds them, as refreshing
+   * accounts, and removing one of those records a tombstone for it on every
+   * install.
+   * @param {Record<string, any>} account
+   */
+  _noRowOfItsOwn(account) {
+    const held = [...this.rows.values()].filter((r) => r.blob && !needsSignIn(r.blob) && sameIdentity(r.blob, account)
+      && !this.am.accounts.some((a) => sameIdentity(a, /** @type {Blob} */ (r.blob)))).length;
+    if (!held) return;
+    this.log(`[TeamClaude] callback.net: the removal of "${safeLine(account.name, 64)}" was not recorded for your other installs: the store holds no row under its account and organization. The ${held === 1 ? 'account' : `${held} accounts`} of that person it holds ${held === 1 ? 'is' : 'are'} added here at the next pass, and removing one removes it on every install`);
+  }
+
+  /**
    * Whether a row names an account removed here whose tombstone is not
    * written yet (see pendingRemovals): by key, or by the identity it carries.
    * @param {Row} row
@@ -881,13 +931,21 @@ export class CredentialSync {
    * signed out after it, or signed in to it again, the removal is given up
    * on. An account a pass evicts for a tombstone is removed in the store
    * already, and nothing is written.
+   * A long-lived account is not carried (isSyncable), but its identity can
+   * be: the account its sign-in's token answer named, or the ids an earlier
+   * full login recorded on the entry it was named onto. A row stored for that
+   * account would add it back here, as a refreshing one, at the next pass.
+   * So its removal is recorded for that identity (removalKeyFor), as any
+   * account's is, and removes that account from every install. It is written
+   * only into the row stored under that key (_rowByKey); one with no identity
+   * has no row to write it into.
    * Resolves with whether a tombstone was written.
    * @param {Record<string, any>} account
    * @param {{ wait?: boolean }} [opts]
    * @returns {Promise<boolean>}
    */
   async onAccountRemoved(account, { wait = true } = {}) {
-    const key = syncKeyFor(account);
+    const key = removalKeyFor(account);
     if (!key || this._evicting.delete(account)) return false;
     // Before anything is awaited: a pass running meanwhile must not add the
     // account back from its row.
@@ -1004,18 +1062,21 @@ export class CredentialSync {
    * Write a pending removal's tombstone. Settled once it is written, and when
    * there is nothing to write: no row (or the row gone since it was read), a
    * tombstone there already, a sign-in here since (storeSignIn), or the
-   * account back on this install. Given up on, and settled, when it is older
-   * than REMOVAL_PENDING_MAX_MS or under another callback.net session than the
+   * account back on this install as one the sync carries (_backHere): a
+   * long-lived login of it is not, and the tombstone lands as it would have
+   * at once. Given up on, and settled, when it is older than
+   * REMOVAL_PENDING_MAX_MS or under another callback.net session than the
    * removal is tied to (each checked on entry, and again with the lock held,
    * just before the write), and when this install is signed out of
    * callback.net. Left pending, to be tried again, when the store cannot be
-   * reached or when the lock is not had within `waitMs`.
+   * reached or when the lock is not had within `waitMs`. A long-lived
+   * account's row is the one under its own key, and none else (_rowByKey).
    * @param {Record<string, any>} account
    * @param {number} waitMs  how long a held lock is waited for
    * @returns {Promise<boolean>} whether a tombstone was written
    */
   async _recordRemoval(account, waitMs) {
-    const key = /** @type {string} */ (syncKeyFor(account));
+    const key = /** @type {string} */ (removalKeyFor(account));
     const name = safeLine(account.name, 64);
     const settle = () => { this._settleRemoval(key, account); return false; };
     // Settled meanwhile (written by a pass, dropped by a sign-in here): done.
@@ -1031,8 +1092,11 @@ export class CredentialSync {
       }
       // Signed in again since: the store may be another user's.
       if (this._dropIfSessionChanged(key, account, await this._readSession())) return false;
-      const row = await this._findRow(account);
-      if (!row) return settle();
+      const row = isLongLived(account) ? await this._rowByKey(key) : await this._findRow(account);
+      if (!row) {
+        if (isLongLived(account)) this._noRowOfItsOwn(account);
+        return settle();
+      }
       const lease = await this._lockWaiting(row, waitMs, () => this.pendingRemovals.get(key) === account);
       if (!lease && this.pendingRemovals.get(key) !== account) return false; // settled while it waited
       if (!lease) {
@@ -1071,8 +1135,10 @@ export class CredentialSync {
 
   /**
    * An explicit sign-in (`login`, `import`): the row takes these tokens
-   * whatever it held, a tombstone included — this is the one thing that brings
-   * a removed account back.
+   * whatever it held, a tombstone included, which is how a removed account is
+   * brought back everywhere (the file header names the other ways it can come
+   * back). Not `login --long-lived`, which is never stored: for an entry the
+   * sync does not carry, nothing is written and this resolves false.
    * @param {Record<string, any>} entry  the config entry, tokens included
    * @returns {Promise<boolean>} whether the store was written
    */
