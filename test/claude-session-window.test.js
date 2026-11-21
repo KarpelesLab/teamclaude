@@ -131,8 +131,8 @@ test('a probe clearing a gating session reading raises the session-reset event; 
     ['gating', 0.99, true, {}],
     ['not gating', 0.5, false, {}],
     ['at a maxUsage cap', 0.7, true, { maxUsage: 0.6 }],
-    // A bare 0 is no cap (capExceeded reads it so), so it holds nothing out.
-    ['maxUsage 0 is no cap', 0.3, false, { maxUsage: 0 }],
+    // A bare 0 is a cap of 0, a hard stop (capExceeded reads it so, #730).
+    ['maxUsage 0 is a cap of 0', 0.3, true, { maxUsage: 0 }],
   ]) {
     const am = new AccountManager([oauth('a', extra)], 0.98);
     const account = am.accounts[0];
