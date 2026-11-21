@@ -193,23 +193,28 @@ export function createDefaultConfig() {
 export async function loadConfig() {
   const path = getConfigPath();
   try {
-    const config = JSON.parse(await readFile(path, 'utf-8'));
-    // A file with no `accounts` key is what an empty or hand-trimmed config
-    // looks like. Every reader treats the list as always present, and the first
-    // one to trip was the save path — so the failure arrived while writing,
-    // long after the read that could have explained it (#330). A missing list
-    // is an empty one.
-    if (!Array.isArray(config.accounts)) config.accounts = [];
-    // Everything downstream pairs config entries to running accounts by entry id,
-    // so a config written before the field existed — or edited by hand — is given
-    // ids here, before anything can read one. The next save persists them.
-    ensureAccountIds(config.accounts);
-    applyUpstreamProxy(config);
-    return config;
+    return configFromFile(JSON.parse(await readFile(path, 'utf-8')));
   } catch (err) {
     if (err.code === 'ENOENT') return null;
     throw err;
   }
+}
+
+/** The config loadConfig hands out, made from the file's parsed contents.
+ * @param {any} config */
+function configFromFile(config) {
+  // A file with no `accounts` key is what an empty or hand-trimmed config
+  // looks like. Every reader treats the list as always present, and the first
+  // one to trip was the save path — so the failure arrived while writing,
+  // long after the read that could have explained it (#330). A missing list
+  // is an empty one.
+  if (!Array.isArray(config.accounts)) config.accounts = [];
+  // Everything downstream pairs config entries to running accounts by entry id,
+  // so a config written before the field existed — or edited by hand — is given
+  // ids here, before anything can read one. The next save persists them.
+  ensureAccountIds(config.accounts);
+  applyUpstreamProxy(config);
+  return config;
 }
 
 /**
@@ -442,4 +447,25 @@ export function loadConfigPersistingIds() {
     if (config && !accountIdsComplete(raw?.accounts)) await writeJsonAtomic(path, config);
     return config;
   });
+}
+
+/**
+ * loadConfigPersistingIds for a reader that usually has nothing to write. The
+ * file is read without the lock, and a read that carries every id is the copy
+ * handed out; only one that lacks an id goes to loadConfigPersistingIds, which
+ * reads again and writes the ids under the lock. Loading through
+ * loadConfigPersistingIds alone would take the lock on every run, and a command
+ * that writes nothing would wait out another writer's hold on it (the 2 s
+ * budget, and its warning). null when there is no file.
+ */
+export async function loadConfigEnsuringIds() {
+  let raw;
+  try {
+    raw = JSON.parse(await readFile(getConfigPath(), 'utf-8'));
+  } catch (err) {
+    if (/** @type {any} */ (err).code === 'ENOENT') return null;
+    throw err;
+  }
+  if (accountIdsComplete(raw?.accounts)) return configFromFile(raw);
+  return loadConfigPersistingIds();
 }
