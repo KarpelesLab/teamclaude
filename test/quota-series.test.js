@@ -195,8 +195,11 @@ test('status carries fleetForecast: null on an empty series, the forecast once t
   assert.ok(lower && lower.allOutAt < f.allOutAt);
 });
 
-test('status carries fleetTimeline by account name, with a busier scenario, and weighs spend by plan', () => {
+test('status carries fleetTimeline by account name, with a busier scenario, and weighs spend by plan', (t) => {
   const now = Date.now();
+  // The status reads the clock itself and caches by the minute: held still, so
+  // the timeline it carries is the one computed for `now` below.
+  t.mock.timers.enable({ apis: ['Date'], now });
   // A 20x account spending 1% an hour of its week, now blocked for 5 days, and
   // an idle 5x one at 50%: the 20x load fills the 5x four times as fast.
   const m = new AccountManager([
@@ -223,6 +226,9 @@ test('status carries fleetTimeline by account name, with a busier scenario, and 
   assert.deepEqual(Object.keys(tl.accounts).sort(), ['big', 'small']);
   assert.equal(tl.accounts.big[0].usable, false);
   assert.equal(tl.outages[0].to, now + 96 * HOUR);
+  for (const state of Object.values(tl.accounts).flat()) assert.ok(Number.isInteger(state.at), `at ${state.at}`);
+  for (const o of [...tl.outages, ...tl.busier.outages]) assert.ok(Number.isInteger(o.from) && (o.to == null || Number.isInteger(o.to)), JSON.stringify(o));
+  assert.ok(Number.isInteger(f.allOutAt), `allOutAt ${f.allOutAt}`);
   assert.equal(tl.busier.loadFactor, 1.25);
   assert.ok(tl.busier.outages[0].from < tl.outages[0].from);
   assert.deepEqual(m.getStatus().fleetTimeline, tl);

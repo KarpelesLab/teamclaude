@@ -387,12 +387,15 @@ export function forecastFleet(input) {
   simulate(prepared, now, now + FORECAST_HORIZON_MS + WEEKLY_PERIOD_MS, 1, (t, fleet, open) => {
     if (allOutAt != null) {
       if (!open.length) return false;
-      firstBackAt = t;
+      firstBackAt = Math.round(t);
       return true;
     }
     if (t - now > FORECAST_HORIZON_MS) { past = true; return true; }
     if (open.length) return false;
-    allOutAt = t;
+    // The simulation steps to the instant a threshold is crossed, a fraction
+    // of a millisecond; what leaves this module is a whole ms epoch, as it
+    // always was for the readers of `status --json`.
+    allOutAt = Math.round(t);
     const weeklyBlocked = fleet.filter(acc => acc.w >= acc.th.weekly).length;
     boundBy = weeklyBlocked * 2 >= fleet.length ? 'weekly' : '5h';
     return false;
@@ -431,12 +434,16 @@ export function fleetTimeline(input) {
     for (const acc of fleet) {
       const states = accounts[acc.id] ??= [];
       const ok = usable(acc);
-      if (states.length && states[states.length - 1].usable === ok) continue;
-      states.push({ at: t, usable: ok, bucket: ok ? null : acc.w >= acc.th.weekly ? 'weekly' : '5h' });
+      // A change of what blocks it is a change too: blocked on both, an
+      // account whose weekly window resets first is then held by the 5-hour one.
+      const bucket = ok ? null : acc.w >= acc.th.weekly ? 'weekly' : '5h';
+      const prev = states[states.length - 1];
+      if (prev && prev.usable === ok && prev.bucket === bucket) continue;
+      states.push({ at: Math.round(t), usable: ok, bucket });
     }
     const last = outages[outages.length - 1];
-    if (!open.length && (!last || last.to != null)) outages.push({ from: t, to: null });
-    if (open.length && last && last.to == null) last.to = t;
+    if (!open.length && (!last || last.to != null)) outages.push({ from: Math.round(t), to: null });
+    if (open.length && last && last.to == null) last.to = Math.round(t);
     return false;
   });
   return { from: now, to: end, accounts, outages };
