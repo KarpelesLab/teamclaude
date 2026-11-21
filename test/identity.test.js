@@ -158,6 +158,19 @@ test('findUpsertTarget: a different person with the same name is a new entry', (
   assert.equal(findUpsertTarget(accounts, { name: 'shared', accountUuid: 'u2', orgUuid: 'o2' }), -1);
 });
 
+// An API-key entry carries no UUID, so the name was all that was compared, and
+// `login --name work` (or an import, or a long-lived login) onto an API-key
+// account named "work" turned it into an OAuth entry that still held the key.
+test('findUpsertTarget: an OAuth login never lands on an API-key entry of its name', () => {
+  const accounts = [{ id: 'k', name: 'work', type: 'apikey', apiKey: 'sk-ant-api03-made-up' }];
+  assert.equal(findUpsertTarget(accounts, { name: 'work', type: 'oauth' }), -1);
+  assert.equal(findUpsertTarget(accounts, { name: 'work', type: 'oauth', accountUuid: 'u1', orgUuid: 'o1' }), -1);
+  assert.equal(findUpsertTarget(accounts, { name: 'work', type: 'oauth', longLived: true }), -1);
+  // An OAuth entry of that name further down is still the one it updates.
+  const both = [...accounts, { id: 'o', name: 'work', type: 'oauth' }];
+  assert.equal(findUpsertTarget(both, { name: 'work', type: 'oauth' }), 1);
+});
+
 test('distinctAccounts: unknown identity on either side is never "different"', () => {
   assert.equal(distinctAccounts({ name: 'a' }, { name: 'a', accountUuid: 'u1' }), false);
   assert.equal(distinctAccounts({ accountUuid: 'u1' }, { accountUuid: 'u1', orgUuid: 'o1' }), false);

@@ -195,6 +195,45 @@ test('status carries fleetForecast: null on an empty series, the forecast once t
   assert.ok(lower && lower.allOutAt < f.allOutAt);
 });
 
+test('status carries fleetTimeline by account name, with a busier scenario, and weighs spend by plan', (t) => {
+  const now = Date.now();
+  // The status reads the clock itself and caches by the minute: held still, so
+  // the timeline it carries is the one computed for `now` below.
+  t.mock.timers.enable({ apis: ['Date'], now });
+  // A 20x account spending 1% an hour of its week, now blocked for 5 days, and
+  // an idle 5x one at 50%: the 20x load fills the 5x four times as fast.
+  const m = new AccountManager([
+    oauth('big', { id: 'id-big', rateLimitTier: 'default_claude_max_20x' }),
+    oauth('small', { id: 'id-small', rateLimitTier: 'default_claude_max_5x' }),
+  ]);
+  assert.equal(m.getStatus().fleetTimeline, null);
+  const big = [];
+  const small = [];
+  for (let t = now - 72 * HOUR, u = 0.98 - 0.72; t <= now; t += SAMPLE_INTERVAL_MS, u += 0.0025) {
+    big.push([t, u, now + 120 * HOUR, null, null]);
+    small.push([t, 0.5, now + 96 * HOUR, null, null]);
+  }
+  m.quotaSeries = QuotaSeries.fromJSON({ version: 1, accounts: { 'id-big': big, 'id-small': small } });
+  Object.assign(m.accounts[0].quota, { unified7d: 0.98, unified7dReset: now + 120 * HOUR, unified7dSeenAt: now });
+  Object.assign(m.accounts[1].quota, { unified7d: 0.5, unified7dReset: now + 96 * HOUR, unified7dSeenAt: now });
+  m.accounts[0].switchThreshold = 0.98;
+  m.accounts[1].switchThreshold = 0.98;
+  const f = m.fleetForecastStatus(now);
+  assert.ok(f);
+  assert.ok(Math.abs(f.allOutAt - (now + 12 * HOUR)) <= MIN, new Date(f.allOutAt).toISOString());
+  const tl = m.fleetTimelineStatus(now);
+  assert.ok(tl);
+  assert.deepEqual(Object.keys(tl.accounts).sort(), ['big', 'small']);
+  assert.equal(tl.accounts.big[0].usable, false);
+  assert.equal(tl.outages[0].to, now + 96 * HOUR);
+  for (const state of Object.values(tl.accounts).flat()) assert.ok(Number.isInteger(state.at), `at ${state.at}`);
+  for (const o of [...tl.outages, ...tl.busier.outages]) assert.ok(Number.isInteger(o.from) && (o.to == null || Number.isInteger(o.to)), JSON.stringify(o));
+  assert.ok(Number.isInteger(f.allOutAt), `allOutAt ${f.allOutAt}`);
+  assert.equal(tl.busier.loadFactor, 1.25);
+  assert.ok(tl.busier.outages[0].from < tl.outages[0].from);
+  assert.deepEqual(m.getStatus().fleetTimeline, tl);
+});
+
 test('an account id of __proto__ is stored, saved and read back like any other', () => {
   const s = new QuotaSeries();
   s.record('__proto__', reading, NOW);

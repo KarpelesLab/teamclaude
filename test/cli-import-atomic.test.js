@@ -2,10 +2,11 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { spawn } from 'node:child_process';
-import { mkdtemp, writeFile, readFile } from 'node:fs/promises';
+import { mkdtemp, writeFile, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { childEnvWithoutProxy } from '../test-helpers/env.js';
 
 // `teamclaude import` (and `login`) load the config, spend a while on the
 // network — a browser flow can take minutes — and then save. A running server
@@ -94,4 +95,61 @@ test('import saves onto a fresh read of the config, not the copy it loaded', asy
   } finally {
     proxy.close();
   }
+});
+
+// An import named after an API-key account turned the key's entry into an OAuth
+// one that still held the key. Named so, with no OAuth account of that name,
+// it is refused before anything is read or renewed: a stale access token is not
+// refreshed (which would spend the refresh token it came with), and nothing is
+// written. With an OAuth account of that name too, the import goes ahead, and
+// the save refuses it when its profile names another account. The token
+// endpoint and the profile are answered in the child (test-helpers/token-endpoint.js).
+const tokenEndpointPreload = new URL('../test-helpers/token-endpoint.js', import.meta.url).href;
+
+async function importAs(t, accounts, creds, { profile } = {}) {
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-import-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const configPath = join(dir, 'config.json');
+  const config = { proxy: { port: 1, apiKey: 'tc-test' }, upstreamProxy: false, accounts };
+  await writeFile(configPath, JSON.stringify(config));
+  const child = spawn(process.execPath, ['--import', tokenEndpointPreload, cliPath, 'import', '--json', JSON.stringify(creds), '--name', 'work'], {
+    env: childEnvWithoutProxy({
+      TEAMCLAUDE_CONFIG: configPath, TEAMCLAUDE_DISABLE_AUTOUPDATE: '1',
+      TEAMCLAUDE_TEST_TOKEN_RESPONSE: JSON.stringify({ access_token: 'at-new', refresh_token: 'rt-new', expires_in: 3600 }),
+      ...(profile && { TEAMCLAUDE_TEST_PROFILE_RESPONSE: JSON.stringify(profile) }),
+    }),
+    stdio: ['ignore', 'pipe', 'pipe'],
+    signal: t.signal,
+  });
+  child.on('error', () => {}); // the abort's kill; the close settles the run
+  let stdout = '';
+  let stderr = '';
+  child.stdout.setEncoding('utf8');
+  child.stderr.setEncoding('utf8');
+  child.stdout.on('data', c => { stdout += c; });
+  child.stderr.on('data', c => { stderr += c; });
+  const code = await new Promise(resolve => child.on('close', resolve));
+  return { code, stdout, stderr, config, saved: JSON.parse(await readFile(configPath, 'utf8')) };
+}
+
+const REFUSED = /"work" already names an API-key account: sign in under another --name, or remove or rename that account first/;
+const apiKeyWork = { id: 'k-id', name: 'work', type: 'apikey', apiKey: 'sk-ant-api03-made-up', priority: 100 };
+
+test('an import named after an API-key account is refused before its stale token is renewed, and nothing is written', async (t) => {
+  const res = await importAs(t, [apiKeyWork], { accessToken: 'at-old', refreshToken: 'rt-old', expiresAt: 1 });
+  assert.equal(res.code, 1, `${res.stdout}\n${res.stderr}`);
+  assert.match(res.stderr, REFUSED);
+  assert.doesNotMatch(res.stderr, /token-endpoint stub: answered/, 'the refresh token it came with was not spent');
+  assert.deepEqual(res.saved, res.config);
+});
+
+test('an import named after an OAuth and an API-key account is refused at the save when its profile names another account', async (t) => {
+  const work = { id: 'w-id', name: 'work', type: 'oauth', accountUuid: 'uuid-W', orgUuid: 'org-W', orgName: 'Org W', accessToken: 'at-W', refreshToken: 'rt-W', expiresAt: Date.now() + 3_600_000 };
+  const res = await importAs(t, [work, apiKeyWork], { accessToken: 'at-y', refreshToken: 'rt-y', expiresAt: Date.now() + 3_600_000 }, {
+    profile: { account: { uuid: 'uuid-Y', email: 'y@example.com' }, organization: { uuid: 'org-Y', name: 'Org Y' } },
+  });
+  assert.equal(res.code, 1, `${res.stdout}\n${res.stderr}`);
+  assert.match(res.stderr, REFUSED);
+  assert.doesNotMatch(res.stderr, /\n\s+at /, 'a refusal, not a crash');
+  assert.deepEqual(res.saved, res.config);
 });
