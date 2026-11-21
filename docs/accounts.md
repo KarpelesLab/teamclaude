@@ -794,6 +794,38 @@ request-id replay and set its fleet hold after success or an unread verdict.
 A failed claim may have spent the reset; the next attempt on that grant reuses
 the same request id. A refusal with a verdict spends nothing.
 
+### Reading and spending a reset over the control API
+
+A headless server has no panel, so the same reads and claims are routes on the
+control plane. They take the proxy key (or the loopback exemption), never a
+client key, and a POST from a web page on another origin is refused like every
+other control mutation.
+
+- `GET /teamclaude/resets` lists every OAuth Claude and Codex account with its
+  last in-memory reading in the panel's shape (`details`, `null` before the
+  first read) and `readableAt`, the time a fresh read is allowed again (`null`
+  when it is now). It sends no request upstream, so a page may poll it.
+- `POST /teamclaude/resets/read` with `{"account": "<name>"}` is the panel's
+  **r**: one fresh read, under the same two-minute floor and `Retry-After`.
+  Inside the floor it answers from the cache with `"read": false`.
+- `POST /teamclaude/resets/redeem` with `{"account": "<name>", "grantId": "<id>"}`
+  spends that grant exactly as **y** in the panel does: fresh token and read
+  first, one manual claim at a time, the same hard blocks. The warnings are
+  in `details` for the caller to show before it asks; the route does not ask.
+  A spend answers `200` with `resetsLeft` and `cleared`, a refusal `409` with
+  the reason, and a claim with no verdict `502` with `"uncertain": true` (it
+  may have been spent; read again to learn). Every outcome is logged.
+  For an hour after a claim that landed or may have landed (the hold the
+  panel shows as a warning), the route refuses another with `409`, so a
+  request retried after a lost answer does not spend twice; `"force": true`
+  in the body spends anyway.
+
+With no `proxy.apiKey` set, the three routes answer only requests from this
+machine that name it in `Host`, as the MCP endpoint does.
+
+The account is named as for `teamclaude switch`. Grant ids come from the list
+and stay in memory only, like the panel's.
+
 ### Spending a Claude reset automatically
 
 With [`autoRedeemResets`](configuration.md) on — the same switch, and the same
