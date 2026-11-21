@@ -307,21 +307,34 @@ export function accountBadges(account, current, currentAccounts, now, fleetThres
   var credits = reading.available;
   var at = now == null ? Date.now() : now;
   var stale = Number.isFinite(reading.seenAt) && at - reading.seenAt > RESET_CREDIT_MAX_AGE_MS;
-  // A Claude banked reset states when it lapses: drop it past then, and say
-  // the date while it stands (the claude.ai Resets page names it the same way).
-  var expired = Number.isFinite(reading.expiresAt) && reading.expiresAt <= at;
-  if (Number.isFinite(credits) && credits > 0 && !stale && !expired) {
-    var expires = Number.isFinite(reading.expiresAt)
-      ? ' \u00b7 expires ' + new Date(reading.expiresAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
-      : '';
+  if (Number.isFinite(credits) && credits > 0 && !stale) {
     // Fable resets (oauth.js bankedResets) clear the Fable weekly only, so they
     // are named apart from the resets that put every model back.
     var fable = Number.isFinite(reading.fable) ? Math.min(Math.max(reading.fable, 0), credits) : 0;
     var general = credits - fable;
+    // A Claude banked reset states when it lapses: drop it past then, and say
+    // the date while it stands (the claude.ai Resets page names it the same way).
+    // The two kinds are dated apart; a reading without `fableExpiresAt` has one
+    // date for all it holds (status-renderer.js heldResetKinds, same rule).
+    var generalEnds = Number.isFinite(reading.expiresAt) ? reading.expiresAt : null;
+    var fableEnds = 'fableExpiresAt' in reading
+      ? (Number.isFinite(reading.fableExpiresAt) ? reading.fableExpiresAt : null)
+      : generalEnds;
+    if (generalEnds != null && generalEnds <= at) general = 0;
+    if (fableEnds != null && fableEnds <= at) fable = 0;
+    /** @param {string} text @param {number|null} ends */
+    var dated = function (text, ends) {
+      return ends == null ? text
+        : text + ' \u00b7 expires ' + new Date(ends).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+    };
     var held = [];
     if (general > 0) held.push(general + ' reset credit' + (general === 1 ? '' : 's'));
     if (fable > 0) held.push(fable + ' Fable reset' + (fable === 1 ? '' : 's'));
-    badges.push({ cls: 'meta', text: held.join(', ') + expires });
+    if (general > 0 && fable > 0 && generalEnds !== fableEnds) {
+      badges.push({ cls: 'meta', text: dated(held[0], generalEnds) + ', ' + dated(held[1], fableEnds) });
+    } else if (held.length) {
+      badges.push({ cls: 'meta', text: dated(held.join(', '), general > 0 ? generalEnds : fableEnds) });
+    }
   }
   // Arguments 5/6 are optional (the pre-#409 unit test above omits them): with
   // no account switchThreshold at all — the common case — thresholdBadgeText

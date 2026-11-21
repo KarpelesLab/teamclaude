@@ -8,7 +8,7 @@ import { createProxyRequestListener, relayUpgrade } from '../src/server.js';
 // Bring up an HTTP server on an ephemeral port and hand back {server, port}.
 async function listen(handler) {
   const server = http.createServer(handler);
-  server.listen(0);
+  server.listen(0, '127.0.0.1');
   await once(server, 'listening');
   return { server, port: server.address().port };
 }
@@ -109,7 +109,7 @@ test('relays a WebSocket Upgrade handshake and echoes bytes both ways', async ()
 
   const proxy = http.createServer();
   proxy.on('upgrade', (req, socket, head) => relayUpgrade(req, socket, head, `http://127.0.0.1:${upstreamPort}`, null));
-  proxy.listen(0);
+  proxy.listen(0, '127.0.0.1');
   await once(proxy, 'listening');
   const port = proxy.address().port;
 
@@ -155,7 +155,7 @@ test('an upstream socket that dies mid-relay tears down the pair instead of cras
 
   const proxy = http.createServer();
   proxy.on('upgrade', (req, socket, head) => relayUpgrade(req, socket, head, `http://127.0.0.1:${upstreamPort}`, null));
-  proxy.listen(0);
+  proxy.listen(0, '127.0.0.1');
   await once(proxy, 'listening');
   const port = proxy.address().port;
 

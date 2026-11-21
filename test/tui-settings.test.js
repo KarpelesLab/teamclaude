@@ -100,6 +100,24 @@ test('the quota-bar percentage toggles on from a config that never had the key',
   assert.deepEqual(saved, [true, false]);
 });
 
+// The stretched row is the default: a config without the key reads as on, and
+// the first toggle from there has to reach disk as `false`.
+test('the lone-bar stretch toggles off from a config that never had the key', async () => {
+  const saved = [];
+  const tui = makeTUI();
+  tui.saveConfig = async c => { saved.push(c.quotaBarStretch); };
+  const row = tui._settingsFields().find(f => f.id === 'quotaBarStretch');
+  assert.equal(stripAnsi(row.value()), 'on');
+
+  await row.right();
+  assert.equal(tui.config.quotaBarStretch, false);
+  assert.equal(stripAnsi(tui._settingsFields().find(f => f.id === 'quotaBarStretch').value()), 'off');
+
+  await row.right();
+  assert.equal(tui.config.quotaBarStretch, true);
+  assert.deepEqual(saved, [false, true]);
+});
+
 test('probe-disabled toggles on from a config that never had the key', async () => {
   const saved = [];
   const tui = makeTUI();
