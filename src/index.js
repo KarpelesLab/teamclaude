@@ -37,6 +37,7 @@ import { ensureCerts, mitmHosts, caCertPath } from './mitm.js';
 import { Prober, probeApplicable } from './prober.js';
 import { CreditMonitor } from './api-credit.js';
 import { ResetCreditRedeemer } from './codex-reset-credits.js';
+import { redeemPolicyWarnings } from './codex-reset-policy.js';
 import { ClaudeResetRedeemer } from './claude-resets.js';
 import { createResetActions } from './reset-actions.js';
 import { Warmer, warmApplicable } from './warmer.js';
@@ -713,10 +714,11 @@ async function serverCommand() {
     // The spending strategy beside the switch (codex-reset-policy.js), read
     // off this object per refusal the same way. Copied raw: the redeemer
     // normalises each knob as it reads it, so a bad value here is "off" there
-    // rather than a reload that fails.
+    // rather than a reload that fails, and said so here, as at start.
     config.autoRedeemMinDaysToReset = diskConfig.autoRedeemMinDaysToReset;
     config.autoRedeemMaxShare = diskConfig.autoRedeemMaxShare;
     config.autoRedeemMaxPerDay = diskConfig.autoRedeemMaxPerDay;
+    for (const line of redeemPolicyWarnings(config)) console.error(line);
     // Read by the prober off this object per cycle, like the switch above.
     config.probeDisabledAccounts = diskConfig.probeDisabledAccounts === true;
     config.blockedModels = Array.isArray(diskConfig.blockedModels) ? diskConfig.blockedModels : [];
@@ -794,8 +796,17 @@ async function serverCommand() {
     clearAddedAccountIds(config);
   };
 
-  const redeemer = new ResetCreditRedeemer(accountManager, { config });
-  const claudeRedeemer = new ClaudeResetRedeemer(accountManager, { config });
+  // Their lines are written through the console as it is when each is said,
+  // like the prober's and the warmer's. Both are built while a TUI start
+  // holds the console (captureEarlyConsole) and before headless mode tees it
+  // into --activity-log, so a log bound now would write to a hold that is
+  // never read again, or past the activity file.
+  const redeemerLog = (/** @type {string} */ line) => console.log(line);
+  const redeemer = new ResetCreditRedeemer(accountManager, { config, log: redeemerLog });
+  // Said at start and at each reload: a reset-credit limit set to a value it
+  // cannot read is off, and nothing else would say so.
+  for (const line of redeemPolicyWarnings(config)) console.error(line);
+  const claudeRedeemer = new ClaudeResetRedeemer(accountManager, { config, log: redeemerLog });
   const resetActions = createResetActions({ accountManager, claudeRedeemer, codexRedeemer: redeemer });
 
   let tui = null;

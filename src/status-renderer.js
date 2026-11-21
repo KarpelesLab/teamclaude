@@ -518,8 +518,12 @@ export function resetCreditLine(account, paint, now = Date.now()) {
 export function autoRedeemLine(account, paint) {
   const view = account?.autoRedeem;
   if (!view || typeof view !== 'object') return null;
+  // The weeks and the days as the server states them, each to the step below
+  // from one reading (codex-reset-policy.js), so they cannot disagree on one
+  // line; worked back from the weeks only for a server older than the field.
+  const days = Number.isFinite(view.daysToReset) ? view.daysToReset : view.creditValueWeeks * 7;
   const value = Number.isFinite(view.creditValueWeeks)
-    ? `credit worth ${view.creditValueWeeks.toFixed(2)} of a week (${(view.creditValueWeeks * 7).toFixed(1)}d to reset)`
+    ? `credit worth ${view.creditValueWeeks.toFixed(2)} of a week (${days.toFixed(1)}d to reset)`
     : 'credit value unknown (no reset time)';
   const state = view.armed
     ? paint.green('armed')
