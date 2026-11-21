@@ -485,16 +485,19 @@ export function showWeeklyRow(quota) {
  */
 export function resetCreditLine(account, paint, now = Date.now()) {
   const credits = account?.quota?.resetCredits;
-  const available = heldResetCredits(account?.quota, now);
-  if (!available) return null;
-  const fable = heldFableResets(account?.quota, now);
-  const general = available - fable;
+  const { general, fable, generalExpiresAt, fableExpiresAt } = heldResetKinds(account?.quota, now);
+  if (!general && !fable) return null;
+  // Both kinds held on different dates: each is dated in place, since they can
+  // lapse months apart. Otherwise the one date goes with the notes.
+  const both = general > 0 && fable > 0 && generalExpiresAt !== fableExpiresAt;
+  const dated = (/** @type {string} */ text, /** @type {number|null} */ at) => (both && at != null ? `${text} (expires ${formatDuration(at - now)})` : text);
   const held = [];
-  if (general) held.push(`${general} free rate-limit reset ${general === 1 ? 'credit' : 'credits'}`);
-  if (fable) held.push(`${fable} Fable ${fable === 1 ? 'reset' : 'resets'}`);
+  if (general) held.push(dated(`${general} free rate-limit reset ${general === 1 ? 'credit' : 'credits'}`, generalExpiresAt));
+  if (fable) held.push(dated(`${fable} Fable ${fable === 1 ? 'reset' : 'resets'}`, fableExpiresAt));
   const notes = [];
   if (credits.applicable === 0) notes.push('none applicable to a window right now');
-  if (Number.isFinite(credits.expiresAt)) notes.push(`expires ${formatDuration(credits.expiresAt - now)}`);
+  const soleExpiry = both ? null : (general ? generalExpiresAt : fableExpiresAt);
+  if (soleExpiry != null) notes.push(`expires ${formatDuration(soleExpiry - now)}`);
   if (Number.isFinite(credits.seenAt)) notes.push(`as of ${formatAgo(Math.min(credits.seenAt, now), now)}`);
   const note = notes.length ? ` — ${notes.join(', ')}` : '';
   return `${paint.dim('Reset'.padEnd(8))} ${paint.cyan(held.join(', '))}${paint.gray(note)}`;
@@ -515,8 +518,12 @@ export function resetCreditLine(account, paint, now = Date.now()) {
 export function autoRedeemLine(account, paint) {
   const view = account?.autoRedeem;
   if (!view || typeof view !== 'object') return null;
+  // The weeks and the days as the server states them, each to the step below
+  // from one reading (codex-reset-policy.js), so they cannot disagree on one
+  // line; worked back from the weeks only for a server older than the field.
+  const days = Number.isFinite(view.daysToReset) ? view.daysToReset : view.creditValueWeeks * 7;
   const value = Number.isFinite(view.creditValueWeeks)
-    ? `credit worth ${view.creditValueWeeks.toFixed(2)} of a week (${(view.creditValueWeeks * 7).toFixed(1)}d to reset)`
+    ? `credit worth ${view.creditValueWeeks.toFixed(2)} of a week (${days.toFixed(1)}d to reset)`
     : 'credit value unknown (no reset time)';
   const state = view.armed
     ? paint.green('armed')
@@ -533,8 +540,8 @@ export const RESET_CREDIT_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
 /**
  * How many reset credits to REPORT for this quota: the held count while the
- * reading is fresh, 0 once it is older than RESET_CREDIT_MAX_AGE_MS, past its
- * stated `expiresAt`, or states no positive count. One rule for the status screen and the TUI row, so the two
+ * reading is fresh, 0 once it is older than RESET_CREDIT_MAX_AGE_MS or states
+ * no positive count, less any kind past its own stated expiry (heldResetKinds). One rule for the status screen and the TUI row, so the two
  * cannot disagree about whether a credit is there (the dashboard page applies
  * the same cut-off in its own serialized helper).
  *
@@ -546,13 +553,43 @@ export const RESET_CREDIT_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
  * @returns {number}
  */
 export function heldResetCredits(quota, now = Date.now()) {
+  const { general, fable } = heldResetKinds(quota, now);
+  return general + fable;
+}
+
+/**
+ * The reported resets by kind, each with when it lapses: `general` (every
+ * Codex credit, and a Claude reset that clears the shared windows) and `fable`
+ * (see bankedResets in oauth.js). Both are 0 for a reading heldResetCredits
+ * would not report, and a kind past its own expiry is 0 while the other stands.
+ *
+ * A reading without `fableExpiresAt` (Codex, or one stored before the kinds
+ * were dated apart) has one `expiresAt` for everything it holds.
+ *
+ * @param {Record<string, any>|null|undefined} quota
+ * @param {number} [now]
+ * @returns {{general: number, fable: number, generalExpiresAt: number|null, fableExpiresAt: number|null}}
+ */
+export function heldResetKinds(quota, now = Date.now()) {
+  const none = { general: 0, fable: 0, generalExpiresAt: null, fableExpiresAt: null };
   const credits = quota?.resetCredits;
   const available = credits?.available;
-  if (!Number.isFinite(available) || available <= 0) return 0;
-  if (Number.isFinite(credits.seenAt) && now - credits.seenAt > RESET_CREDIT_MAX_AGE_MS) return 0;
+  if (!Number.isFinite(available) || available <= 0) return none;
+  if (Number.isFinite(credits.seenAt) && now - credits.seenAt > RESET_CREDIT_MAX_AGE_MS) return none;
+  const at = (/** @type {unknown} */ v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+  const generalExpiresAt = at(credits.expiresAt);
+  const fableExpiresAt = 'fableExpiresAt' in credits ? at(credits.fableExpiresAt) : generalExpiresAt;
+  let fable = Number.isFinite(credits.fable) && credits.fable > 0 ? Math.min(credits.fable, available) : 0;
+  let general = available - fable;
   // A grant past its stated expiry is gone whatever the last reading said.
-  if (Number.isFinite(credits.expiresAt) && credits.expiresAt <= now) return 0;
-  return available;
+  if (generalExpiresAt != null && generalExpiresAt <= now) general = 0;
+  if (fableExpiresAt != null && fableExpiresAt <= now) fable = 0;
+  return {
+    general,
+    fable,
+    generalExpiresAt: general ? generalExpiresAt : null,
+    fableExpiresAt: fable ? fableExpiresAt : null,
+  };
 }
 
 // Upstream refused the account itself: its words, and its link when the
@@ -584,9 +621,7 @@ function lastGoodRefresh(account, err) {
  * @param {number} [now]
  */
 export function heldFableResets(quota, now = Date.now()) {
-  const fable = quota?.resetCredits?.fable;
-  if (!Number.isFinite(fable) || fable <= 0) return 0;
-  return Math.min(fable, heldResetCredits(quota, now));
+  return heldResetKinds(quota, now).fable;
 }
 
 export function unavailableLine(account, paint) {

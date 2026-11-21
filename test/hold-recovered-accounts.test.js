@@ -108,7 +108,7 @@ async function fleet(t, accounts, respond, { holdSeconds = 300 } = {}) {
   });
   const port = await listen(proxy);
   return {
-    port, seen, times, holds: log.holds, waits: log.waits, refreshes: () => refreshes,
+    am, port, seen, times, holds: log.holds, waits: log.waits, refreshes: () => refreshes,
     close() { proxy.closeAllConnections(); proxy.close(); upstream.closeAllConnections(); upstream.close(); },
   };
 }
@@ -183,6 +183,30 @@ test('a held request never retries an account upstream refused, even once anothe
     assert.equal(result, 200, `the held request was held again instead of retrying the account that recovered (got ${result})`);
     assert.equal(f.seen.filter(x => x === 'ta').length, 1, 'the refused credential was sent again');
     assert.equal(f.seen.at(-1), 'tb', 'the retry goes to the account that recovered');
+  } finally { await drain(f, outcome); }
+});
+
+// An account removed while the request is held renumbers the rest of the fleet
+// in place (removeAccount). The request kept the accounts it had tried by their
+// old positions, so after the hold the refused account read as untried and its
+// credential was sent again. As above, b comes first and the walk resumes from
+// a; x, never selected, sits between them, so its removal moves a.
+test('a held request never retries an account upstream refused, even when another is removed during the hold', async t => {
+  let bRecovered = false;
+  const f = await fleet(t, [oauth('b', 'tb'), { ...oauth('x', 'tx'), disabled: true }, oauth('a', 'ta')], (token, req, res) => {
+    if (token === 'ta') return refused(res);
+    if (bRecovered) return served(res);
+    rateLimited(res, START + 90 * SEC);
+  });
+  const outcome = post(f.port);
+  try {
+    await f.holds.next(1);                 // b out of quota, a refused: the request is held
+    f.am.removeAccount(1);                 // x goes: a moves from 2 to 1
+    bRecovered = true;
+    t.mock.timers.tick(90 * SEC);
+    const result = await reply(outcome, f);
+    assert.equal(result, 200, `the held request was not served by the account that recovered (got ${result})`);
+    assert.deepEqual(f.seen, ['tb', 'ta', 'tb'], 'the refused credential was sent again after the removal');
   } finally { await drain(f, outcome); }
 });
 
