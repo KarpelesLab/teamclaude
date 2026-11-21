@@ -1110,6 +1110,19 @@ export class AccountManager {
   }
 
   /**
+   * Whether a bucket's reading has reached its cap. A cap of 0 is a hard stop:
+   * it is reached with any reading, and with none, since no request may be
+   * sent to learn one. `maxUsage: 0` and `{ "default": 0 }` are the same cap.
+   * @param {number|null} cap
+   * @param {unknown} used
+   */
+  _atCap(cap, used) {
+    if (cap == null) return false;
+    if (cap <= 0) return true;
+    return typeof used === 'number' && used >= cap;
+  }
+
+  /**
    * The bucket that has reached this account's cap for `model`, or null.
    *
    * The shared buckets (unified5h, unified7d) cap every request; a family bucket
@@ -1129,14 +1142,14 @@ export class AccountManager {
     // the figure being reached, and a new month lifts it on the next reading
     // by itself.
     if (this._spendCapBinds(account, model)) return 'spend';
-    if (!account?.maxUsage) return null;
+    if (account?.maxUsage == null) return null;
     const q = account.quota;
     // Same reason _isNearQuota does this first: a window that has already reset
     // must not read as capped on a value that no longer applies.
     this._clearExpiredQuotas(account);
 
     const cap5h = this.capFor('unified5h', account);
-    if (cap5h != null && q.unified5h != null && q.unified5h >= cap5h) return 'unified5h';
+    if (this._atCap(cap5h, q.unified5h)) return 'unified5h';
 
     // The shared weekly bucket caps every request, family requests included:
     // family spend meters into BOTH its own bucket and the shared one (#175), so
@@ -1145,7 +1158,7 @@ export class AccountManager {
     // a threshold gates on the governing bucket alone — but a threshold is a
     // preference and a cap is a total.
     const capWeekly = this.capFor('unified7d', account);
-    if (capWeekly != null && q.unified7d != null && q.unified7d >= capWeekly) return 'unified7d';
+    if (this._atCap(capWeekly, q.unified7d)) return 'unified7d';
 
     // …and on top of it, the family bucket that meters THIS model, when the
     // family has one. A Fable cap stops Fable and leaves Opus alone.
@@ -1153,7 +1166,7 @@ export class AccountManager {
     if (familyKey !== 'unified7d') {
       const familyCap = this.capFor(familyKey, account);
       const familyVal = q[familyKey];
-      if (familyCap != null && familyVal != null && familyVal >= familyCap) return familyKey;
+      if (this._atCap(familyCap, familyVal)) return familyKey;
     }
 
     const tokensCap = this.capFor('tokens', account);
@@ -1256,12 +1269,12 @@ export class AccountManager {
       this._clearExpiredQuotas(account);
       if (this._familySpendCapBinds(account, model)) return 'spend';
     }
-    if (!account?.maxUsage) return null;
+    if (account?.maxUsage == null) return null;
     const key = this._weeklyBucketFor(model);
     if (key === 'unified7d') return null;
     const cap = this.capFor(key, account);
     const val = account.quota[key];
-    return cap != null && val != null && val >= cap ? key : null;
+    return this._atCap(cap, val) ? key : null;
   }
 
   /**
@@ -4112,7 +4125,10 @@ export class AccountManager {
       if (account.status === 'error') return { eligible: false, reason: isRefused(account) ? 'refused by upstream' : 'in an error state and needs a re-login' };
       if (account.status === 'exhausted') return { eligible: false, reason: 'out of quota' };
       if (account.status === 'throttled') return { eligible: false, reason: 'rate-limited' };
-      if (this.unavailableReason(account) === 'cordoned') return { eligible: false, reason: 'cordoned, so it takes no new conversations' };
+      const why = this.unavailableReason(account);
+      if (why === 'cordoned') return { eligible: false, reason: 'cordoned, so it takes no new conversations' };
+      if (why === 'capped' || why === 'spend-capped') return { eligible: false, reason: why === 'capped' ? 'at its maxUsage cap' : 'at its maxSpend cap' };
+      if (why === 'entitlement') return { eligible: false, reason: 'refused by its organization for now' };
       return { eligible: false, reason: 'at or above the switch threshold' };
     }
     // Healthy, but a higher-priority account preempts it on the next selection.
@@ -4895,7 +4911,7 @@ export class AccountManager {
    * @returns {number|null}
    */
   _spendLimit(account, window, used) {
-    if (!account.maxUsage) return null;
+    if (account.maxUsage == null) return null;
     // A learned scoped bucket stands in for a family the shared weekly meters,
     // so the shared weekly's cap is the one that applies to it.
     const key = window.startsWith('scoped:') ? 'unified7d' : window;
@@ -7051,8 +7067,8 @@ export class AccountManager {
 
   /**
    * Whether the account's 5-hour reading is what holds it out of rotation: at
-   * its switch threshold, or at its `maxUsage` cap. A falsy `maxUsage` is no
-   * cap, as in capExceeded, though capFor reads a bare 0 as one. Shared by the
+   * its switch threshold, or at its `maxUsage` cap (a bare 0 is a cap of 0, as
+   * in capExceeded). Shared by the
    * two paths that remove such a reading on a plan with no session window.
    * @param {any} account
    */
@@ -7060,7 +7076,7 @@ export class AccountManager {
     const u = account.quota.unified5h;
     if (u == null) return false;
     if (u >= this.thresholdFor('unified5h', account)) return true;
-    const cap = account.maxUsage ? this.capFor('unified5h', account) : null;
+    const cap = this.capFor('unified5h', account);
     return cap != null && u >= cap;
   }
 
