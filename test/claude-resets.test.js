@@ -1095,3 +1095,36 @@ test('without the hook nothing changes', async () => {
   assert.notEqual(r.status, 200);
   assert.equal(r.hits, 0);
 });
+
+// An account this request already tried stays excluded from the re-selection
+// after a redemption, so it is not worth a reset for this request either: here
+// a is sent the request and turned away at its 5-hour limit, and only b, whose
+// Fable window was spent before the request came, is offered.
+test('an account the request already tried is not offered for a reset', async () => {
+  const seen = [];
+  const upstream = http.createServer((req, res) => {
+    req.resume();
+    seen.push(String(req.headers.authorization || '').replace(/^Bearer /, ''));
+    res.writeHead(429, {
+      'content-type': 'application/json', 'retry-after': '3600',
+      'anthropic-ratelimit-unified-5h-status': 'rejected',
+      'anthropic-ratelimit-unified-5h-reset': String(Math.floor((Date.now() + H) / 1000)),
+      'anthropic-ratelimit-unified-5h-utilization': '1',
+    });
+    res.end('{"type":"error","error":{"type":"rate_limit_error"}}');
+  });
+  const port = await new Promise(r => upstream.listen(0, '127.0.0.1', () => r(upstream.address().port)));
+  const am = new AccountManager([oauth('a'), oauth('b')], 0.98);
+  fableSpent(am.accounts[1], 3 * DAY);
+  am._nextProbeAt = Date.now() + H;
+  const asked = [];
+  const hooks = { redeemClaudeResetForPool: async (cands) => { asked.push(cands.map(a => a.name)); return { redeemed: false, reason: 'test' }; } };
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${port}` }, hooks);
+  const pport = await new Promise(r => proxy.listen(0, '127.0.0.1', () => r(proxy.address().port)));
+  try {
+    const res = await fetch(`http://127.0.0.1:${pport}/v1/messages`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: 'claude-fable-5-1', max_tokens: 1, messages: [] }) });
+    await res.text();
+    assert.deepEqual(seen, ['t-a'], 'the fixture must send the request to a alone');
+    assert.deepEqual(asked, [['b']]);
+  } finally { proxy.close(); upstream.close(); }
+});

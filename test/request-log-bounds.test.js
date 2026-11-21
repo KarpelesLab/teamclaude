@@ -401,7 +401,7 @@ test('a relay through many backpressure cycles keeps its close listeners bounded
   const stream = new ReadableStream({
     pull(controller) { if (n < 50) controller.enqueue(new TextEncoder().encode(`event: ping\ndata: {"n":${n++}}\n\n`)); else controller.close(); },
   });
-  await streamResponse(stream, res, 0, { recordTokenUsage() {} }, null);
+  await streamResponse(stream, res, { index: 0 }, { recordTokenUsage() {} }, null);
   assert.equal(n, 50);
   assert.equal(res.writableEnded, true);
   assert.ok(res.maxClose <= 2, `at most the relay's own close listener and one drain wait's, saw ${res.maxClose}`);

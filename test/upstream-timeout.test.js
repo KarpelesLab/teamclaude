@@ -18,7 +18,7 @@ test('client disconnect cancels a silent upstream immediately, not at idle timeo
   let cancelled = false;
   const upstream = new ReadableStream({ cancel() { cancelled = true; } });
   const client = new Writable({ write(chunk, enc, cb) { cb(); } });
-  const running = streamResponse(upstream, client, 0, { recordTokenUsage() {} });
+  const running = streamResponse(upstream, client, { index: 0 }, { recordTokenUsage() {} });
   client.destroy();
   // The cancel settles the pending read, which is what ends the relay: a
   // relay that instead waited for the idle watchdog (2 minutes by default)
@@ -464,7 +464,7 @@ test('a body-idle setting past the timer range is read as the longest timer, not
       });
       let written = 0;
       const client = new Writable({ write(chunk, _enc, cb) { written += chunk.length; cb(); } });
-      await streamResponse(slow, client, 0, { recordTokenUsage() {} });
+      await streamResponse(slow, client, { index: 0 }, { recordTokenUsage() {} });
       assert.equal(n, 3);
       assert.ok(written > 0 && written === 3 * 'event: ping\ndata: {"n":0}\n\n'.length, `relayed ${written} bytes`);
     });

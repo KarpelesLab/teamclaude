@@ -91,7 +91,7 @@ test('a stream with no blank line is relayed in full and does not accumulate', a
     },
   });
 
-  await streamResponse(stream, res, 0, am, null, null, null, null);
+  await streamResponse(stream, res, { index: 0 }, am, null, null, null, null);
 
   assert.equal(total, N * (1 << 20) + tail.length, 'every byte was relayed');
   assert.equal(written.length, N + 1, 'relayed chunk by chunk, never re-buffered');
@@ -123,7 +123,7 @@ test('well-formed events still yield their usage line by line', async () => {
   let i = 0;
   const stream = new ReadableStream({ pull(c) { if (i < parts.length) c.enqueue(enc.encode(parts[i++])); else c.close(); } });
 
-  await streamResponse(stream, res, 0, am, null, null, null, null);
+  await streamResponse(stream, res, { index: 0 }, am, null, null, null, null);
 
   assert.deepEqual(calls, [[12, 0], [0, 500]]);
   assert.deepEqual(recorded, [{ input_tokens: 12, output_tokens: 500 }]);
@@ -412,7 +412,7 @@ test('a relay past the hold limit reads no further while its client has not drai
     write() { this.writes++; parked.fire(); return false; }
     end() { this.writableEnded = true; }
   }();
-  const relay = streamResponse(/** @type {any} */ (held.body), res, 0, { recordTokenUsage() {} }, null, null, null, null, null, null, false);
+  const relay = streamResponse(/** @type {any} */ (held.body), res, { index: 0 }, { recordTokenUsage() {} }, null, null, null, null, null, null, false);
   await parked.fired;
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(res.writes, 1, 'nothing more was written to a client that had not drained');
