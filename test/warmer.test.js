@@ -101,6 +101,30 @@ test('an account whose entitlement cooldown has ended is warmed again', async ()
   assert.equal(spawn.calls.length, 1);
 });
 
+// The account manager writes the cooldown on its own clock (Date.now) and reads
+// it on that clock too, clearing it once it reads it as over. The warmer's clock
+// is its own (injected here, as the schedule tests do), and asking the cooldown
+// on it cleared a cooldown rotation still held, or kept one rotation had ended.
+for (const [what, skewMs, ended, warmed] of [
+  ['ahead of', 10 * 60_000, false, 0],
+  ['behind', -10 * 60_000, true, 1],
+]) {
+  test(`a warmer whose clock runs ${what} the account manager's reads the entitlement cooldown on the manager's clock`, async () => {
+    const am = new AccountManager([oauth('denied')], 0.98);
+    const until = am.markEntitlementDenied(0, { seconds: 300 });
+    if (ended) am.accounts[0].entitlementDeniedUntil = Date.now() - 1;
+    const spawn = fakeSpawner();
+    const log = console.log;
+    console.log = () => {};
+    try { await makeWarmer(am, spawn, { nowFn: () => Date.now() + skewMs }).warmAll(); } finally { console.log = log; }
+    assert.equal(spawn.calls.length, warmed);
+    if (!ended) {
+      assert.equal(am.accounts[0].entitlementDeniedUntil, until, 'the cooldown rotation holds is left in place');
+      assert.equal(am.isEntitlementDenied(0), true);
+    }
+  });
+}
+
 // ── spawn spec ───────────────────────────────────────────────────────────────
 
 test('the spawn invocation is a minimal non-interactive claude pinned to the account', async () => {
@@ -395,9 +419,9 @@ test('a rolling slot defers an account until just after its near-future reset', 
 // The cooldown is asked about when the warm-up would be sent, not when the slot
 // is scheduled: a rolling slot still defers an account in a cooldown, and the
 // deferred warm-up asks again when it fires.
-for (const [what, cooldownMs, warmed] of [
-  ['has ended', 20_000, true],
-  ['is still running', 10 * 60_000, false],
+for (const [what, ended, warmed] of [
+  ['has ended', true, true],
+  ['is still running', false, false],
 ]) {
   test(`a rolling slot defers an account in its entitlement cooldown, and warms it only if the cooldown ${what}`, async () => {
     const am = new AccountManager([oauth('near'), oauth('idle')], 0.98);
@@ -418,12 +442,15 @@ for (const [what, cooldownMs, warmed] of [
     warmer.start();
 
     now = Date.parse('2030-09-01T07:30:00.001Z');
-    am.accounts[0].entitlementDeniedUntil = now + cooldownMs; // on the warmer's clock
+    // On the account manager's clock, as a refused request writes it, not on the
+    // warmer's injected one: the cooldown is the manager's to time.
+    am.markEntitlementDenied(0, { seconds: 600 });
     await timers[0].fn();
     const deferred = timers.find(timer => timer.delay === 70_000);
     assert.ok(deferred, 'the near-reset account is still deferred until reset + 10s');
 
     now = Date.parse('2030-09-01T07:31:10.001Z');
+    if (ended) am.accounts[0].entitlementDeniedUntil = Date.now() - 1;
     const log = console.log;
     console.log = () => {};
     try { await deferred.fn(); } finally { console.log = log; }
@@ -819,6 +846,364 @@ test('stop cancels a deferred rolling warm-up', async () => {
   await deferred.fn();
 
   assert.equal(spawn.calls.length, 0);
+});
+
+// The "delaying" line promises a warm-up, so each way a delayed one ends unsent
+// says why. The fixture is the deferral tests' above, logging into `lines`: each
+// account resets within two minutes of the 07:30 slot, is delayed to
+// 07:31:10.001, and has until 07:32:10.001 to go out; the clock is left at
+// 07:31:10.001. With `holdRefresh` the token refresh, and with `holdFirstSpawn`
+// the first spawn, waits for `release()`; `reached` resolves once it waits.
+async function delayedWarmups(names, { holdRefresh = false, holdFirstSpawn = false, failSpawn = false } = {}) {
+  const am = new AccountManager(names.map(name => oauth(name)), 0.98);
+  const clock = { now: Date.parse('2030-09-01T07:29:00.000Z') };
+  for (const account of am.accounts) account.quota.unified5hReset = Date.parse('2030-09-01T07:31:00.001Z');
+  let release = () => {};
+  const held = new Promise(resolve => { release = resolve; });
+  let reach = () => {};
+  const reached = new Promise(resolve => { reach = resolve; });
+  if (holdRefresh) am.ensureTokenFresh = () => { reach(); return held; };
+  const spawn = async (spec) => {
+    spawn.calls.push(spec);
+    if (holdFirstSpawn && spawn.calls.length === 1) { reach(); await held; }
+    if (failSpawn) throw new Error('spawn claude ENOENT');
+    return 0;
+  };
+  spawn.calls = [];
+  const timers = [];
+  const lines = [];
+  const schedule = { mode: 'rolling', resetTime: '15:30', timezone: 'Europe/Moscow', anchorResetAt: '2030-09-01T12:30:00.000Z' };
+  const warmer = makeWarmer(am, spawn, {
+    schedule,
+    nowFn: () => clock.now,
+    setTimeoutFn: (fn, delay) => {
+      const timer = { fn, delay, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeoutFn: () => {},
+    log: line => lines.push(line),
+  });
+  warmer.start();
+  clock.now = Date.parse('2030-09-01T07:30:00.001Z');
+  await timers[0].fn();
+  const deferred = timers.filter(timer => timer.delay === 70_000);
+  assert.equal(deferred.length, names.length, 'each account is delayed until reset + 10s');
+  clock.now = Date.parse('2030-09-01T07:31:10.001Z');
+  const dropped = () => lines.filter(line => line.includes('Keep-warm dropped'));
+  const sent = () => spawn.calls.map(call => call.env.ANTHROPIC_BASE_URL.split('/').at(-1));
+  return { am, warmer, schedule, clock, deferred, release, reached, dropped, sent };
+}
+
+const dropLine = (name, why) => `[TeamClaude] Keep-warm dropped the delayed warm-up of "${name}" (${why})`;
+const LATE = 'not sent by 2030-09-01T07:32:10.001Z';
+const AFTER_ITS_MINUTE = Date.parse('2030-09-01T07:32:10.001Z');
+
+for (const [what, names, opts, act, expected] of [
+  ['its account started a new 5h window', ['near'], {}, async (w) => {
+    w.am.accounts[0].quota.unified5hReset = w.clock.now + 5 * 60 * 60 * 1000;
+    await w.deferred[0].fn();
+  }, dropLine('near', '5h window already running')],
+  ['its account is in an entitlement cooldown', ['near'], {}, async (w) => {
+    w.am.markEntitlementDenied(0, { seconds: 600 });
+    await w.deferred[0].fn();
+  }, dropLine('near', 'entitlement cooldown')],
+  ['its account was disabled', ['near'], {}, async (w) => {
+    w.am.accounts[0].disabled = true;
+    await w.deferred[0].fn();
+  }, dropLine('near', 'no longer eligible')],
+  // Removed in-process (the MCP remove_account does no reload, so nothing
+  // cancels the delayed warm-up): its pin could resolve to another account.
+  ['its account was removed', ['near'], {}, async (w) => {
+    const log = console.log;
+    console.log = () => {};
+    try { w.am.removeAccount(0); } finally { console.log = log; }
+    await w.deferred[0].fn();
+  }, dropLine('near', 'account removed')],
+  ['its timer fired a minute late', ['near'], {}, async (w) => {
+    w.clock.now = AFTER_ITS_MINUTE;
+    await w.deferred[0].fn();
+  }, dropLine('near', LATE)],
+  // The tests' clearTimeoutFn cancels nothing, so the old timer still fires: the
+  // drop is logged once, by the reconfiguration, and not again by the timer.
+  ['keep-warm was reconfigured', ['near'], {}, async (w) => {
+    w.warmer.rescheduleSchedule(w.schedule);
+    await w.deferred[0].fn();
+  }, dropLine('near', 'keep-warm reconfigured')],
+  ['keep-warm was stopped', ['near'], {}, async (w) => {
+    w.warmer.stop();
+    await w.deferred[0].fn();
+  }, dropLine('near', 'keep-warm stopped')],
+  // `warmup off` from a schedule: the reload turns the interval mode off.
+  ['keep-warm was turned off', ['near'], {}, async (w) => {
+    w.warmer.reschedule(0);
+    await w.deferred[0].fn();
+  }, dropLine('near', 'keep-warm reconfigured')],
+  ['its token refresh outlived its minute', ['near'], { holdRefresh: true }, async (w) => {
+    const retry = w.deferred[0].fn();
+    await w.reached;
+    w.clock.now = AFTER_ITS_MINUTE;
+    w.release();
+    await retry;
+  }, dropLine('near', LATE)],
+  ['its account started a new 5h window during the token refresh', ['near'], { holdRefresh: true }, async (w) => {
+    const retry = w.deferred[0].fn();
+    await w.reached;
+    w.am.accounts[0].quota.unified5hReset = w.clock.now + 5 * 60 * 60 * 1000;
+    w.release();
+    await retry;
+  }, dropLine('near', '5h window already running')],
+  // Both hold by the time the refresh ends; the run stops on its minute first,
+  // and the reason is read in that order.
+  ['its token refresh outlived its minute while a new 5h window started', ['near'], { holdRefresh: true }, async (w) => {
+    const retry = w.deferred[0].fn();
+    await w.reached;
+    w.clock.now = AFTER_ITS_MINUTE;
+    w.am.accounts[0].quota.unified5hReset = w.clock.now + 5 * 60 * 60 * 1000;
+    w.release();
+    await retry;
+  }, dropLine('near', LATE)],
+  // The clock moves on between the stand-down and the reason: the window the
+  // run stood down on resets as soon as the stand-down has read it, so no check
+  // fails by the time the reason is read.
+  ['what stood it down is over when the reason is read', ['near'], { holdRefresh: true }, async (w) => {
+    const retry = w.deferred[0].fn();
+    await w.reached;
+    const resetAt = w.clock.now + 1;
+    Object.defineProperty(w.am.accounts[0].quota, 'unified5hReset', {
+      configurable: true,
+      get() { w.clock.now = resetAt; return resetAt; },
+    });
+    w.release();
+    await retry;
+  }, dropLine('near', 'no longer a warm target')],
+  ['keep-warm was reconfigured during the token refresh', ['near'], { holdRefresh: true }, async (w) => {
+    const retry = w.deferred[0].fn();
+    await w.reached;
+    w.warmer.rescheduleSchedule(null);
+    w.release();
+    await retry;
+  }, dropLine('near', 'keep-warm reconfigured')],
+  ['keep-warm was stopped during the token refresh', ['near'], { holdRefresh: true }, async (w) => {
+    const retry = w.deferred[0].fn();
+    await w.reached;
+    w.warmer.stop();
+    w.release();
+    await retry;
+  }, dropLine('near', 'keep-warm stopped')],
+  ['it waited behind another delayed warm-up past its minute', ['first', 'second'], { holdFirstSpawn: true }, async (w) => {
+    const first = w.deferred[0].fn();
+    await w.reached;
+    const second = w.deferred[1].fn(); // waits for the first to finish
+    w.clock.now = AFTER_ITS_MINUTE;
+    w.release();
+    await Promise.all([first, second]);
+  }, dropLine('second', LATE)],
+  ['its account started a new 5h window while it waited behind another', ['first', 'second'], { holdFirstSpawn: true }, async (w) => {
+    const first = w.deferred[0].fn();
+    await w.reached;
+    const second = w.deferred[1].fn();
+    w.am.accounts[1].quota.unified5hReset = w.clock.now + 5 * 60 * 60 * 1000;
+    w.release();
+    await Promise.all([first, second]);
+  }, dropLine('second', '5h window already running')],
+]) {
+  test(`a delayed warm-up dropped because ${what} says so in the log`, async () => {
+    const w = await delayedWarmups(names, opts);
+    await act(w);
+    assert.deepEqual(w.dropped(), [expected]);
+    assert.deepEqual(w.sent().filter(name => name !== 'first'), [], 'nothing was sent for the dropped account');
+  });
+}
+
+// The cancel drops every pending warm-up, and says so for each.
+test('stopping keep-warm with two delayed warm-ups pending says so for each', async () => {
+  const w = await delayedWarmups(['first', 'second']);
+  w.warmer.stop();
+  assert.deepEqual(w.dropped(), [dropLine('first', 'keep-warm stopped'), dropLine('second', 'keep-warm stopped')]);
+  assert.deepEqual(w.sent(), []);
+});
+
+// Controls: a delayed warm-up that goes out logs no drop, and neither does one
+// whose outcome the status records - a rejected token refresh, a failed spawn.
+test('a delayed warm-up that goes out logs no drop', async () => {
+  const w = await delayedWarmups(['near']);
+  await w.deferred[0].fn();
+  assert.deepEqual(w.sent(), ['near']);
+  assert.deepEqual(w.dropped(), []);
+});
+
+test('a delayed warm-up whose token refresh is rejected records the error and logs no drop', async () => {
+  const w = await delayedWarmups(['near'], { holdRefresh: true });
+  const retry = w.deferred[0].fn();
+  await w.reached;
+  w.am.accounts[0].status = 'error';
+  w.release();
+  await retry;
+  assert.deepEqual(w.sent(), []);
+  assert.deepEqual(w.dropped(), []);
+  assert.equal(w.warmer.getStatus().accounts[0].status, 'error');
+});
+
+test('a delayed warm-up whose spawn fails records the error and logs no drop', async () => {
+  const w = await delayedWarmups(['near'], { failSpawn: true });
+  await w.deferred[0].fn();
+  assert.deepEqual(w.sent(), ['near']);
+  assert.deepEqual(w.dropped(), []);
+  assert.equal(w.warmer.getStatus().accounts[0].status, 'error');
+});
+
+// A config reload re-reads the whole file whatever changed in it, and hands the
+// warmer the schedule it found (index.js). One that left the schedule as it was
+// must leave keep-warm running; one that changed it reschedules, as before.
+const ROLLING = { mode: 'rolling', resetTime: '15:30', timezone: 'Europe/Moscow', anchorResetAt: '2030-09-01T12:30:00.000Z' };
+const DAILY = { resetTime: '15:30', timezone: 'Europe/Moscow' };
+
+// Both schedules warm at 07:30Z on 2030-09-01. The slot's sweep over two idle
+// accounts is held on its first spawn until `release()`.
+async function heldSlot(schedule) {
+  const am = new AccountManager([oauth('first'), oauth('second')], 0.98);
+  am.ensureTokenFresh = async () => {};
+  const clock = { now: Date.parse('2030-09-01T07:29:00.000Z') };
+  let release = () => {};
+  const held = new Promise(resolve => { release = resolve; });
+  let reach = () => {};
+  const reached = new Promise(resolve => { reach = resolve; });
+  const spawn = async (spec) => {
+    spawn.calls.push(spec);
+    if (spawn.calls.length === 1) { reach(); await held; }
+    return 0;
+  };
+  spawn.calls = [];
+  const timers = [];
+  const warmer = makeWarmer(am, spawn, {
+    schedule,
+    nowFn: () => clock.now,
+    setTimeoutFn: (fn, delay) => {
+      const timer = { fn, delay, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeoutFn: () => {},
+  });
+  warmer.start();
+  clock.now = Date.parse('2030-09-01T07:30:00.001Z');
+  const slot = timers[0].fn();
+  await reached;
+  const sent = () => spawn.calls.map(call => call.env.ANTHROPIC_BASE_URL.split('/').at(-1));
+  return { warmer, release, slot, sent, inFlight: spawn.calls[0].signal };
+}
+
+for (const [what, schedule, reloaded] of [
+  ['the same rolling schedule', ROLLING, { ...ROLLING }],
+  ['the same daily schedule', DAILY, { ...DAILY }],
+  ['the same daily schedule, its mode spelled null', DAILY, { ...DAILY, mode: null }],
+]) {
+  test(`a reload with ${what} leaves the running sweep alone`, async () => {
+    const s = await heldSlot(schedule);
+    s.warmer.reloadSchedule(reloaded);
+    assert.equal(s.inFlight.aborted, false, 'the warm-up in flight is not killed');
+    s.release();
+    await s.slot;
+    assert.deepEqual(s.sent(), ['first', 'second'], 'the rest of the sweep still goes out');
+  });
+}
+
+test('a reload with the same schedule leaves the delayed warm-ups alone', async () => {
+  const w = await delayedWarmups(['first', 'second']);
+  w.warmer.reloadSchedule({ ...w.schedule });
+  for (const timer of w.deferred) await timer.fn();
+  assert.deepEqual(w.dropped(), []);
+  assert.deepEqual(w.sent(), ['first', 'second']);
+});
+
+// Off or in interval mode there is no schedule to compare with, so it is armed.
+test('a reload that brings a schedule to a warmer without one arms it', async () => {
+  const am = new AccountManager([oauth('a')], 0.98);
+  const now = Date.parse('2030-09-01T07:29:00.000Z');
+  const timers = [];
+  const warmer = makeWarmer(am, fakeSpawner(), {
+    nowFn: () => now,
+    setTimeoutFn: (fn, delay) => {
+      const timer = { fn, delay, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeoutFn: () => {},
+  });
+  warmer.start();
+  warmer.reloadSchedule(ROLLING);
+  assert.equal(warmer.getStatus().mode, 'rolling');
+  assert.equal(warmer.getStatus().nextWarmupAt, '2030-09-01T07:30:00.000Z');
+  assert.equal(timers.length, 1);
+});
+
+// Guards: a schedule that differs in any field still reschedules. The mode
+// alone: the rolling fields kept, read as a daily schedule.
+for (const [field, schedule, changed] of [
+  ['mode', ROLLING, { ...ROLLING, mode: undefined }],
+  ['anchor', ROLLING, { ...ROLLING, anchorResetAt: '2030-09-02T12:30:00.000Z' }],
+  ['reset time', DAILY, { ...DAILY, resetTime: '16:30' }],
+  ['timezone', DAILY, { ...DAILY, timezone: 'Europe/Istanbul' }],
+]) {
+  test(`a reload that changes the schedule's ${field} reschedules it`, async () => {
+    const s = await heldSlot(schedule);
+    s.warmer.reloadSchedule(changed);
+    assert.equal(s.inFlight.aborted, true, 'the old schedule\'s sweep is cut short');
+    assert.equal(s.warmer.schedule, changed);
+    s.release();
+    await s.slot;
+  });
+}
+
+test('a reload that changes the schedule drops its delayed warm-ups as reconfigured', async () => {
+  const w = await delayedWarmups(['first', 'second']);
+  w.warmer.reloadSchedule({ ...w.schedule, anchorResetAt: '2030-09-02T12:30:00.000Z' });
+  assert.deepEqual(w.dropped(), [dropLine('first', 'keep-warm reconfigured'), dropLine('second', 'keep-warm reconfigured')]);
+});
+
+// The sweep picks its targets when it starts; one removed before its turn is
+// not warmed, since its pin could resolve to another account.
+test('an account removed while a sweep is running is not warmed', async () => {
+  const s = await heldSlot(ROLLING);
+  const log = console.log;
+  console.log = () => {};
+  try { s.warmer.am.removeAccount(1); } finally { console.log = log; }
+  s.release();
+  await s.slot;
+  assert.deepEqual(s.sent(), ['first']);
+});
+
+// Guards on the removal check: an account after the removed one is renumbered
+// in place, so it is still the manager's at its new index, and still warmed.
+test('an account renumbered by an earlier removal mid-sweep is still warmed', async () => {
+  const s = await heldSlot(ROLLING);
+  const log = console.log;
+  console.log = () => {};
+  try { s.warmer.am.removeAccount(0); } finally { console.log = log; }
+  s.release();
+  await s.slot;
+  assert.deepEqual(s.sent(), ['first', 'second']);
+});
+
+test('a delayed warm-up of an account renumbered by an earlier removal still goes out', async () => {
+  const w = await delayedWarmups(['first', 'second']);
+  const log = console.log;
+  console.log = () => {};
+  try { w.am.removeAccount(0); } finally { console.log = log; }
+  for (const timer of w.deferred) await timer.fn();
+  assert.deepEqual(w.sent(), ['second']);
+  assert.deepEqual(w.dropped(), [dropLine('first', 'account removed')]);
+});
+
+// A bad hand edit still fails the reload and leaves the schedule running.
+test('a reload with an invalid schedule throws and keeps the running one', async () => {
+  const s = await heldSlot(ROLLING);
+  assert.throws(() => s.warmer.reloadSchedule({ ...ROLLING, timezone: 'Moscow' }), /invalid IANA timezone/);
+  assert.equal(s.inFlight.aborted, false);
+  assert.equal(s.warmer.schedule, ROLLING);
+  s.release();
+  await s.slot;
 });
 
 test('a late rolling timer skips to the next five-hour lattice point', async () => {
