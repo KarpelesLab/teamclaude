@@ -13,7 +13,7 @@ import { decideBand, pressureOf, pressureRank, assertNever, WEEKLY_WINDOW_SECOND
 import { BurnRateLearner, ConcurrencyLearner, fiveHourHeadroomFraction, scoreCandidate } from './adaptive-distribution.js';
 import { OutsideSpendTracker, OUTSIDE_SPEND_STATES, OUTSIDE_SPEND_SETTLE_MS, outsideSpendKey } from './outside-spend.js';
 import { forecastWindow } from './forecast.js';
-import { forecastFleet } from './fleet-forecast.js';
+import { forecastFleet, fleetTimeline, BUSIER_LOAD_FACTOR } from './fleet-forecast.js';
 import { QuotaSeries } from './quota-series.js';
 import { safeLine } from './safe-text.js';
 import { parseEndsAt } from './ends-at.js';
@@ -228,6 +228,18 @@ const underOne = v => v != null && v < 1;
  * @property {{available: number, applicable: number|null, seenAt: number, expiresAt?: number|null, fable?: number, fableExpiresAt?: number|null}} [resetCredits]  free rate-limit reset credits (Codex) or banked usage-limit resets (Claude) held, when that was last seen, and when the soonest one lapses where the provider says (for Claude, the general and the Fable resets each dated apart)
  * @property {Record<string, {name: string, utilization: number, resetAt: number|null, seenAt: number}>} [codexModelBuckets]  model-scoped weekly buckets, keyed by slug
  * @property {Record<string, string>} [codexModelLimits]  which limit each model was last metered on, from `x-codex-active-limit`: a `codexModelBuckets` slug, or the name upstream gives the account-wide limit
+ */
+
+/**
+ * `fleetTimeline` in status: fleet-forecast.js's timeline with accounts keyed
+ * by name, and the outages of the busier scenario beside it.
+ *
+ * @typedef {object} FleetTimelineStatus
+ * @property {number} from
+ * @property {number} to
+ * @property {Record<string, import('./fleet-forecast.js').AccountState[]>} accounts
+ * @property {import('./fleet-forecast.js').Outage[]} outages
+ * @property {{ loadFactor: number, outages: import('./fleet-forecast.js').Outage[] }} busier
  */
 
 /**
@@ -899,7 +911,7 @@ export class AccountManager {
     // samples into it and reads it, the file I/O lives with the caller.
     /** @type {QuotaSeries} */
     this.quotaSeries = new QuotaSeries();
-    /** @type {{ series: QuotaSeries, key: string, value: import('./fleet-forecast.js').FleetForecast|null }|null} */
+    /** @type {{ series: QuotaSeries, key: string, value: { forecast: import('./fleet-forecast.js').FleetForecast|null, timeline: FleetTimelineStatus|null } }|null} */
     this._fleetForecastCache = null;
     // The last adaptiveStats() a status read computed, and when. Time is the
     // only thing that invalidates it (see _adaptiveStatsCached).
@@ -7683,6 +7695,9 @@ export class AccountManager {
       // When the whole fleet is out at once, and when the first account is
       // back (#550). Null until there are 48 hours of samples.
       fleetForecast: this.fleetForecastStatus(),
+      // The week ahead from the same simulation: each account's state changes
+      // and the pool's outages, at the measured load and a busier one.
+      fleetTimeline: this.fleetTimelineStatus(),
       accounts: this.accounts.map(a => ({
         name: a.name,
         type: a.type,
@@ -7867,11 +7882,29 @@ export class AccountManager {
    * `fleetForecast` for status (#550): when every account is out at once and
    * when the first one is back, from the stored series. Null until the series
    * spans 48 hours, and when nothing runs out within the forecast horizon.
-   * Cached for a minute per series revision: status is polled every few
-   * seconds, and the answer moves in five-minute steps.
    * @param {number} [now]
    */
   fleetForecastStatus(now = Date.now()) {
+    return this._fleetForecasts(now).forecast;
+  }
+
+  /**
+   * `fleetTimeline` for status: the week ahead from the same simulation, each
+   * account's state changes keyed by its name and the pool's outages, with
+   * the outages of a busier fleet beside them. Null until the series spans 48
+   * hours; unlike fleetForecast it answers when nothing runs out.
+   * @param {number} [now]
+   */
+  fleetTimelineStatus(now = Date.now()) {
+    return this._fleetForecasts(now).timeline;
+  }
+
+  /**
+   * Both fleet answers, cached for a minute per series revision: status is
+   * polled every few seconds, and a minute moves neither much.
+   * @param {number} now
+   */
+  _fleetForecasts(now) {
     // The series object is part of the key: the server swaps in the one it
     // loaded from disk, whose revision can equal the empty one's.
     const series = this.quotaSeries;
@@ -7882,14 +7915,29 @@ export class AccountManager {
     /** @type {Record<string, import('./fleet-forecast.js').BucketThresholds>} */
     const thresholds = Object.create(null);
     for (const a of accounts) thresholds[a.id] = { weekly: this.thresholdFor('unified7d', a), fiveHour: this.thresholdFor('unified5h', a) };
-    const value = forecastFleet({
+    const input = {
       series: this.quotaSeries.all(),
       accounts: accounts.map(a => ({
         id: a.id, weekly: a.quota?.unified7d, weeklyResetAt: a.quota?.unified7dReset, fiveHour: a.quota?.unified5h, fiveHourResetAt: a.quota?.unified5hReset,
+        weight: quotaTier(a).weight,
       })),
       thresholds,
       now,
-    });
+    };
+    const forecast = forecastFleet(input);
+    const base = fleetTimeline(input);
+    const busier = base && fleetTimeline({ ...input, loadFactor: BUSIER_LOAD_FACTOR });
+    /** @type {FleetTimelineStatus|null} */
+    let timeline = null;
+    if (base) {
+      // Status names accounts, so the timeline does too; the id stays inside.
+      const names = new Map(accounts.map(a => [a.id, a.name]));
+      /** @type {Record<string, import('./fleet-forecast.js').AccountState[]>} */
+      const byName = Object.create(null);
+      for (const [id, states] of Object.entries(base.accounts)) byName[names.get(id) ?? id] = states;
+      timeline = { from: base.from, to: base.to, accounts: byName, outages: base.outages, busier: { loadFactor: BUSIER_LOAD_FACTOR, outages: busier ? busier.outages : [] } };
+    }
+    const value = { forecast, timeline };
     this._fleetForecastCache = { series, key, value };
     return value;
   }
