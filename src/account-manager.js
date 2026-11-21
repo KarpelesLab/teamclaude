@@ -668,9 +668,10 @@ function makeAccount(acct, index, listener = null) {
     refreshToken: isLongLived(acct) ? null : acct.refreshToken || null,
     expiresAt: acct.expiresAt || null,
     // When the refresh token itself lapses (epoch ms), where the provider or
-    // the imported credential file said; null when nobody did. See
-    // refresh-token-expiry.js. A long-lived account has no refresh token for
-    // a date to describe.
+    // the imported credential file said, or 30 days from a Claude sign-in
+    // whose response said nothing (signInRefreshTokenExpiry); null otherwise.
+    // See refresh-token-expiry.js. A long-lived account has no refresh token
+    // for a date to describe.
     refreshTokenExpiresAt: isLongLived(acct) ? null : knownRefreshTokenExpiry(acct.refreshTokenExpiresAt),
     status: 'active',
     // Why the account last went to 'error' (see _needsLogin); read only while
@@ -7729,8 +7730,9 @@ export class AccountManager {
         // beside a refresh_rejected error it tells a token that died after
         // days idle from one rotated away by another client (#629).
         lastRefreshAt: a._lastRefreshAt ?? null,
-        // When the refresh token lapses (epoch ms). Present only when the
-        // provider or the imported credential file stated it (#674).
+        // When the refresh token lapses (epoch ms). Present only when it is
+        // known: stated by the provider or the imported credential file
+        // (#674), or the 30 days a Claude sign-in that stated none is given.
         ...(a.refreshTokenExpiresAt != null ? { refreshTokenExpiresAt: a.refreshTokenExpiresAt } : {}),
         // A `login --long-lived` account, with when its token lapses (epoch
         // ms, null when the entry states none). Present only on such an
