@@ -705,6 +705,15 @@ export class ResetCreditRedeemer {
     if (policy.maxShare < 1) ordered.sort((a, b) => byExhaustion(a.account, b.account));
     for (const { account } of ordered) {
       const state = this._stateFor(account);
+      // An account the reads left in the error state (its refresh token was
+      // refused, while the access token it still held read its rows) serves
+      // nothing until it is signed in again, so a credit spent on it buys no
+      // request, and under a share cap takes the slot of an account in service.
+      if (account.status === 'error') {
+        reason = 'went into the error state while its credits were read';
+        this._logSkip(account, state, reason, now);
+        continue;
+      }
       // The share cap again, over the accounts as they stand now: a refresh
       // token upstream rejects during the reads above leaves its account in
       // the error state, and so out of the cohort the other accounts are
