@@ -4356,6 +4356,10 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         && !(resetProvider === DEFAULT_PROVIDER && a.upstream)
         // Not a cordoned account: the reset would buy new work it takes none of.
         && !a.cordoned
+        // Nor one the request's model route excludes. unavailableReason names
+        // `quota` ahead of `route`, so such an account can read as resettable,
+        // and a reset there clears windows this request may never use.
+        && accountManager._routeAllows(a, ctx.model)
         && clears.has(accountManager.unavailableReason(a, ctx.model) ?? ''))
       : [];
     if (resettable.length) {
@@ -4363,15 +4367,20 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // but leaves the account unselectable (upstream not yet caught up with its
       // own reset) must cost this request one re-selection, not a loop of them.
       ctx.resetRedeemTried = true;
-      let redeemed = false;
+      let reselect = false;
       try {
         // The model tells the Claude redeemer which weekly bucket parked each
         // account; the Codex one has no use for it.
-        redeemed = !!(await redeemHook?.(resettable, { model: ctx.model }))?.redeemed;
+        const outcome = await redeemHook?.(resettable, { model: ctx.model });
+        // A reset that landed, or a fresh reading that shows an account can
+        // serve after all (the Claude redeemer's `available`): either way the
+        // pool is no longer dry for this request.
+        reselect = !!(outcome?.redeemed || outcome?.available);
       } catch { /* a failed redemption must leave the refusal exactly as it was */ }
-      if (redeemed) {
+      if (reselect) {
         // No upstream attempt was made, so this costs no retry from the budget:
-        // re-select against the account whose windows were just cleared.
+        // re-select against the account whose windows were just cleared or
+        // re-read.
         if (clientGone(res)) { ctx.abandoned = true; return; }
         return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
       }

@@ -38,13 +38,20 @@ function fableSpent(account, resetIn) {
   return account;
 }
 
+// Every account is also held after the 429 that brought word of its wall, as
+// the proxy holds it, so it is out for a request that names no model too. The
+// status read reports the account's own readings until a claim lands on it.
 function harness({ accounts = [oauth('a')], status = () => block(), claim = () => ({ result: 'reset', reason: null, resetsLeft: 0, cleared: ['five_hour', 'seven_day', 'seven_day_overage_included'], cooldownUntil: null }), config = { ...ARMED } } = {}) {
   const am = new AccountManager(accounts, 0.98);
-  am.accounts.forEach((a, i) => fableSpent(a, (i + 1) * DAY));
+  am.accounts.forEach((a, i) => Object.assign(fableSpent(a, (i + 1) * DAY), { status: 'throttled', rateLimitedUntil: Date.now() + H }));
   const calls = { status: 0, claim: [], grants: [], keys: [], logs: [] };
+  const reading = (account) => {
+    const q = calls.claim.includes(account.name) ? { unified5h: 0, unified7d: 0, unified7dFable: 0 } : account.quota;
+    return { fiveHour: { utilization: q.unified5h }, sevenDay: { utilization: q.unified7d }, sevenDayFable: { utilization: q.unified7dFable } };
+  };
   const redeemer = new ClaudeResetRedeemer(am, {
     config, log: line => calls.logs.push(line),
-    statusFn: async (account) => { calls.status++; const b = status(account, calls); return { reset: parseResetStatus(b), usage: { fiveHour: { utilization: 0 }, sevenDay: { utilization: 0 }, sevenDayFable: { utilization: 0 } } }; },
+    statusFn: async (account) => { calls.status++; const b = status(account, calls); return { reset: parseResetStatus(b), usage: reading(account) }; },
     claimFn: async (account, c) => { calls.claim.push(account.name); calls.grants.push(c.grantId); calls.keys.push(c.requestId); return claim(calls.claim.length, c); },
   });
   am.ensureTokenFresh = async () => {};
@@ -276,6 +283,22 @@ test('no verdict on one account: no sibling is spent in the same refusal', async
   assert.equal(calls.claim.length, 1);
 });
 
+// The hold is saved on the account it was armed for, and a removed account is
+// no longer among those fleetHoldUntil reads.
+test('a claim on an account removed while it was in flight still holds the rest of the fleet off', async () => {
+  for (const verdict of [{ result: 'reset', resetsLeft: 0, cleared: ['seven_day_overage_included'] }, { error: 'socket hang up' }]) {
+    const h = harness({ accounts: [oauth('a'), oauth('b')], claim: () => {
+      h.am.removeAccount(h.am.accounts.findIndex(a => a.name === h.calls.claim.at(-1)));
+      return verdict;
+    } });
+    await h.redeemer.maybeRedeemForPool(h.am.accounts);
+    assert.deepEqual(h.am.accounts.map(a => a.name), ['a'], 'b, which waits longest, was claimed on and removed');
+    const next = await h.redeemer.maybeRedeemForPool(h.am.accounts);
+    assert.equal(next.redeemed, false); assert.match(next.reason, /holding off/, JSON.stringify(verdict));
+    assert.deepEqual(h.calls.claim, ['b']);
+  }
+});
+
 test('a 5-hour wall alone is never worth a grant', async () => {
   const { am, redeemer, calls } = harness({ status: () => block({ exhausted: ['five_hour'] }) });
   const r = await redeemer.maybeRedeemForPool(am.accounts);
@@ -358,6 +381,10 @@ function parkedHarness({ accounts = [oauth('a')], quota, upstream = null, grants
 
 const declines = calls => calls.logs.filter(l => /banked reset not redeemed/.test(l));
 
+// Held after a 429, as the proxy holds an account: one whose readings are under
+// its threshold is offered on that, and is out for every model.
+const held = am => { for (const a of am.accounts) Object.assign(a, { status: 'throttled', rateLimitedUntil: Date.now() + H }); return am; };
+
 test('parked at the switch threshold on the all-models weekly: the reset is spent though upstream reports no limit', async () => {
   const { am, redeemer, calls } = parkedHarness({ quota: { unified7d: 0.985 }, grants: [fableWithSession, weeklyGrant] });
   assert.equal(am.unavailableReason(am.accounts[0], OPUS), 'quota');
@@ -397,6 +424,93 @@ test('parked by the weekly and the 5-hour window: a grant that leaves the 5-hour
   assert.deepEqual(spent.calls.grants, ['fable']);
 });
 
+test('at upstream\'s 5-hour wall and parked on a weekly reading: the weekly reading is what bars it, so a reset that clears both is spent', async () => {
+  const atFiveHour = { at_limit: true, exhausted: ['five_hour'] };
+  const { am, redeemer, calls } = parkedHarness({ quota: { unified5h: 1, unified7d: 0.99 }, blockExtra: atFiveHour, grants: [{ ...weeklyGrant, use_requires_limit: true }] });
+  const r = await redeemer.maybeRedeemForPool(am.accounts, { model: OPUS });
+  assert.equal(r.redeemed, true, r.reason);
+  assert.deepEqual(calls.grants, ['weekly'], 'at an upstream limit, a grant that needs one reached may be used');
+  // The 5-hour wall alone is still never worth a grant, and the weekly limit
+  // behind the parked reading has to be cleared too.
+  const fiveHourOnly = parkedHarness({ quota: { unified5h: 1, unified7d: 0.5 }, blockExtra: atFiveHour });
+  const alone = await fiveHourOnly.redeemer.maybeRedeemForPool(fiveHourOnly.am.accounts, { model: OPUS });
+  assert.equal(alone.redeemed, false); assert.equal(alone.reason, 'no weekly limit is exhausted');
+  const sessionOnly = parkedHarness({ quota: { unified5h: 1, unified7d: 0.99 }, blockExtra: atFiveHour, grants: [{ id: 'session', type: 'session', clears: ['five_hour'] }] });
+  const partial = await sessionOnly.redeemer.maybeRedeemForPool(sessionOnly.am.accounts, { model: OPUS });
+  assert.equal(partial.redeemed, false); assert.equal(partial.reason, 'its reset does not clear seven_day');
+  assert.equal(fiveHourOnly.calls.claim.length + sessionOnly.calls.claim.length, 0);
+});
+
+// The Fable reset is the cheapest kind that clears an upstream Fable wall, but
+// the shared weekly behind it keeps the account parked for Opus and for Fable.
+test('at upstream\'s Fable wall on an account the shared weekly parks: only a reset that clears both is spent', async () => {
+  const fableWall = { at_limit: true, exhausted: ['seven_day_overage_included'] };
+  for (const model of [OPUS, FABLE]) {
+    const both = parkedHarness({ quota: { unified7d: 0.99, unified7dFable: 1 }, blockExtra: fableWall, grants: [fableGrant, weeklyGrant] });
+    assert.equal((await both.redeemer.maybeRedeemForPool(both.am.accounts, { model })).redeemed, true, model);
+    assert.deepEqual(both.calls.grants, ['weekly'], model);
+    assert.equal(both.am.unavailableReason(both.am.accounts[0], model), null, model);
+    const fableOnly = parkedHarness({ quota: { unified7d: 0.99, unified7dFable: 1 }, blockExtra: fableWall, grants: [fableGrant] });
+    const r = await fableOnly.redeemer.maybeRedeemForPool(fableOnly.am.accounts, { model });
+    assert.equal(r.redeemed, false, model); assert.equal(r.reason, 'its reset does not clear seven_day');
+    assert.equal(fableOnly.calls.claim.length, 0);
+  }
+  // A park on a reading no grant is known to clear stands at an upstream wall too.
+  const scoped = parkedHarness({ quota: { unified7d: 1, scopedWeekly: { opus: { utilization: 0.99, resetAt: Date.now() + 3 * DAY } } },
+    blockExtra: { at_limit: true, exhausted: ['seven_day'] } });
+  assert.equal((await scoped.redeemer.maybeRedeemForPool(scoped.am.accounts, { model: OPUS })).reason, 'no reset is known to clear its scopedWeekly reading');
+  assert.equal(scoped.calls.claim.length, 0);
+});
+
+// The proxy usually learns of upstream's 5-hour wall from a 429, and holds the
+// account `throttled` for up to an hour, which outranks `quota`.
+test('held after the 429 of upstream\'s 5-hour wall and parked on a weekly reading: the reset is spent and lifts the hold', async () => {
+  const atFiveHour = { at_limit: true, exhausted: ['five_hour'] };
+  const { am, redeemer, calls } = parkedHarness({ quota: { unified5h: 1, unified7d: 0.99 }, blockExtra: atFiveHour });
+  am.markRateLimited(0, 3600);
+  assert.equal(am.unavailableReason(am.accounts[0], OPUS), 'throttled');
+  const r = await redeemer.maybeRedeemForPool(am.accounts, { model: OPUS });
+  assert.equal(r.redeemed, true, r.reason);
+  assert.deepEqual(calls.claim, ['a']);
+  assert.equal(am.unavailableReason(am.accounts[0], OPUS), null, 'the hold went with the reset');
+  // A hold whose weekly reading is under the threshold is still not worth one.
+  const held = parkedHarness({ quota: { unified5h: 1, unified7d: 0.5 }, blockExtra: atFiveHour });
+  held.am.markRateLimited(0, 3600);
+  assert.equal((await held.redeemer.maybeRedeemForPool(held.am.accounts, { model: OPUS })).reason, 'no weekly limit is exhausted');
+  assert.equal(held.calls.claim.length, 0);
+  // Nor is a weekly window that has already reset, read with no fresh quota:
+  // the hold must not keep an expired reading in play.
+  const lapsed = parkedHarness({ quota: { unified5h: 1, unified7d: 0.99 }, blockExtra: atFiveHour });
+  lapsed.am.accounts[0].quota.unified7dReset = Date.now() - 1;
+  lapsed.am.markRateLimited(0, 3600);
+  const read = lapsed.redeemer.statusFn;
+  lapsed.redeemer.statusFn = async account => ({ ...(await read(account)), usage: undefined });
+  assert.equal((await lapsed.redeemer.maybeRedeemForPool(lapsed.am.accounts, { model: OPUS })).reason, 'no weekly limit is exhausted');
+  assert.equal(lapsed.calls.claim.length, 0);
+  // A family weekly behind the hold parks the account for the model it
+  // governs, its 5-hour and shared readings under their thresholds.
+  const family = parkedHarness({ quota: { unified7dFable: 0.99 }, grants: [fableGrant] });
+  family.am.markRateLimited(0, 3600);
+  assert.equal((await family.redeemer.maybeRedeemForPool(family.am.accounts, { model: FABLE })).redeemed, true);
+  assert.deepEqual(family.calls.grants, ['fable']);
+});
+
+test('a weekly reading exactly at the switch threshold parks the account, as it does for selection', async () => {
+  const { am, redeemer, calls } = parkedHarness({ quota: { unified7d: 0.98 } });
+  assert.equal(am.unavailableReason(am.accounts[0], OPUS), 'quota');
+  assert.equal((await redeemer.maybeRedeemForPool(am.accounts, { model: OPUS })).redeemed, true);
+  assert.deepEqual(calls.claim, ['a']);
+});
+
+test('parked by a learned scoped weekly beside the shared one: a reset that clears only the shared weekly is not spent', async () => {
+  const scopedWeekly = { opus: { utilization: 0.99, resetAt: Date.now() + 3 * DAY } };
+  const { am, redeemer, calls } = parkedHarness({ quota: { unified7d: 0.99, scopedWeekly } });
+  const r = await redeemer.maybeRedeemForPool(am.accounts, { model: OPUS });
+  assert.equal(r.redeemed, false);
+  assert.equal(r.reason, 'no reset is known to clear its scopedWeekly reading');
+  assert.equal(calls.claim.length, 0);
+});
+
 test('parked only by the 5-hour window: a weekly reset is never spent for it', async () => {
   const { am, redeemer, calls } = parkedHarness({ quota: { unified5h: 0.99, unified7d: 0.5 } });
   assert.equal(am.unavailableReason(am.accounts[0], OPUS), 'quota', 'the server would offer this account');
@@ -407,7 +521,7 @@ test('parked only by the 5-hour window: a weekly reset is never spent for it', a
 
 test('below its switch threshold: nothing is spent', async () => {
   const { am, redeemer, calls } = parkedHarness({ quota: { unified7d: 0.97 } });
-  const r = await redeemer.maybeRedeemForPool(am.accounts, { model: OPUS });
+  const r = await redeemer.maybeRedeemForPool(held(am).accounts, { model: OPUS });
   assert.equal(r.redeemed, false); assert.match(r.reason, /not at a usage limit/);
   assert.equal(calls.claim.length, 0);
 });
@@ -417,12 +531,12 @@ test('the threshold is the one that applies to the account: its own override, or
   const own = parkedHarness({ accounts: [oauth('a', { switchThreshold: 0.9 })], quota: { unified7d: 0.92 } });
   assert.equal((await own.redeemer.maybeRedeemForPool(own.am.accounts, { model: OPUS })).redeemed, true);
   const fleet = parkedHarness({ quota: { unified7d: 0.92 } });
-  assert.equal((await fleet.redeemer.maybeRedeemForPool(fleet.am.accounts, { model: OPUS })).redeemed, false);
+  assert.equal((await fleet.redeemer.maybeRedeemForPool(held(fleet.am).accounts, { model: OPUS })).redeemed, false);
   // A fresh fleet per model: the first redemption would hold the second off.
   const perBucket = () => parkedHarness({ quota: { unified7dFable: 0.92 }, threshold: { default: 0.98, unified7dFable: 0.9 } });
   const forFable = perBucket(), forOpus = perBucket();
   assert.equal((await forFable.redeemer.maybeRedeemForPool(forFable.am.accounts, { model: FABLE })).redeemed, true);
-  const opus = await forOpus.redeemer.maybeRedeemForPool(forOpus.am.accounts, { model: OPUS });
+  const opus = await forOpus.redeemer.maybeRedeemForPool(held(forOpus.am).accounts, { model: OPUS });
   assert.equal(opus.redeemed, false, 'the Fable bucket does not park an Opus request');
   assert.match(opus.reason, /not at a usage limit/);
 });
@@ -456,6 +570,13 @@ test('a grant that needs the upstream limit reached is not claimed below it', as
   assert.equal(calls.claim.length, 0);
 });
 
+test('upstream at a limit it does not name: a grant that needs one reached is still not claimed', async () => {
+  const { am, redeemer, calls } = parkedHarness({ quota: { unified7d: 0.99 }, blockExtra: { at_limit: true }, grants: [{ ...weeklyGrant, use_requires_limit: true }] });
+  const r = await redeemer.maybeRedeemForPool(am.accounts, { model: OPUS });
+  assert.equal(r.redeemed, false); assert.match(r.reason, /only be used at the upstream limit/);
+  assert.equal(calls.claim.length, 0);
+});
+
 test('the parked verdict is judged on the fresh read, not on a stale local reading', async () => {
   const { am, redeemer, calls } = parkedHarness({ quota: { unified7d: 0.99 }, upstream: { unified7d: 0.4 } });
   const r = await redeemer.maybeRedeemForPool(am.accounts, { model: OPUS });
@@ -474,6 +595,54 @@ test('several parked accounts: still one reset, on the account that would wait l
   assert.equal(calls.claim.length, 1);
 });
 
+test('parked below 0.98: the reset still goes to the account that would wait longest', async () => {
+  // The fleet's threshold, and the accounts' own under the fleet default.
+  for (const [threshold, own] of [[0.9, {}], [0.98, { switchThreshold: 0.9 }]]) {
+    for (const order of [['soon', 'late'], ['late', 'soon']]) {
+      const { am, redeemer, calls } = parkedHarness({ accounts: order.map(name => oauth(name, own)), quota: { unified7d: 0.92 }, threshold });
+      for (const a of am.accounts) a.quota.unified7dReset = Date.now() + (a.name === 'late' ? 6 : 1) * DAY;
+      assert.equal((await redeemer.maybeRedeemForPool(am.accounts, { model: OPUS })).redeemed, true);
+      assert.deepEqual(calls.claim, ['late'], `threshold ${threshold}, own ${JSON.stringify(own)}, config order ${order}`);
+    }
+  }
+  // A request that names no model: each window at its own bucket's threshold.
+  const { am, redeemer, calls } = parkedHarness({ accounts: [oauth('soon'), oauth('late')], quota: { unified7d: 0.92 }, threshold: 0.9 });
+  for (const a of am.accounts) a.quota.unified7dReset = Date.now() + (a.name === 'late' ? 6 : 1) * DAY;
+  assert.equal((await redeemer.maybeRedeemForPool(am.accounts)).redeemed, true);
+  assert.deepEqual(calls.claim, ['late'], 'no model');
+});
+
+test('the ranking reads only what bars the refused model, each against the threshold that governs it', async () => {
+  // A Fable request holds the shared weekly to the Fable bucket's threshold.
+  for (const order of [['soon', 'late'], ['late', 'soon']]) {
+    const { am, redeemer, calls } = parkedHarness({ accounts: order.map(name => oauth(name)), quota: { unified7d: 0.92, unified7dFable: 0.5 },
+      threshold: { default: 0.98, unified7dFable: 0.9 } });
+    for (const a of am.accounts) a.quota.unified7dReset = Date.now() + (a.name === 'late' ? 6 : 1) * DAY;
+    assert.equal((await redeemer.maybeRedeemForPool(am.accounts, { model: FABLE })).redeemed, true);
+    assert.deepEqual(calls.claim, ['late'], `per-bucket threshold, config order ${order}`);
+  }
+  // A Fable window does not bar an Opus request: `soon` is back for Opus in a
+  // day, though its Fable weekly waits six.
+  for (const order of [['soon', 'late'], ['late', 'soon']]) {
+    const { am, redeemer, calls } = parkedHarness({ accounts: order.map(name => oauth(name)),
+      quota: a => (a.name === 'soon' ? { unified7d: 0.99, unified7dFable: 0.99 } : { unified7d: 0.99 }) });
+    for (const a of am.accounts) {
+      a.quota.unified7dReset = Date.now() + (a.name === 'late' ? 3 : 1) * DAY;
+      if (a.name === 'soon') a.quota.unified7dFableReset = Date.now() + 6 * DAY;
+    }
+    assert.equal((await redeemer.maybeRedeemForPool(am.accounts, { model: OPUS })).redeemed, true);
+    assert.deepEqual(calls.claim, ['late'], `another family's window, config order ${order}`);
+  }
+  // The 5-hour window bars every model: `a` is back for Opus only when its
+  // 5-hour window resets, in four hours, though its weekly resets in one.
+  const five = parkedHarness({ accounts: [oauth('a'), oauth('b')], quota: a => (a.name === 'a' ? { unified5h: 0.99, unified7d: 0.99 } : { unified7d: 0.99 }) });
+  const [a5, b5] = five.am.accounts;
+  Object.assign(a5.quota, { unified7dReset: Date.now() + H, unified5hReset: Date.now() + 4 * H });
+  b5.quota.unified7dReset = Date.now() + 2 * H;
+  assert.equal((await five.redeemer.maybeRedeemForPool(five.am.accounts, { model: OPUS })).redeemed, true);
+  assert.deepEqual(five.calls.claim, ['a'], 'the 5-hour window');
+});
+
 test('a decline is logged once per account per cooldown, not once per refusal', async () => {
   const { am, redeemer, calls, advance } = parkedHarness({ quota: { unified7d: 0.99 }, grants: [fableGrant] });
   for (let i = 0; i < 3; i++) assert.equal((await redeemer.maybeRedeemForPool(am.accounts, { model: OPUS })).redeemed, false);
@@ -483,6 +652,270 @@ test('a decline is logged once per account per cooldown, not once per refusal', 
   await redeemer.maybeRedeemForPool(am.accounts, { model: OPUS });
   assert.equal(declines(calls).length, 2);
   assert.equal(calls.claim.length, 0);
+});
+
+// Whether a weekly reading parks an account depends on the refused request's
+// model, so a pass made for one model must not stand in for another's.
+test('a pass made for one model neither cools the account down for another nor answers its refusal', async () => {
+  // The 5-hour reading holds the account out for every model, the Fable weekly
+  // only for Fable: an Opus refusal is passed over, a Fable one is worth a reset.
+  const quota = { unified5h: 0.99, unified7dFable: 0.99 };
+  const after = parkedHarness({ quota });
+  const opus = await after.redeemer.maybeRedeemForPool(after.am.accounts, { model: OPUS });
+  assert.equal(opus.redeemed, false); assert.match(opus.reason, /not at a usage limit/);
+  const fable = await after.redeemer.maybeRedeemForPool(after.am.accounts, { model: FABLE });
+  assert.equal(fable.redeemed, true, fable.reason);
+  assert.deepEqual(after.calls.claim, ['a']);
+
+  // Both refusals at once: the Opus attempt is in flight when the Fable
+  // refusal arrives, and the Fable one does not take its answer.
+  const together = parkedHarness({ quota });
+  const [o, f] = await Promise.all([OPUS, FABLE].map(model => together.redeemer.maybeRedeemForPool(together.am.accounts, { model })));
+  assert.equal(o.redeemed, false);
+  assert.equal(f.redeemed, true, f.reason);
+  assert.deepEqual(together.calls.claim, ['a']);
+});
+
+test('a model\'s pass is kept by the weekly bucket that governs the model and by its family', async () => {
+  // A route can meter one Opus model on the Fable bucket: the two Opus models
+  // are then parked by different readings.
+  const routed = parkedHarness({ quota: { unified5h: 0.99, unified7dFable: 0.99 } });
+  routed.am.setRoutes([{ name: 'opus-on-fable', match: ['claude-opus-4-7'], bucket: 'unified7dFable' }]);
+  assert.match((await routed.redeemer.maybeRedeemForPool(routed.am.accounts, { model: 'claude-opus-4-6' })).reason, /not at a usage limit/);
+  assert.equal((await routed.redeemer.maybeRedeemForPool(routed.am.accounts, { model: 'claude-opus-4-7' })).redeemed, true);
+  // A learned scoped weekly is one family's: it parks Opus here, not Haiku.
+  const scoped = parkedHarness({ quota: { unified7d: 0.99, scopedWeekly: { opus: { utilization: 0.99, resetAt: Date.now() + 3 * DAY } } } });
+  assert.match((await scoped.redeemer.maybeRedeemForPool(scoped.am.accounts, { model: OPUS })).reason, /scopedWeekly/);
+  assert.equal((await scoped.redeemer.maybeRedeemForPool(scoped.am.accounts, { model: 'claude-haiku-4-5' })).redeemed, true);
+  // A parked wall no grant covers is the model's as well: with the shared
+  // weekly's own threshold lower, it parks Opus and not Fable.
+  const uncovered = parkedHarness({ quota: { unified7d: 0.92, unified7dFable: 0.99 }, grants: [fableGrant], threshold: { default: 0.98, unified7d: 0.9 } });
+  assert.equal((await uncovered.redeemer.maybeRedeemForPool(uncovered.am.accounts, { model: OPUS })).reason, 'its reset does not clear seven_day');
+  assert.equal((await uncovered.redeemer.maybeRedeemForPool(uncovered.am.accounts, { model: FABLE })).redeemed, true);
+});
+
+test('a pass that does not turn on the model holds the account for every model', async () => {
+  const { am, redeemer, calls } = harness({ status: () => block({ exhausted: ['seven_day_overage_included', 'seven_day_sonnet'] }) });
+  assert.match((await redeemer.maybeRedeemForPool(am.accounts, { model: OPUS })).reason, /does not clear seven_day_sonnet/);
+  assert.equal((await redeemer.maybeRedeemForPool(am.accounts, { model: FABLE })).redeemed, false);
+  assert.equal(calls.status, 1, 'upstream\'s own wall is the same for every model, so the account is not read again');
+});
+
+test('refusals judged on the same readings share a pass and an attempt, whatever their family', async () => {
+  // No scoped bucket is learned, so Opus and Haiku are both judged on the
+  // 5-hour window and the shared weekly.
+  const after = parkedHarness({ quota: { unified5h: 0.99 } });
+  assert.match((await after.redeemer.maybeRedeemForPool(after.am.accounts, { model: OPUS })).reason, /not at a usage limit/);
+  assert.equal((await after.redeemer.maybeRedeemForPool(after.am.accounts, { model: 'claude-haiku-4-5' })).redeemed, false);
+  assert.equal(after.calls.status, 1, 'the pass made for Opus holds for Haiku');
+  assert.equal(declines(after.calls).length, 1);
+  const together = parkedHarness({ quota: { unified5h: 0.99 } });
+  const [o, h] = await Promise.all([OPUS, 'claude-haiku-4-5'].map(model => together.redeemer.maybeRedeemForPool(together.am.accounts, { model })));
+  assert.equal(h.reason, o.reason);
+  assert.equal(together.calls.status, 1, 'one attempt answers both');
+  // A scoped bucket gates only beside the shared weekly: an Opus model a route
+  // meters on the Fable bucket is judged as Fable is, scoped Opus bucket or not.
+  const routed = parkedHarness({ quota: { unified5h: 0.99, scopedWeekly: { opus: { utilization: 0.2, resetAt: Date.now() + 3 * DAY } } } });
+  routed.am.setRoutes([{ name: 'opus-on-fable', match: ['claude-opus-4-7'], bucket: 'unified7dFable' }]);
+  for (const model of [OPUS, FABLE]) assert.equal((await routed.redeemer.maybeRedeemForPool(routed.am.accounts, { model })).redeemed, false);
+  assert.equal(routed.calls.status, 1);
+});
+
+// No account has learned a scoped Opus weekly yet, so Opus and Haiku start
+// with one key. The walk's own status read then reports Opus's weekly spent
+// beside the shared one: Opus is parked on a reading no grant is known to
+// clear, Haiku on the shared weekly alone, which the weekly reset clears.
+function scopedFirstSeen() {
+  const h = parkedHarness({ quota: { unified7d: 0.99 } });
+  const scopedWeekly = { opus: { utilization: 0.99, resetAt: Date.now() + 3 * DAY } };
+  const read = h.redeemer.statusFn;
+  h.redeemer.statusFn = async account => {
+    const r = await read(account);
+    return h.calls.claim.length ? r : { ...r, usage: { ...r.usage, scopedWeekly } };
+  };
+  assert.equal(h.am.accounts[0].quota.scopedWeekly?.opus, undefined);
+  return h;
+}
+
+test('a scoped bucket first seen in the walk\'s own read keys the pass it decides', async () => {
+  const { am, redeemer, calls } = scopedFirstSeen();
+  assert.equal((await redeemer.maybeRedeemForPool(am.accounts, { model: OPUS })).reason, 'no reset is known to clear its scopedWeekly reading');
+  assert.ok(am.accounts[0].quota.scopedWeekly.opus, 'the read taught the fleet the scoped bucket');
+  const haiku = await redeemer.maybeRedeemForPool(am.accounts, { model: 'claude-haiku-4-5' });
+  assert.equal(haiku.redeemed, true, haiku.reason);
+  assert.deepEqual(calls.claim, ['a']);
+});
+
+test('a refusal that joins an attempt is matched on the key the attempt\'s reads give the attempt\'s model', async () => {
+  // The Haiku refusal joins the Opus attempt on the key both had before the
+  // read, and does not take the decline the read made Opus's own.
+  const { am, redeemer, calls } = scopedFirstSeen();
+  const [o, h] = await Promise.all([OPUS, 'claude-haiku-4-5'].map(model => redeemer.maybeRedeemForPool(am.accounts, { model })));
+  assert.equal(o.reason, 'no reset is known to clear its scopedWeekly reading');
+  assert.equal(h.redeemed, true, h.reason);
+  assert.deepEqual(calls.claim, ['a']);
+});
+
+test('a refusal that joins an attempt is matched on the key the attempt\'s reads give the refusal\'s own model', async () => {
+  // The other way round: an Opus refusal joins a Haiku attempt. That walk's
+  // read of a teaches the fleet a scoped Opus weekly and shows a can serve
+  // Haiku after all, but not Opus, which a's scoped weekly parks; b, parked
+  // on the shared weekly alone, is Opus's to redeem.
+  const { am, redeemer, calls } = parkedHarness({ accounts: [oauth('a'), oauth('b')], quota: { unified7d: 0.99 } });
+  const [a] = am.accounts;
+  a.quota.unified7dReset = Date.now() + 5 * DAY;
+  const scopedWeekly = { opus: { utilization: 0.99, resetAt: Date.now() + 3 * DAY } };
+  const read = redeemer.statusFn;
+  redeemer.statusFn = async account => {
+    const r = await read(account);
+    return account === a && !calls.claim.length ? { ...r, usage: { ...r.usage, sevenDay: { utilization: 0.5 }, scopedWeekly } } : r;
+  };
+  const [haiku, opus] = await Promise.all(['claude-haiku-4-5', OPUS].map(model => redeemer.maybeRedeemForPool(am.accounts, { model })));
+  assert.equal(haiku.available, true); assert.equal(haiku.account, 'a');
+  assert.notEqual(am.unavailableReason(a, OPUS), null, 'a cannot serve Opus');
+  assert.equal(opus.redeemed, true, opus.reason); assert.equal(opus.account, 'b');
+  assert.deepEqual(calls.claim, ['b']);
+});
+
+test('a refusal keyed apart from the attempt it joins does not take its decline once an expiry makes the keys alike', async t => {
+  // a has learned a scoped Opus weekly, which runs out while the Opus walk
+  // reads b, and another request's selection sweeps it. The walk passed a
+  // over on that bucket and b on its Fable-only reset; Haiku, parked on a's
+  // shared weekly alone, is served by a's weekly reset.
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  const { am, redeemer, calls } = parkedHarness({ accounts: [oauth('a'), oauth('b')], quota: { unified7d: 0.99 } });
+  const [a, b] = am.accounts;
+  Object.assign(a.quota, { unified7dReset: Date.now() + 5 * DAY, scopedWeekly: { opus: { utilization: 0.99, resetAt: Date.now() + 5_000 } } });
+  const read = redeemer.statusFn;
+  let swept = false;
+  redeemer.statusFn = async account => {
+    if (account === b && !swept) { swept = true; t.mock.timers.tick(10_000); am.refreshExpiredQuotas(); }
+    const r = await read(account);
+    return account === b ? { ...r, reset: parseResetStatus(grantBlock([fableGrant], NOT_WALLED)) } : r;
+  };
+  const [opus, haiku] = await Promise.all([OPUS, 'claude-haiku-4-5'].map(model => redeemer.maybeRedeemForPool(am.accounts, { model })));
+  assert.equal(opus.reason, 'its reset does not clear seven_day');
+  assert.equal(a.quota.scopedWeekly.opus, undefined, 'the bucket ran out during the attempt');
+  assert.equal(haiku.redeemed, true, haiku.reason);
+  assert.deepEqual(calls.claim, ['a']);
+});
+
+test('a refusal that joins once an expiry has made the keys alike does not take a decline made on the bucket that ran out', async t => {
+  // As above, but the Haiku refusal arrives after a's scoped Opus weekly ran
+  // out: its own selection sweeps the reading, and only then does it join.
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  const { am, redeemer, calls } = parkedHarness({ accounts: [oauth('a'), oauth('b')], quota: { unified7d: 0.99 } });
+  const [a, b] = am.accounts;
+  Object.assign(a.quota, { unified7dReset: Date.now() + 5 * DAY, scopedWeekly: { opus: { utilization: 0.99, resetAt: Date.now() + 5_000 } } });
+  const read = redeemer.statusFn;
+  let late = null;
+  redeemer.statusFn = async account => {
+    if (account === b && !late) {
+      t.mock.timers.tick(10_000);
+      am.refreshExpiredQuotas('claude-haiku-4-5', new Set());
+      assert.equal(a.quota.scopedWeekly.opus, undefined, 'the bucket ran out before the refusal joined');
+      late = redeemer.maybeRedeemForPool(am.accounts, { model: 'claude-haiku-4-5' });
+    }
+    const r = await read(account);
+    return account === b ? { ...r, reset: parseResetStatus(grantBlock([fableGrant], NOT_WALLED)) } : r;
+  };
+  const opus = await redeemer.maybeRedeemForPool(am.accounts, { model: OPUS });
+  assert.equal(opus.reason, 'its reset does not clear seven_day');
+  assert.ok(late, 'the Haiku refusal joined while the attempt ran');
+  const haiku = await late;
+  assert.equal(haiku.redeemed, true, haiku.reason);
+  assert.deepEqual(calls.claim, ['a']);
+});
+
+// The budget has to bind on the token refresh too: ensureTokenFresh takes no
+// timeout, and a refusal waiting on this attempt is held as long as it runs.
+test('a token refresh that outlives the attempt\'s budget is left behind, not waited out', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { am, redeemer, calls } = parkedHarness({ quota: { unified7d: 0.99 } });
+  /** @type {() => void} */
+  let finishRefresh = () => {};
+  am.ensureTokenFresh = () => new Promise(resolve => { finishRefresh = resolve; });
+  let settled = null;
+  const attempt = redeemer.maybeRedeemForPool(am.accounts, { model: OPUS }).then(r => { settled = r; });
+  t.mock.timers.tick(redeemer.timeoutMs);
+  await new Promise(resolve => setImmediate(resolve));
+  try {
+    assert.ok(settled, 'the attempt answered when its budget ran out, the refresh still pending');
+    assert.match(settled.reason, /budget/);
+    assert.equal(calls.status, 0, 'nothing is read on a token the attempt never got');
+  } finally { finishRefresh(); await attempt; }
+  assert.equal(calls.claim.length, 0, 'a refresh that lands late does not reach the claim');
+  // A refresh that fails is that account's answer, not the walk's: the next
+  // account is still asked.
+  const failing = parkedHarness({ accounts: [oauth('a'), oauth('b')], quota: { unified7d: 0.99 } });
+  failing.am.accounts[0].quota.unified7dReset = Date.now() + 6 * DAY;
+  failing.am.ensureTokenFresh = async index => { if (index === 0) throw new Error('refresh refused'); };
+  const next = await failing.redeemer.maybeRedeemForPool(failing.am.accounts, { model: OPUS });
+  assert.equal(next.redeemed, true, next.reason);
+  assert.deepEqual(failing.calls.claim, ['b']);
+});
+
+test('concurrent refusals for one model share one attempt, whatever it decides', async () => {
+  const { am, redeemer, calls } = parkedHarness({ quota: { unified5h: 0.99 } });
+  const [x, y] = await Promise.all([OPUS, OPUS].map(model => redeemer.maybeRedeemForPool(am.accounts, { model })));
+  assert.equal(x.redeemed || y.redeemed, false);
+  assert.equal(y.reason, x.reason);
+  assert.equal(calls.status, 1);
+});
+
+test('a refusal for another model that waited on a reset that landed is answered by it', async () => {
+  const { am, redeemer, calls } = parkedHarness({ quota: { unified7d: 0.99 } });
+  const [o, f] = await Promise.all([OPUS, FABLE].map(model => redeemer.maybeRedeemForPool(am.accounts, { model })));
+  assert.equal(o.redeemed, true);
+  assert.equal(f.redeemed, true, f.reason);
+  assert.deepEqual(calls.claim, ['a']);
+});
+
+// The offer is filtered by route, the key is not: a refusal that joins or
+// waits on another's attempt may not have been offered the account that
+// attempt answered for.
+test('another refusal\'s answer about an account this one was not offered is not this one\'s answer', async () => {
+  // An Opus attempt over x, y and z finds x serviceable; a Haiku refusal
+  // offered z alone joins it, then makes its own attempt.
+  const joined = parkedHarness({ accounts: [oauth('x'), oauth('y'), oauth('z')], quota: a => ({ unified7d: a.name === 'x' ? 0.5 : 0.99 }) });
+  const [x, , z] = joined.am.accounts;
+  Object.assign(x.quota, { unified7d: 0.99, unified7dReset: Date.now() + 6 * DAY });
+  const [opus, haiku] = await Promise.all([
+    joined.redeemer.maybeRedeemForPool(joined.am.accounts, { model: OPUS }),
+    joined.redeemer.maybeRedeemForPool([z], { model: 'claude-haiku-4-5' }),
+  ]);
+  assert.equal(opus.available, true); assert.equal(opus.account, 'x');
+  assert.equal(haiku.redeemed, true, haiku.reason); assert.equal(haiku.account, 'z');
+  assert.deepEqual(joined.calls.claim, ['z']);
+  // The same when the attempt answers before walking, x already able to serve.
+  const early = parkedHarness({ accounts: [oauth('x'), oauth('z')], quota: a => ({ unified7d: a.name === 'x' ? 0.5 : 0.99 }) });
+  const [, ez] = early.am.accounts;
+  const [eo, eh] = await Promise.all([
+    early.redeemer.maybeRedeemForPool(early.am.accounts, { model: OPUS }),
+    early.redeemer.maybeRedeemForPool([ez], { model: 'claude-haiku-4-5' }),
+  ]);
+  assert.equal(eo.available, true); assert.equal(eo.account, 'x');
+  assert.equal(eh.redeemed, true, eh.reason);
+  assert.deepEqual(early.calls.claim, ['z']);
+  // A Fable refusal offered z alone waits on an Opus attempt that spends on
+  // y: that reset does not serve it, and its own attempt holds off.
+  const waited = parkedHarness({ accounts: [oauth('y'), oauth('z')], quota: { unified7d: 0.99 } });
+  const [y2, z2] = waited.am.accounts;
+  const [o, f] = await Promise.all([
+    waited.redeemer.maybeRedeemForPool([y2], { model: OPUS }),
+    waited.redeemer.maybeRedeemForPool([z2], { model: FABLE }),
+  ]);
+  assert.equal(o.redeemed, true);
+  assert.equal(f.redeemed, false); assert.match(f.reason, /holding off/);
+  assert.deepEqual(waited.calls.claim, ['y']);
+  // `available` speaks for its own key: a Fable refusal offered the same
+  // account does not take an Opus walk's answer that it can serve Opus, and
+  // walks itself, the account still parked on its Fable weekly.
+  const other = parkedHarness({ quota: { unified7d: 0.99, unified7dFable: 0.99 }, upstream: { unified7d: 0.5 } });
+  const [o3, f3] = await Promise.all([OPUS, FABLE].map(model => other.redeemer.maybeRedeemForPool(other.am.accounts, { model })));
+  assert.equal(o3.available, true);
+  assert.equal(f3.redeemed, true, f3.reason);
+  assert.deepEqual(other.calls.claim, ['a']);
 });
 
 test('an account holding no reset is passed over without a line', async () => {
@@ -507,6 +940,115 @@ test('a dry pool of parked accounts: the proxy hands the redeemer the model, and
     assert.equal(hits, 1);
     assert.deepEqual(calls.grants, ['fable'], 'the Fable bucket parked it, so the model reached the redeemer');
   } finally { proxy.close(); upstream.close(); }
+});
+
+/** Two accounts parked on the shared weekly; `x` ranks first on a stale local
+ *  reading, and its fresh read shows the week well short of the threshold. */
+function staleFleet() {
+  const h = parkedHarness({ accounts: [oauth('y'), oauth('x')], quota: a => (a.name === 'x' ? { unified7d: 0.5, unified7dFable: 0.3 } : { unified7d: 0.99 }) });
+  const x = h.am.accounts[1];
+  Object.assign(x.quota, { unified7d: 0.99, unified7dReset: Date.now() + 6 * DAY });
+  return { ...h, x };
+}
+
+// The fresh read is judged before anything about the account's own resets:
+// one that holds none, or is not eligible, can still serve the request.
+test('a stale account with no reset of its own still ends the walk once its fresh read shows it can serve', async () => {
+  for (const own of [grantBlock([{ ...weeklyGrant, resets_left: 0 }], NOT_WALLED), block({ eligible: false, ineligible_reason: 'tier' })]) {
+    const { am, redeemer, calls } = staleFleet();
+    const read = redeemer.statusFn;
+    redeemer.statusFn = async account => {
+      const r = await read(account);
+      return account.name === 'x' ? { ...r, reset: parseResetStatus(own) } : r;
+    };
+    const r = await redeemer.maybeRedeemForPool(am.accounts, { model: OPUS });
+    assert.equal(r.available, true, r.reason);
+    assert.deepEqual(calls.claim, [], 'the pool was not dry: no reset is spent on y');
+  }
+});
+
+test('a fresh read that shows an account can serve ends the walk without spending, and the request is served', async () => {
+  const served = [];
+  const upstream = http.createServer((req, res) => { served.push(req.headers.authorization); res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"ok":true}'); });
+  const port = await new Promise(r => upstream.listen(0, '127.0.0.1', () => r(upstream.address().port)));
+  const { am, redeemer, calls, x } = staleFleet();
+  am._nextProbeAt = Date.now() + H;
+  const hooks = { redeemClaudeResetForPool: (cands, opts) => redeemer.maybeRedeemForPool(cands, opts) };
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${port}` }, hooks);
+  try {
+    const pport = await new Promise(r => proxy.listen(0, '127.0.0.1', () => r(proxy.address().port)));
+    const res = await fetch(`http://127.0.0.1:${pport}/v1/messages`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: OPUS, max_tokens: 1, messages: [] }) });
+    await res.text();
+    assert.equal(res.status, 200);
+    assert.deepEqual(calls.claim, [], 'the pool was not dry: no reset is spent on y');
+    assert.deepEqual(served, [`Bearer ${x.credential}`]);
+  } finally { proxy.close(); upstream.close(); }
+});
+
+test('a refusal that waited on another model\'s walk sees what that walk re-read', async () => {
+  const { am, redeemer, calls } = staleFleet();
+  const [o, f] = await Promise.all([OPUS, FABLE].map(model => redeemer.maybeRedeemForPool(am.accounts, { model })));
+  assert.equal(o.available, true);
+  assert.equal(f.available, true, f.reason);
+  assert.deepEqual(calls.claim, []);
+  assert.equal(calls.status, 1, 'the Opus walk read x; the Fable refusal needs no read of its own');
+});
+
+// Selection routes an advisor request by its own model when no account can
+// serve the advisor too, so a pool is dry only for the request's model: a
+// reset judged on that model serves the request, though the advisor's family
+// bucket stays spent.
+test('an advisor request on a dry pool is served by a reset judged on its own model', async () => {
+  let hits = 0;
+  const upstream = http.createServer((_req, res) => { hits++; res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"ok":true}'); });
+  const port = await new Promise(r => upstream.listen(0, '127.0.0.1', () => r(upstream.address().port)));
+  const sharedOnly = { ...weeklyGrant, clears: ['five_hour', 'seven_day'] };
+  const { am, redeemer, calls } = parkedHarness({ accounts: [oauth('a'), oauth('b')], quota: { unified7d: 0.99, unified7dFable: 0.99 }, grants: [sharedOnly] });
+  // After the claim upstream reports the shared weekly cleared and the Fable
+  // weekly as it was.
+  redeemer.statusFn = async () => ({ reset: parseResetStatus(grantBlock([sharedOnly], NOT_WALLED)),
+    usage: { fiveHour: { utilization: 0.1 }, sevenDay: { utilization: calls.claim.length ? 0 : 0.99 }, sevenDayFable: { utilization: 0.99 } } });
+  redeemer.claimFn = async account => { calls.claim.push(account.name); return { result: 'reset', resetsLeft: 0, cleared: ['five_hour', 'seven_day'] }; };
+  am._nextProbeAt = Date.now() + H;
+  const hooks = { redeemClaudeResetForPool: (cands, opts) => redeemer.maybeRedeemForPool(cands, opts) };
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${port}` }, hooks);
+  try {
+    const pport = await new Promise(r => proxy.listen(0, '127.0.0.1', () => r(proxy.address().port)));
+    const body = { model: OPUS, max_tokens: 1, tools: [{ type: 'advisor_20260301', name: 'advisor', model: FABLE }], messages: [] };
+    const res = await fetch(`http://127.0.0.1:${pport}/v1/messages`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+    await res.text();
+    assert.equal(calls.claim.length, 1);
+    assert.equal(res.status, 200);
+    assert.equal(hits, 1);
+  } finally { proxy.close(); upstream.close(); }
+});
+
+// unavailableReason names `quota` ahead of `route`, so an account the model's
+// route excludes reads as resettable unless the offer asks the route itself.
+test('a dry pool offers only the accounts the request model\'s route allows, parked or at the upstream limit', async () => {
+  for (const atLimit of [false, true]) {
+    let hits = 0;
+    const upstream = http.createServer((_req, res) => { hits++; res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"ok":true}'); });
+    const port = await new Promise(r => upstream.listen(0, '127.0.0.1', () => r(upstream.address().port)));
+    const { am, redeemer, calls } = parkedHarness({ accounts: [oauth('a'), oauth('b')], quota: { unified7d: atLimit ? 1 : 0.99 },
+      blockExtra: atLimit ? { at_limit: true, exhausted: ['seven_day'] } : {} });
+    am.setRoutes([{ name: 'fable-on-a', match: ['*fable*'], accounts: ['a'] }]);
+    // `b` would wait longest, so it is the one a route-blind offer spends on.
+    am.accounts[1].quota.unified7dReset = Date.now() + 6 * DAY;
+    am._nextProbeAt = Date.now() + H;
+    const offered = [];
+    const hooks = { redeemClaudeResetForPool: (cands, opts) => { offered.push(cands.map(a => a.name)); return redeemer.maybeRedeemForPool(cands, opts); } };
+    const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${port}` }, hooks);
+    try {
+      const pport = await new Promise(r => proxy.listen(0, '127.0.0.1', () => r(proxy.address().port)));
+      const res = await fetch(`http://127.0.0.1:${pport}/v1/messages`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: FABLE, max_tokens: 1, messages: [] }) });
+      await res.text();
+      assert.deepEqual(offered, [['a']], `atLimit=${atLimit}`);
+      assert.deepEqual(calls.claim, ['a'], `atLimit=${atLimit}`);
+      assert.equal(res.status, 200);
+      assert.equal(hits, 1);
+    } finally { proxy.close(); upstream.close(); }
+  }
 });
 
 // ── through the proxy ───────────────────────────────────────────────────────

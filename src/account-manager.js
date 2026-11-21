@@ -225,7 +225,7 @@ const underOne = v => v != null && v < 1;
  *
  * @typedef {object} CodexLearnedQuota
  * @property {string} [planType]  the Codex subscription tier
- * @property {{available: number, applicable: number|null, seenAt: number, expiresAt?: number|null}} [resetCredits]  free rate-limit reset credits (Codex) or banked usage-limit resets (Claude) held, when that was last seen, and when the soonest one lapses where the provider says
+ * @property {{available: number, applicable: number|null, seenAt: number, expiresAt?: number|null, fable?: number, fableExpiresAt?: number|null}} [resetCredits]  free rate-limit reset credits (Codex) or banked usage-limit resets (Claude) held, when that was last seen, and when the soonest one lapses where the provider says (for Claude, the general and the Fable resets each dated apart)
  * @property {Record<string, {name: string, utilization: number, resetAt: number|null, seenAt: number}>} [codexModelBuckets]  model-scoped weekly buckets, keyed by slug
  * @property {Record<string, string>} [codexModelLimits]  which limit each model was last metered on, from `x-codex-active-limit`: a `codexModelBuckets` slug, or the name upstream gives the account-wide limit
  */
@@ -1640,10 +1640,14 @@ export class AccountManager {
     return false;
   }
 
-  /** Public form used by the request path to re-check an account after waiting
-   * in storm-control admission. */
-  isEntitlementDenied(index, now = Date.now()) {
-    return this._entitlementDenied(this.accounts[index], now);
+  /** Public form for the callers outside selection: the request path re-checks
+   * an account after waiting in storm-control admission, and the warmer asks
+   * before it sends a warm-up. Always on this manager's clock (Date.now), the
+   * one markEntitlementDenied writes the cooldown on: a read that finds the
+   * cooldown over also clears it for rotation, so a caller's own clock would
+   * decide the manager's state. */
+  isEntitlementDenied(index) {
+    return this._entitlementDenied(this.accounts[index]);
   }
 
   /** Keep a Codex account out of rotation for one model its ChatGPT plan
@@ -5876,8 +5880,11 @@ export class AccountManager {
    * The readings that hold `account` out of rotation for `model`, when the
    * switch threshold on a WEEKLY reading is what holds it. Null when it is
    * serving, when something other than the threshold bars it (disabled, a cap,
-   * a hold, an error: whatever unavailableReason reports ahead of `quota`), or
-   * when only its 5-hour, token or request reading is over.
+   * an error: whatever unavailableReason reports ahead of `quota`), or when
+   * only its 5-hour, token or request reading is over. A rate-limit hold is the
+   * exception: the proxy usually learns of upstream's 5-hour wall from the 429
+   * that arms one, and a reset lifts the hold too (the redeemer clears it), so
+   * the readings behind the hold decide whether the account stays out.
    *
    * For the reset redeemer (#685): selection stops using an account at its
    * threshold, so a busy fleet parks every account just short of upstream's own
@@ -5894,7 +5901,8 @@ export class AccountManager {
    * @returns {string[]|null}
    */
   weeklyParkedBuckets(account, model = null) {
-    if (this.unavailableReason(account, model) !== 'quota') return null;
+    const reason = this.unavailableReason(account, model);
+    if (reason !== 'quota' && !(reason === 'throttled' && this._isNearQuota(account, model))) return null;
     const q = account.quota;
     const key = this._weeklyBucketFor(model);
     const threshold = this.thresholdFor(key, account);
