@@ -134,6 +134,73 @@ test('a headerless 429 that clears on the retry is never shown to the client', a
   } finally { restore(); }
 });
 
+// The account the hop landed on is removed while the retry waits. Removing an
+// account renumbers the rest in place (removeAccount), and the retry named its
+// account by the index read after the wait, which was -1 by then: no account,
+// so the client was told every account was at its quota or rate limit (a 429
+// pool_exhausted) while c sat idle. The retry is for that account alone (never
+// a third one), so with it gone the refusal it gave goes back to the client,
+// and nothing selects: the fleet stays on a. The removal is made at the
+// retry's own log line, which the proxy writes just before it waits.
+test('a retry whose account is removed during the wait returns its refusal, on no third account', async t => {
+  const restore = withRetryDelay(25);
+  const cServes = (req, res) => {
+    if (tokenOf(req) !== 't-c') return upstreamHandler(req, res);
+    req.resume();
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"ok":true}');
+  };
+  try {
+    await withFleet(['a', 'b', 'c'], async ({ am, proxyPort, seen }) => {
+      t.mock.method(console, 'log', (...args) => {
+        if (/429 followed the request onto "b" with no rate-limit headers — retrying/.test(String(args[0]))) {
+          am.removeAccount(am.accounts.findIndex(a => a.name === 'b'));
+        }
+      });
+      const r = await post(proxyPort);
+      assert.equal(r.status, 429, `answered ${r.status}: ${JSON.stringify(r.body)}`);
+      assert.match(r.body.error.message, /not available/, 'the refusal b gave reaches the client');
+      assert.deepEqual(seen, ['t-a', 't-b']);
+      assert.equal(am.accounts[am.currentIndex].name, 'a', 'the fleet cursor moved');
+    }, cServes);
+  } finally { restore(); }
+});
+
+// The retry's account is the one the hop landed on, wherever it sits: here the
+// fleet is on b, so the hop lands on a, the first account, at index 0, and the
+// retry after the wait still runs there.
+test('the retry runs on a hop destination that is the first account in the list', async () => {
+  const restore = withRetryDelay(25);
+  try {
+    await withFleet(['a', 'b'], async ({ am, proxyPort, seen }) => {
+      am.currentIndex = 1;
+      const r = await post(proxyPort);
+      assert.equal(r.status, 429);
+      assert.deepEqual(seen, ['t-b', 't-a', 't-a'], 'one hop, then one retry on the account it landed on');
+    });
+  } finally { restore(); }
+});
+
+// The retry is for the account the hop landed on, whatever happens to it during
+// the wait: here another request's quota rejection throttles b while the retry
+// waits (at the retry's own log line), and the retry still goes to b, never to
+// c, a third account (docs/routing.md, the two kinds of 429).
+test('the retry stays on the account the hop landed on when it is throttled during the wait', async t => {
+  const restore = withRetryDelay(25);
+  try {
+    await withFleet(['a', 'b', 'c'], async ({ am, proxyPort, seen }) => {
+      t.mock.method(console, 'log', (...args) => {
+        if (/429 followed the request onto "b" with no rate-limit headers — retrying/.test(String(args[0]))) {
+          am.markRateLimited(am.accounts.findIndex(a => a.name === 'b'), 60);
+        }
+      });
+      const r = await post(proxyPort);
+      assert.equal(r.status, 429);
+      assert.deepEqual(seen, ['t-a', 't-b', 't-b'], 'the retry went to a third account');
+    });
+  } finally { restore(); }
+});
+
 // The wait must not outlive the client. waitForRetry ends on the request's
 // abort signal, and the attempt it was waiting to make is dropped rather than
 // sent — a retry nobody is waiting for costs an account a request for nothing.

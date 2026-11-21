@@ -32,9 +32,9 @@ const rowCategoryOf = (a) => (a.type === 'oauth' || a.quota.unified5h != null ||
 
 /** Render at `width`: the frame's lines, and each row before fitLine cuts it, since the
  *  frame is always exactly `width` wide and only raw rows can show an overrun. */
-function screen(am, width, { remote = false } = {}) {
+function screen(am, width, { remote = false, config = {} } = {}) {
   const tui = new TUI({
-    accountManager: am, config: { proxy: { port: 1 }, accounts: [], routes: [] }, sx: null,
+    accountManager: am, config: { proxy: { port: 1 }, accounts: [], routes: [], ...config }, sx: null,
     saveConfig: async () => {}, syncAccounts: async () => 0, onQuit: () => {}, probeQuota: () => {},
     remote,
   });
@@ -293,6 +293,41 @@ test('a Claude row whose plan meters no five-hour window draws only the weekly b
   const only = fleet([claude('u1@x.com'), claude('u2@x.com')]);
   for (const a of only.accounts) noSessionWindow(a);
   for (const r of accountRows(screen(only, 120).lines)) { assert.doesNotMatch(r, /Ses/); assert.match(r, /Wk /); }
+});
+
+// `quotaBarStretch: false`: the lone bar keeps its own width in its own
+// column, so it lines up with the same bar on the rows around it, and the
+// other cell is blank rather than `Ses -`. The row still ends where its
+// neighbours do.
+test('quotaBarStretch false keeps a lone bar in its own column, the other cell blank', () => {
+  const am = fleet([claude('ultra@x.com'), claude('max@x.com'), codex('k@x.com')]);
+  noSessionWindow(am.accounts[0]);
+  const rowsAt = (/** @type {any} */ config) => accountRows(screen(am, 160, { config }).lines).map(r => halves(r)[0]).filter(r => r.trim());
+
+  const [ultra, max] = rowsAt({ quotaBarStretch: false });
+  assert.doesNotMatch(ultra, /Ses/, ultra);
+  assert.match(ultra, /ultra@x\.com +active {2,}Wk .*F7/, ultra);
+  assert.equal(ultra.indexOf('Wk '), max.indexOf('Wk '), 'the weekly bar sits in the Wk column');
+  assert.equal(ultra.indexOf('F7'), max.indexOf('F7'), 'the family bars stay aligned');
+
+  // The default, and an absent key, stretch it as before: Wk takes the first slot.
+  for (const config of [{}, { quotaBarStretch: true }]) {
+    const [stretched, neighbour] = rowsAt(config);
+    assert.ok(stretched.indexOf('Wk ') < neighbour.indexOf('Wk '), stretched);
+    assert.equal(stretched.indexOf('F7'), neighbour.indexOf('F7'));
+  }
+});
+
+// The mirror case, a seat with no shared weekly window: its session bar keeps
+// the first slot at its own width and the Wk cell is blank.
+test('quotaBarStretch false leaves the Wk cell blank on a row with no weekly window', () => {
+  const am = fleet([claude('seat@x.com'), claude('max@x.com'), codex('k@x.com')]);
+  Object.assign(am.accounts[0].quota, { unified7d: null, unified7dReset: null, weeklyWindowStated: false });
+  const rowsAt = (/** @type {any} */ config) => accountRows(screen(am, 160, { config }).lines).map(r => halves(r)[0]).filter(r => r.trim());
+  const [seat, max] = rowsAt({ quotaBarStretch: false });
+  assert.match(seat, /seat@x\.com +active +Ses /, seat);
+  assert.doesNotMatch(seat, /Wk /, seat);
+  assert.equal(seat.indexOf('F7'), max.indexOf('F7'), seat);
 });
 
 // The row's shape is a fact about the plan, so a weekly reset — which nulls

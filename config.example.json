@@ -32,6 +32,7 @@
   },
   "advisorEligibility": "strict",
   "quotaProbeSeconds": 0,
+  "quotaBarStretch": true,
   "autoUpdate": true,
   "autoRedeemResets": false,
   "autoRedeemMinDaysToReset": 0,

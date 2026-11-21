@@ -6,7 +6,7 @@ import { lstat, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { SESSION_ID_SHAPE } from './server.js';
-import { stopHookOutput } from './claude-code-surface.js';
+import { stopHookOutput, EMPTY_NOTICE_STATE } from './claude-code-surface.js';
 
 /** @typedef {import('./claude-code-surface.js').SessionAdviceReply} SessionAdviceReply */
 /** @typedef {import('./claude-code-surface.js').NoticeState} NoticeState */
@@ -38,7 +38,10 @@ export async function stopHookTurn(dir, sessionId, advice) {
   await mkdir(dir, { recursive: true, mode: 0o700 });
   // A directory someone else made (a shared /tmp) could hold planted symlinks.
   const st = await lstat(dir);
-  if (!st.isDirectory() || (st.mode & 0o077) !== 0 || (process.getuid && st.uid !== process.getuid())) return null;
+  // Owner and mode are POSIX facts: Windows has no uid and reports a mode with
+  // group and other bits set for every directory, and its temp directory is
+  // the user's own.
+  if (!st.isDirectory() || (process.getuid && ((st.mode & 0o077) !== 0 || st.uid !== process.getuid()))) return null;
   // The suffix keeps an id such as `..` a plain file name inside `dir`.
   const file = join(dir, `${sessionId}.json`);
   /** @type {NoticeState|null} */
@@ -49,7 +52,9 @@ export async function stopHookTurn(dir, sessionId, advice) {
     state = null;
   }
   const { output, nextState } = stopHookOutput(advice, state);
-  if (JSON.stringify(nextState) !== JSON.stringify(state)) {
+  // Nothing on record and nothing to record: no file, so a session that is
+  // never advised leaves none behind.
+  if (JSON.stringify(nextState) !== JSON.stringify(state ?? EMPTY_NOTICE_STATE)) {
     await writeFile(file, JSON.stringify(nextState), { mode: 0o600 });
   }
   return output;

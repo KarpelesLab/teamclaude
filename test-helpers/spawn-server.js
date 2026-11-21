@@ -69,7 +69,8 @@ async function fetchStatus(port) {
  * Poll /teamclaude/status on `port` until a reply satisfies `predicate`, or
  * until `stopWhen()` says there is no point waiting any longer (the child
  * exited). No overall deadline of its own: a child that hangs at startup
- * without listening is what the runner's --test-timeout is for.
+ * without listening is what the runner's --test-timeout is for, and the
+ * `signal` a test hands spawnServer is what then ends this wait.
  * @param {number} port
  * @param {(status: any) => boolean} [predicate]
  * @param {{ stopWhen?: () => boolean }} [opts]
@@ -98,14 +99,23 @@ export async function waitForStatus(port, predicate = () => true, { stopWhen } =
  * taken, it is respawned on a fresh port; any other exit throws with the
  * child's output.
  *
+ * `signal` (a test's t.signal) ends a startup that never finishes. The runner's
+ * timeout fails a test whose child never answers, but does not end the wait
+ * here, and the wait and the child would keep the file from ever exiting on
+ * Node 24 and later (test/README.md, "Clean up in finally"). When the signal
+ * aborts before spawnServer has resolved, even as the child's ready reply
+ * arrives, the child is stopped, which ends the wait as its exit does, and the
+ * promise rejects with the signal's reason instead of respawning or resolving.
+ *
  * @param {object} opts
  * @param {(port: number) => object} opts.config  builds the config for a candidate port (proxy.port is set by the helper; the callback may read the port for other fields)
  * @param {string} [opts.dir]        directory for the config file (mkdtemp'd when absent)
  * @param {Record<string, string>} [opts.env]  extra environment for the child
  * @param {string[]} [opts.args]     extra CLI args after `server --headless`
+ * @param {AbortSignal} [opts.signal] stops the child and rejects when it aborts before spawnServer resolves
  * @returns {Promise<{ port: number, pid: number, configPath: string, dir: string, config: object, child: import('node:child_process').ChildProcess, output: () => string, stop: () => Promise<void> }>}
  */
-export async function spawnServer({ config: buildConfig, dir, env = {}, args = [] }) {
+export async function spawnServer({ config: buildConfig, dir, env = {}, args = [], signal }) {
   dir ??= await mkdtemp(join(tmpdir(), 'teamclaude-spawn-'));
   const configPath = join(dir, 'config.json');
   const failures = [];
@@ -116,14 +126,21 @@ export async function spawnServer({ config: buildConfig, dir, env = {}, args = [
     config.proxy = { ...(config.proxy || {}), port };
     await writeFile(configPath, JSON.stringify(config));
 
+    signal?.throwIfAborted();
     const { child, exited, output } = spawnChild(configPath, env, args);
     let done = false;
     exited.then(() => { done = true; });
+    const onAbort = () => { void stop(child, exited); };
+    signal?.addEventListener('abort', onAbort, { once: true });
 
     // Readiness is a status reply carrying the child's OWN pid. A 200 from a
     // server with a different pid is the wrong-server case: keep polling — the
     // child cannot come up on a taken port, so it will exit and end the wait.
     const status = await waitForStatus(port, s => s?.server?.pid === child.pid, { stopWhen: () => done });
+    signal?.removeEventListener('abort', onAbort);
+    // An abort that came as the child's ready reply arrived has begun stopping
+    // it: reject rather than hand back a child on its way out.
+    if (signal?.aborted) { await stop(child, exited); signal.throwIfAborted(); }
     if (status) {
       return {
         port, pid: child.pid, configPath, dir, config, child, output,
@@ -131,8 +148,8 @@ export async function spawnServer({ config: buildConfig, dir, env = {}, args = [
       };
     }
 
-    const { code, signal } = await exited;
-    const report = `attempt ${attempt} on port ${port}: exited (code ${code}, signal ${signal})\n${output()}`;
+    const { code, signal: killedBy } = await exited;
+    const report = `attempt ${attempt} on port ${port}: exited (code ${code}, signal ${killedBy})\n${output()}`;
     if (!/already in use/.test(output())) {
       throw new Error(`server exited before answering status\n${report}`);
     }

@@ -159,6 +159,10 @@ test('the state file lives in a 0700 directory, one file per session, written be
     assert.equal(await stopHookTurn(dir, id, adv('out-of-band', { to: 'B' })), null, 'the file remembers the notice');
     assert.ok(await stopHookTurn(dir, 'other-session', adv('out-of-band', { to: 'B' })), 'another session has its own file');
 
+    // A session with nothing to remember leaves no file behind.
+    assert.equal(await stopHookTurn(dir, 'quiet-session', adv('in-band')), null);
+    await assert.rejects(stat(join(dir, 'quiet-session.json')), { code: 'ENOENT' });
+
     // A crafted id never becomes a path outside the directory.
     assert.equal(await stopHookTurn(dir, '../escape', adv('out-of-band', { to: 'B' })), null);
     assert.ok(await stopHookTurn(dir, '..', adv('out-of-band', { to: 'B' })));

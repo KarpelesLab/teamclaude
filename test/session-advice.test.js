@@ -31,6 +31,9 @@ function request({ am, tracker }, conv, model, account, input, session = SESSION
   const key = `${session}#${conv}`;
   am.beginSession(key, { sessionId: session, conversation: conv });
   am.recordSession(key, account, model);
+  // Without session affinity a request is served where the fleet walk rests,
+  // so the walk rests on the account that served this one.
+  if (!am.distributeSessions) am.currentIndex = account;
   tracker.recordTokens(key, am._weeklyBucketFor(model), typeof input === 'number' ? { input_tokens: input } : input);
   am.endSession(key);
 }
@@ -349,7 +352,6 @@ test('a manual pin the forward path still sends upstream is judged by the band, 
   for (const [label, bar] of /** @type {[string, (a: any) => void][]} */ ([
     ['disabled', a => { a.disabled = true; }],
     ['over the threshold', a => { a.quota.unified7d = 0.99; }],
-    ['throttled', a => { a.status = 'throttled'; a.rateLimitedUntil = Date.now() + H; }],
   ])) {
     const f = adviceFleet();
     request(f, 'main', OPUS, 1, 5_000);
@@ -361,6 +363,53 @@ test('a manual pin the forward path still sends upstream is judged by the band, 
     assert.equal(advice.reason, 'out-of-band', `${label}: the band leaves b out`);
     assert.ok(advice.recommendation && advice.recommendation.to !== 'b', label);
   }
+});
+
+// An accepted move is a pin, and a pin never fails over. When the account it
+// names then reaches its limit, every request of the session fails there: said
+// at once, past the cooldown the move itself started and the context ceiling.
+test('a manual pin on an account upstream has stopped serving is advised past the cooldown of the move that made it', () => {
+  for (const [label, stop] of /** @type {[string, (a: any) => void][]} */ ([
+    ['throttled', a => { a.status = 'throttled'; a.rateLimitedUntil = Date.now() + H; }],
+    ['exhausted', a => { a.status = 'exhausted'; }],
+    ['in error', a => { a.status = 'error'; }],
+  ])) {
+    const f = adviceFleet({ advice: { enabled: true, maxContextTokens: 1_000 } });
+    request(f, 'main', OPUS, 1, 50_000);
+    f.am.sessionPins.set(SESSION, 'b', f.clock.t);
+    f.am.noteAdviceCooldown(SESSION, f.clock.t);
+    stop(f.am.accounts[1]);
+    assert.equal(f.am.pinBars(f.am.accounts[1], OPUS), null, `${label}: the pin gate still forwards to b`);
+    const advice = f.am.sessionAdvice(SESSION, f.clock.t);
+    assert.equal(advice.reason, 'pinned-unavailable', label);
+    assert.ok(advice.recommendation && advice.recommendation.to !== 'b', label);
+  }
+});
+
+// With distribution off a session has no affinity: its next request goes where
+// the fleet walk rests. Once that is another account (a manual switch, or
+// rotation), the router has moved the session, and advice to move would pin it.
+test('without distributeSessions a session the fleet walk has already left gets no recommendation', () => {
+  const f = adviceFleet();
+  request(f, 'main', OPUS, 0, 5_000);
+  pushOut(f.am);
+  assert.equal(f.am.sessionAdvice(SESSION, f.clock.t).reason, 'out-of-band', 'while the walk rests on a');
+  f.am.currentIndex = 1;
+  assert.deepEqual([f.am.sessionAdvice(SESSION, f.clock.t).reason, f.am.sessionAdvice(SESSION, f.clock.t).recommendation], ['router-moves', null]);
+});
+
+// A subscription of another provider cannot take the session: it neither sets
+// the band the session's account is judged against nor is named as the move.
+test('a subscription of another provider is neither the band nor the destination', () => {
+  const f = adviceFleet();
+  // b, the Codex seat, has the best pressure of all: nearly unused, resetting soonest.
+  f.am.accounts[1].provider = 'codex';
+  weekly(f.am, 1, 0.01, 1);
+  request(f, 'main', OPUS, 0, 5_000);
+  assert.equal(f.am.sessionAdvice(SESSION, f.clock.t).reason, 'in-band', 'a is the best Claude account, whatever b offers');
+  pushOut(f.am);
+  const advice = f.am.sessionAdvice(SESSION, f.clock.t);
+  assert.deepEqual([advice.reason, advice.recommendation?.to], ['out-of-band', 'c']);
 });
 
 test('a manual pin to a subscription of another provider is not forwarded', () => {

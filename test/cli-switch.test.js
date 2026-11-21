@@ -47,7 +47,11 @@ async function writeConfig(port, extra = {}) {
 // `input`: what to write to stdin and close it; `true` leaves stdin open.
 function runCli(configPath, cliArgs, extraEnv = {}, input = null) {
   const child = spawn(process.execPath, [cliPath, ...cliArgs], {
-    env: { ...process.env, TEAMCLAUDE_CONFIG: configPath, ...extraEnv },
+    // The surfaces give the server a second (surfaceTimeoutMs). The proxy these
+    // tests ask lives in this process, so a second in which it does not get
+    // to run would read as `teamclaude offline`: the budget is lifted, and what
+    // the surfaces print is asserted on an answer that arrived.
+    env: { ...process.env, TEAMCLAUDE_CONFIG: configPath, TEAMCLAUDE_SURFACE_TIMEOUT_MS: '60000', ...extraEnv },
     stdio: [input == null ? 'ignore' : 'pipe', 'pipe', 'pipe'],
   });
   // A child that stops reading early (the byte cap) closes the pipe under the write.

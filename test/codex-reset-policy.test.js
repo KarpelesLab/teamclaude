@@ -58,6 +58,38 @@ test('each knob is normalised to its own range, and a bad value is off rather th
   assert.deepEqual(redeemPolicyFrom({ autoRedeemMinDaysToReset: null, autoRedeemMaxShare: '', autoRedeemMaxPerDay: [3] }), DEFAULT_REDEEM_POLICY);
 });
 
+test('a knob set to a value it cannot read is named in a warning, with what was read', async () => {
+  const { redeemPolicyWarnings } = await import('../src/codex-reset-policy.js');
+  assert.deepEqual(redeemPolicyWarnings({ autoRedeemMinDaysToReset: '3d', autoRedeemMaxShare: 50, autoRedeemMaxPerDay: 2.5 }), [
+    '[TeamClaude] autoRedeemMinDaysToReset is "3d", which is not a number of days above 0, so the minimum-days floor is off',
+    '[TeamClaude] autoRedeemMaxShare is 50, which is not a fraction strictly between 0 and 1, so the cohort share cap is off',
+    '[TeamClaude] autoRedeemMaxPerDay is 2.5, which is not a whole number above 0, so the per-day cap is off',
+  ]);
+  assert.match(redeemPolicyWarnings({ autoRedeemMaxShare: '50%' })[0], /autoRedeemMaxShare is "50%", /);
+  assert.match(redeemPolicyWarnings({ autoRedeemMaxShare: 0 })[0], /autoRedeemMaxShare is 0, /);
+  assert.match(redeemPolicyWarnings({ autoRedeemMinDaysToReset: -1 })[0], /autoRedeemMinDaysToReset is -1, /);
+  assert.match(redeemPolicyWarnings({ autoRedeemMaxPerDay: true })[0], /autoRedeemMaxPerDay is true, /);
+  // Nothing to say about a key that is absent, null, off as written, or usable.
+  for (const config of [
+    undefined, {},
+    { autoRedeemMinDaysToReset: null, autoRedeemMaxShare: null, autoRedeemMaxPerDay: null },
+    { autoRedeemMinDaysToReset: 0, autoRedeemMaxShare: 1, autoRedeemMaxPerDay: 0 },
+    { autoRedeemMinDaysToReset: '0', autoRedeemMaxShare: '1', autoRedeemMaxPerDay: '0' },
+    { autoRedeemMinDaysToReset: 2, autoRedeemMaxShare: 0.5, autoRedeemMaxPerDay: 3 },
+    { autoRedeemMinDaysToReset: 6.9 },
+  ]) assert.deepEqual(redeemPolicyWarnings(config), [], JSON.stringify(config));
+});
+
+test('a floor of 7 days or more is kept as written, and said to stop every automatic redemption', async () => {
+  const { redeemPolicyWarnings } = await import('../src/codex-reset-policy.js');
+  for (const days of [7, 10]) {
+    assert.equal(redeemPolicyFrom({ autoRedeemMinDaysToReset: days }).minDaysToReset, days);
+    assert.deepEqual(redeemPolicyWarnings({ autoRedeemMinDaysToReset: days }), [
+      `[TeamClaude] autoRedeemMinDaysToReset is ${days}, but an account whose 7-day weekly window has run out is always less than 7 days from its reset, so no Codex credit on such a window is redeemed automatically (the usage parser also reads a window of up to 7.7 days as weekly)`,
+    ]);
+  }
+});
+
 // ── the value of a credit ───────────────────────────────────────────────────
 
 test('a credit is worth the days to the natural reset over seven', () => {
@@ -90,6 +122,48 @@ test('the floor stops an account whose reset is too close, and says what the cre
   assert.match(reason, /0\.20 of a week/);
   assert.equal(minDaysReason(codex('a', 2), 2, NOW), null, 'exactly at the floor clears it');
   assert.equal(minDaysReason(codex('a', 5), 2, NOW), null);
+});
+
+test('the floor\'s reason never rounds the days up to the minimum they are under', () => {
+  // Rounded to the nearest tenth, 1.96 days read "2d away, under the 2d minimum".
+  assert.match(minDaysReason(codex('a', 1.96), 2, NOW), /^natural weekly reset is 1\.9d away, under the 2d minimum /);
+  assert.match(minDaysReason(codex('a', 2.96), 3, NOW), /^natural weekly reset is 2\.9d away, under the 3d minimum /);
+  assert.match(minDaysReason(codex('a', 1.04), 2, NOW), /^natural weekly reset is 1d away, under the 2d minimum /);
+  // A minimum is stated as set: 2.04 rounded is 2, which 2.03 days would floor to.
+  assert.match(minDaysReason(codex('a', 2.03), 2.04, NOW), /^natural weekly reset is 2d away, under the 2\.04d minimum /);
+});
+
+test('a standing states the weeks and the days from one reading, each to the step below', () => {
+  const at = ms => autoRedeemStanding({
+    account: codex('a', null, { quota: { unified7dReset: NOW + ms } }), autoRedeemResets: true,
+    policy: DEFAULT_REDEEM_POLICY, members: [], ledger: [], now: NOW,
+  });
+  // Weeks to the nearest hundredth beside days to the tenth below read 6.199
+  // days as "0.89 of a week (6.1d)", and 0.89 of a week is 6.23 days.
+  const v = at(6.199 * DAY);
+  assert.deepEqual([v.creditValueWeeks, v.daysToReset], [0.88, 6.1]);
+  // An exact step is not read one low: 1.96 days is 0.28 of a week, which a
+  // division in days floors to 0.27.
+  assert.deepEqual([at(1.96 * DAY).creditValueWeeks, at(1.96 * DAY).daysToReset], [0.28, 1.9]);
+  // A credit is never worth more than a week, however far a reset reads.
+  assert.deepEqual([at(7.5 * DAY).creditValueWeeks, at(7.5 * DAY).daysToReset], [1, 7.5]);
+  // Across the week, each figure is the step at or just below the reading.
+  const WEEK = 7 * DAY;
+  for (let ms = 0; ms <= WEEK; ms += 37 * 60 * 1000) {
+    const s = at(ms);
+    const hundredths = Math.round(s.creditValueWeeks * 100);
+    const tenths = Math.round(s.daysToReset * 10);
+    assert.ok(hundredths * WEEK / 100 <= ms && (ms < (hundredths + 1) * WEEK / 100 || hundredths === 100), `weeks at ${ms}ms`);
+    assert.ok(tenths * DAY / 10 <= ms && ms < (tenths + 1) * DAY / 10, `days at ${ms}ms`);
+  }
+});
+
+test('a reset already behind us reads as 0 weeks and 0 days, never less', () => {
+  // Nothing sweeps a passed reset until the account is next read.
+  const past = codex('a', null, { quota: { unified7dReset: NOW - 60 * 60 * 1000 } });
+  const s = autoRedeemStanding({ account: past, autoRedeemResets: true, policy: DEFAULT_REDEEM_POLICY, members: [], ledger: [], now: NOW });
+  assert.deepEqual([s.creditValueWeeks, s.daysToReset], [0, 0]);
+  assert.match(minDaysReason(past, 2, NOW), /^natural weekly reset is 0d away, under the 2d minimum \(the credit would buy 0\.00 of a week\)$/);
 });
 
 test('with the floor on, an account whose reset is unknown cannot be shown to clear it', () => {
@@ -178,6 +252,19 @@ test('a manual redemption takes a slot of its cohort, and keeps the cohort at it
   assert.deepEqual({ ok: v.ok, size: v.size, allowed: v.allowed, used: v.used }, { ok: false, size: 2, allowed: 1, used: 1 });
 });
 
+test('a redemption up to a week old still holds its cohort\'s slot', () => {
+  // a was redeemed five days ago, out of the cohort b still resets in: a
+  // day from now. Its timer then restarted, so it resets in two. The phase
+  // it moved stays moved until the members reset on their own.
+  const a = codex('a', 2);
+  const b = codex('b', 1);
+  const ledger = [{ account: a, name: 'a', cohort: resetCohort(b), at: NOW - 5 * DAY, manual: false }];
+  const v = shareCapVerdict({ account: b, members: [a, b], ledger, maxShare: 0.5, now: NOW });
+  assert.deepEqual({ ok: v.ok, size: v.size, allowed: v.allowed, used: v.used }, { ok: false, size: 2, allowed: 1, used: 1 });
+  assert.equal(recentRedemptions(ledger, NOW + 2 * DAY - 1).length, 1, 'just under a week old');
+  assert.equal(recentRedemptions(ledger, NOW + 2 * DAY).length, 0, 'a week old');
+});
+
 test('a redemption from another cohort, or from more than a week ago, is not charged to this one', () => {
   const members = [codex('a', 2), codex('b', 5)];
   const ledger = [
@@ -188,6 +275,15 @@ test('a redemption from another cohort, or from more than a week ago, is not cha
   assert.equal(v.ok, true);
   assert.equal(v.used, 0);
   assert.equal(v.size, 1);
+});
+
+test('the account asked about is in its own cohort even when the members leave it out', () => {
+  // The status payload asks about a disabled or cordoned account too, which
+  // the redeemer's members do not list: alone on its day it is a cohort of
+  // one, not of none.
+  const a = codex('a', 2);
+  const v = shareCapVerdict({ account: a, members: [codex('b', 5)], ledger: [], maxShare: 0.5, now: NOW });
+  assert.deepEqual({ ok: v.ok, size: v.size, allowed: v.allowed, used: v.used }, { ok: true, size: 1, allowed: 1, used: 0 });
 });
 
 test('an account with no stated reset belongs to no cohort and is not capped by one', () => {
@@ -238,10 +334,10 @@ test('standing names the first thing that exempts an account, and the value eith
   const policy = { minDaysToReset: 2, maxShare: 0.5, maxPerDay: 1 };
   const a = codex('a', 3.5);
   const armed = autoRedeemStanding({ account: a, autoRedeemResets: true, policy, members: [a], ledger: [], now: NOW });
-  assert.deepEqual(armed, { armed: true, exemptReason: null, creditValueWeeks: 0.5 });
+  assert.deepEqual(armed, { armed: true, exemptReason: null, creditValueWeeks: 0.5, daysToReset: 3.5 });
 
   const off = autoRedeemStanding({ account: a, autoRedeemResets: false, policy, members: [a], ledger: [], now: NOW });
-  assert.deepEqual(off, { armed: false, exemptReason: 'auto-redeem is switched off', creditValueWeeks: 0.5 });
+  assert.deepEqual(off, { armed: false, exemptReason: 'auto-redeem is switched off', creditValueWeeks: 0.5, daysToReset: 3.5 });
 
   const optOut = autoRedeemStanding({ account: { ...a, autoRedeemReset: false }, autoRedeemResets: true, policy, members: [a], ledger: [], now: NOW });
   assert.equal(optOut.exemptReason, 'auto-redeem is switched off for this account');
@@ -253,6 +349,16 @@ test('standing names the first thing that exempts an account, and the value eith
   const full = autoRedeemStanding({ account: a, autoRedeemResets: true, policy, members: [a], ledger: [{ account: {}, name: 'x', cohort: 0, at: NOW, manual: false }], now: NOW });
   assert.match(full.exemptReason, /daily cap/);
 
+  // The share cap, with the per-day cap off: another member of a's cohort
+  // was redeemed by hand, which takes the one slot a half share of two has.
+  const b = codex('b', 3.5);
+  const shared = autoRedeemStanding({
+    account: a, autoRedeemResets: true, policy: { ...policy, maxPerDay: 0 }, members: [a],
+    ledger: [{ account: b, name: 'b', cohort: resetCohort(a), at: NOW, manual: true }], now: NOW,
+  });
+  assert.equal(shared.armed, false);
+  assert.match(shared.exemptReason, /^its reset cohort of 2 already had 1 redeemed, the 50% share cap allows 1$/);
+
   const unknown = autoRedeemStanding({ account: codex('u', null), autoRedeemResets: true, policy: DEFAULT_REDEEM_POLICY, members: [], ledger: [], now: NOW });
-  assert.deepEqual(unknown, { armed: true, exemptReason: null, creditValueWeeks: null });
+  assert.deepEqual(unknown, { armed: true, exemptReason: null, creditValueWeeks: null, daysToReset: null });
 });
