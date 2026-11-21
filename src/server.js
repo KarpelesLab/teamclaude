@@ -4529,8 +4529,14 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   await accountManager.ensureTokenFresh(account.index);
   // A pinned account removed during the refresh is a pin that names no account,
   // as at the top of the attempt: answered here, before its token is looked at,
-  // and so before anything is sent.
-  if (ctx.pinnedIndex != null && account.index < 0) return respondPinGone(res, ctx);
+  // and so before anything is sent. An unpinned request is selected again
+  // instead, with the account that left among those it has tried: nothing was
+  // sent, so the retry budget is not spent.
+  if (account.index < 0) {
+    if (ctx.pinnedIndex != null) return respondPinGone(res, ctx);
+    ctx.tried.add(account);
+    return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
+  }
   if (account.status === 'error' && retryCount < maxRetries) {
     ctx.tried.add(account);
     return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
@@ -4678,8 +4684,16 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // admit() stops waiting the moment it sees the account has left, and takes
     // no slot then. A slot it took just before the removal stays counted on
     // that account, which admission never reads once it has left, so there is
-    // nothing to give back (release, by index, would find no account).
-    if (ctx.pinnedIndex != null && account.index < 0) return respondPinGone(res, ctx);
+    // nothing to give back (release, by index, would find no account). An
+    // unpinned request does not send on the account that left either: admit()
+    // let it through at once, past the pause and the ramp it was waiting on,
+    // so every request queued there would go out together on a credential
+    // the operator has just removed. It is selected again, as above.
+    if (account.index < 0) {
+      if (ctx.pinnedIndex != null) return respondPinGone(res, ctx);
+      ctx.tried.add(account);
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
+    }
     accountManager.beginActivity(account.index);
     activityOpened = true;
     // This request may have selected the account before another in-flight request

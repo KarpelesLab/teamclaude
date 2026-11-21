@@ -363,6 +363,26 @@ test('an unpinned request whose account is removed during its token refresh is s
   });
 });
 
+// And one removed while the unpinned request waits out beta's rate-limit pause
+// in admission. admit() stops waiting once beta has left, and the request, let
+// through at once, used to be sent with beta's credential: every request
+// queued on the pause went out together on an account the operator had just
+// removed. It is selected again instead, and nothing is sent to beta. The
+// removal is made once: the re-selected attempt enters admission too.
+test('an unpinned request whose account is removed during a pause in admission is served by another', async () => {
+  let removed = false;
+  const onAdmit = am => { if (!removed) { removed = true; removeNamed(am, 'beta'); } };
+  await withRemoval({ form: 'unpinned', onAdmit }, async ({ am, send, seen }) => {
+    am.currentIndex = 1;
+    am.pauseAccount(1, 3600);
+    const res = await send();
+    await res.text();
+    assert.equal(res.status, 200);
+    assert.equal(seen.length, 1);
+    assert.ok(!seen.includes('t-beta'), 'the credential of an account that left was sent upstream');
+  });
+});
+
 // Removed while the request waits out beta's rate-limit pause in admission:
 // admit() stops waiting as soon as it comes back round, takes no slot, and the
 // pin is answered. It used to sit out the whole pause first (an hour here, so
