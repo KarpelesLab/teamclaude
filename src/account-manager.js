@@ -1640,10 +1640,14 @@ export class AccountManager {
     return false;
   }
 
-  /** Public form used by the request path to re-check an account after waiting
-   * in storm-control admission. */
-  isEntitlementDenied(index, now = Date.now()) {
-    return this._entitlementDenied(this.accounts[index], now);
+  /** Public form for the callers outside selection: the request path re-checks
+   * an account after waiting in storm-control admission, and the warmer asks
+   * before it sends a warm-up. Always on this manager's clock (Date.now), the
+   * one markEntitlementDenied writes the cooldown on: a read that finds the
+   * cooldown over also clears it for rotation, so a caller's own clock would
+   * decide the manager's state. */
+  isEntitlementDenied(index) {
+    return this._entitlementDenied(this.accounts[index]);
   }
 
   /** Keep a Codex account out of rotation for one model its ChatGPT plan
