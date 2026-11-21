@@ -779,7 +779,10 @@ request before choosing anyone, the redeemer spends a reset, and the request is
 selected again against the account it cleared.
 
 - It spends on the account that would otherwise wait longest for its own
-  windows to reset, since that is where a reset buys the most.
+  windows to reset, since that is where a reset buys the most. Only the
+  windows that bar the refused request's model count (the 5-hour window, the
+  all-models weekly and that model's family weekly), each at the threshold
+  rotation holds that model to.
 - It fires when the pool is dry and the account is in one of two states:
   upstream itself reports it **at** a limit, or the proxy is holding it out of
   rotation because a **weekly** reading is at or past the
@@ -788,7 +791,9 @@ selected again against the account it cleared.
   fleet: rotation stops using an account at its threshold, so every account
   parks a little short of upstream's limit and upstream never reports a wall.
   The account's quota is re-read first, and the threshold is judged on that
-  reading.
+  reading. If that reading shows the account can serve the refused request
+  after all (the one the proxy held had gone stale), nothing is spent: the
+  pool was not dry, and the request is selected again.
 - **What the second state gives up:** the reset is spent while the account
   still has the last part of its week below upstream's limit — 2% at the
   default threshold of `0.98`, more with a lower one. That remainder goes with
@@ -801,14 +806,26 @@ selected again against the account it cleared.
   those limits are the ones behind the readings that parked it for the
   refused request's model: the all-models weekly (`seven_day`), the Fable
   weekly (`seven_day_overage_included`), and the 5-hour window too if that is
-  over its threshold as well. An account parked on a reading with no known
+  over its threshold as well. They count beside upstream's own limits even when
+  upstream reports a weekly one: an account at its Fable limit that the proxy
+  also holds out on the all-models weekly needs a reset that clears both, not
+  the Fable reset alone. An account parked on a reading with no known
   upstream limit name (the Sonnet weekly, a learned scoped bucket) is passed
   over, as is one out for any other reason (disabled, cordoned, capped by
-  `maxUsage` or `maxSpend`, throttled, in error). While upstream reports a
-  reset cooldown, nothing is claimed.
+  `maxUsage` or `maxSpend`, in error). A rate-limit hold, which the proxy sets
+  on the 429 that usually brings word of upstream's 5-hour wall, does not hide
+  the weekly reading behind it: the reset lifts the hold as well. While
+  upstream reports a reset cooldown, nothing is claimed.
 - An account that holds a usable reset and is passed over is named in the
   log with the reason (`Account "x": banked reset not redeemed: …`), once per
-  account per cooldown (30 minutes) rather than once per refused request.
+  account per cooldown (30 minutes) rather than once per refused request. A
+  reason that depends on the refused request's model (whether a weekly reading
+  parks the account for it) holds only for requests judged on the same
+  readings: those whose model the same weekly bucket governs (the Fable
+  weekly, the Sonnet weekly, or the all-models one, unless a route names
+  another), and, where some account has learned a scoped weekly bucket for
+  the model's family, those of that family. Passing an account over for an
+  Opus request does not pass it over for a Fable one.
 - Among usable, unpaused, unexpired grants that clear every exhausted limit,
   it spends the cheapest kind: **Fable**, then **session**, then **weekly**.
   Within the same kind it spends the soonest-expiring grant (no expiry comes
@@ -818,7 +835,8 @@ selected again against the account it cleared.
   none clears the whole wall. Manual selection still chooses any usable grant.
 - `accounts[].autoRedeemReset: false` exempts an account, as it does for Codex;
   so does being disabled, having no organization id, or last reading zero held
-  resets.
+  resets. An account the refused request's model route does not allow is never
+  offered.
 
 After a reset the Claude pool holds off for an hour, so one dry pool costs one
 reset. A claim whose answer never arrived may still have spent the grant: its
