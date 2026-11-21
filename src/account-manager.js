@@ -5,7 +5,8 @@ import { parseCodexQuota, parseCodexPlanType, parseCodexActiveLimit } from './co
 import { sameIdentity, sameOrg } from './identity.js';
 import { weeklyBucketForModel, modelGlobMatches, modelFamily, gatingUtilization, resolveMaxUsage, spendCapReached, resolveSwitchThreshold, sanitizeSwitchThreshold, WEEKLY_BUCKET_KEYS } from './model.js';
 import { SessionTracker } from './session-tracker.js';
-import { SessionPins } from './session-pins.js';
+import { SessionPins, MAX_SESSION_PINS } from './session-pins.js';
+import { normalizeSessionAdvice, decideAdvice } from './session-advice.js';
 import { CompactAsks } from './compact-before-switch.js';
 import { buildQuotaSummary, quotaTier } from './quota-summary.js';
 import { ROLLOVER_MIN_JUMP_MS, remapHeld, findHeld, dropHeld, newObservation } from './rollover.js';
@@ -25,6 +26,7 @@ import { isSelfProxy } from './upstream-proxy.js';
 import { envVar } from './brand.js';
 import { accountCredit, emptyCreditState, recordCreditUsage, rollCreditCycle, creditView, exportCreditState, restoreCreditState } from './api-credit.js';
 /** @typedef {import('./session-tracker.js').Observation} Observation */
+/** @typedef {import('./session-advice.js').SessionAdviceConfig} SessionAdviceConfig */
 
 // Re-exported for callers that import these model helpers from here.
 export { isFableModel, parseRequestModel, parseAdvisorModel } from './model.js';
@@ -830,6 +832,13 @@ export function advisorEligibilityMode(setting) {
   return 'strict';
 }
 
+/**
+ * The unavailableReason values under which a manually pinned session's requests
+ * fail upstream rather than being served: a pin never fails over, so session
+ * advice reports such a pin as unavailable ahead of every other check.
+ */
+const PIN_NOT_SERVED = new Set(['throttled', 'exhausted', 'error', 'upstream-rejected']);
+
 export class AccountManager {
   /**
    * @param {Array<Object>} accounts  config entries, credentials resolved
@@ -850,10 +859,11 @@ export class AccountManager {
    * @param {Object} [opts.expiryRouting]
    * @param {boolean} [opts.preferSoonestWeeklyReset]  earliest-deadline-first rotation (see setPreferSoonestWeeklyReset)
    * @param {boolean} [opts.switchOnSessionReset]  move to an account whose 5h window just reset (see setSwitchOnSessionReset)
+   * @param {Object} [opts.sessionAdvice]
    * @param {string} [opts.advisorEligibility]  'strict' (default) or 'prefer'
    * @param {{ host: string, port: number }|null} [opts.listener]  this server's own address, so an accounts[].routing that points back at it is refused (see accountRouting)
    */
-  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, refreshCoordinator = (_account, refresh, _info) => refresh(), throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, adaptive, sessionTracker, expiryRouting, preferSoonestWeeklyReset = false, switchOnSessionReset = true, advisorEligibility, listener = null } = {}) {
+  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, refreshCoordinator = (_account, refresh, _info) => refresh(), throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, adaptive, sessionTracker, expiryRouting, sessionAdvice, preferSoonestWeeklyReset = false, switchOnSessionReset = true, advisorEligibility, listener = null } = {}) {
     // How long a just-minted token is trusted against a forced refresh.
     this._forcedRefreshFloorMs = forcedRefreshFloorMs;
     // Injectable for tests (mirrors Prober's probeFn); defaults to the real
@@ -885,6 +895,10 @@ export class AccountManager {
     // there is one record per fleet. Empty and unread unless the setting is on.
     /** @type {CompactAsks} */
     this.compactAsks = new CompactAsks();
+    // Session id -> when its move advice may speak again, after a move or a
+    // decline (see noteAdviceCooldown). Runtime only, like the pins beside it.
+    /** @type {Map<string, number>} */
+    this.adviceCooldowns = new Map();
     // 'off' | 'even' | 'adaptive' | 'load'. `distributeSessions` stays a boolean beside
     // it ("is distribution on at all") because the status readout, the TUI
     // header and the remote dashboard all ask only that question.
@@ -963,6 +977,8 @@ export class AccountManager {
     this.setExpiryRouting(expiryRouting);
     this.setPreferSoonestWeeklyReset(preferSoonestWeeklyReset);
     this.setSwitchOnSessionReset(switchOnSessionReset);
+    /** @type {SessionAdviceConfig} */
+    this.sessionAdviceConfig = normalizeSessionAdvice(sessionAdvice);
     // The rollover mechanism's whole state for the sticky current account: one
     // observation, { idx, windows: name → reset }, of the account traffic was
     // resting on when a request last arrived to find it there. Null while the
@@ -1299,6 +1315,20 @@ export class AccountManager {
       // Not a cap, but the same kind of bar, needed on the same paths: these
       // are the paths that skip unavailableReason, which also checks it.
       || (this._modelDenied(account, model) ? 'model-unsupported' : null);
+  }
+
+  /**
+   * Why a hard pin (TC_ACCT, a session pin) to `account` is not forwarded, or
+   * null when it is: a subscription of another provider, or a capBars bar. The
+   * pinned branch of forwardRequest (server.js) applies exactly this.
+   * @param {Record<string, any>} account
+   * @param {string|null} [model]
+   * @param {string|null} [advisorModel]
+   * @param {string} [provider]
+   */
+  pinBars(account, model = null, advisorModel = null, provider = DEFAULT_PROVIDER) {
+    if (!canServeProvider(account, provider)) return 'provider';
+    return this.capBars(account, model, advisorModel);
   }
 
   /** Start (or restart) the ramp window for an account that just became current,
@@ -3116,7 +3146,8 @@ export class AccountManager {
     // SENT, and being sent somewhere is not arriving there. The observation is
     // taken where the evidence is, at the start of the NEXT request from
     // wherever this one left the pin (see _restOn).
-    this.sessionTracker.touch(sessionId, accountIndex, bucket);
+    const record = this.sessionTracker.touch(sessionId, accountIndex, bucket);
+    if (record && model) record.model = model;
     // The load mode's input: one entry per routed request that carries a
     // session id, in every mode, so switching to load starts from a warm picture.
     this.sessionTracker.noteRouted(accountIndex);
@@ -3125,6 +3156,189 @@ export class AccountManager {
     if (!this.expiryRouting.enabled || !this.expiryRouting.preempt) return;
     this._firstSightOn(this.sessionTracker.refsFor(sessionId, bucket, true),
       this.accounts[accountIndex]);
+  }
+
+  /**
+   * Which account a client session is on, from its conversations seen within the
+   * active window of its LAST request. `cost`: the largest context among them,
+   * null for a conversation with no response on record (one restored across a
+   * restart, until its next response). `shown`: the manual pin, else the newest
+   * one's pin in `cost`'s bucket. A conversation with no model on record (a
+   * restored one) is in the bucket of its newest pin. `served`: that pin, under
+   * a manual pin too.
+   * @param {string|null} sessionId
+   * @param {number} [now]
+   * @returns {{ shown: { index: number|null, name: string|null, via: 'manual'|'affinity' }|null,
+   *   cost: { model: string|null, bucket: string, context: number|null }|null, served: number|null }|null}
+   */
+  sessionAccount(sessionId, now = Date.now()) {
+    const rows = this.sessionTracker.conversationsOf(sessionId, now);
+    let cost = null;
+    let display = null;
+    if (rows.length) {
+      const last = Math.max(...rows.map(r => r.lastSeen));
+      const recent = rows
+        .filter(r => last - r.lastSeen <= this.sessionTracker.activeTtlMs)
+        .map(r => {
+          const bucket = r.model != null ? this._weeklyBucketFor(r.model) : r.pinBucket ?? this._weeklyBucketFor(null);
+          return { row: r, bucket, context: r.tokens[bucket]?.context ?? null };
+        });
+      const size = (/** @type {{ context: number|null }} */ c) => c.context ?? -1;
+      const big = recent.reduce((a, b) => (size(b) > size(a) ? b : a));
+      cost = { model: big.row.model, bucket: big.bucket, context: big.context };
+      display = recent.filter(c => c.bucket === big.bucket).reduce((a, b) =>
+        (b.row.lastSeen > a.row.lastSeen || (b.row.lastSeen === a.row.lastSeen && size(b) > size(a)) ? b : a)).row;
+    }
+    const served = display && cost
+      ? display.pins[cost.bucket] ?? this.sessionTracker.pinnedAccounts(display.id, now)[0] ?? null
+      : null;
+    let shown = null;
+    const manual = this.sessionPins.peek(sessionId, now);
+    if (manual != null) {
+      const index = this.accounts.findIndex(a => a.name === manual);
+      shown = { index: index < 0 ? null : index, name: manual, via: /** @type {const} */ ('manual') };
+    } else if (served != null) {
+      shown = { index: served, name: this.accounts[served]?.name ?? null, via: /** @type {const} */ ('affinity') };
+    }
+    return shown || cost ? { shown, cost, served } : null;
+  }
+
+  /** @param {any} cfg  the `sessionAdvice` config block */
+  setSessionAdvice(cfg) {
+    this.sessionAdviceConfig = normalizeSessionAdvice(cfg);
+  }
+
+  /**
+   * Hold `sessionId`'s move advice for `cooldownMinutes`, after a move or a
+   * decline. Does nothing while the feature is off; returns whether it held.
+   * @param {string} sessionId
+   * @param {number} [now]
+   */
+  noteAdviceCooldown(sessionId, now = Date.now()) {
+    if (!this.sessionAdviceConfig.enabled) return false;
+    for (const [id, until] of this.adviceCooldowns) if (until <= now) this.adviceCooldowns.delete(id);
+    this.adviceCooldowns.delete(sessionId);
+    while (this.adviceCooldowns.size >= MAX_SESSION_PINS) {
+      this.adviceCooldowns.delete(/** @type {string} */ (this.adviceCooldowns.keys().next().value));
+    }
+    this.adviceCooldowns.set(sessionId, now + this.sessionAdviceConfig.cooldownMinutes * 60_000);
+    return true;
+  }
+
+  /**
+   * Whether `sessionId` should move, and where. Gathers the snapshot
+   * decideAdvice judges; it scans every conversation, so it is for the control
+   * plane, never the request path.
+   * @param {string} sessionId
+   * @param {number} [now]
+   */
+  sessionAdvice(sessionId, now = Date.now()) {
+    const cfg = this.sessionAdviceConfig;
+    const found = this.sessionAccount(sessionId, now);
+    const shown = found?.shown ?? null;
+    const account = shown?.name ?? null;
+    const via = shown?.via ?? null;
+    /** @type {any} */
+    const model = found?.cost?.model ?? null;
+    const context = found?.cost?.context ?? null;
+    const current = shown?.index != null ? this.accounts[shown.index] : null;
+    // Only read the fleet when the answer can depend on it: the reads clear
+    // expired windows and throttles, as a status read does.
+    const judged = cfg.enabled && shown != null;
+    let currentAvailable = false;
+    let routerMoves = false;
+    let inBand = false;
+    let destination = null;
+    // The provider of the session's traffic: that of the account its requests
+    // were routed to, which for a manual pin is the one before the pin. A
+    // subscription of another provider can neither set the band nor take the move.
+    const servedAccount = found?.served != null ? this.accounts[found.served] : null;
+    const provider = servedAccount || current ? providerOf(servedAccount ?? current) : DEFAULT_PROVIDER;
+    if (judged) {
+      if (shown.via === 'manual') {
+        // A manual pin is forwarded unless the pin gate bars it, and never fails
+        // over: on an account upstream has stopped serving (its limit reached,
+        // or in error) every request fails until the pin is moved or dropped,
+        // and the cooldown the move itself started must not hide that. Any
+        // other reason (disabled, its own switch threshold, a cordon, a route)
+        // does not stop a pin, and is judged by the band like a serving account.
+        const reason = current ? this.unavailableReason(current, model) : 'error';
+        currentAvailable = !!current && !this.pinBars(current, model, null, provider)
+          && !PIN_NOT_SERVED.has(/** @type {string} */ (reason));
+      } else {
+        // A cordoned account takes no new work but keeps the conversations on it
+        // (_keepOnCordoned, which returns ahead of the reclaim window), so it serves them.
+        const unavailable = current ? this.unavailableReason(current, model) : 'error';
+        const cordoned = unavailable === 'cordoned';
+        currentAvailable = unavailable === null || cordoned;
+        if (currentAvailable) {
+          const acct = /** @type {Record<string, any>} */ (current);
+          // In _pickActiveAccount's order: an available route pin wins outright;
+          // the cordon keep runs unless a route pin to a healthy account exists;
+          // session affinity (priority, then reclaim) only with no route pin at all.
+          const routePin = this._pinnedAccountForModel(model);
+          const keepsCordon = !routePin || routePin.cordoned;
+          const affinity = this.distributeSessions && !routePin;
+          const others = this._excludeOtherProviders(null, providerOf(acct));
+          if (routePin && this._isAvailable(routePin, model)) {
+            routerMoves = routePin.index !== acct.index;
+          } else if (cordoned && !keepsCordon) {
+            routerMoves = true; // the fleet walk never picks a cordoned account
+          } else {
+            // _keepOnCordoned and _selectForSession compare inline as
+            // _outrankedByPriority does; the fleet walk (_select) uses _preemptedBy.
+            const outranked = cordoned || affinity
+              ? this._outrankedByPriority(acct, model, null, others)
+              : this._preemptedBy(acct, model, null, others, providerOf(acct));
+            routerMoves = outranked != null
+              || (!cordoned && affinity && this._reclaimDestination(acct, null, model, null) != null);
+            // Without session affinity nothing ties the session to the account
+            // that served it last: its next request goes where the fleet walk
+            // rests (a manual switch, or rotation since). When that is another
+            // account the router has already moved it, and a recommendation
+            // would pin it somewhere the walk was not going.
+            if (!routerMoves && !cordoned && !affinity) {
+              const next = this.previewRouteIndex(model, provider);
+              routerMoves = next != null && next !== acct.index;
+            }
+          }
+        }
+      }
+      const foreign = this._excludeOtherProviders(null, provider);
+      const banded = this._bandedCandidates(foreign, model);
+      const top = Math.min(...banded.map(a => a.priority || 0));
+      inBand = !!current && banded.some(a => a.index === current.index && (a.priority || 0) === top);
+      // With no model on record (a restored conversation) a destination is named
+      // only where the model could not change it: the shared bucket and no routes.
+      const modelFree = (found?.cost?.bucket ?? this._weeklyBucketFor(null)) === this._weeklyBucketFor(null)
+        && !this.routes?.length && !this.accounts.some(a => a.models?.length);
+      if (model != null || modelFree) {
+        const exclude = new Set(foreign || []);
+        if (current) exclude.add(current.index);
+        destination = this._pickLeastLoaded(exclude, model)?.name ?? null;
+      }
+    }
+    const decision = decideAdvice({
+      now,
+      enabled: cfg.enabled,
+      maxContextTokens: cfg.maxContextTokens,
+      expiryOn: !!this.expiryRouting?.enabled,
+      account,
+      via,
+      context,
+      currentAvailable,
+      routerMoves,
+      inBand,
+      destination,
+      cooldownUntil: this.adviceCooldowns.get(sessionId) ?? null,
+    });
+    return {
+      account,
+      via,
+      context,
+      advice: { enabled: cfg.enabled, ask: cfg.ask },
+      ...decision,
+    };
   }
 
   /** Mark a session request as in flight / finished. Paired around the whole

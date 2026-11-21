@@ -190,10 +190,15 @@ export function createDefaultConfig() {
   };
 }
 
-export async function loadConfig() {
+/**
+ * The config file, or null when there is none. `applyProxy: false` skips the
+ * egress proxy, for a command that only talks to the local server.
+ * @param {{ applyProxy?: boolean }} [opts]
+ */
+export async function loadConfig({ applyProxy = true } = {}) {
   const path = getConfigPath();
   try {
-    return configFromFile(JSON.parse(await readFile(path, 'utf-8')));
+    return configFromFile(JSON.parse(await readFile(path, 'utf-8')), { applyProxy });
   } catch (err) {
     if (err.code === 'ENOENT') return null;
     throw err;
@@ -201,8 +206,9 @@ export async function loadConfig() {
 }
 
 /** The config loadConfig hands out, made from the file's parsed contents.
- * @param {any} config */
-function configFromFile(config) {
+ * @param {any} config
+ * @param {{ applyProxy?: boolean }} [opts] */
+function configFromFile(config, { applyProxy = true } = {}) {
   // A file with no `accounts` key is what an empty or hand-trimmed config
   // looks like. Every reader treats the list as always present, and the first
   // one to trip was the save path — so the failure arrived while writing,
@@ -213,7 +219,7 @@ function configFromFile(config) {
   // so a config written before the field existed — or edited by hand — is given
   // ids here, before anything can read one. The next save persists them.
   ensureAccountIds(config.accounts);
-  applyUpstreamProxy(config);
+  if (applyProxy) applyUpstreamProxy(config);
   return config;
 }
 

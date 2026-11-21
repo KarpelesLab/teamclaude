@@ -40,3 +40,12 @@ export function safeLine(value, max = 120) {
   const cleaned = sanitizeText(value);
   return cleaned.length > max ? cleaned.slice(0, max) : cleaned;
 }
+
+/**
+ * `value` as one POSIX shell word, for a command we print for someone to run:
+ * bare when it is plainly safe, else single-quoted, inside which nothing expands.
+ * @param {string} value
+ */
+export function shellWord(value) {
+  return /^[\w.@+-]+$/.test(value) ? value : `'${value.replace(/'/g, `'\\''`)}'`;
+}

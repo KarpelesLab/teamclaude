@@ -361,6 +361,9 @@ test('a detail row carries the labels and the per-bucket tokens the responses re
   assert.equal(row.tokens[SHARED].context, 960);
   assert.equal(row.inFlight, 1);
   assert.equal(row.active, true);
+  // The status payload's row shape: the routed model stays on the record, off the payload.
+  assert.deepEqual(Object.keys(row), ['id', 'active', 'inFlight', 'requests', 'starved', 'firstSeen', 'lastSeen',
+    'session', 'conversation', 'client', 'dimensions', 'pins', 'tokens']);
 });
 
 test('detail rows are newest-first, and a forgotten session is absent', () => {
@@ -539,4 +542,34 @@ test('a conversation holds a bounded number of thread messages, newest kept', ()
   for (let i = 0; i <= MAX_THREAD_MESSAGES; i++) st.recordThreadMessage('S/conv', `msg_${i}`, null, clock.t);
   assert.equal(st.threadOwner('S', 'msg_0', clock.t), null);
   assert.equal(st.threadOwner('S', `msg_${MAX_THREAD_MESSAGES}`, clock.t)?.key, 'S/conv');
+});
+
+test('conversationsOf lists the live conversations of one client session', () => {
+  const { clock, now } = fixedClock();
+  const st = new SessionTracker({ now });
+  st.beginRequest('s1#a', clock.t, { sessionId: 's1', conversation: 'a' });
+  st.touch('s1#a', 0, SHARED, clock.t).model = 'claude-opus-4-1';
+  st.recordTokens('s1#a', SHARED, { input_tokens: 500 }, clock.t);
+  st.endRequest('s1#a', clock.t);
+  st.beginRequest('s1#b', clock.t, { sessionId: 's1', conversation: 'b' });
+  st.beginRequest('s2#c', clock.t, { sessionId: 's2', conversation: 'c' });
+  st.touch('s1', 1, SHARED, clock.t);
+
+  const rows = st.conversationsOf('s1', clock.t);
+  assert.deepEqual(rows.map(r => r.id).sort(), ['s1', 's1#a', 's1#b']);
+  const a = rows.find(r => r.id === 's1#a');
+  assert.equal(a?.model, 'claude-opus-4-1');
+  assert.equal(a?.tokens[SHARED].context, 500);
+  assert.deepEqual(a?.pins, { [SHARED]: 0 });
+  assert.equal(a?.pinBucket, SHARED);
+  clock.t += 1;
+  st.touch('s1#a', 1, FABLE, clock.t);
+  assert.equal(st.conversationsOf('s1', clock.t).find(r => r.id === 's1#a')?.pinBucket, FABLE, 'the newest pin');
+  assert.equal(rows.find(r => r.id === 's1#b')?.model, null, 'nothing routed for it yet');
+
+  st.endRequest('s1#b', clock.t);
+  clock.t += SESSION_KNOWN_TTL_MS + 1;
+  st.touch('s1', 1, SHARED, clock.t);
+  assert.deepEqual(st.conversationsOf('s1', clock.t).map(r => r.id), ['s1'], 'expired records are skipped');
+  assert.deepEqual(st.conversationsOf(null, clock.t), []);
 });

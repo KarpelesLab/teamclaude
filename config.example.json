@@ -45,6 +45,12 @@
     "reclaimHours": 0,
     "reclaimAcrossOrganizations": false
   },
+  "sessionAdvice": {
+    "enabled": false,
+    "maxContextTokens": 150000,
+    "cooldownMinutes": 60,
+    "ask": false
+  },
   "accounts": [
     {
       "name": "primary-max",
