@@ -169,6 +169,41 @@ for (const [status, body, code, link, contentType] of [
   });
 }
 
+// A pin to the only account, which upstream refuses with a 400: the request
+// records the account as tried and answers with the refusal. Recorded as
+// anything the next attempt does not recognise, the pin was selected again,
+// and with a one-account retry budget already spent it was sent again, refused
+// again, and so on without end. The second send is awaited as an event.
+test('a request pinned to the only account gets its 400 refusal after one attempt', async () => {
+  const seen = [];
+  let second = () => {};
+  const sentAgain = new Promise(resolve => { second = resolve; });
+  const upstream = http.createServer((req, res) => {
+    req.resume();
+    seen.push((req.headers.authorization || '').replace(/^Bearer /, ''));
+    if (seen.length === 2) second('sent again');
+    res.writeHead(400, { 'content-type': 'application/json' });
+    res.end(errorBody('invalid_request_error', 'This organization has been disabled.', 'organization_disabled'));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager([accounts()[0]], 0.98, { refreshFn: async () => { throw new Error('must not refresh'); } });
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const port = await listen(proxy);
+  try {
+    const answered = fetch(`http://127.0.0.1:${port}/tc-acct/a/v1/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'x', messages: [] }),
+    }).then(r => r.status);
+    assert.equal(await Promise.race([answered, sentAgain]), 502);
+    assert.deepEqual(seen, ['a-token']);
+  } finally {
+    proxy.closeAllConnections();
+    proxy.close();
+    upstream.closeAllConnections();
+    upstream.close();
+  }
+});
+
 // The 400 is read before it is relayed, so the relay must still carry every
 // byte, including past the size the classifier reads.
 for (const size of [0, 1024 * 1024]) {

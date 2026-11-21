@@ -74,3 +74,20 @@ for (const [label, preferExtraUsage, text] of [
     assert.match(renderStatus(status, { color: false }), text);
   });
 }
+
+// docs/quota.md: the Usage line holds only while the account can still serve
+// that way. Once it cannot, here disabled by the operator, the line goes back
+// to the Blocked form with its reason, the billing mark still on it.
+test('subscription fallback status: a preferred billing account that can no longer serve reads Blocked', t => {
+  t.mock.method(console, 'log', () => {});
+  const am = new AccountManager([
+    { name: 'paid', type: 'oauth', accessToken: 't', allowExtraUsage: true, preferExtraUsage: true },
+  ], 0.98);
+  Object.assign(am.accounts[0].quota, { unified7d: 1, spend: { enabled: true, usedMinor: 0, currency: 'GBP', exponent: 2 } });
+  am._nextProbeAt = Date.now() + 60_000;
+  assert.equal(am.getActiveAccount(null, 'claude-opus-5')?.name, 'paid');
+  am.accounts[0].disabled = true;
+  const status = am.getStatus();
+  assert.deepEqual({ billing: status.accounts[0].onExtraUsage, tier: status.accounts[0].fallbackTier }, { billing: true, tier: null });
+  assert.match(renderStatus(status, { color: false }), /Blocked\s+disabled by operator \u2014 serving on extra usage \(paid overage\), billing/);
+});

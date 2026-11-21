@@ -384,6 +384,112 @@ test('a Claude request that brings a Codex roll leaves the Codex cursor to the C
   assert.equal(am.accounts[am.providerCursors.get('codex')].name, 'codex-c1');
 });
 
+// The Codex run's three guards. The first two are on the path a Claude request
+// takes when it brings the roll of an API key tagged for Codex: `codexRun`
+// builds that fleet - the operator's choice on claude-a1, the Codex cursor on
+// codex-c1, expiry routing on - and `fleet` adds the accounts each test needs.
+// The third is a poll, with an untagged shared key, below.
+function codexRun(fleet, expiry = { enabled: true }) {
+  const hour = 3600_000;
+  const now = Date.now();
+  const oauth = (name, fields) => ({ name, type: 'oauth', accessToken: 't-' + name, refreshToken: 'r', expiresAt: now + hour, ...fields });
+  const am = new AccountManager([
+    oauth('claude-a1', { accountUuid: 'u1' }),
+    oauth('codex-c1', { provider: 'codex', accountId: 'i1' }),
+    ...fleet.map(([name, type]) => (type === 'key' ? { name, type: 'apikey', apiKey: 'k-' + name, provider: 'codex' } : oauth(name, { provider: 'codex', accountId: 'i-' + name }))),
+  ], 0.98, { expiryRouting: expiry });
+  const by = Object.fromEntries(am.accounts.map(a => [a.name, a]));
+  const set = (name, used, hours) => Object.assign(by[name].quota, { unified7d: used, unified7dReset: now + hours * hour, unified5h: 0.1, unified5hReset: now + hour });
+  return {
+    am, by, set,
+    // The Codex cursor on codex-c1, then the operator's choice on claude-a1.
+    place: () => {
+      am._setCurrent(by['codex-c1']);
+      assert.equal(am.getActiveAccount(null, 'gpt-5', null, null, 'codex').name, 'codex-c1');
+      assert.equal(am.setCurrentAccount(by['claude-a1'].index), true);
+    },
+    // `name`'s five-hour window rolls, and a status read clears it: the reset
+    // waits for a request, which the Claude request below is.
+    roll: name => {
+      Object.assign(by[name].quota, { unified5h: 0.5, unified5hReset: now - 1000, sessionWindowStated: true });
+      am.sweepExpiredQuotas();
+      assert.equal(by[name].sessionResetPending, true);
+    },
+  };
+}
+
+// The Codex cursor serves Codex requests, which never carry a Claude advisor:
+// the Claude request's advisor model must not narrow the Codex band either.
+// codex-c3 holds the Codex fleet's most pressing quota, and its Fable bucket is
+// spent: drawn on the advisor model, the band would drop it and hold the key.
+test('a Claude advisor request that brings a Codex roll draws the Codex band without its advisor model', t => {
+  t.mock.method(console, 'log', () => {});
+  const FABLE = 'claude-fable-5';
+  const { am, by, set, place, roll } = codexRun([['codex-c3'], ['codex-key', 'key']]);
+  set('claude-a1', 0.3, 5 * 24);
+  set('codex-c1', 0.3, 5 * 24);
+  set('codex-c3', 0, 24);
+  set('codex-key', 0.3, 2 * 24);
+  Object.assign(by['codex-c3'].quota, { unified7dFable: 1, unified7dFableReset: Date.now() + 24 * 3600_000 });
+  assert.equal(am._isAvailable(by['codex-c3'], null, FABLE), false, 'the fixture must bar codex-c3 from the advisor model');
+  assert.equal(am._isAvailable(by['codex-c3'], null), true, 'and leave it in the Codex fleet');
+  place();
+  roll('codex-key');
+  assert.equal(am.getActiveAccount(new Set(), MODEL, FABLE).name, 'claude-a1');
+  assert.equal(by['codex-key'].sessionResetPending, false, 'the Claude request spent the key\'s reset');
+  assert.equal(am.accounts[am.providerCursors.get('codex')].name, 'codex-c1');
+});
+
+// The band admits the key once the tolerance is wide, so membership is not what
+// stops it: the rank guard is, measured against the Codex cursor's account.
+test('a Codex roll ranked strictly worse than the Codex cursor does not take it, inside the band', t => {
+  t.mock.method(console, 'log', () => {});
+  const { am, set, place, roll } = codexRun([['codex-key', 'key']], { enabled: true, tolerance: 100 });
+  set('claude-a1', 0.3, 5 * 24);
+  set('codex-c1', 0.05, 10);
+  set('codex-key', 0.95, 2);
+  assert.deepEqual(am._bandedCandidates(am._excludeOtherProviders(null, 'codex')).map(a => a.name), ['codex-c1', 'codex-key'],
+    'the fixture must keep the key inside the Codex band');
+  place();
+  roll('codex-key');
+  assert.equal(am.getActiveAccount(new Set(), MODEL).name, 'claude-a1');
+  assert.equal(am.accounts[am.providerCursors.get('codex')].name, 'codex-c1');
+});
+
+// _unstrandCursor can leave a provider's cursor on a shared API key, which reads
+// as Claude's: that is no Codex incumbent, so a poll leaves a Codex roll to the
+// next Codex walk, which picks on merit (codex-c1). Weighed against the key, the
+// roll took the Codex cursor and held the next Codex request on codex-c2. With
+// the operator's choice on claude-a1 and without one.
+for (const manual of [true, false]) {
+  test(`a poll leaves a Codex roll to the walk when the Codex cursor rests on a shared key (${manual ? 'manual choice' : 'automatic placement'})`, t => {
+    t.mock.method(console, 'log', () => {});
+    const hour = 3600_000;
+    const day = 24 * hour;
+    const now = Date.now();
+    const oauth = (name, fields) => ({ name, type: 'oauth', accessToken: 't-' + name, refreshToken: 'r', expiresAt: now + hour, ...fields });
+    const am = new AccountManager([
+      oauth('claude-a1', { accountUuid: 'u1' }),
+      oauth('codex-c1', { provider: 'codex', accountId: 'i1' }),
+      oauth('codex-c2', { provider: 'codex', accountId: 'i2' }),
+      { name: 'shared-key', type: 'apikey', apiKey: 'k' },
+    ], 0.98);
+    const by = Object.fromEntries(am.accounts.map(a => [a.name, a]));
+    const set = (name, days, q = {}) => Object.assign(by[name].quota, { unified7d: 0.3, unified7dReset: now + days * day, unified5h: 0.1, unified5hReset: now + hour, ...q });
+    set('claude-a1', 6);
+    set('codex-c1', 1);
+    set('codex-c2', 2, { unified5h: 0.5, unified5hReset: now - 1000 }); // its five-hour window has rolled
+    set('shared-key', 5);
+    if (manual) assert.equal(am.setCurrentAccount(by['claude-a1'].index), true);
+    else am._setCurrent(by['claude-a1']);
+    am.providerCursors.set('codex', by['shared-key'].index);
+    am.refreshExpiredQuotas();
+    assert.equal(am.accounts[am.currentIndex].name, 'claude-a1');
+    assert.equal(am.providerCursors.get('codex'), by['shared-key'].index, 'the poll moved a Codex cursor it has no Codex incumbent for');
+    assert.equal(am.getActiveAccount(null, 'gpt-5', null, null, 'codex').name, 'codex-c1');
+  });
+}
+
 // With distribution on, a new conversation is placed within the best priority
 // tier and never reads the manual choice. The switch endpoints ask for that
 // check (`manualSwitch`); the plain flag does not carry it.

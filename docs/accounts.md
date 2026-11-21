@@ -167,7 +167,7 @@ While signed in, every **OAuth** account (Claude and Codex) is kept as one row o
 
 - **A pass** runs when the server starts, on every reload (`callback login`, `login`, `import` and `callback sync` all trigger one) and once a day. A row with no local account becomes one, so signing in on a new machine brings every account over. A row whose token is newer than the local one — the later `expiresAt`, which a renewal always pushes forward — replaces it. A local account newer than its row updates the row, and one with no row creates it — but only with a token this install just renewed (below).
 - **Only fresh tokens are stored.** A token is written to the store only when the token endpoint has just minted it: a renewal on this install, or a `login` or `import`. A token read from the config at start, or from disk on a reload, may have died while the proxy was down, and one that served a request may still have been revoked since, so neither is ever stored. An account holding one only reads (it adopts newer tokens and follows tombstones); its next renewal writes the row. That renewal is still made under a lock: with no row yet, it first creates one holding only the account's identity and no token, so that two installs started from the same config renew the account once, not twice.
-- **A token refresh** goes through the row's advisory lock, so one install renews and the rest adopt. A refresh rotates the token family, and two installs renewing one account at once would each invalidate the other's copy — which is exactly the "sign in again everywhere" this exists to end. With the lock taken, the row is read first (the lock answers with it): if it holds a token other than this install's, another install renewed or signed in since, and that token is adopted whatever its expiry; the provider is not called. The one exception is a row this install wrote itself with an older token than it holds now, a renewal of its own that never reached the store, which is renewed over rather than taken back. Refused, another install is renewing: a token that is still good (the refresh runs five minutes ahead of expiry) is simply kept, the renewal arrives through the store, and the next request asks again. A token that has already expired, or that upstream just rejected, waits instead, re-reading every 5 seconds for 30 seconds, adopts what the holder stores, and otherwise tries the lock again, three rounds in all before that refresh fails; a lock that nobody releases times out after 30 seconds.
+- **A token refresh** goes through the row's advisory lock, so one install renews and the rest adopt. A refresh rotates the token family, and two installs renewing one account at once would each invalidate the other's copy — which is exactly the "sign in again everywhere" this exists to end. With the lock taken, the row is read first (the lock answers with it): if it holds a token other than this install's, another install renewed or signed in since, and that token is adopted whatever its expiry; the provider is not called. Two kinds of row are renewed over rather than taken back, as taking them would revive a refresh token this install already used: a row holding the very tokens the proxy's last renewal of the account started from, whoever wrote that row (the renewal was made while signed out of callback.net, or every write of it failed, or another install wrote those tokens back since), until the proxy restarts, which forgets them (a command-line renewal keeps no such note); and a row this install wrote itself with an older token than it holds now, a renewal of its own that never reached the store. Refused, another install is renewing: a token that is still good (the refresh runs five minutes ahead of expiry) is simply kept, the renewal arrives through the store, and the next request asks again. A token that has already expired, or that upstream just rejected, waits instead, re-reading every 5 seconds for 30 seconds, adopts what the holder stores, and otherwise tries the lock again, three rounds in all before that refresh fails; a lock that nobody releases times out after 30 seconds.
 - **An unreachable store stops renewals.** When callback.net cannot be reached, or refuses this install's session, a refresh does not wait: nothing renews a token the store holds without the lock, so a token that is still good is kept and the next request asks again, and one that has expired, or that upstream just rejected, fails that refresh at once. While the store is out of reach no OAuth account is renewed at all: each serves until its token expires, and then its refreshes fail until the store answers. `teamclaude callback logout` stops the sync, and the next refresh goes without the lock. While signed in, the only renewal made without the lock is when a read of the store finds neither a row for the account nor one holding its token, and the account is one the store cannot carry (no identity to key a row on) or one in error, which no other install can hold.
 - **A sign-in** (`login`, `import`) is stored right away, over whatever the row held.
 - **An account in error never writes.** Once upstream has rejected an account's token (status `error`, "needs re-login"), what this install holds is dead, so it is never stored — not by a pass, not as a token change — however late its `expiresAt`. It only reads: the moment it goes into error, and at every pass after, a row holding a different token (another install renewed it, or you signed in there) is adopted whatever its expiry, and the account is back in rotation. If instead the row still holds the very refresh token that was rejected, the row is emptied: under its lock, and only if it is unchanged once locked, its refresh token becomes `""`. An empty refresh token means "needs a sign-in": no install adopts it or adds an account from it, and the first install with a working token for that account overwrites it, whatever the expiry.
@@ -373,6 +373,14 @@ Add `--no-browser` to print the URL instead of opening one, and `--name` to
 label the account yourself (it defaults to the email on the login). Over SSH,
 or on Linux with no display, no browser is opened.
 
+A login updates the row of the ChatGPT account (workspace) and user it signs
+in as. One email in two workspaces, such as a Personal plan and a Business
+workspace, is two accounts: the second one added without `--name` is named
+`email (plan)`, for example `me@example.com (plus)`, or `email (2)` when the
+plan is unknown or that name is taken too. A row that has no account id yet,
+such as one that imports `~/.codex/auth.json` (below), is still matched by its
+name: give it a name other than the email, or sign in with `--name`.
+
 On a terminal you can finish the sign-in from another device. Open the URL
 there and sign in. The browser is then sent to
 `http://localhost:1455/auth/callback`, which does not load on that device:
@@ -557,7 +565,8 @@ nothing is ever sent upstream. On a pool of two this is what almost every
 request gets. Only the accounts a reset would actually return to service are
 considered — an account you disabled or capped stays out whatever its windows
 say — and when several qualify, the one whose credit expires soonest is asked
-first.
+first (under [`autoRedeemMaxShare`](#the-spending-strategy), the most exhausted
+is).
 
 While it is on, a credit is spent only when **all** of this holds:
 
@@ -602,7 +611,9 @@ That has two consequences the switch above knows nothing about.
 
 Three keys shape what the switch spends, all off unless set, so a fleet that
 never sets them behaves exactly as before. They narrow the automatic policy and
-never widen it: every condition above still has to hold.
+never widen it: every condition above still has to hold. A key set to a value
+it cannot read, such as `50` for a half share or `"3d"` for three days, is off
+as well, and the server names it in the log at start and at each reload.
 
 - [`autoRedeemMinDaysToReset`](configuration.md) — never auto-redeem an
   account whose natural reset is closer than this many days. The account is
@@ -612,13 +623,20 @@ never widen it: every condition above still has to hold.
 - [`autoRedeemMaxShare`](configuration.md) — of the armed accounts whose
   natural resets fall on the same UTC calendar day (a **cohort**), redeem at
   most this share (rounded up), most-exhausted first, so the rest keep their
-  phase. The cohort is sized as it was before any of it was redeemed this week;
+  phase. A disabled or cordoned account, or one waiting for a sign-in, is
+  never offered a reset, so it does not count towards its cohort's size unless
+  it was redeemed this week; a capped one does. The cohort is sized as it was
+  before any of it was redeemed this week;
   otherwise each redemption would shrink it and let the next one through. A
   cohort is a calendar day, not a 24-hour span: two resets an hour apart on
   either side of 00:00 UTC are in different cohorts. An account whose reset
   time is not known is in no cohort, and this cap does not hold it.
 - [`autoRedeemMaxPerDay`](configuration.md) — at most this many automatic
-  redemptions per rolling 24 hours, across all Codex accounts.
+  redemptions per rolling 24 hours, across all Codex accounts. The six-hour
+  hold after each redemption this cap counts already keeps those to 4 in any
+  24 hours, so a value of 4 or more never stops one. A consume whose answer
+  was lost arms only a 30-minute hold and is not counted until a retry reads
+  its answer, so it does not use up any of this cap.
 
 A credit you spend by hand from the resets panel is not stopped by any of the
 three. It is still recorded: it counts towards its cohort's share, because it
@@ -634,20 +652,33 @@ All three concern Codex accounts only. A
 [Claude banked reset](#claude-banked-usage-limit-resets) leaves the weekly
 timer where it was, so none of them is applied to it.
 
-Every account the policy passes over is logged, once per reason and at most
-every ten minutes while the reason stands:
+Each account the floor or the share cap passes over is logged with its
+reason. The per-day cap stops the whole fleet at once, so it is logged against
+the first account it stops. A reason is logged when it first applies to an
+account, and again at most every ten minutes while it stands:
 `[TeamClaude] Codex rate-limit reset on "<name>" skipped — <reason>`.
+The caps are asked before any account's credit rows are read, since a read
+costs a token refresh and a request, so a line for a cap can name an account
+that turns out to hold no credit. The share cap is asked again after the
+reads: a refresh token upstream rejects during them leaves its account
+waiting for a sign-in, and so out of the cohort the other accounts are
+counted in.
 
 While `autoRedeemResets` is on, `teamclaude status` prints a `Redeem` line
 under each Codex account — `armed` or `exempt — <reason>`, and what a credit
 spent now is worth (`credit worth 0.43 of a week (3.0d to reset)`). The JSON
 carries the same under `accounts[].autoRedeem`
-(`{ armed, exemptReason, creditValueWeeks }`; `null` on a non-Codex row, and on
-every row while the switch is off) and the fleet's `redeemPolicy`
+(`{ armed, exemptReason, creditValueWeeks, daysToReset }`, the credit's worth
+in weeks to the hundredth below and the days to the natural reset to the tenth
+below, as the floor's reason gives them; `null` on a non-Codex row, and on
+every row while the switch is off) and the fleet's
+`redeemPolicy`
 (`{ minDaysToReset, maxShare, maxPerDay, redeemedLast24h }`, where
-`redeemedLast24h` counts automatic redemptions). `armed` is about the policy
-and the caps, not the moment: an armed account whose weekly window is still
-healthy is armed and simply not exhausted.
+`redeemedLast24h` counts automatic redemptions). `armed` does not wait for the
+account to run out: an armed account whose weekly window is still healthy is
+armed and simply not exhausted. It does move with the clock, as the floor and
+the caps do: under a 2-day minimum an account reads `armed` 3.5 days before its
+reset and `exempt` the day before it.
 
 ## Claude banked usage-limit resets
 
@@ -675,7 +706,10 @@ the Fable weekly and leaves the shared weekly at 80%. It is worth the most on an
 account whose Fable weekly is spent. The usage payload's `weekly_scoped_shares`
 says how much of the weekly Fable has used. The surfaces count the two kinds
 apart: `FR3` on the TUI row (`RC1 FR2` for an account holding both), and
-"Fable resets" on the `Reset` line and the dashboard badge.
+"Fable resets" on the `Reset` line and the dashboard badge. The two kinds lapse
+on their own dates (the October resets in December, the Fable ones in March),
+so an account holding both shows each date beside its kind, and one kind past
+its date drops out while the other stays.
 
 A bucket the account cannot serve from right now is marked on its own bar:
 `⊘Wk` in place of `Wk`, `⊘F` in place of `F7`, `⊘S` in place of `S7`. Only a
@@ -770,7 +804,10 @@ request before choosing anyone, the redeemer spends a reset, and the request is
 selected again against the account it cleared.
 
 - It spends on the account that would otherwise wait longest for its own
-  windows to reset, since that is where a reset buys the most.
+  windows to reset, since that is where a reset buys the most. Only the
+  windows that bar the refused request's model count (the 5-hour window, the
+  all-models weekly and that model's family weekly), each at the threshold
+  rotation holds that model to.
 - It fires when the pool is dry and the account is in one of two states:
   upstream itself reports it **at** a limit, or the proxy is holding it out of
   rotation because a **weekly** reading is at or past the
@@ -779,7 +816,9 @@ selected again against the account it cleared.
   fleet: rotation stops using an account at its threshold, so every account
   parks a little short of upstream's limit and upstream never reports a wall.
   The account's quota is re-read first, and the threshold is judged on that
-  reading.
+  reading. If that reading shows the account can serve the refused request
+  after all (the one the proxy held had gone stale), nothing is spent: the
+  pool was not dry, and the request is selected again.
 - **What the second state gives up:** the reset is spent while the account
   still has the last part of its week below upstream's limit — 2% at the
   default threshold of `0.98`, more with a lower one. That remainder goes with
@@ -792,14 +831,26 @@ selected again against the account it cleared.
   those limits are the ones behind the readings that parked it for the
   refused request's model: the all-models weekly (`seven_day`), the Fable
   weekly (`seven_day_overage_included`), and the 5-hour window too if that is
-  over its threshold as well. An account parked on a reading with no known
+  over its threshold as well. They count beside upstream's own limits even when
+  upstream reports a weekly one: an account at its Fable limit that the proxy
+  also holds out on the all-models weekly needs a reset that clears both, not
+  the Fable reset alone. An account parked on a reading with no known
   upstream limit name (the Sonnet weekly, a learned scoped bucket) is passed
   over, as is one out for any other reason (disabled, cordoned, capped by
-  `maxUsage` or `maxSpend`, throttled, in error). While upstream reports a
-  reset cooldown, nothing is claimed.
+  `maxUsage` or `maxSpend`, in error). A rate-limit hold, which the proxy sets
+  on the 429 that usually brings word of upstream's 5-hour wall, does not hide
+  the weekly reading behind it: the reset lifts the hold as well. While
+  upstream reports a reset cooldown, nothing is claimed.
 - An account that holds a usable reset and is passed over is named in the
   log with the reason (`Account "x": banked reset not redeemed: …`), once per
-  account per cooldown (30 minutes) rather than once per refused request.
+  account per cooldown (30 minutes) rather than once per refused request. A
+  reason that depends on the refused request's model (whether a weekly reading
+  parks the account for it) holds only for requests judged on the same
+  readings: those whose model the same weekly bucket governs (the Fable
+  weekly, the Sonnet weekly, or the all-models one, unless a route names
+  another), and, where some account has learned a scoped weekly bucket for
+  the model's family, those of that family. Passing an account over for an
+  Opus request does not pass it over for a Fable one.
 - Among usable, unpaused, unexpired grants that clear every exhausted limit,
   it spends the cheapest kind: **Fable**, then **session**, then **weekly**.
   Within the same kind it spends the soonest-expiring grant (no expiry comes
@@ -809,7 +860,8 @@ selected again against the account it cleared.
   none clears the whole wall. Manual selection still chooses any usable grant.
 - `accounts[].autoRedeemReset: false` exempts an account, as it does for Codex;
   so does being disabled, having no organization id, or last reading zero held
-  resets.
+  resets. An account the refused request's model route does not allow is never
+  offered.
 
 After a reset the Claude pool holds off for an hour, so one dry pool costs one
 reset. A claim whose answer never arrived may still have spent the grant: its

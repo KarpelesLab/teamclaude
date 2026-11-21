@@ -1387,21 +1387,27 @@ test('path 3: the knob-off poll spends the reset on sight', () => {
 });
 
 test('path 3: the knob-off switch sees the whole fleet', () => {
-  // The exclusion is gated at the call site for the reason the model is. Both
-  // challengers rank equally off, so the tiebreak takes the Codex account.
-  const am = mgr([oauth('cur'), oauth('anth'), oauth('codex', { provider: 'codex' })], { expiry: OFF });
+  // The exclusion is gated at the call site for the reason the model is: with
+  // the knob off the switch is handed no exclusion set. The set here holds the
+  // Codex accounts, as an Anthropic request's partition does, and `anth`, as a
+  // tried account would be; neither keeps a roll out. Outside a walk each
+  // provider's roll is weighed against its own cursor, so the Codex roll moves
+  // the Codex cursor, and the Anthropic one moves the shared cursor.
+  const am = mgr([oauth('cur'), oauth('anth'), oauth('codex', { provider: 'codex' }), oauth('codex-cur', { provider: 'codex' })], { expiry: OFF });
   bucket(am, 0, 'unified7d', 0.50, 50);
   bucket(am, 1, 'unified7d', 0.50, 40);
   bucket(am, 2, 'unified7d', 0.50, 10);
+  bucket(am, 3, 'unified7d', 0.50, 30);
   for (const i of [1, 2]) {
     am.accounts[i].quota.unified5h = 0.5;
     am.accounts[i].quota.unified5hReset = Date.now() - 1000;
   }
-  // The switch's own pick, read before the walk can move the cursor again: an
-  // Anthropic request cannot be sent where the knob-off switch installs.
-  am.refreshExpiredQuotas(OPUS, am._excludeOtherProviders(null, DEFAULT_PROVIDER));
-  assert.equal(am.accounts[am.currentIndex].name, 'codex',
+  am._setCurrent(am.accounts[3]);
+  am._setCurrent(am.accounts[0]);
+  am.refreshExpiredQuotas(OPUS, new Set([...am._excludeOtherProviders(null, DEFAULT_PROVIDER), 1]));
+  assert.equal(am.accounts[am.providerCursors.get('codex')].name, 'codex',
     'the knob-off switch dropped a candidate the router keeps');
+  assert.equal(am.accounts[am.currentIndex].name, 'anth');
 });
 
 test('path 3: the knob-off switch keeps a spent account out', () => {

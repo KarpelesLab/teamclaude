@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { sameIdentity, distinctAccounts, findUpsertTarget } from '../src/identity.js';
+import { sameIdentity, distinctAccounts, findUpsertTarget, codexLoginTarget } from '../src/identity.js';
 import { AccountManager } from '../src/account-manager.js';
 
 // One email can hold a Claude subscription and a ChatGPT one. Both accounts are
@@ -75,4 +75,37 @@ test('a Codex account restores its own saved quota', () => {
   })));
 
   assert.equal(am.accounts[0].quota.unified7d, 0.35);
+});
+
+// One person's Personal plan and Business workspace sign in with one email, and
+// an unnamed Codex login is named after it. The login matched a row by that
+// name even when the ChatGPT account ids differed, so the second workspace's
+// tokens replaced the first's.
+const business = { name: 'me@example.com', type: 'oauth', provider: 'codex', accountId: 'ws-business', userId: 'user-1' };
+const personal = { ...business, accountId: 'ws-personal' };
+
+test('a second ChatGPT workspace on one email is a new row, named for its plan', () => {
+  assert.deepEqual(codexLoginTarget([business], personal, { planType: 'plus' }), { index: -1, name: 'me@example.com (plus)' });
+});
+
+test('a Codex re-login lands on its own workspace row, past an earlier namesake', () => {
+  const accounts = [business, { ...personal, name: 'me@example.com (plus)' }];
+  assert.deepEqual(codexLoginTarget(accounts, personal, { planType: 'plus' }), { index: 1, name: 'me@example.com (plus)' });
+  assert.deepEqual(codexLoginTarget(accounts, business, { planType: 'team' }), { index: 0, name: 'me@example.com' });
+});
+
+test('a Codex row with no account id yet is still matched by its name', () => {
+  const imported = { name: 'me@example.com', type: 'oauth', provider: 'codex' };
+  assert.deepEqual(codexLoginTarget([imported], personal), { index: 0, name: 'me@example.com' });
+});
+
+test('a new Codex row is named the email while free, then for its plan, then with a counter', () => {
+  assert.equal(codexLoginTarget([claude], personal, { planType: 'plus' }).name, 'me@example.com');
+  const two = [business, { ...personal, accountId: 'ws-other', name: 'me@example.com (plus)' }];
+  assert.equal(codexLoginTarget(two, personal, { planType: 'plus' }).name, 'me@example.com (2)');
+  assert.equal(codexLoginTarget([business], personal).name, 'me@example.com (2)');
+  // The plan is a token claim that ends up typed on the command line: only a plain word is used.
+  assert.equal(codexLoginTarget([business], personal, { planType: 'pro\u001b[2J' }).name, 'me@example.com (2)');
+  // A name given with --name is the operator's, and is kept as given.
+  assert.equal(codexLoginTarget([business], personal, { userNamed: true, planType: 'plus' }).name, 'me@example.com');
 });
