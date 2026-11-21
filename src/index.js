@@ -61,7 +61,7 @@ import { formatTerminalTitle, titleSequence, TITLE_STACK_PUSH, TITLE_STACK_POP }
 import { getUpstreamProxy, describeProxy, describeSelfProxy, localListener, isSelfProxy } from './upstream-proxy.js';
 import { parseRoutingUrl, routingToUrl, describeRouting, checkRouting } from './account-routing.js';
 import { proxyFetch } from './upstream-fetch.js';
-import { upstreamFor } from './provider.js';
+import { upstreamFor, applyAuthHeaders, providerForHost } from './provider.js';
 import { startEventLoopMonitor } from './event-loop-monitor.js';
 import { envVar } from './brand.js';
 import { loginCallback, loadCallbackToken, saveCallbackToken, callbackWhoami, logoutCallback, callbackClientId, getCallbackAuthPath } from './callback-auth.js';
@@ -2175,11 +2175,19 @@ async function accountsCommand() {
     return;
   }
 
+  // The renewal and the profile read below are Anthropic's endpoints, so only a
+  // Claude login's tokens may go there: a Codex row holds OpenAI's tokens, and a
+  // third-party backend (`upstream`) row holds another API's key. Nor a
+  // long-lived login: its token cannot read the profile (403). The prober
+  // draws the same line (isAnthropicProbeTarget).
+  const isClaudeLogin = (/** @type {Record<string, any>} */ a) => a.type === 'oauth'
+    && providerOf(a) === 'anthropic' && !a.upstream && !isLongLived(a);
+
   // Refresh expired tokens before fetching profiles. Each call goes by the
   // account's own routing when it has one — this is that account's traffic.
   const refreshed = [];
   await Promise.all(config.accounts.map(async (a) => {
-    if (a.type !== 'oauth' || !a.refreshToken || isLongLived(a)) return;
+    if (!isClaudeLogin(a) || !a.refreshToken) return;
     if (!isTokenExpiringSoon(a.expiresAt)) return;
     try {
       // Through the callback.net lock when signed in there, as the running
@@ -2216,11 +2224,10 @@ async function accountsCommand() {
     });
   }
 
-  // Fetch profiles in parallel for all OAuth accounts
+  // Fetch profiles in parallel for the Claude logins
   const profiles = await Promise.all(
     config.accounts.map(a =>
-      // Not a long-lived account: its token cannot read the profile (403).
-      a.type === 'oauth' && a.accessToken && !isLongLived(a) ? fetchProfile(a.accessToken, accountRouting(a, localListener(config))) : null
+      isClaudeLogin(a) && a.accessToken ? fetchProfile(a.accessToken, accountRouting(a, localListener(config))) : null
     )
   );
 
@@ -2303,6 +2310,8 @@ async function accountsCommand() {
     const hasProfile = p && !p.error;
     const tier = hasProfile ? (p.hasClaudeMax ? 'Max' : p.hasClaudePro ? 'Pro' : 'subscription') : null;
     const status = hasProfile ? `Claude ${tier}`
+      : providerOf(a) === 'codex' ? 'Codex'
+      : a.upstream ? 'third-party backend'
       : isLongLived(a) ? 'long-lived token, inference only'
       : `unknown (${p?.error || 'no token'})`;
     const src = a.source ? `, ${a.source}` : '';
@@ -2349,18 +2358,33 @@ async function apiCommand() {
     account = resolveAccount(accounts, accountName, argValue('--org'));
     if (!account) { console.error(`Account "${accountName}" not found`); process.exit(1); }
   } else {
-    account = accounts.find(a => a.type === 'oauth') || accounts[0];
+    // A Claude login, or for an absolute URL on a provider's own host that
+    // provider's login: a pick nobody named must not put one provider's token on
+    // another's host.
+    const host = path.startsWith('http') && URL.canParse(path) ? new URL(path).hostname : null;
+    const hostProvider = providerForHost(host);
+    const wanted = hostProvider || 'anthropic';
+    account = accounts.find(a => a.type === 'oauth' && providerOf(a) === wanted && !a.upstream);
+    // The first account stands in only where its credential goes to its own
+    // host (a path) or to a host no provider owns. On a provider's host with
+    // no login of that provider, it would be another provider's token there.
+    if (!account && hostProvider) {
+      console.error(`No ${hostProvider} login to use on ${host}. Name the account with --account to send its credential there anyway.`);
+      process.exit(1);
+    }
+    account ||= accounts[0];
     if (!account) { console.error('No accounts configured'); process.exit(1); }
   }
 
   const credential = account.accessToken || account.apiKey;
-  const isOAuth = account.type === 'oauth';
-  const upstream = config.upstream || 'https://api.anthropic.com';
+  // The account's own host and header: a Codex login's tokens are OpenAI's and
+  // a backend's key is that API's, and neither belongs at the Anthropic upstream.
+  const upstream = upstreamFor(account, config.upstream);
   const url = path.startsWith('http') ? path : `${upstream}${path}`;
 
-  const headers = isOAuth
-    ? { 'Authorization': `Bearer ${credential}` }
-    : { 'x-api-key': credential };
+  /** @type {Record<string, string>} */
+  const headers = {};
+  applyAuthHeaders(headers, { ...account, credential });
 
   const fetchOpts = { method, headers };
   if (data) {
