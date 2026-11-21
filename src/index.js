@@ -2346,8 +2346,17 @@ async function apiCommand() {
     // provider's login: a pick nobody named must not put one provider's token on
     // another's host.
     const host = path.startsWith('http') && URL.canParse(path) ? new URL(path).hostname : null;
-    const wanted = providerForHost(host) || 'anthropic';
-    account = accounts.find(a => a.type === 'oauth' && providerOf(a) === wanted && !a.upstream) || accounts[0];
+    const hostProvider = providerForHost(host);
+    const wanted = hostProvider || 'anthropic';
+    account = accounts.find(a => a.type === 'oauth' && providerOf(a) === wanted && !a.upstream);
+    // The first account stands in only where its credential goes to its own
+    // host (a path) or to a host no provider owns. On a provider's host with
+    // no login of that provider, it would be another provider's token there.
+    if (!account && hostProvider) {
+      console.error(`No ${hostProvider} login to use on ${host}. Name the account with --account to send its credential there anyway.`);
+      process.exit(1);
+    }
+    account ||= accounts[0];
     if (!account) { console.error('No accounts configured'); process.exit(1); }
   }
 

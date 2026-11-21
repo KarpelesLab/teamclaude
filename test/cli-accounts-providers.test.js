@@ -101,6 +101,16 @@ test('`teamclaude api` sends an account\'s credential to its own host', async (t
   assert.deepEqual(onChatgpt.targets, ['chatgpt.com:443'], onChatgpt.stderr);
   assert.deepEqual(routedClaude.targets, []);
 
+  // With no Codex login there is none to take: the Claude login's token is not
+  // sent to chatgpt.com in its place, nor a Codex login's to Anthropic.
+  const noCodex = await runCli(t, [claude], ['api', 'https://chatgpt.com/backend-api/wham/usage']);
+  assert.equal(noCodex.code, 1, noCodex.stdout);
+  assert.deepEqual(noCodex.targets, []);
+  assert.match(noCodex.stderr, /No codex login to use on chatgpt\.com/);
+  const noClaude = await runCli(t, [codex], ['api', 'https://api.anthropic.com/v1/models']);
+  assert.equal(noClaude.code, 1, noClaude.stdout);
+  assert.deepEqual(noClaude.targets, []);
+
   const asCodex = await runCli(t, [claude, codex], ['api', '/backend-api/wham/usage', '--account', 'codex@example.com']);
   assert.deepEqual(asCodex.targets, ['chatgpt.com:443'], asCodex.stderr);
 
