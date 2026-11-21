@@ -225,7 +225,7 @@ const underOne = v => v != null && v < 1;
  *
  * @typedef {object} CodexLearnedQuota
  * @property {string} [planType]  the Codex subscription tier
- * @property {{available: number, applicable: number|null, seenAt: number, expiresAt?: number|null}} [resetCredits]  free rate-limit reset credits (Codex) or banked usage-limit resets (Claude) held, when that was last seen, and when the soonest one lapses where the provider says
+ * @property {{available: number, applicable: number|null, seenAt: number, expiresAt?: number|null, fable?: number, fableExpiresAt?: number|null}} [resetCredits]  free rate-limit reset credits (Codex) or banked usage-limit resets (Claude) held, when that was last seen, and when the soonest one lapses where the provider says (for Claude, the general and the Fable resets each dated apart)
  * @property {Record<string, {name: string, utilization: number, resetAt: number|null, seenAt: number}>} [codexModelBuckets]  model-scoped weekly buckets, keyed by slug
  * @property {Record<string, string>} [codexModelLimits]  which limit each model was last metered on, from `x-codex-active-limit`: a `codexModelBuckets` slug, or the name upstream gives the account-wide limit
  */
@@ -1640,10 +1640,14 @@ export class AccountManager {
     return false;
   }
 
-  /** Public form used by the request path to re-check an account after waiting
-   * in storm-control admission. */
-  isEntitlementDenied(index, now = Date.now()) {
-    return this._entitlementDenied(this.accounts[index], now);
+  /** Public form for the callers outside selection: the request path re-checks
+   * an account after waiting in storm-control admission, and the warmer asks
+   * before it sends a warm-up. Always on this manager's clock (Date.now), the
+   * one markEntitlementDenied writes the cooldown on: a read that finds the
+   * cooldown over also clears it for rotation, so a caller's own clock would
+   * decide the manager's state. */
+  isEntitlementDenied(index) {
+    return this._entitlementDenied(this.accounts[index]);
   }
 
   /** Keep a Codex account out of rotation for one model its ChatGPT plan

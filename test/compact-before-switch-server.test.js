@@ -29,6 +29,14 @@ function listen(server) {
  * and weekly windows on every response, so a reading arrives the way a real
  * one does.
  *
+ * `send` takes the test's t.signal. A request the proxy never answers waits
+ * with no deadline: the runner's timeout fails the test but does not end that
+ * wait, so the finally below would never close the servers, and on Node 24 and
+ * later they would keep the file from ever exiting (test/README.md, "Clean up
+ * in finally"). node:test aborts t.signal once the test has ended, however it
+ * ended: the request rejects then, and the finally runs.
+ *
+ * @param {import('node:test').TestContext} t
  * @param {Object} opts
  * @param {Record<string, any>} opts.config
  * @param {any[]} [opts.accounts]
@@ -37,7 +45,7 @@ function listen(server) {
  * @param {number} [opts.listeners]
  * @param {(h: any) => Promise<void>} fn
  */
-async function withFleet({ config, accounts = [oauth('a'), oauth('b')], quota = { a: { five: 0.95 } }, distribute = false, listeners = 1 }, fn) {
+async function withFleet(t, { config, accounts = [oauth('a'), oauth('b')], quota = { a: { five: 0.95 } }, distribute = false, listeners = 1 }, fn) {
   /** @type {{ url: string, account: string, bytes: number }[]} */
   const hits = [];
   const stub = http.createServer((req, res) => {
@@ -80,6 +88,7 @@ async function withFleet({ config, accounts = [oauth('a'), oauth('b')], quota = 
       method: 'POST',
       headers: { 'content-type': 'application/json', ...(session ? { 'x-claude-code-session-id': session } : {}) },
       body: JSON.stringify({ model, max_tokens: 16, messages: [{ role: 'user', content: opening }, { role: 'assistant', content: 'x'.repeat(pad) }] }),
+      signal: t.signal,
     });
     const text = await res.text();
     return { status: res.status, headers: res.headers, text, json: text ? JSON.parse(text) : null };
@@ -96,12 +105,12 @@ async function withFleet({ config, accounts = [oauth('a'), oauth('b')], quota = 
 const ON = { compactBeforeSwitch: { minBodyBytes: 2000 } };
 const TOO_LONG = /^prompt is too long: (\d+) tokens > (\d+) maximum$/;
 
-test('a long conversation near the threshold gets the 400, upstream sees nothing, and the compaction runs on the same account', async () => {
+test('a long conversation near the threshold gets the 400, upstream sees nothing, and the compaction runs on the same account', async (t) => {
   const logged = [];
   const original = console.log;
   console.log = (...args) => { logged.push(args.join(' ')); };
   try {
-    await withFleet({ config: ON }, async ({ am, hits, send, activity }) => {
+    await withFleet(t, { config: ON }, async ({ am, hits, send, activity }) => {
       // The first turn has no account on record yet, and no reading either.
       assert.equal((await send()).status, 200);
       assert.deepEqual(hits.map(h => h.account), ['a']);
@@ -147,37 +156,37 @@ test('a long conversation near the threshold gets the 400, upstream sees nothing
   assert.match(lines[0], /Asked session sess-1 to compact before "a" switches: unified5h is at 95%, switch threshold 98%/);
 });
 
-test('the weekly window asks too, and an account not within the margin forwards', async () => {
-  await withFleet({ config: ON, quota: { a: { five: 0.2, week: 0.96 } } }, async ({ hits, send }) => {
+test('the weekly window asks too, and an account not within the margin forwards', async (t) => {
+  await withFleet(t, { config: ON, quota: { a: { five: 0.2, week: 0.96 } } }, async ({ hits, send }) => {
     await send();
     assert.equal((await send({ pad: 8000 })).status, 400);
     assert.equal(hits.length, 1);
   });
-  await withFleet({ config: ON, quota: { a: { five: 0.9, week: 0.9 } } }, async ({ hits, send }) => {
+  await withFleet(t, { config: ON, quota: { a: { five: 0.9, week: 0.9 } } }, async ({ hits, send }) => {
     await send();
     assert.equal((await send({ pad: 8000 })).status, 200);
     assert.equal(hits.length, 2);
   });
 });
 
-test('a request under minBodyBytes forwards', async () => {
-  await withFleet({ config: ON }, async ({ hits, send }) => {
+test('a request under minBodyBytes forwards', async (t) => {
+  await withFleet(t, { config: ON }, async ({ hits, send }) => {
     await send();
     assert.equal((await send({ pad: 500 })).status, 200);
     assert.equal(hits.length, 2);
   });
 });
 
-test('an account already at its threshold is not asked: the request rotates as it always did', async () => {
-  await withFleet({ config: ON, quota: { a: { five: 0.99 } } }, async ({ hits, send }) => {
+test('an account already at its threshold is not asked: the request rotates as it always did', async (t) => {
+  await withFleet(t, { config: ON, quota: { a: { five: 0.99 } } }, async ({ hits, send }) => {
     await send();
     assert.equal((await send({ pad: 8000 })).status, 200);
     assert.deepEqual(hits.map(h => h.account), ['a', 'b']);
   });
 });
 
-test('pinned requests are never asked: /tc-acct/, and an operator session pin', async () => {
-  await withFleet({ config: ON }, async ({ am, hits, send }) => {
+test('pinned requests are never asked: /tc-acct/, and an operator session pin', async (t) => {
+  await withFleet(t, { config: ON }, async ({ am, hits, send }) => {
     await send();
     assert.equal((await send({ pad: 8000, path: '/tc-acct/a/v1/messages' })).status, 200);
     assert.equal(hits.length, 2);
@@ -190,8 +199,8 @@ test('pinned requests are never asked: /tc-acct/, and an operator session pin', 
   });
 });
 
-test('count_tokens, a request with no session id, and an API-key account are never asked', async () => {
-  await withFleet({ config: ON }, async ({ hits, send }) => {
+test('count_tokens, a request with no session id, and an API-key account are never asked', async (t) => {
+  await withFleet(t, { config: ON }, async ({ hits, send }) => {
     await send();
     assert.equal((await send({ pad: 8000, path: '/v1/messages/count_tokens' })).status, 200);
     assert.equal((await send({ pad: 8000, session: null })).status, 200);
@@ -200,7 +209,7 @@ test('count_tokens, a request with no session id, and an API-key account are nev
     assert.equal(hits.length, 3);
   });
   const apikey = [{ name: 'a', type: 'apikey', apiKey: 't-a' }, { name: 'b', type: 'apikey', apiKey: 't-b' }];
-  await withFleet({ config: ON, accounts: apikey }, async ({ am, hits, send }) => {
+  await withFleet(t, { config: ON, accounts: apikey }, async ({ am, hits, send }) => {
     await send();
     assert.equal(am.accounts[0].quota.unified5h, 0.95, 'setup: the key reads as inside the margin');
     assert.equal((await send({ pad: 8000 })).status, 200);
@@ -208,10 +217,10 @@ test('count_tokens, a request with no session id, and an API-key account are nev
   });
 });
 
-test('off by default, and the live config turns it on and off for the next request', async () => {
+test('off by default, and the live config turns it on and off for the next request', async (t) => {
   /** @type {Record<string, any>} */
   const config = {};
-  await withFleet({ config }, async ({ am, hits, send }) => {
+  await withFleet(t, { config }, async ({ am, hits, send }) => {
     await send();
     assert.equal((await send({ pad: 8000 })).status, 200, 'unset: forwarded');
     assert.equal(hits.length, 2);
@@ -234,8 +243,8 @@ test('off by default, and the live config turns it on and off for the next reque
   });
 });
 
-test('the cooldowns: the conversation, then the client session, then asked again', async () => {
-  await withFleet({ config: { compactBeforeSwitch: { minBodyBytes: 2000, cooldownSeconds: 600 } } }, async ({ hits, send, clock }) => {
+test('the cooldowns: the conversation, then the client session, then asked again', async (t) => {
+  await withFleet(t, { config: { compactBeforeSwitch: { minBodyBytes: 2000, cooldownSeconds: 600 } } }, async ({ hits, send, clock }) => {
     await send();
     assert.equal((await send({ pad: 8000 })).status, 400);
     // Within the cooldown the same conversation is forwarded however large.
@@ -255,8 +264,8 @@ test('the cooldowns: the conversation, then the client session, then asked again
   });
 });
 
-test('distributeSessions: only the conversation whose own account is near the threshold is asked', async () => {
-  await withFleet({ config: ON, distribute: true, quota: { a: { five: 0.2 }, b: { five: 0.96 } } }, async ({ am, hits, send }) => {
+test('distributeSessions: only the conversation whose own account is near the threshold is asked', async (t) => {
+  await withFleet(t, { config: ON, distribute: true, quota: { a: { five: 0.2 }, b: { five: 0.96 } } }, async ({ am, hits, send }) => {
     // Two concurrent conversations, so distribution places them apart: the
     // first is still in flight (held by the tracker) when the second arrives.
     am.beginSession((await placed(am, send, { session: 'sess-1', opening: 'one' })));
@@ -288,8 +297,8 @@ async function placed(am, send, r) {
   return pin.sessionId;
 }
 
-test('one record per fleet: a second listener sharing the account manager sees what the first asked', async () => {
-  await withFleet({ config: ON, listeners: 2 }, async ({ hits, send }) => {
+test('one record per fleet: a second listener sharing the account manager sees what the first asked', async (t) => {
+  await withFleet(t, { config: ON, listeners: 2 }, async ({ hits, send }) => {
     await send({ listener: 0 });
     assert.equal((await send({ pad: 8000, listener: 0 })).status, 400);
     // The compaction request arrives through the other listener.
@@ -298,12 +307,12 @@ test('one record per fleet: a second listener sharing the account manager sees w
   });
 });
 
-test('an error inside the decision forwards the request', async () => {
+test('an error inside the decision forwards the request', async (t) => {
   const original = console.error;
   const errors = [];
   console.error = (...args) => { errors.push(args.join(' ')); };
   try {
-    await withFleet({ config: ON }, async ({ am, hits, send }) => {
+    await withFleet(t, { config: ON }, async ({ am, hits, send }) => {
       await send();
       am.conversationHost = () => { throw new Error('boom'); };
       assert.equal((await send({ pad: 8000 })).status, 200);
@@ -315,8 +324,8 @@ test('an error inside the decision forwards the request', async () => {
   assert.ok(errors.some(e => e.includes('compactBeforeSwitch') && e.includes('forwarding the request')), errors.join('\n'));
 });
 
-test('unset: the request path does not consult the account manager for it at all', async () => {
-  await withFleet({ config: {} }, async ({ am, hits, send }) => {
+test('unset: the request path does not consult the account manager for it at all', async (t) => {
+  await withFleet(t, { config: {} }, async ({ am, hits, send }) => {
     let calls = 0;
     const host = am.conversationHost.bind(am);
     am.conversationHost = (/** @type {any[]} */ ...args) => { calls++; return host(...args); };

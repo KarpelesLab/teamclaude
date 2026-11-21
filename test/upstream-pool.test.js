@@ -7,7 +7,7 @@ import { upstreamFetch, DEFAULT_UPSTREAM_MAX_SOCKETS } from '../src/upstream-fet
 
 async function listen(handler) {
   const server = http.createServer(handler);
-  server.listen(0);
+  server.listen(0, '127.0.0.1');
   await once(server, 'listening');
   return { server, port: server.address().port };
 }
