@@ -353,16 +353,24 @@ function supersedes(/** @type {Blob|null} */ blob, /** @type {Record<string, any
  * written by another install since we last took ours, and ours are the stale
  * copy — expiry does not enter into it: another install's clock, or a sign-in
  * there, can stamp a renewal with an earlier expiresAt than the token it
- * rotated away. The one exception is a row this install wrote itself with an
- * older token than it now holds: its own renewal whose PATCH did not land, and
- * taking that back would revive a refresh token it already rotated.
+ * rotated away. The exceptions are rows where taking the row back would revive
+ * a refresh token this install already rotated: a row holding the very tokens
+ * the proxy's last renewal of the account started from (`renewedFrom`), whoever
+ * wrote it and whatever the account holds since (a renewal made while signed
+ * out of callback.net, or one whose writes all failed, never reached the row;
+ * or another install wrote those tokens back since), until a restart forgets
+ * them; and a row this install wrote itself with an older token than it now
+ * holds (by its name and its expiry, which another install of the same name can
+ * match).
  * @param {Blob|null} blob
  * @param {Record<string, any>} account
  * @param {string} by  this install's name, as it signs the rows it writes
+ * @param {TokenPair|null} [renewedFrom]  what the proxy's last renewal of the account started from (_renewedFrom)
  */
-function heldElsewhere(blob, account, by) {
+function heldElsewhere(blob, account, by, renewedFrom = null) {
   if (!blob || needsSignIn(blob)) return false;
   if (blob.accessToken === account.credential && blob.refreshToken === account.refreshToken) return false;
+  if (renewedFrom && holdsPair(blob, renewedFrom)) return false;
   return !(blob.by === by && blob.expiresAt < (Number(account.expiresAt) || 0));
 }
 
@@ -379,6 +387,18 @@ export function isInError(account) {
 /** Whether the account's current token was minted by a renewal on this install, this launch. */
 export function isMinted(/** @type {Record<string, any>} */ account) {
   return account._minted === true;
+}
+
+/**
+ * @typedef {{ accessToken: string, refreshToken: string }} TokenPair
+ * @param {{ accessToken: string, refreshToken: string }} t
+ * @returns {TokenPair}
+ */
+const pairOf = (t) => ({ accessToken: t.accessToken, refreshToken: t.refreshToken });
+
+/** Whether a blob holds the tokens a pair names. */
+function holdsPair(/** @type {TokenPair} */ blob, /** @type {TokenPair} */ pair) {
+  return blob.accessToken === pair.accessToken && blob.refreshToken === pair.refreshToken;
 }
 
 /**
@@ -471,6 +491,18 @@ export class CredentialSync {
      * @type {WeakSet<Record<string, any>>}
      */
     this._evicting = new WeakSet();
+    /**
+     * The tokens each account held when the proxy last renewed it
+     * (coordinateRefresh), noted once the provider call went through: one that
+     * failed renewed nothing away. Renewed away, they are used, so a row
+     * holding them is behind this install whatever the account holds since
+     * (heldElsewhere). In memory only: a restart forgets them, and a row
+     * holding them is then read as any other. A command-line renewal
+     * (refreshOutsideProxy) notes them on a sync that ends with it, so it
+     * keeps no note.
+     * @type {WeakMap<Record<string, any>, TokenPair>}
+     */
+    this._renewedFrom = new WeakMap();
     /** @type {Promise<any>|null} */
     this._syncing = null;
     /** @type {NodeJS.Timeout|null} */
@@ -1161,7 +1193,12 @@ export class CredentialSync {
     // Read before the call: a sign-in installed while the grant is in flight
     // brings another token's date, which is not this rotation's to carry.
     const held = { refreshTokenExpiresAt: account.refreshTokenExpiresAt };
-    refresh = async (opts) => withFamilyExpiry(held, await renew(opts));
+    const from = pairOf({ accessToken: account.credential, refreshToken: account.refreshToken });
+    refresh = async (opts) => {
+      const tokens = withFamilyExpiry(held, await renew(opts));
+      this._renewedFrom.set(account, from);
+      return tokens;
+    };
     if (!await this.isSignedIn()) return refresh();
     const name = safeLine(account.name, 64);
     let row;
@@ -1207,7 +1244,7 @@ export class CredentialSync {
           let r;
           try { r = rowOf(await this.api('GET', `User/Credential/${row.id}`)); } catch { continue; }
           this.rows.set(r.key, r);
-          if (heldElsewhere(r.blob, account, this.by)) {
+          if (heldElsewhere(r.blob, account, this.by, this._renewedFrom.get(account))) {
             this.log(`[TeamClaude] Account "${name}": renewed on ${safeLine(/** @type {Blob} */ (r.blob).by, 48)} while this install waited`);
             return tokensOf(/** @type {Blob} */ (r.blob));
           }
@@ -1218,7 +1255,7 @@ export class CredentialSync {
       const leaseEnd = leaseStart + LOCK_TIMEOUT_S * 1000 - LEASE_SAFETY_MS;
       const current = rowOf({ ...locked, Data: locked?.Data ?? '' });
       this.rows.set(current.key, current);
-      if (current.deletedAt == null && heldElsewhere(current.blob, account, this.by)) {
+      if (current.deletedAt == null && heldElsewhere(current.blob, account, this.by, this._renewedFrom.get(account))) {
         await this._unlock(row, leaseEnd);
         this.log(`[TeamClaude] Account "${name}": already renewed on ${safeLine(/** @type {Blob} */ (current.blob).by, 48)}; taking that token`);
         return tokensOf(/** @type {Blob} */ (current.blob));

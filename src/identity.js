@@ -172,6 +172,43 @@ export function updateAccountEntry(prev, incoming) {
   return merged;
 }
 
+/**
+ * Where a Codex login is saved, and under what name: `{ index, name }`, with
+ * index -1 for a new row.
+ *
+ * The row is found the way any login's is (findUpsertTarget): by ChatGPT
+ * account id and user id, and by name only where those do not contradict it.
+ * One person's Personal plan and Business workspace sign in with one email, and
+ * an unnamed login is named after it, so matching on the name alone put the
+ * second workspace's tokens on the first one's row.
+ *
+ * An existing row keeps its name: routes and pins refer to it. A new row the
+ * operator did not name is `name` while no Codex row holds it, else
+ * `name (plan)`, else `name (2)`, `name (3)`…, because two rows of one name
+ * cannot be told apart by `remove`, `rename` or a route (`--org` reads only
+ * Claude organizations). A Claude namesake is left alone: one email holding a
+ * Claude and a ChatGPT plan has always been named the email on both.
+ *
+ * @param {Array<Record<string, any>>} accounts
+ * @param {Record<string, any>} incoming - the login's row, named
+ * @param {{ userNamed?: boolean, planType?: string|null }} [opts] - userNamed: the
+ *   name came from --name; planType: the id_token's chatgpt_plan_type
+ * @returns {{ index: number, name: string }}
+ */
+export function codexLoginTarget(accounts, incoming, { userNamed = false, planType = null } = {}) {
+  const index = findUpsertTarget(accounts, incoming);
+  if (index >= 0) return { index, name: accounts[index].name };
+  const { name } = incoming;
+  const taken = new Set(accounts.filter(a => providerOf(a) === 'codex').map(a => a.name));
+  if (userNamed || !taken.has(name)) return { index, name };
+  // The plan is a token claim, and the name is typed back on the command line.
+  const plan = /^[\w-]{1,32}$/.test(planType || '') ? planType : null;
+  if (plan && !taken.has(`${name} (${plan})`)) return { index, name: `${name} (${plan})` };
+  for (let n = 2; ; n++) {
+    if (!taken.has(`${name} (${n})`)) return { index, name: `${name} (${n})` };
+  }
+}
+
 /** The email portion of a display name, stripping any " (org)" suffix. */
 export function emailOf(acct) {
   return (acct?.name || '').replace(/ \(.*\)$/, '');

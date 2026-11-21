@@ -1739,6 +1739,86 @@ test('lock taken and the row is this install\'s own older write: renewed, not ta
   assert.equal(store.blob(syncKeyFor(am.accounts[0])).accessToken, 'rt-a-1-renewed-at');
 });
 
+test('lock taken and the row still holds the tokens this install renewed into the ones it holds, whoever wrote it: renewed over, not taken back', async () => {
+  // Renewed while signed out (or with every write of it failing), the token
+  // never reached the row, which still holds the refresh token it rotated
+  // away. Taken back, both installs would hold a used refresh token.
+  const store = makeStore();
+  store.put(syncKeyFor(claude('a')), encodeBlob(claude('a'), tokensOf({ credential: 'at-a-1', refreshToken: 'rt-a-1', expiresAt: T0 + 8 * H }), { now: T0, by: 'office' }));
+  const { am, refreshed, signOut, signIn } = setup([claude('a')], { store, minted: false });
+  signOut();
+  await am.ensureTokenFresh(0, true);
+  signIn();
+  await am.ensureTokenFresh(0);
+  assert.deepEqual(refreshed, ['rt-a-1', 'rt-a-1-renewed-rt']);
+  assert.equal(am.accounts[0].refreshToken, 'rt-a-1-renewed-rt-renewed-rt');
+  assert.equal(store.blob(syncKeyFor(claude('a'))).refreshToken, 'rt-a-1-renewed-rt-renewed-rt');
+});
+
+test('lock refused, and the row read while waiting still holds the tokens this install renewed from: not taken, and the lock is tried again', async () => {
+  const store = makeStore();
+  store.put(syncKeyFor(claude('a')), encodeBlob(claude('a'), tokensOf({ credential: 'at-a-1', refreshToken: 'rt-a-1', expiresAt: T0 + 8 * H }), { now: T0, by: 'office' }));
+  const { am, refreshed, signOut, signIn } = setup([claude('a')], { store, minted: false });
+  signOut();
+  await am.ensureTokenFresh(0, true);
+  signIn();
+  // Held by an install that stopped: it lapses after 30s.
+  store.byKey(syncKeyFor(claude('a'))).Locked = { unixms: String(store.now()), unix: Math.floor(store.now() / 1000) };
+  await am.ensureTokenFresh(0);
+  assert.deepEqual(refreshed, ['rt-a-1', 'rt-a-1-renewed-rt']);
+  assert.equal(am.accounts[0].refreshToken, 'rt-a-1-renewed-rt-renewed-rt');
+});
+
+test('lock taken and the row holds the tokens this install last renewed from, written back since by another install: renewed over, not taken back, though this install took a newer token in between', async () => {
+  // A stale sign-in on the office (an import of an old credentials file)
+  // writes back the token the laptop renewed away before it took the
+  // office's renewal: that refresh token is used, whatever the laptop holds.
+  const store = makeStore();
+  const key = syncKeyFor(claude('a'));
+  store.put(key, encodeBlob(claude('a'), tokensOf({ credential: 'at-a-1', refreshToken: 'rt-a-1', expiresAt: T0 + 8 * H }), { now: T0, by: 'office' }));
+  const laptop = setup([claude('a')], { store, minted: false });
+  const office = setup([claude('a')], { store, minted: false });
+  office.sync.by = 'office';
+  await laptop.am.ensureTokenFresh(0, true); // renews rt-a-1, stores it
+  await office.am.ensureTokenFresh(0, true); // takes the laptop's
+  await office.am.ensureTokenFresh(0); // renews it, stores it
+  await laptop.am.ensureTokenFresh(0); // takes the office's
+  const taken = laptop.am.accounts[0].refreshToken;
+  assert.equal(taken, 'rt-a-1-renewed-rt-renewed-rt');
+  await office.sync.storeSignIn({ ...claude('a') });
+  assert.equal(store.blob(key).refreshToken, 'rt-a-1');
+  await laptop.am.ensureTokenFresh(0);
+  assert.deepEqual(laptop.refreshed, ['rt-a-1', taken], 'renewed what it holds');
+  assert.equal(laptop.am.accounts[0].refreshToken, `${taken}-renewed-rt`);
+  assert.equal(store.blob(key).refreshToken, `${taken}-renewed-rt`);
+});
+
+test('a renewal whose provider call fails for now keeps what the last one that went through renewed from: the row still holding it is renewed over at the next try, not taken back', async () => {
+  // Renewed while signed out, from the row's rt-a-1. Signed back in, the next
+  // renewal under the lock reaches the provider, which fails for now (a 503):
+  // it renewed nothing away, and rt-a-1 is still the used token.
+  const store = makeStore();
+  store.put(syncKeyFor(claude('a')), encodeBlob(claude('a'), tokensOf({ credential: 'at-a-1', refreshToken: 'rt-a-1', expiresAt: T0 + 8 * H }), { now: T0, by: 'office' }));
+  let unavailable = false;
+  const refresh = (rt) => {
+    if (unavailable) {
+      unavailable = false;
+      throw Object.assign(new Error('Token refresh failed (503): unavailable'), { status: 503 });
+    }
+    return { accessToken: `${rt}-renewed-at`, refreshToken: `${rt}-renewed-rt`, expiresAt: store.now() + 8 * H };
+  };
+  const { am, refreshed, signOut, signIn } = setup([claude('a')], { store, minted: false, refresh });
+  signOut();
+  await am.ensureTokenFresh(0, true);
+  signIn();
+  unavailable = true;
+  await am.ensureTokenFresh(0);
+  await am.ensureTokenFresh(0);
+  assert.deepEqual(refreshed, ['rt-a-1', 'rt-a-1-renewed-rt', 'rt-a-1-renewed-rt'], 'the token it holds, sent again');
+  assert.equal(am.accounts[0].refreshToken, 'rt-a-1-renewed-rt-renewed-rt');
+  assert.equal(store.blob(syncKeyFor(claude('a'))).refreshToken, 'rt-a-1-renewed-rt-renewed-rt');
+});
+
 test('lock refused: wait, re-read every 5s, adopt what the holder stores', async () => {
   const { sync, am, store, refreshed, sleeps } = setup([claude('a')]);
   await sync.sync();

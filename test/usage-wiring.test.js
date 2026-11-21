@@ -69,18 +69,18 @@ test('streamResponse fills usageTotals from message_start + message_delta, merge
     event({ type: 'message_start', message: { usage: { input_tokens: 7, cache_read_input_tokens: 900, cache_creation_input_tokens: 50 } } }),
     event({ type: 'message_delta', usage: { output_tokens: 11 } }),
   );
-  await streamResponse(stream, fakeRes(), 0, fakeAccountManager(), null, null, null, null, null, (u) => bookUsageTotals(usageTotals, u));
+  await streamResponse(stream, fakeRes(), { index: 0 }, fakeAccountManager(), null, null, null, null, null, (u) => bookUsageTotals(usageTotals, u));
   assert.deepEqual(usageTotals, { input: 7, cacheRead: 900, cacheWrite: 50, output: 11 });
 });
 
 test('streamResponse leaves usageTotals untouched when the stream carried no usage at all', async () => {
   const usageTotals = {};
   const stream = sseStream(event({ type: 'ping' }));
-  await streamResponse(stream, fakeRes(), 0, fakeAccountManager(), null, null, null, null, null, (u) => bookUsageTotals(usageTotals, u));
+  await streamResponse(stream, fakeRes(), { index: 0 }, fakeAccountManager(), null, null, null, null, null, (u) => bookUsageTotals(usageTotals, u));
   assert.deepEqual(usageTotals, {}, 'an empty merge is written nowhere, same as the accountManager side');
 });
 
 test('streamResponse tolerates a missing onTotals (no throw, existing callers unaffected)', async () => {
   const stream = sseStream(event({ type: 'message_start', message: { usage: { input_tokens: 1 } } }));
-  await assert.doesNotReject(() => streamResponse(stream, fakeRes(), 0, fakeAccountManager(), null, null, null, null));
+  await assert.doesNotReject(() => streamResponse(stream, fakeRes(), { index: 0 }, fakeAccountManager(), null, null, null, null));
 });

@@ -28,6 +28,7 @@
 // codex-reset-credits.js, which imports it — the dependency runs one way.
 
 import { providerOf } from './provider.js';
+import { safeLine } from './safe-text.js';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const WEEK_MS = 7 * DAY_MS;
@@ -49,28 +50,32 @@ const WEEK_MS = 7 * DAY_MS;
 export const DEFAULT_REDEEM_POLICY = Object.freeze({ minDaysToReset: 0, maxShare: 1, maxPerDay: 0 });
 
 /**
+ * Only a number, or a string that spells one, is read as a value. `true`, an
+ * array or an object would each coerce to a number, and a knob nobody set must
+ * not start limiting on the strength of that.
+ *
+ * @param {unknown} value
+ */
+const knob = value => (typeof value === 'number' ? value
+  : typeof value === 'string' && value.trim() !== '' ? Number(value) : NaN);
+
+/**
  * The policy as the config states it, each knob normalised to its own range
  * and falling back to "off" for anything that is not a usable number. A typo
- * in a hand-edited config therefore relaxes nothing it did not mean to —
- * every fallback is the conservative one only in the sense of being what the
- * fleet did before the key existed.
+ * in a hand-edited config therefore turns off the very limit it was meant to
+ * set, rather than failing the load: off is what the fleet did before the key
+ * existed, and redeemPolicyWarnings names every key it happens to, for the
+ * server to log at start and at each reload.
  *
  *  - `autoRedeemMinDaysToReset`: days, >= 0; 0 is off.
  *  - `autoRedeemMaxShare`: a fraction, 0 < share < 1 caps; 1 (or anything
  *    outside the range) is off.
  *  - `autoRedeemMaxPerDay`: a whole number >= 0; 0 is off.
  *
- * Only a number, or a string that spells one, is read as a value. `true`, an
- * array or an object would each coerce to a number, and a knob nobody set must
- * not start limiting on the strength of that.
- *
  * @param {Record<string, any>|null|undefined} config
  * @returns {RedeemPolicy}
  */
 export function redeemPolicyFrom(config) {
-  /** @param {unknown} value */
-  const knob = value => (typeof value === 'number' ? value
-    : typeof value === 'string' && value.trim() !== '' ? Number(value) : NaN);
   const minDays = knob(config?.autoRedeemMinDaysToReset);
   const share = knob(config?.autoRedeemMaxShare);
   const perDay = knob(config?.autoRedeemMaxPerDay);
@@ -79,6 +84,42 @@ export function redeemPolicyFrom(config) {
     maxShare: Number.isFinite(share) && share > 0 && share < 1 ? share : 1,
     maxPerDay: Number.isInteger(perDay) && perDay > 0 ? perDay : 0,
   };
+}
+
+/**
+ * One log line for each knob the config sets to a value redeemPolicyFrom
+ * cannot use, and so reads as off, saying which key and what it read: a
+ * limit an operator set with a typo (50 for a half share, "3d" for three
+ * days) is otherwise off in silence. A key that is absent, null, or set to
+ * its own off value (0, 1, 0) is not a typo and says nothing.
+ *
+ * Also a floor of 7 days or more, which is kept as written. A Codex weekly
+ * window is 7 days long, so an account that has used one up is always less
+ * than 7 days from its reset, and on such a window the floor stops every
+ * automatic redemption, which is what the fleet switch is for. The usage
+ * parser also reads a window of up to 7.7 days as weekly (codex-quota.js),
+ * and on one of those a floor from 7 to 7.5 can pass.
+ *
+ * @param {Record<string, any>|null|undefined} config
+ * @returns {string[]}
+ */
+export function redeemPolicyWarnings(config) {
+  const policy = redeemPolicyFrom(config);
+  /** @type {string[]} */
+  const lines = [];
+  /** @param {string} key @param {number} off @param {number} read @param {string} wanted @param {string} limit */
+  const check = (key, off, read, wanted, limit) => {
+    const value = config?.[key];
+    if (value == null || read !== off || knob(value) === off) return;
+    lines.push(`[TeamClaude] ${key} is ${safeLine(JSON.stringify(value) ?? String(value), 40)}, which is not ${wanted}, so the ${limit} is off`);
+  };
+  check('autoRedeemMinDaysToReset', 0, policy.minDaysToReset, 'a number of days above 0', 'minimum-days floor');
+  check('autoRedeemMaxShare', 1, policy.maxShare, 'a fraction strictly between 0 and 1', 'cohort share cap');
+  check('autoRedeemMaxPerDay', 0, policy.maxPerDay, 'a whole number above 0', 'per-day cap');
+  if (policy.minDaysToReset >= 7) {
+    lines.push(`[TeamClaude] autoRedeemMinDaysToReset is ${policy.minDaysToReset}, but an account whose 7-day weekly window has run out is always less than 7 days from its reset, so no Codex credit on such a window is redeemed automatically (the usage parser also reads a window of up to 7.7 days as weekly)`);
+  }
+  return lines;
 }
 
 /**
@@ -100,7 +141,9 @@ export function daysToReset(account, now = Date.now()) {
  * What a credit spent on this account right now is worth, as a fraction of a
  * week: the days until its natural reset over seven. Null when the reset is
  * unknown, which is not 0 — an unvalued credit is a different thing from a
- * worthless one, and the policy treats the two differently.
+ * worthless one, and the policy treats the two differently. The exact value:
+ * the status standing and the floor's reason state it to the hundredth
+ * below instead (shownToReset).
  *
  * @param {Record<string, any>|null|undefined} account
  * @param {number} [now]
@@ -128,10 +171,10 @@ export function creditValueWeeks(account, now = Date.now()) {
 export function minDaysReason(account, minDaysToReset, now = Date.now()) {
   if (!(minDaysToReset > 0)) return null;
   const days = daysToReset(account, now);
-  if (days == null) return `weekly reset time is unknown, so the credit cannot be valued against the ${formatDays(minDaysToReset)} minimum`;
+  if (days == null) return `weekly reset time is unknown, so the credit cannot be valued against the ${minDaysToReset}d minimum`;
   if (days >= minDaysToReset) return null;
-  const value = Math.min(1, days / 7);
-  return `natural weekly reset is ${formatDays(days)} away, under the ${formatDays(minDaysToReset)} minimum (the credit would buy ${value.toFixed(2)} of a week)`;
+  const shown = /** @type {{days: number, weeks: number}} */ (shownToReset(account, now));
+  return `natural weekly reset is ${formatDays(shown.days)} away, under the ${minDaysToReset}d minimum (the credit would buy ${shown.weeks.toFixed(2)} of a week)`;
 }
 
 /**
@@ -151,8 +194,9 @@ export function resetCohort(account) {
 /**
  * Whether this account is one the auto-redeem policy may ever spend on: a
  * Codex account on an armed fleet that has not opted out. The cohort is
- * counted over these, not over every Codex row — an account that can never
- * redeem is not one the cap needs to hold back.
+ * counted over these, less the disabled, cordoned and error-state ones the
+ * redeemer also leaves out (see its _members), not over every Codex row — an
+ * account that can never redeem is not one the cap needs to hold back.
  *
  * @param {Record<string, any>|null|undefined} account
  * @param {boolean} autoRedeemResets
@@ -223,7 +267,7 @@ export function dailyCapVerdict(ledger, maxPerDay, now) {
  *
  * @param {Object} args
  * @param {Record<string, any>} args.account
- * @param {Record<string, any>[]} args.members  every account the policy may spend on (see autoRedeemArmed), this one included
+ * @param {Record<string, any>[]} args.members  the armed Codex accounts a cohort is counted over (see autoRedeemArmed); `account` is counted whether listed or not
  * @param {RedeemRecord[]} args.ledger
  * @param {number} args.maxShare
  * @param {number} args.now
@@ -235,7 +279,11 @@ export function shareCapVerdict({ account, members, ledger, maxShare, now }) {
   const moved = recentRedemptions(ledger, now).filter(r => r.cohort === cohort);
   // One account counts once, whichever list it is on: a member that redeemed
   // and (somehow) still states a reset in the same bucket is not two accounts.
+  // The account asked about is in its own cohort whether or not it is listed:
+  // the status payload asks about a disabled or cordoned one too, which the
+  // members leave out.
   const population = new Set(members.filter(m => resetCohort(m) === cohort));
+  population.add(account);
   for (const r of moved) population.add(/** @type {Record<string, any>} */ (r.account));
   const size = population.size;
   const used = moved.length;
@@ -271,24 +319,28 @@ export function byExhaustion(a, b) {
 /**
  * The account's standing under the policy, for the status payload: whether
  * the automatic policy may spend on it at all, why not when it may not, and
- * what a credit spent on it now would buy. `armed` is about the policy and
- * the caps, not about the moment — an armed account whose weekly window is
- * still healthy is armed and simply not exhausted.
+ * what a credit spent on it now would buy, in weeks and as the days to the
+ * natural reset (each to the step below, as the floor's reason states them;
+ * see shownToReset). `armed` does not wait for the account to run out — an
+ * armed account whose weekly window is still healthy is armed and simply not
+ * exhausted — but it does move with the clock: the floor turns on how far
+ * away the reset is, and the caps on what the last day and week spent.
  *
  * @param {Object} args
  * @param {Record<string, any>} args.account
  * @param {boolean} args.autoRedeemResets
  * @param {RedeemPolicy} args.policy
- * @param {Record<string, any>[]} args.members  the fleet's armed Codex accounts
+ * @param {Record<string, any>[]} args.members  as shareCapVerdict takes them
  * @param {RedeemRecord[]} args.ledger
  * @param {number} args.now
- * @returns {{armed: boolean, exemptReason: string|null, creditValueWeeks: number|null}}
+ * @returns {{armed: boolean, exemptReason: string|null, creditValueWeeks: number|null, daysToReset: number|null}}
  */
 export function autoRedeemStanding({ account, autoRedeemResets, policy, members, ledger, now }) {
-  const creditValue = creditValueWeeks(account, now);
-  const value = creditValue == null ? null : Math.round(creditValue * 100) / 100;
+  const shown = shownToReset(account, now);
+  const value = shown ? shown.weeks : null;
+  const toReset = shown ? shown.days : null;
   /** @param {string} reason */
-  const exempt = reason => ({ armed: false, exemptReason: reason, creditValueWeeks: value });
+  const exempt = reason => ({ armed: false, exemptReason: reason, creditValueWeeks: value, daysToReset: toReset });
   if (autoRedeemResets !== true) return exempt('auto-redeem is switched off');
   if (account.autoRedeemReset === false) return exempt('auto-redeem is switched off for this account');
   const floor = minDaysReason(account, policy.minDaysToReset, now);
@@ -297,11 +349,32 @@ export function autoRedeemStanding({ account, autoRedeemResets, policy, members,
   if (!daily.ok) return exempt(/** @type {string} */ (daily.reason));
   const share = shareCapVerdict({ account, members, ledger, maxShare: policy.maxShare, now });
   if (!share.ok) return exempt(/** @type {string} */ (share.reason));
-  return { armed: true, exemptReason: null, creditValueWeeks: value };
+  return { armed: true, exemptReason: null, creditValueWeeks: value, daysToReset: toReset };
 }
 
-/** @param {number} days */
+/**
+ * How far the natural reset is, as the floor's reason and the status line
+ * state it: the days to the tenth below and the credit's worth in weeks to
+ * the hundredth below, both from the one reading and neither rounded up. A
+ * reset 1.96 days away is not yet 2, and rounded it would read as meeting
+ * the 2-day floor it is stopped by; two figures rounded different ways would
+ * disagree on one line. Counted in whole milliseconds, so a figure at an
+ * exact step never lands one low, as a division in days can (1.96 days is
+ * 0.28 of a week, and 1.96 / 7 * 100 is 27.999999999999996). Null when the
+ * reset is unknown.
+ *
+ * @param {Record<string, any>|null|undefined} account
+ * @param {number} now
+ * @returns {{days: number, weeks: number}|null}
+ */
+function shownToReset(account, now) {
+  const resetAt = account?.quota?.unified7dReset;
+  if (!Number.isFinite(resetAt)) return null;
+  const ms = Math.max(0, resetAt - now);
+  return { days: Math.floor(ms * 10 / DAY_MS) / 10, weeks: Math.min(100, Math.floor(ms * 100 / WEEK_MS)) / 100 };
+}
+
+/** @param {number} days  already to a tenth */
 function formatDays(days) {
-  const rounded = Math.round(days * 10) / 10;
-  return `${Number.isInteger(rounded) ? rounded : rounded.toFixed(1)}d`;
+  return `${Number.isInteger(days) ? days : days.toFixed(1)}d`;
 }

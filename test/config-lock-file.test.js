@@ -177,6 +177,24 @@ test('a lock that stays held past the wait budget is bypassed with one warning, 
   }, { lockWaitMs: 200 });
 });
 
+// A reader with nothing to write takes no lock: loadConfigEnsuringIds decides
+// on a read taken without it, and only a file missing an id goes to the lock.
+// Under a lock that stays held, a reader that took it would give up after the
+// budget with the bypass warning.
+test('loadConfigEnsuringIds takes no lock on a file that carries every id', async () => {
+  await withConfigDir(async ({ cfg, path, lockPath }) => {
+    await writeFile(path, JSON.stringify({ proxy: { port: 1, apiKey: 'tc-test' }, upstreamProxy: false, accounts: [{ id: 'a-id', name: 'a', type: 'apikey', apiKey: 'k' }] }));
+    const body = { pid: process.pid, at: Date.now() };
+    await writeFile(lockPath, JSON.stringify(body));
+    const { warnings, restore } = captureBypassWarnings();
+    let config;
+    try { config = await cfg.loadConfigEnsuringIds(); } finally { restore(); }
+    assert.deepEqual(warnings, []);
+    assert.deepEqual(config.accounts.map((/** @type {any} */ a) => a.id), ['a-id']);
+    assert.deepEqual(await readJson(lockPath), body, 'the other holder\'s lock was not touched');
+  }, { lockWaitMs: 200 });
+});
+
 test('a waiter that judged a lock stale does not remove the fresh lock a faster waiter has since taken', async () => {
   // Two waiters find a dead holder's lock. A breaks it and takes the lock; B,
   // which had already judged the old lock stale, must not then unlink A's. The

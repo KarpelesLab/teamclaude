@@ -852,14 +852,19 @@ export function normalizeUsagePayload(data, now = Date.now()) {
  *  - `applicable` is the subset upstream says can be spent this instant
  *    (`usable_now`, not `paused`); a grant whose `starts_at` is still ahead
  *    reads `usable_now: false`.
- *  - `expiresAt` is the soonest `ends_at` among the grants counted, so the
- *    displays can say when the reset lapses and drop it once it has.
+ *  - `expiresAt` is the soonest `ends_at` among the general resets counted,
+ *    so the displays can say when the reset lapses and drop it once it has.
  *  - `fable` is the part of `available` that is a Fable reset (isFableReset):
  *    a grant that clears the Fable weekly but not the shared one. Those
  *    arrived with the Fable 5.2 launch (2026-11-09, "New model launch: one
  *    Fable reset ..."); the October grants cleared `seven_day` too. The
  *    displays name the two apart, since a Fable reset gives back only what
  *    Fable used of the shared weekly.
+ *  - `fableExpiresAt` is the soonest `ends_at` among the Fable resets. The two
+ *    kinds lapse months apart (the October resets in December, the Fable ones
+ *    in March), so one date for both would misdate one kind and drop it early.
+ *    Its presence also tells a reading dated by kind from an older one, whose
+ *    `expiresAt` was the soonest of all grants.
  *
  * An ineligible block is null, not zero. Its reason so far has always been
  * about the caller (`surface`, `cli_version`), not the account, so "none" would
@@ -872,7 +877,7 @@ export function normalizeUsagePayload(data, now = Date.now()) {
  *
  * @param {any} block  the payload's `cedar_ember` object
  * @param {number} [now]  ms epoch a grant's expiry is measured against
- * @returns {{available: number, applicable: number, expiresAt: number|null, fable: number}|null}
+ * @returns {{available: number, applicable: number, expiresAt: number|null, fable: number, fableExpiresAt: number|null}|null}
  */
 export function bankedResets(block, now = Date.now()) {
   if (!block || typeof block !== 'object' || block.eligible !== true) return null;
@@ -882,6 +887,8 @@ export function bankedResets(block, now = Date.now()) {
   let fable = 0;
   /** @type {number|null} */
   let expiresAt = null;
+  /** @type {number|null} */
+  let fableExpiresAt = null;
   for (const grant of block.grants) {
     if (!grant || typeof grant !== 'object') continue;
     const left = creditCount(grant.resets_left);
@@ -890,8 +897,12 @@ export function bankedResets(block, now = Date.now()) {
     if (Number.isFinite(ends) && ends <= now) continue;
     available += left;
     if (grant.usable_now === true && grant.paused !== true) applicable += left;
-    if (isFableReset(grant.clears)) fable += left;
-    if (Number.isFinite(ends) && (expiresAt == null || ends < expiresAt)) expiresAt = ends;
+    if (isFableReset(grant.clears)) {
+      fable += left;
+      if (Number.isFinite(ends) && (fableExpiresAt == null || ends < fableExpiresAt)) fableExpiresAt = ends;
+    } else if (Number.isFinite(ends) && (expiresAt == null || ends < expiresAt)) {
+      expiresAt = ends;
+    }
   }
   // Re-capped after summing, for the same width budget creditCount guards.
   return {
@@ -899,6 +910,7 @@ export function bankedResets(block, now = Date.now()) {
     applicable: creditCount(applicable) ?? 0,
     expiresAt,
     fable: creditCount(fable) ?? 0,
+    fableExpiresAt,
   };
 }
 

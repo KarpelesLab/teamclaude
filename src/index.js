@@ -3,9 +3,8 @@
 import { spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { createWriteStream, existsSync } from 'node:fs';
-import { readFile } from 'node:fs/promises';
 import net from 'node:net';
-import { loadOrCreateConfig, loadConfig, loadConfigPersistingIds, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, getQuotaSeriesPath, getUsageDbPath, loadState, createStatePersister } from './config.js';
+import { loadOrCreateConfig, loadConfig, loadConfigPersistingIds, loadConfigEnsuringIds, atomicConfigUpdate, getConfigPath, getCrashLogPath, getQuotaSeriesPath, getUsageDbPath, loadState, createStatePersister } from './config.js';
 import { loadQuotaSeries, saveQuotaSeries } from './quota-series.js';
 import { installCrashHandlers } from './crash-log.js';
 import { AccountManager, distributionMode, accountRouting, isLongLived } from './account-manager.js';
@@ -21,6 +20,7 @@ import {
   matchAccounts,
   findUpsertTarget,
   apiKeyNamed,
+  codexLoginTarget,
   updateAccountEntry,
   canUpsertOAuthAccount,
   isTokenRejection,
@@ -32,12 +32,13 @@ import { isRemoteSession, openBrowser, PANEL_LOGIN_TIMEOUT_MS } from './login-fl
 import { providerOf, canServeProvider } from './provider.js';
 import { syncAccountsFromDisk } from './sync-accounts.js';
 import { mergeAccountsForSave, syncRefreshedTokens, removedAccountIds, clearRemovedAccountIds, clearAddedAccountIds, markAccountRemoved, configIndexFor } from './account-pairing.js';
-import { ensureAccountIds, accountIdsComplete } from './account-id.js';
+import { ensureAccountIds } from './account-id.js';
 import * as alias from './alias.js';
 import { ensureCerts, mitmHosts, caCertPath } from './mitm.js';
 import { Prober, probeApplicable } from './prober.js';
 import { CreditMonitor } from './api-credit.js';
 import { ResetCreditRedeemer } from './codex-reset-credits.js';
+import { redeemPolicyWarnings } from './codex-reset-policy.js';
 import { ClaudeResetRedeemer } from './claude-resets.js';
 import { createResetActions } from './reset-actions.js';
 import { Warmer, warmApplicable } from './warmer.js';
@@ -360,11 +361,10 @@ async function serverCommand() {
     && process.stdout.isTTY && process.stdin.isTTY;
   const earlyConsole = tuiExpected ? captureEarlyConsole() : null;
 
-  const config = await loadOrCreateConfig();
-  const persistSessionAffinity = config.persistSessionAffinity === true;
   // Token writes below pair rows by entry id against a re-read of the file, so
   // the ids have to be on disk before the first refresh, not just in memory.
-  await persistMintedAccountIds(config);
+  const config = await loadConfigWithIdsOnDisk();
+  const persistSessionAffinity = config.persistSessionAffinity === true;
 
   // --log-to <dir>
   const logTo = argValue('--log-to');
@@ -705,6 +705,7 @@ async function serverCommand() {
     config.messageThreads = fleetThreads;
     // Read by the TUI on every frame, so a hand edit lands on the next reload.
     config.quotaBarPercent = diskConfig.quotaBarPercent === true;
+    config.quotaBarStretch = diskConfig.quotaBarStretch !== false;
     config.accountSort = ACCOUNT_SORTS.includes(diskConfig.accountSort) ? diskConfig.accountSort : 'arranged';
     // Read by `run`/`env` from disk, but the TUI settings screen shows it live.
     config.defaultClientMode = diskConfig.defaultClientMode === 'base-url' ? 'base-url' : 'mitm';
@@ -716,10 +717,11 @@ async function serverCommand() {
     // The spending strategy beside the switch (codex-reset-policy.js), read
     // off this object per refusal the same way. Copied raw: the redeemer
     // normalises each knob as it reads it, so a bad value here is "off" there
-    // rather than a reload that fails.
+    // rather than a reload that fails, and said so here, as at start.
     config.autoRedeemMinDaysToReset = diskConfig.autoRedeemMinDaysToReset;
     config.autoRedeemMaxShare = diskConfig.autoRedeemMaxShare;
     config.autoRedeemMaxPerDay = diskConfig.autoRedeemMaxPerDay;
+    for (const line of redeemPolicyWarnings(config)) console.error(line);
     // Read by the prober off this object per cycle, like the switch above.
     config.probeDisabledAccounts = diskConfig.probeDisabledAccounts === true;
     config.blockedModels = Array.isArray(diskConfig.blockedModels) ? diskConfig.blockedModels : [];
@@ -751,7 +753,9 @@ async function serverCommand() {
       if (diskSchedule) {
         // Validate and arm before publishing the disk value to live readers. A
         // bad hand edit leaves the prior schedule intact and makes reload fail.
-        warmer.rescheduleSchedule(diskSchedule);
+        // An unchanged schedule keeps running, as an unchanged interval does
+        // below (reloadSchedule).
+        warmer.reloadSchedule(diskSchedule);
         config.warmupSchedule = diskSchedule;
         config.warmupSeconds = 0;
       } else if (config.warmupSchedule || ms !== warmer.intervalMs) {
@@ -795,8 +799,17 @@ async function serverCommand() {
     clearAddedAccountIds(config);
   };
 
-  const redeemer = new ResetCreditRedeemer(accountManager, { config });
-  const claudeRedeemer = new ClaudeResetRedeemer(accountManager, { config });
+  // Their lines are written through the console as it is when each is said,
+  // like the prober's and the warmer's. Both are built while a TUI start
+  // holds the console (captureEarlyConsole) and before headless mode tees it
+  // into --activity-log, so a log bound now would write to a hold that is
+  // never read again, or past the activity file.
+  const redeemerLog = (/** @type {string} */ line) => console.log(line);
+  const redeemer = new ResetCreditRedeemer(accountManager, { config, log: redeemerLog });
+  // Said at start and at each reload: a reset-credit limit set to a value it
+  // cannot read is off, and nothing else would say so.
+  for (const line of redeemPolicyWarnings(config)) console.error(line);
+  const claudeRedeemer = new ClaudeResetRedeemer(accountManager, { config, log: redeemerLog });
   const resetActions = createResetActions({ accountManager, claudeRedeemer, codexRedeemer: redeemer });
 
   let tui = null;
@@ -820,6 +833,7 @@ async function serverCommand() {
         // the edit never reached disk and was silently undone by the next start.
         if (config.eventLogging != null) diskConfig.eventLogging = config.eventLogging;
         if (config.quotaBarPercent != null) diskConfig.quotaBarPercent = config.quotaBarPercent;
+        if (config.quotaBarStretch != null) diskConfig.quotaBarStretch = config.quotaBarStretch;
         if (config.accountSort != null) diskConfig.accountSort = config.accountSort;
         if (config.defaultClientMode != null) diskConfig.defaultClientMode = config.defaultClientMode;
         if (config.autoRedeemResets != null) diskConfig.autoRedeemResets = config.autoRedeemResets;
@@ -1502,11 +1516,10 @@ async function upsertCodexAccount(requestedName, creds, routing = null, storeRou
     // When the refresh token lapses, if these credentials came with it.
     setRefreshTokenExpiry(account, creds.refreshTokenExpiresAt);
 
-    // Identity for a Codex account is its ChatGPT account id and user id; fall
-    // back to the display name when upstream did not supply one.
-    const idx = config.accounts.findIndex(a => (
-      a.provider === 'codex' && (sameIdentity(a, account) || a.name === account.name)
-    ));
+    // By ChatGPT account and user id, not by the email the login is named
+    // after: one person's Personal plan and Business workspace share it.
+    const target = codexLoginTarget(config.accounts, account, { userNamed: !!requestedName, planType: creds.planType });
+    const idx = target.index;
     if (idx >= 0) {
       const prev = config.accounts[idx];
       config.accounts[idx] = { ...prev, ...account, name: prev.name };
@@ -1518,9 +1531,12 @@ async function upsertCodexAccount(requestedName, creds, routing = null, storeRou
       console.log(`Updated account "${prev.name}"`);
       if (!storeRouting) noteUnusedRouting(prev, routing);
     } else {
+      account.name = target.name;
       config.accounts.push(account);
       outcome = { action: 'added', name: account.name };
-      console.log(`Added account "${account.name}"${creds.planType ? ` (${creds.planType})` : ''}`);
+      // The plan once, when the name does not already carry it; it is a token claim.
+      const plan = creds.planType && !account.name.endsWith(`(${creds.planType})`) ? ` (${sanitizeText(creds.planType)})` : '';
+      console.log(`Added account "${account.name}"${plan}`);
     }
     signedIn = config.accounts[idx >= 0 ? idx : config.accounts.length - 1];
   });
@@ -2181,7 +2197,9 @@ async function switchSessionCommand(port, headers, name) {
 // ── accounts ────────────────────────────────────────────────
 
 async function accountsCommand() {
-  const config = await loadOrCreateConfig();
+  // Both writes below pair rows by entry id against a fresh read of the file,
+  // so a file written before ids existed needs its ids on disk first.
+  const config = await loadConfigWithIdsOnDisk();
   const verbose = args.includes('-v') || args.includes('--verbose');
 
   if (config.accounts.length === 0) {
@@ -2189,10 +2207,6 @@ async function accountsCommand() {
     console.log('Add one with: teamclaude import, teamclaude login, or teamclaude login --api');
     return;
   }
-
-  // Both writes below pair rows by entry id against a fresh read of the file,
-  // so a file written before ids existed needs its ids on disk first.
-  await persistMintedAccountIds(config);
 
   // Refresh expired tokens before fetching profiles. Each call goes by the
   // account's own routing when it has one — this is that account's traffic.
@@ -2845,9 +2859,10 @@ function resolveAccount(accounts, query, orgFilter) {
 
 /**
  * resolveAccount for use inside a config update: the same two refusals, in the
- * same words, thrown rather than printed. Exiting there would leave the config
- * lock behind for the next writer to wait out; thrown, the update is abandoned
- * with the file untouched and updateConfigOrExit prints the message.
+ * same words, thrown rather than printed. Thrown, the update is abandoned with
+ * the file untouched, the lock is released, and updateConfigOrExit prints the
+ * message. Exiting there would leave the lock file behind for the next writer
+ * to find its holder gone and break (config.js).
  * @param {any[]} accounts
  * @param {string} query
  * @param {string|null} orgFilter
@@ -2974,7 +2989,11 @@ async function priorityCommand() {
   const { config, result } = await updateConfigOrExit(disk => {
     // An unknown account is reported before a missing number, as it always was.
     requireAccount(disk.accounts, name, orgFilter);
-    if (!spec.place && spec.priority === undefined) {
+    // A number outside the safe-integer range is refused here too, in the
+    // CLI's own words: setAccountPriority's refusal names the `priority` and
+    // `place` fields that POST /teamclaude/priority (the dashboard's call)
+    // sends, which no one typed.
+    if (!spec.place && !Number.isSafeInteger(spec.priority)) {
       throw new ConfigOpError('Provide an integer priority, or --first / --last.');
     }
     return setAccountPriority(disk, name, spec);
@@ -3524,6 +3543,9 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
   let outcome = { action: 'added', name: name || '' };
   /** @type {Record<string, any>|null} */
   let signedIn = null;
+  // Another entry holding the name a long-lived login was given with --name,
+  // when the login was saved onto a different one (see below).
+  let namesake = false;
   const config = await atomicConfigUpdate(config => {
     if (!name) {
       const n = config.accounts.filter(a => a.name.startsWith('account-')).length + 1;
@@ -3576,6 +3598,7 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
       // came with (the login response, the credential file), or dropped.
       setRefreshTokenExpiry(config.accounts[idx], creds.refreshTokenExpiresAt);
       outcome = { action: 'updated', name: prev.name };
+      namesake = longLived && userNamed && prev.name !== name && config.accounts.some((/** @type {Record<string, any>} */ a, /** @type {number} */ i) => i !== idx && a.name === name);
       if (storeRouting && !routing) delete config.accounts[idx].routing; // --routing none
       console.log(`Updated account "${prev.name}"`);
       if (!storeRouting) noteUnusedRouting(prev, routing);
@@ -3615,6 +3638,11 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
   // Said once the entry is known: one that already holds the account the
   // token answer named is renewed under its own name, not the one given.
   if (longLived) console.log(`A long-lived token serves inference only: saved as "${outcome.name}", with no profile lookup.`);
+  // A renewal meant for the entry named with --name that the token answer
+  // placed on another one: the named entry keeps its old token, which lapses.
+  if (namesake) {
+    console.log(`"${sanitizeText(name)}" was left as it is: this token is for the account "${sanitizeText(outcome.name)}" already holds. If "${sanitizeText(name)}" was an earlier long-lived login of the same account, remove it with: teamclaude remove ${JSON.stringify(sanitizeText(name))}`);
+  }
   console.log(`Saved to ${getConfigPath()}`);
   // Before the server is told: its reload pass would otherwise read a tombstone
   // for an account that was just signed in again and remove it.
@@ -3642,7 +3670,7 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
  *
  * The id is exact and survives the refresh that rewrites the credential. A file
  * written before the field existed gets its ids persisted at startup
- * (persistMintedAccountIds), so the in-memory ids are the on-disk ids.
+ * (loadConfigWithIdsOnDisk), so the in-memory ids are the on-disk ids.
  */
 function findConfigAccount(diskConfig, account) {
   if (!account?.id) return -1;
@@ -3650,23 +3678,25 @@ function findConfigAccount(diskConfig, account) {
 }
 
 /**
- * Persist the entry ids loadConfig just minted, if the file did not carry them.
+ * The config, with any entry id the file lacked written to it first, so the ids
+ * in the copy handed out are the ids on disk; a first run creates the file.
  *
  * Every later token write pairs its row by id and re-reads the file to do it. A
  * config written before the field existed has ids in memory only, and the
  * re-read would mint a second, different set — nothing would pair until the
- * next start, and refreshed tokens would never reach disk. One save up front
- * makes the in-memory ids the on-disk ids. A file that already carries a
- * complete, unique set is left alone.
+ * next start, and refreshed tokens would never reach disk. A file that already
+ * carries a complete, unique set is not written, and its read takes no lock.
+ *
+ * Through loadConfigEnsuringIds, which writes missing ids under the config lock
+ * and hands out the read it wrote. This used to save the copy loaded first,
+ * read outside the lock, over the whole file, and whatever another writer had
+ * saved since that read was lost: a refresh token the running server had
+ * rotated went back to its old, dead value.
  */
-async function persistMintedAccountIds(config) {
-  let raw;
-  try {
-    raw = JSON.parse(await readFile(getConfigPath(), 'utf-8'));
-  } catch {
-    return; // nothing on disk to reconcile with (or unreadable — the next save will tell)
-  }
-  if (!accountIdsComplete(raw?.accounts)) await saveConfig(config);
+async function loadConfigWithIdsOnDisk() {
+  // null when there is no file: the one created then has no accounts, so no
+  // id to write.
+  return (await loadConfigEnsuringIds()) ?? await loadOrCreateConfig();
 }
 
 // ── helpers ─────────────────────────────────────────────────

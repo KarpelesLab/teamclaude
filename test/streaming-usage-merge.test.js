@@ -221,3 +221,59 @@ test('the account counters are unchanged by the merge', async () => {
   assert.equal(usage.totalInputTokens, 12, 'the legacy input counter moved');
   assert.equal(usage.totalOutputTokens, 500, 'the legacy output counter moved');
 });
+
+// A stream can outlive the fleet's numbering: an account removed while the
+// reply runs renumbers the rest in place (removeAccount). The relay booked
+// every figure by the index the serving account had when the stream began, so
+// once x went, a's output and cache reads landed on b, the account that slid
+// into a's place. x never serves; it sits first so its removal moves both.
+test('a stream books its usage to the account that served it when another is removed mid-stream', async t => {
+  let release = () => {};
+  const held = new Promise(r => { release = r; });
+  const upstream = http.createServer(async (req, res) => {
+    for await (const c of req) void c;
+    res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+    res.write(`event: message_start\ndata: ${JSON.stringify(start({ input_tokens: 100, cache_read_input_tokens: 7000, cache_creation_input_tokens: 0 }))}\n\n`);
+    await held;
+    res.end(`event: message_delta\ndata: ${JSON.stringify(delta({ output_tokens: 555 }))}\n\nevent: message_stop\ndata: ${JSON.stringify(stop)}\n\n`);
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager([
+    { name: 'x', type: 'apikey', apiKey: 'k-x', disabled: true },
+    { name: 'a', type: 'apikey', apiKey: 'k-a' },
+    { name: 'b', type: 'apikey', apiKey: 'k-b' },
+  ], 0.98);
+  const [, a, b] = am.accounts;
+  const proxy = createProxyServer(am, { proxy: {}, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const port = await listen(proxy);
+  // However the test ends, upstream is let go and both servers close: a relay
+  // that never forwards message_start would leave the request below and the
+  // held upstream pending, and the file alive (test/README.md). The test's
+  // signal ends the request.
+  t.after(() => {
+    release();
+    proxy.closeAllConnections();
+    proxy.close();
+    upstream.closeAllConnections();
+    upstream.close();
+  });
+  await new Promise((resolve, reject) => {
+    const rq = http.request({
+      host: '127.0.0.1', port, path: '/v1/messages', method: 'POST',
+      headers: { 'content-type': 'application/json' }, signal: t.signal,
+    }, (res) => {
+      // The relay books an event as it forwards it, so by the time the
+      // client holds message_start its figures are booked: remove x then.
+      res.once('data', () => { am.removeAccount(0); release(); });
+      res.on('data', () => {});
+      res.on('end', resolve);
+      res.on('error', reject);
+    });
+    rq.on('error', reject);
+    rq.end(JSON.stringify({ model: 'claude-opus-5', stream: true, messages: [] }));
+  });
+  assert.deepEqual([a.usage.totalInputTokens, a.usage.totalOutputTokens, a.usage.totalCacheReadTokens], [100, 555, 7000],
+    'the account that served the stream holds all of its usage');
+  assert.deepEqual([b.usage.totalInputTokens, b.usage.totalOutputTokens, b.usage.totalCacheReadTokens], [0, 0, 0],
+    'the account that took its place holds none');
+});
