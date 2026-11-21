@@ -25,6 +25,7 @@ import { createDrainState, DRAIN_RETRY_AFTER_SECONDS } from './drain.js';
 import { resolveCompactBeforeSwitch, decideCompactBeforeSwitch, promptTooLongBody } from './compact-before-switch.js';
 import { isRoutingFailure, describeRouting } from './account-routing.js';
 import { safeLine } from './safe-text.js';
+import { oauthAccount as holdsResets } from './reset-actions.js';
 import { upstreamErrorType } from './error-type.js';
 import { forwardRefusal, guardedLookup, FORBIDDEN_FORWARD } from './forward-target.js';
 import { renderDashboardHtml, dashboardCsp } from './dashboard.js';
@@ -749,6 +750,9 @@ const CLIENT_KEY_REFUSED_PATHS = new Map([
   // Drain stops new traffic for the whole proxy, which is the operator's call.
   ['/teamclaude/drain', 'a client key cannot drain the proxy'],
   ['/teamclaude/undrain', 'a client key cannot drain the proxy'],
+  // A read spends the account's usage-request budget; a claim spends a reset.
+  ['/teamclaude/resets/read', 'a client key cannot read resets'],
+  ['/teamclaude/resets/redeem', 'a client key cannot spend resets'],
 ]);
 
 // What an inference-scoped key is refused: every route under the control
@@ -1165,6 +1169,68 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           res.writeHead(500, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: false, error: 'quota probe failed; see the proxy log' }));
         }
+        return;
+      }
+
+      // Banked resets — the control-plane form of the TUI's resets panel (`r`),
+      // for a headless server and the pages that drive it. Reading and spending
+      // live in reset-actions.js; these routes add only HTTP and the log line.
+      // GET lists the in-memory readings and never sends a request, so a page
+      // may poll it. POST read is the panel's `r`: one fresh read, held to the
+      // same two-minute floor and Retry-After. POST redeem spends the chosen
+      // grant, with the panel's own checks (fresh read first, one claim at a
+      // time). A client key gets none of them: grant ids are spend handles.
+      if ((req.url === '/teamclaude/resets' && req.method === 'GET')
+        || (req.method === 'POST' && (req.url === '/teamclaude/resets/read' || req.url === '/teamclaude/resets/redeem'))) {
+        /** @param {number} code @param {Record<string, any>} body */
+        const reply = (code, body) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(body)); };
+        const actions = hooks.resetActions;
+        if (!actions) { reply(501, { ok: false, error: 'resets not supported' }); return; }
+        if (req.tcClient) { reply(403, { ok: false, error: 'a client key cannot read resets' }); return; }
+        const readableAt = (/** @type {Record<string, any>} */ account) => {
+          const until = actions.readWindow(account)?.until;
+          return Number.isFinite(until) && until > Date.now() ? until : null;
+        };
+        if (req.method === 'GET') {
+          reply(200, {
+            ok: true,
+            accounts: (accountManager.accounts || []).filter((/** @type {Record<string, any>} */ a) => holdsResets(a))
+              .map((/** @type {Record<string, any>} */ a) => ({
+                account: a.name, provider: providerOf(a) === 'codex' ? 'codex' : 'claude',
+                details: actions.cached(a) ?? null, readableAt: readableAt(a),
+              })),
+          });
+          return;
+        }
+        const spend = req.url === '/teamclaude/resets/redeem';
+        let body;
+        try {
+          body = JSON.parse(await readControlBody(req) || '{}') ?? {};
+        } catch (/** @type {any} */ err) {
+          const tooLarge = err.message === 'body too large';
+          reply(tooLarge ? 413 : 400, { ok: false, error: tooLarge ? 'request body too large' : 'invalid request body' });
+          return;
+        }
+        const target = body?.account;
+        if (typeof target !== 'string' || !target.trim()) { reply(400, { ok: false, error: 'missing "account"' }); return; }
+        if (spend && (typeof body.grantId !== 'string' || !body.grantId)) { reply(400, { ok: false, error: 'missing "grantId"' }); return; }
+        const index = resolveAccountPin(accountManager, target);
+        if (index == null) { reply(404, { ok: false, error: `no such account "${safeLine(target, 64)}"` }); return; }
+        const account = accountManager.accounts[index];
+        if (!holdsResets(account)) { reply(400, { ok: false, error: 'not an OAuth Claude or Codex account' }); return; }
+        if (!spend) {
+          const wait = readableAt(account);
+          const details = wait == null ? await actions.read(account) : actions.cached(account);
+          reply(200, { ok: true, account: account.name, read: wait == null, details: details ?? null, readableAt: wait == null ? readableAt(account) : wait });
+          return;
+        }
+        const result = await actions.redeem(account, body.grantId);
+        // The TUI logs this line to its activity pane; headless mode tees
+        // console.log to the activity log, so the spend leaves the same trace.
+        console.log(`[TeamClaude] ${result.message}`);
+        const { message, ...outcome } = result;
+        if (result.redeemed) reply(200, { ok: true, account: account.name, ...outcome, message });
+        else reply(result.uncertain ? 502 : 409, { ok: false, account: account.name, redeemed: false, uncertain: result.uncertain === true, error: message });
         return;
       }
 
