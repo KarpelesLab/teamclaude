@@ -264,7 +264,7 @@ No CLI editor for this one, matching `maxUsage`: hand-edit the config and let a 
 }
 ```
 
-A bare number caps every bucket. Keys are the same quota field names as `switchThreshold`, and `default` covers the ones a table does not list — but a bucket that is neither listed nor covered by `default` is **uncapped**, so a cap is only ever what you asked for.
+A bare number caps every bucket. Keys are the same quota field names as `switchThreshold`, and `default` covers the ones a table does not list — but a bucket that is neither listed nor covered by `default` is **uncapped**, so a cap is only ever what you asked for. A cap of `0` is a hard stop: the bucket counts as at its cap whatever it reads, and before any reading exists, so `"maxUsage": 0` (or `{ "default": 0 }`) keeps every request off the account and `{ "unified7dFable": 0 }` keeps Fable off it.
 
 At the cap, that account receives **nothing**:
 
