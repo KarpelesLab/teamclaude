@@ -149,6 +149,8 @@ teamclaude routing <name> none  # clear it
 teamclaude routing <name> --check  # test the proxy the account already has
 ```
 
+`teamclaude accounts` reads the profile, and first renews a token about to expire, only for Claude logins. Those are Anthropic's endpoints, so a Codex account's tokens and a [third-party backend](#third-party-backend-accounts)'s key are never sent there: those rows are listed as `Codex` and `third-party backend`. `teamclaude api <path>` likewise resolves a path against the account's own host: `https://chatgpt.com` for a Codex login, `upstream` for a backend. With no `--account` it uses the first Claude login, or the first Codex login for an absolute `https://chatgpt.com/…` URL; an absolute URL on a provider's own host is refused when no login of that provider is configured. Any other absolute URL is used as given, so name the account with `--account`.
+
 Rename while the server runs: an API-key account's saved quota readings are matched by name, so a rename made with the server stopped loses them on the next start. Sessions launched with `TC_ACCT=<old name>` pin by name and need relaunching with the new one.
 
 `login`, `import`, `enable`, `disable`, `priority`, `rename` and `routing` notify a running server to reload, so credential, priority, enable/disable, name and routing changes are picked up live; the same reload (POST `/teamclaude/reload`, or **R** in the TUI) also applies hand edits to an account's `upstream`/`modelMap`. Account **removals** made on disk (`teamclaude remove` from another shell, or a hand edit) are applied by the same reload: a running account whose entry is gone from the file is dropped from the fleet, and the reload reports how many it added and how many it removed. An account added in the TUI is safe during the moment between its addition and its save — a reload that reads the file first leaves it alone rather than treating the missing row as a removal. Removing one from the TUI or through the [MCP endpoint](usage.md#mcp-endpoint)'s `remove_account` takes effect at once.
@@ -798,6 +800,38 @@ only one manual claim can run at a time. Manual claims share the automatic path'
 request-id replay and set its fleet hold after success or an unread verdict.
 A failed claim may have spent the reset; the next attempt on that grant reuses
 the same request id. A refusal with a verdict spends nothing.
+
+### Reading and spending a reset over the control API
+
+A headless server has no panel, so the same reads and claims are routes on the
+control plane. They take the proxy key (or the loopback exemption), never a
+client key, and a POST from a web page on another origin is refused like every
+other control mutation.
+
+- `GET /teamclaude/resets` lists every OAuth Claude and Codex account with its
+  last in-memory reading in the panel's shape (`details`, `null` before the
+  first read) and `readableAt`, the time a fresh read is allowed again (`null`
+  when it is now). It sends no request upstream, so a page may poll it.
+- `POST /teamclaude/resets/read` with `{"account": "<name>"}` is the panel's
+  **r**: one fresh read, under the same two-minute floor and `Retry-After`.
+  Inside the floor it answers from the cache with `"read": false`.
+- `POST /teamclaude/resets/redeem` with `{"account": "<name>", "grantId": "<id>"}`
+  spends that grant exactly as **y** in the panel does: fresh token and read
+  first, one manual claim at a time, the same hard blocks. The warnings are
+  in `details` for the caller to show before it asks; the route does not ask.
+  A spend answers `200` with `resetsLeft` and `cleared`, a refusal `409` with
+  the reason, and a claim with no verdict `502` with `"uncertain": true` (it
+  may have been spent; read again to learn). Every outcome is logged.
+  For an hour after a claim that landed or may have landed (the hold the
+  panel shows as a warning), the route refuses another with `409`, so a
+  request retried after a lost answer does not spend twice; `"force": true`
+  in the body spends anyway.
+
+With no `proxy.apiKey` set, the three routes answer only requests from this
+machine that name it in `Host`, as the MCP endpoint does.
+
+The account is named as for `teamclaude switch`. Grant ids come from the list
+and stay in memory only, like the panel's.
 
 ### Spending a Claude reset automatically
 
