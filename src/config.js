@@ -189,7 +189,12 @@ export function createDefaultConfig() {
   };
 }
 
-export async function loadConfig() {
+/**
+ * The config file, or null when there is none. `applyProxy: false` skips the
+ * egress proxy, for a command that only talks to the local server.
+ * @param {{ applyProxy?: boolean }} [opts]
+ */
+export async function loadConfig({ applyProxy = true } = {}) {
   const path = getConfigPath();
   try {
     const config = JSON.parse(await readFile(path, 'utf-8'));
@@ -203,7 +208,7 @@ export async function loadConfig() {
     // so a config written before the field existed — or edited by hand — is given
     // ids here, before anything can read one. The next save persists them.
     ensureAccountIds(config.accounts);
-    applyUpstreamProxy(config);
+    if (applyProxy) applyUpstreamProxy(config);
     return config;
   } catch (err) {
     if (err.code === 'ENOENT') return null;

@@ -453,6 +453,50 @@ A status read, a TUI paint, the quota poll behind the status line and the openin
 
 The event stays recorded on the account. The first request that can be sent both there and to the cursor's account acts on it, ranked on the window governing that request. Acting on it can mean staying. The band that refuses the move covers the fleet the cursor serves and not this attempt's reach, so it holds the accounts the request's provider partition leaves that are available for its models, the ones already tried included, since that cursor also serves the requests behind this one. A request that also names an advisor model is admitted on both models, by the same test that selection applies. So it spends the event only onto an account it could itself be sent to. Where no account the request can be sent to serves the advisor model, selection routes on the main model alone. The switch follows it there, so advisor traffic can still spend a reset. The flag is not in the quota state the proxy saves, and the poll that raised it already cleared the window, so a restart drops the event. Startup then places traffic by the ranking any start uses, owed nothing, the cursor included.
 
+## Session move advice
+
+With `sessionAdvice` on, the proxy answers, for one Claude Code session, whether moving it to another account is worth it. It only advises: moving is the operator's [`teamclaude switch <account> --session`](#move-one-running-session).
+
+```json
+"sessionAdvice": { "enabled": true, "maxContextTokens": 150000, "cooldownMinutes": 60, "ask": false }
+```
+
+```bash
+curl -s 'http://127.0.0.1:3456/teamclaude/session-advice?session=<x-claude-code-session-id>'
+```
+
+```json
+{ "session": "…", "account": "a", "via": "affinity", "context": 42300,
+  "advice": { "enabled": true, "ask": false },
+  "recommendation": { "to": "b", "reread": 42300 }, "reason": "out-of-band" }
+```
+
+`account` is the session's manual pin (`via: "manual"`) or else the account its conversations are pinned to (`via: "affinity"`). Among the session's conversations seen within two minutes of its last request, the one with the largest context prices the move. `context` is that conversation's last prompt size (cache read, cache write and uncached input), and `reread` is the same figure: an estimate of what the destination re-reads without the prompt cache. A later side conversation on a smaller model does not change the account shown. A conversation brought back by [affinity across restarts](#affinity-across-restarts) keeps its pin but no token figures, so until its next response `context` and `reread` are `null` and the ceiling below is not applied.
+
+A move made this way is not compacted first. [`compactBeforeSwitch`](#compact-before-a-switch) asks a conversation only ahead of a rotation and never asks a request that a session pin holds, so the destination re-reads the conversation at the size `reread` gives. Compacting the session first (`/compact` in Claude Code) is what makes it smaller.
+
+`reason` is the first of these that applies:
+
+| `reason` | Recommendation | When |
+|---|---|---|
+| `disabled` | none | `sessionAdvice.enabled` is not `true` |
+| `unknown-session` | none | the proxy has no pin and no live conversation for that id |
+| `pinned-unavailable` | when an account can take it | the session is manually pinned to an account its requests are not forwarded to: one over a `maxUsage` or spend cap, one whose plan is refusing the model, a subscription of another provider, or an account that no longer exists. A manual pin never fails over, so every request fails and this is advised past every check below, expiry routing off included. A pinned account that is disabled, throttled, over its switch threshold or excluded by a route is still sent the session's requests (a rate-limit pause only delays them), so it is judged by the rules below like any other. The check is made for the conversation's own model only: a family cap on an advisor model the session's requests declare can still bar them while the advice reads the pin as serving |
+| `expiry-routing-off` | none | [`expiryRouting`](#expiry-pressure-routing) is off, so there is no pressure band to leave |
+| `cooldown` | none | the session was moved or the advice declined less than `cooldownMinutes` ago |
+| `context-over-ceiling` | none | `context` is over `maxContextTokens`: the re-read costs more than the move gains |
+| `current-unavailable` | none | the account cannot serve, and the router decides where the session's next request goes: another account, or, under an [extra-usage preference](quota.md#extra-usage-fallback), the same account spending credits. A [cordoned](usage.md#cordoning-one-account) account counts as serving here, since it keeps the conversations already on it; the band leaves it out, so its sessions read `out-of-band` |
+| `router-moves` | none | the router itself moves the session on its next request, judged in the router's order. A manual [route pin](#model-routes) for the session's model to an available account decides alone: `router-moves` exactly when it names another account. Without one, an available account of the session's provider with a higher priority (a lower `priority` number) preempts it in every distribution mode (with distribution off, not while the account is the operator's `teamclaude switch` choice), and with `distributeSessions` on, no route pin at all and an account that is not cordoned, so does the [reclaim window](#the-reclaim-window). A [cordoned](usage.md#cordoning-one-account) account keeps the session unless a route pin names a healthy account that cannot serve, in which case the fleet walk leaves it. A session pin would only hold the session where it is, since a pin never fails over and neither preemption nor reclaim moves one. Not anticipated: a governing-window rollover under `expiryRouting.preempt` (the session can read `out-of-band` for the one request before the router moves it); the advisor model's family cap and route pin, since the check uses the conversation's own model only, so the advice can say `router-moves` while the router keeps the session; and the routes of a restored conversation, which has no model on record until its next request |
+| `in-band` | none | the account is in the top pressure band |
+| `out-of-band` | yes | the account left the band; `to` is the account session placement would give a new conversation of that model in the configured `distributeSessions` mode (the even walk when it is off). On a route-pinned session the move is still made: a session pin resolves before selection, where route pins are read, so it overrides the route pin for that session |
+| `no-destination` | none | out of the band, but no other account can take the session |
+
+A successful `POST /teamclaude/session-pin` starts the cooldown while the feature is on. `POST /teamclaude/session-advice/decline` with `{"sessionId": "<id>"}` starts it without moving and answers `{"ok": true, "recorded": true}`, or `"recorded": false` with the feature off. Cooldowns live in the server's memory and are gone on a restart. `ask` is echoed under `advice` for clients that want to ask before moving.
+
+The destination is judged on the model of the conversation that prices the move. On a fleet whose [`routes`](#model-routes) restrict accounts by model, it may not serve the session's other model families. A restored conversation has no model on record until its next request; it is placed in the bucket of its newest pin, and no destination is named unless that is the shared weekly bucket on a fleet with no `routes` and no `models` claims.
+
+Both endpoints are refused with `403` for a caller holding a [client key](configuration.md): the answer names a session's account and context size. The shared `proxy.apiKey` and key-exempt loopback callers are allowed.
+
 ## Pin a session to one account
 
 `TC_ACCT` forces every request onto **one** account, bypassing rotation (and never failing over to another, except along a [list of API-key accounts](#a-list-of-api-key-accounts) when billing refuses one). It works in **both** modes — MITM (the default) and `--no-mitm`:

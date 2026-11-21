@@ -80,9 +80,11 @@ It is a setting, not a nudge: the number is written to the config file (under it
 
 You usually don't need to call it directly. `login`, `import`, `enable`, `disable`, `cordon`, `uncordon`, `priority`, `ends`, `route`, `threshold`, `distribute`, `probe` and `warmup` notify a running server themselves.
 
-Control-plane **writes** (`reload`, `switch`, `session-pin`, `threshold`, `priority`, `disable`, `account-cordon`, `account-release`) are refused when the request carries a browser `Origin` or a cross-site `Sec-Fetch-Site`. Loopback is exempt from the proxy API key so the CLI needs no configuration, but that exemption also covers any web page you happen to visit: a page can POST to `127.0.0.1` cross-origin without a preflight, and while it cannot read the reply, the write would still land. `curl` and the CLI send neither header and are unaffected. Reads (`status`) are not restricted — the same-origin policy already stops a page from seeing the response.
+Control-plane **writes** (`reload`, `switch`, `session-pin`, `session-advice/decline`, `threshold`, `priority`, `disable`, `account-cordon`, `account-release`) are refused when the request carries a browser `Origin` or a cross-site `Sec-Fetch-Site`. Loopback is exempt from the proxy API key so the CLI needs no configuration, but that exemption also covers any web page you happen to visit: a page can POST to `127.0.0.1` cross-origin without a preflight, and while it cannot read the reply, the write would still land. `curl` and the CLI send neither header and are unaffected. Reads (`status`) are not restricted — the same-origin policy already stops a page from seeing the response.
 
 `GET /teamclaude/quota` is the compact read endpoint for status-line integrations. It returns tier-weighted fleet aggregates and the underlying per-account limits; see [Fleet quota endpoint](quota.md#fleet-quota-endpoint).
+
+`GET /teamclaude/session-advice?session=<id>` answers which account one session is on and whether to move it, and `POST /teamclaude/session-advice/decline` holds that advice; see [Session move advice](routing.md#session-move-advice). Both are refused for a client key.
 
 Switching the account by hand has the same headless path — the equivalent of pressing **s** in the TUI and confirming with the default target selected:
 
@@ -92,7 +94,9 @@ teamclaude switch me@example.com  # make that account the preferred one
 teamclaude switch me@example.com --session   # move only the session this runs in
 ```
 
-`--session [<id>]` moves one session instead of the fleet; see [Move one running session](routing.md#move-one-running-session).
+`--session [<id>]` moves one session instead of the fleet; see [Move one running session](routing.md#move-one-running-session). `teamclaude switch --session [<id>] --to <account>` does the same with the account last, and must be exactly that: the account is the last word, taken as given even when it starts with `-`, and the id, when given, is the one word between `--session` and `--to`. Anything else with `--to`, a word after the account included (an account name with spaces left unquoted), is an error and pins nothing. With no account, `teamclaude switch --session` prints that session's account, each account's weekly usage, any move advice and its `reason`, and when a move is recommended a `move command: teamclaude switch --session <id> --to <account>` line, the account as one shell word, to run exactly as printed (`--json` prints the raw [session advice](routing.md#session-move-advice), without that line); `teamclaude switch --session --stay` declines the advice for `cooldownMinutes`; `--stay` with an account or `--clear` is a usage error.
+
+With `--session`, the account may also be given as any part of its display name, in any letter case, when exactly one account contains it: `limit5` for `team-limit5@example.com`. An exact name, email or UUID always wins over a partial match, the full name is what gets pinned, and a part several accounts share is refused with the accounts it matched. The fleet-wide `switch <account>` takes exact names only.
 
 Both forms need a running server: the choice is runtime state and is never written to the config, so there is nothing to apply on a later restart. The command wraps `POST /teamclaude/switch` with a `{"account": "<name>"}` body, and the account can be given as its display name, its bare email, its `accountUuid`, its `orgUuid`, or the fully qualified `accountUuid/orgUuid` — the last being the only form that tells apart one email that holds accounts in several orgs. The rotation index is deliberately not accepted — it is array position, so a script pinned to `1` would silently follow a different account after a removal.
 
@@ -119,6 +123,70 @@ curl -X POST http://localhost:3456/teamclaude/account-cordon \
 ```
 
 `POST /teamclaude/priority` takes `{"account", "place": "first" | "last"}` or `{"account", "priority": <integer>}`; `POST /teamclaude/disable` takes `{"account", "disabled": true | false}`. Both accept an optional `"org"` (name or uuid) for an email that holds accounts in several orgs — an ambiguous name is refused rather than guessed. Unlike `switch`, these are config **writes**: the change is saved to the config file under the same lock the TUI uses, and the server reloads itself afterwards, so it survives a restart. `place` is relative — `first` lands one below the lowest priority in the fleet, `last` one above the highest — and the reply carries the account as it now stands (`{"ok": true, "name": ..., "priority": ...}` or `{"ok": true, "name": ..., "disabled": ...}`), so a caller learns the number it did not choose. `POST /teamclaude/account-cordon` takes `{"account", "cordoned": true | false}` (see [Cordoning one account](#cordoning-one-account)) and answers the same way, plus `remaining`, the conversations still on the account, and `inService`, how many other accounts of its provider are neither disabled nor cordoned. An unknown or ambiguous account, or a priority that is not an integer, is a `400` with the reason; a write that landed but whose reload failed is a `500` that says so, since the file did change. A request authenticated with a `proxy.clientKeys` entry is refused with `403`: a client key is for using the fleet, not for changing which accounts it contains. Use the shared proxy key, or call from the proxy's own machine.
+
+### Claude Code status line and Stop hook
+
+Two commands read the JSON Claude Code passes on stdin and answer from the running server. Neither can fail Claude Code: stdin is read for at most a second and 256 KiB, each server read gives up after a second, and both exit 0. They take only the proxy port and key from the config, so a bad egress proxy setting does not stop them.
+
+- `teamclaude statusline`, for `statusLine`, prints one line: the session's account (`(pinned)` for a manual pin), each account's weekly usage, and the move the server advises, if any — `on a | a 90% · b 25% | move to b`, or `pinned account unavailable, move to b` when the session's requests are not forwarded to its pinned account ([`pinned-unavailable`](routing.md#session-move-advice)). Account names are printed on one line, control characters removed. Without the session's account it prints `session unknown | fleet 40% | a 90% · b 25%`; with no server, `teamclaude offline`. With `sessionAdvice` off it still shows the account and usage.
+- `teamclaude stop-hook`, for the `Stop` hook, prints a hook answer when the advice newly applies, and nothing otherwise or while `sessionAdvice` is off. An `out-of-band` move is announced once until the advice goes away; a change of destination alone is not announced again. A `pinned-unavailable` pin is announced once per pinned account, and again only after the pin has moved to another account that serves. Nothing is announced for `router-moves`, where the router moves the session itself. Suggested moves use the `teamclaude switch --session --to <account>` form, with the account as one shell word, single-quoted unless it is plain. The word is the name with control characters removed and runs of whitespace collapsed, so for a name that has either the printed command names the cleaned name, which matches no account unless one is called exactly that, and fails. The answer is `{"systemMessage": "…"}`; with `sessionAdvice.ask` on, an `out-of-band` move is `{"decision": "block", "reason": "…"}` instead, asking Claude to offer the user the move or `--stay`. A dead pin is never a `block`, since the turn Claude would continue goes to the same account.
+
+The session id is stdin's `session_id`; when the proxy does not know it, `$CLAUDE_CODE_SESSION_ID` is tried. Whether either equals the `x-claude-code-session-id` header the proxy keys sessions by is not established. The Stop hook keeps one file per session, `<session_id>.json` holding `{"outOfBand", "pinnedAnnounced"}`, in `teamclaude-advice/` under the OS temp directory, created mode `0700`; a directory with other permissions or another owner is not used. Files are left for the OS's temp cleanup. Both commands read with the proxy key, so they need the shared `proxy.apiKey` or a key-exempt loopback caller, not a client key.
+
+### Install the Claude Code surfaces
+
+The status line, the Stop hook and the `/switch` skill are assets of this repository and are not wired up by installing the package. They read the session advice, so the server must have `sessionAdvice` on.
+
+1. Make `teamclaude` run this code: `npm link` in the clone, or `node <clone>/src/index.js` wherever the examples below say `teamclaude`.
+2. Link the skill. `claude-code/` is not in the npm package (`package.json` `files` lists only `src/`), so link it from a clone:
+
+   ```bash
+   mkdir -p ~/.claude/skills
+   ln -s <clone>/claude-code/skills/switch ~/.claude/skills/switch
+   ```
+
+   The skill is `/switch`, or `/switch <account>` to move the session without being asked.
+3. Add the status line and the Stop hook to `~/.claude/settings.json`, merging with what is already there:
+
+   ```json
+   {
+     "statusLine": { "type": "command", "command": "teamclaude statusline" },
+     "hooks": {
+       "Stop": [
+         { "hooks": [{ "type": "command", "command": "teamclaude stop-hook" }] }
+       ]
+     }
+   }
+   ```
+
+4. Turn the advice on in the teamclaude config. A move recommendation also needs `expiryRouting`; the pinned-account-unavailable warning does not.
+
+   ```json
+   {
+     "sessionAdvice": { "enabled": true },
+     "expiryRouting": { "enabled": true }
+   }
+   ```
+
+   Add `"ask": true` to `sessionAdvice` to have the Stop hook ask Claude to offer the move. See [Session move advice](routing.md#session-move-advice).
+
+The skill's frontmatter, `$ARGUMENTS` substitution, inline `!` command and `allowed-tools` field, and the `statusLine` and `Stop` hook settings shapes, follow the Claude Code docs for [skills](https://code.claude.com/docs/en/skills), [status line](https://code.claude.com/docs/en/statusline) and [hooks](https://code.claude.com/docs/en/hooks). The skill pre-approves only `Bash(teamclaude switch --session *)`, and every command it runs starts that way, with the account last behind `--to`. `/switch <account>` takes everything after the command as one account name (Claude Code substitutes `$ARGUMENTS` as typed, and the skill single-quotes it), so a name with spaces needs no quotes, and an extra word makes a name that matches no account and fails. How Claude Code's permission matcher treats shell operators (`;`, `&&`, `|`, `#`, a substitution) inside a command that starts with that prefix is not verified here.
+
+#### Manual checklist: not yet verified
+
+None of the nine checks below has been run in a real Claude Code session. No item is claimed to pass. Run them in order and record the result of each; a failed item switches to the fallback beside it.
+
+1. `/switch` appears as a personal skill. NOT verified.
+2. The skill's inline `!` command sees `$CLAUDE_CODE_SESSION_ID`. NOT verified. Fallback: the skill runs `teamclaude switch --session` through the shell tool, whose environment the CLI already relies on.
+3. The Stop hook's `systemMessage` is shown to the user as one line and does not enter the model's context. NOT verified. If it is not shown, the turn-end notice is unmet: the status line keeps showing the advice, but it does not count as that notice.
+4. With `sessionAdvice.ask` on, Claude asks once. NOT verified.
+5. `/switch` without an argument shows the account, usage and advice, then asks for a choice. NOT verified. Fallback if the AskUserQuestion tool is not used: Claude lists the choices as plain text.
+6. After `/switch B`, the next request goes to B and the status line shows B. NOT verified.
+7. The account in the status line equals the one `teamclaude switch --session` prints for the same session. NOT verified. This is the check that stdin's `session_id` equals the proxy's session id (the `x-claude-code-session-id` header). If the id cannot be resolved, the status line shows fleet usage with `session unknown`, and the status line and Stop hook checks are met only in part.
+8. With the pinned account blocked so that a turn ends in an API error: whether the Stop hook runs, and whether the status line shows the `pinned-unavailable` warning. NOT verified. The status line is the reliable surface for that warning.
+9. The skill's `allowed-tools` rule approves `teamclaude switch --session --to <account>` without a prompt, and still prompts for a command that adds a shell operator after that prefix (for example `teamclaude switch --session --to b; teamclaude switch b`). NOT verified. Fallback: leave the prompt on by removing `allowed-tools`.
+
+Also unverified: whether the Stop hook's stdin carries the model (the server records it instead), and whether a hook or status line command sees `CLAUDE_CODE_SESSION_ID` in its environment.
 
 ### TUI keyboard shortcuts
 
@@ -216,6 +284,8 @@ teamclaude attach            # Open the live dashboard against a running server
 teamclaude dashboard         # Open the web dashboard in the browser (needs server)
 teamclaude service install   # Run the proxy as a login service (uninstall/status/print)
 teamclaude switch [name]     # Prefer an account; no name lists them (needs server)
+teamclaude statusline        # Claude Code status line: account, usage, move advice
+teamclaude stop-hook         # Claude Code Stop hook: notice when move advice applies
 teamclaude remove <name>     # Remove an account (by name or email)
 teamclaude disable <name>    # Temporarily exclude an account from rotation
 teamclaude enable <name>     # Re-enable it (also clears a stuck error state)

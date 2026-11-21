@@ -181,3 +181,29 @@ test('an ordinary Anthropic path still draws on the Anthropic pool', async () =>
     assert.equal(seen[0].url, '/v1/messages');
   });
 });
+
+// A same-account hop (ctx.hopTo) can find its pin reindexed onto a subscription of
+// another provider by a reload during the retry wait; it is still refused with 400.
+test('a pinned hop onto a subscription of another provider is answered 400', async () => {
+  const { forwardRequest } = await import('../src/server.js');
+  const am = new AccountManager([codex('cx')], 0.98, { refreshFn: async () => { throw new Error('no refresh'); } });
+  const host = http.createServer(async (req, res) => {
+    const ctx = {
+      account: null, status: null, tried: new Set(), reauthed: new Set(), hopTo: 0,
+      model: 'claude-opus-4-1', advisorModel: null, pinnedIndex: 0,
+      provider: 'anthropic', holdBudgetMs: 0, sessionId: null, client: null,
+      delivered: false, abandoned: false, onUsage: () => {}, stripHeaders: null, logLevel: 'off',
+    };
+    await forwardRequest(req, res, Buffer.from('{}'), am, 'http://127.0.0.1:9', 0, {}, 'req-1', ctx, null, null, undefined);
+  });
+  host.listen(0, '127.0.0.1');
+  await once(host, 'listening');
+  try {
+    const res = await fetch(`http://127.0.0.1:${/** @type {any} */ (host.address()).port}/v1/messages`, { method: 'POST', body: '{}' });
+    assert.equal(res.status, 400);
+    assert.match((await res.json()).error.message, /Pinned account "cx" is a codex subscription and cannot serve a anthropic request/);
+  } finally {
+    host.closeAllConnections();
+    host.close();
+  }
+});

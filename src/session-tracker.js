@@ -201,7 +201,8 @@ export class SessionTracker {
     this._routedCounts = new Map();
     // id -> { pins: Map<bucketKey, { idx, at }>,
     //         refs: Map<bucketKey, Observation>,
-    //         firstSeen, lastSeen, count, inFlight, tokens: Map<bucketKey, ...> }
+    //         firstSeen, lastSeen, count, inFlight, tokens: Map<bucketKey, ...>,
+    //         model: the model of the last request routed for it, or null }
     this.sessions = new Map();
     this.knownTtlMs = knownTtlMs ?? SESSION_KNOWN_TTL_MS;
     this.activeTtlMs = activeTtlMs ?? SESSION_ACTIVE_TTL_MS;
@@ -553,6 +554,7 @@ export class SessionTracker {
         conversation: null,
         client: null,
         dimensions: null,
+        model: null,
       };
       this.sessions.set(sessionId, s);
     }
@@ -847,6 +849,29 @@ export class SessionTracker {
       if (id === sessionId || s.sessionId === sessionId) return true;
     }
     return false;
+  }
+
+  // Every live conversation of a client session, matched the way knowsSession
+  // matches: a readout row plus its routed model and the bucket of its newest
+  // pin, which the status payload leaves out. A scan, for the control plane only.
+  /** @param {string|null} sessionId */
+  conversationsOf(sessionId, now = this._now()) {
+    if (!sessionId) return [];
+    const out = [];
+    for (const [id, s] of this.sessions) {
+      if (this._isExpired(s, now)) continue;
+      if (id !== sessionId && s.sessionId !== sessionId) continue;
+      let pinBucket = null;
+      let at = -Infinity;
+      for (const [bucket, pin] of s.pins) {
+        if (pin.at > at) {
+          at = pin.at;
+          pinBucket = bucket;
+        }
+      }
+      out.push({ ...sessionItem(id, s, this._isActive(s, now)), model: s.model, pinBucket });
+    }
+    return out;
   }
 
   // Drop sessions idle longer than the known window (but never one still in flight).

@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { AccountManager } from '../src/account-manager.js';
-import { createProxyServer } from '../src/server.js';
+import { accountsContaining, createProxyServer } from '../src/server.js';
 import { SessionPins, MAX_SESSION_PINS } from '../src/session-pins.js';
 import { SessionTracker } from '../src/session-tracker.js';
 import { renderStatus } from '../src/status-renderer.js';
@@ -159,6 +159,46 @@ test('the endpoint validates its body and says when it has not seen the session'
   });
 });
 
+test('a part of a name that names one account pins it; one that names several, or none, does not', async () => {
+  const ctx = await proxyWith([apikey('me@example.com'), apikey('team-limit4@example.com'), apikey('team-limit5@example.com (Acme)')]);
+  await quietly(async () => {
+    try {
+      for (const part of ['team-limit5', 'Team-Limit5', 'limit5', 'T5@', 'acme']) {
+        const one = await pin(ctx.port, { sessionId: SESSION, account: part });
+        assert.equal(one.status, 200, part);
+        assert.equal(one.body.account, 'team-limit5@example.com (Acme)', 'the full name is what is pinned');
+      }
+      const several = await pin(ctx.port, { sessionId: OTHER, account: 'limit' });
+      assert.equal(several.status, 409);
+      assert.match(several.body.error, /several accounts/);
+      assert.deepEqual(several.body.matches, ['team-limit4@example.com', 'team-limit5@example.com (Acme)']);
+
+      const none = await pin(ctx.port, { sessionId: OTHER, account: 'limit6' });
+      assert.equal(none.status, 404);
+      assert.equal(none.body.accounts.length, 3);
+      assert.equal(ctx.am.sessionPins.peek(OTHER), null, 'no refusal pinned anything');
+    } finally {
+      ctx.close();
+    }
+  });
+});
+
+test('a whole name wins over the names that contain it', async () => {
+  const ctx = await proxyWith([apikey('aa@example.com'), apikey('a@example.com')]);
+  await quietly(async () => {
+    try {
+      const exact = await pin(ctx.port, { sessionId: SESSION, account: 'a@example.com' });
+      assert.equal(exact.status, 200);
+      assert.equal(exact.body.account, 'a@example.com');
+      assert.deepEqual(accountsContaining(ctx.am, 'A@EXAMPLE'), [0, 1]);
+      assert.deepEqual(accountsContaining({ accounts: [{}, { name: '' }] }, 'x'), []);
+      assert.deepEqual(accountsContaining(ctx.am, '  '), []);
+    } finally {
+      ctx.close();
+    }
+  });
+});
+
 test('a client key is refused; the shared proxy key is not', async () => {
   const ctx = await proxyWith([apikey('a'), apikey('b')], { clientKeys: [{ name: 'ci', key: 'ci-key' }] });
   await quietly(async () => {
@@ -230,4 +270,17 @@ test('SessionTracker.knowsSession matches the session behind a conversation key'
   tracker.touch(OTHER);
   assert.equal(tracker.knowsSession(OTHER), true, 'a key with no conversation is the session id itself');
   assert.equal(tracker.knowsSession(null), false);
+});
+
+test('SessionPins.peek reads a pin without extending its lifetime', () => {
+  let now = 1_000;
+  const pins = new SessionPins({ ttlMs: HOUR, now: () => now });
+  pins.set(SESSION, 'b');
+  now += HOUR;
+  assert.equal(pins.peek(SESSION), 'b');
+  assert.equal(pins.pins.get(SESSION)?.lastUsed, 1_000, 'a peek is not use');
+  now += 1;
+  assert.equal(pins.peek(SESSION), null, 'idle past the window, however often it was peeked');
+  assert.equal(pins.peek(null), null);
+  assert.equal(pins.peek(OTHER), null);
 });
