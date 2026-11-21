@@ -130,6 +130,23 @@ test('a re-import onto a tokenless entry does not rewrite a live account', async
   assert.equal(am.accounts[0].orgUuid, 'org-b');
 });
 
+// An import whose account is named after an API-key account turned the key's
+// entry into an OAuth one that still held the key. It is refused instead, and
+// nothing changes, on the screen or on disk.
+test('a TUI import named after an API-key account is refused, and changes nothing', async () => {
+  const { tui, am, config, saved } = await makeTUI([{ name: 'a@example.com', type: 'apikey', apiKey: 'k-a' }]);
+  tui._readCredentials = async () => ({ accessToken: 'at-imported', refreshToken: 'rt-imported', expiresAt: Date.now() + 8 * 3_600_000 });
+  tui._readProfile = async () => ({ accountUuid: 'ua', orgUuid: 'oa', email: 'a@example.com' });
+
+  await tui._doImport();
+
+  assert.deepEqual(config.accounts.map(a => [a.name, a.type, a.apiKey, a.accessToken]), [['a@example.com', 'apikey', 'k-a', undefined]]);
+  assert.deepEqual(am.accounts.map(a => [a.name, a.type]), [['a@example.com', 'apikey']]);
+  assert.deepEqual(saved, []);
+  assert.ok(tui.log.some(e => e.msg.includes('Import refused: "a@example.com" already names an API-key account; remove or rename that account first')),
+    tui.log.map(e => e.msg).join('\n'));
+});
+
 test('an account imported from the TUI pairs with the entry that created it', async () => {
   const { tui, am, config } = await makeTUI(droppedEntryAhead());
 

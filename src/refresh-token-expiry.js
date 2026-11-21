@@ -4,10 +4,11 @@
 // and a rotation does not extend it (issue #674): the account then fails with
 // `invalid_grant` / "Refresh token expired" and needs a new login. The date is
 // the one that was STATED — by the token endpoint, or by the credential file an
-// account was imported from. One case is assumed, exactly as Claude Code does
-// it: a Claude sign-in whose response states no lifetime is given 30 days
-// (signInRefreshTokenExpiry). A refresh assumes nothing, and neither does any
-// other provider; an account without a date simply shows none.
+// account was imported from. One case is assumed, with the 30-day fallback
+// Claude Code uses: a Claude sign-in whose response states no lifetime is given
+// 30 days (signInRefreshTokenExpiry). One whose response states a lifetime that
+// cannot be believed is given none. A refresh assumes nothing, and neither
+// does any other provider; an account without a date simply shows none.
 //
 // The date describes one refresh-token family. It follows a rotation (the same
 // sign-in, a new token), is replaced by a new sign-in, and is never carried
@@ -28,16 +29,23 @@ const MAX_AHEAD_MS = 10 * 365 * DAY_MS;
 const MAX_PAST_MS = DAY_MS;
 
 /**
- * A stored expiry (epoch ms) when it is one, else null. The config file and the
- * status payload are both read from outside this process.
+ * A stored expiry (epoch ms) when it is one, else null. The config file, the
+ * credential store and the status payload are all read from outside this
+ * process.
  * @param {unknown} value
+ * @param {number} [now]
  * @returns {number|null}
  */
-export function knownRefreshTokenExpiry(value) {
+export function knownRefreshTokenExpiry(value, now = Date.now()) {
   // Epoch milliseconds only: below 1e11 is epoch seconds (or a count of
-  // something), which would read as 1973 and warn "expired" for ever, and
-  // above 8.64e15 is no date at all.
-  return typeof value === 'number' && value >= 1e11 && value <= 8.64e15 ? value : null;
+  // something), which would read as 1973 and warn "expired" for ever. And no
+  // further out than a stated date may be (refreshTokenExpiryFromResponse):
+  // beyond that is no refresh token's date, and kept, it would hide the real
+  // one's approach for as long as the refreshes state no lifetime, since a
+  // refresh that states none keeps the date it holds.
+  // Long past is still a date here, unlike in a response: a token that has
+  // expired keeps the date it expired on, which status shows.
+  return typeof value === 'number' && value >= 1e11 && value <= now + MAX_AHEAD_MS ? value : null;
 }
 
 /** @param {unknown} v @returns {number|null} a finite number from a number or a numeric string */
@@ -56,7 +64,9 @@ function numberOf(v) {
  * from this endpoint, at sign-in and at refresh. `refresh_token_expires_at`,
  * the other common spelling (epoch seconds, epoch milliseconds, or an ISO
  * date), is read too, for a provider that uses it. A response with neither
- * yields null; what a sign-in does then is signInRefreshTokenExpiry's.
+ * yields null; what a sign-in does then is signInRefreshTokenExpiry's. One
+ * that states a date this does not believe yields null as well:
+ * statesRefreshTokenExpiry tells the two apart.
  *
  * @param {any} data  the parsed response body
  * @param {number} [now]
@@ -87,6 +97,20 @@ export function refreshTokenExpiryFromResponse(data, now = Date.now()) {
 }
 
 /**
+ * Whether a token-endpoint response states a refresh-token lifetime at all, in
+ * either spelling, believable or not. A field that is absent or null states
+ * nothing. A sign-in whose response states one that refreshTokenExpiryFromResponse
+ * rejects (further out than any token lives, 0, long past) is given no date: the
+ * provider did say something, and it was not 30 days.
+ * @param {any} data  the parsed response body
+ * @returns {boolean}
+ */
+export function statesRefreshTokenExpiry(data) {
+  return !!data && typeof data === 'object'
+    && (data.refresh_token_expires_in != null || data.refresh_token_expires_at != null);
+}
+
+/**
  * How long a Claude refresh token is taken to live when the sign-in that issued
  * it stated no lifetime: 30 days, the figure Claude Code itself falls back to
  * for `refreshTokenExpiresAt` at login (and only at login). The accounts
@@ -96,8 +120,11 @@ export const ASSUMED_SIGN_IN_LIFETIME_MS = 30 * DAY_MS;
 
 /**
  * The tokens a Claude SIGN-IN returned, with the date its refresh token lapses:
- * the one the response stated, else 30 days from now, as Claude Code records
- * it. Tokens with no refresh token have nothing to lapse and get no date.
+ * the one they carry, else 30 days from now, the fallback Claude Code uses.
+ * Only for a sign-in whose response stated no lifetime (statesRefreshTokenExpiry):
+ * one that stated a lifetime keeps what it stated, or no date when that could
+ * not be believed (see exchangeCodeForTokens). Tokens with no refresh token
+ * have nothing to lapse and get no date.
  *
  * An assumed date that turns out wrong corrects itself: a refresh that succeeds
  * after it drops it (withFamilyExpiry).

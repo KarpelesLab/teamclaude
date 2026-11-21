@@ -484,6 +484,22 @@ test('the server logs one line per account per day while a known date is close',
   ]);
 });
 
+// The once-a-day memory is per account, and an account removed takes its entry
+// with it: one added back (removed and signed in again) is warned at once.
+test('the log line forgets an account once it is gone, and warns an account added back at once', () => {
+  let clock = NOW;
+  /** @type {string[]} */
+  const logged = [];
+  const warn = createRefreshTokenExpiryWarner({ log: (l) => logged.push(l), now: () => clock });
+  const account = { id: 'a', name: 'soon@x.com', type: 'oauth', status: 'active', refreshTokenExpiresAt: NOW + 3 * DAY };
+  assert.equal(warn([account]).length, 1);
+  clock += H;
+  assert.deepEqual(warn([]), []);
+  clock += H;
+  assert.equal(warn([account]).length, 1, 'the day since its last line restarts with the account');
+  assert.equal(logged.length, 2);
+});
+
 test('the log line follows the account: a new sign-in ends it, a name cannot break it', () => {
   let clock = NOW;
   const warn = createRefreshTokenExpiryWarner({ log: () => {}, now: () => clock });
@@ -510,4 +526,22 @@ test('a refresh that succeeds after the held date drops that date', () => {
 test('a stored value that is not epoch milliseconds is not a date', () => {
   for (const bad of [1796083200, 1e300, 8.64e15 + 1, -1, NaN, '1796083200000']) assert.equal(knownRefreshTokenExpiry(bad), null, String(bad));
   assert.equal(knownRefreshTokenExpiry(1796083200000), 1796083200000);
+});
+
+// A stored date (the config, an imported file, a row of the credential store)
+// is held to the ceiling a stated one is: further out than any refresh token
+// lives is no date of one, and kept, it hid the real date's approach for as
+// long as the refreshes stated no lifetime, since a refresh that states none
+// keeps the date it holds. Long past is still a date:
+// a token that has expired keeps the date it expired on.
+test('a stored date further out than any refresh token lives is not a date; a long-past one still is', () => {
+  assert.equal(knownRefreshTokenExpiry(NOW + 30 * DAY, NOW), NOW + 30 * DAY);
+  assert.equal(knownRefreshTokenExpiry(NOW + 11 * 365 * DAY, NOW), null);
+  assert.equal(knownRefreshTokenExpiry(NOW - 40 * DAY, NOW), NOW - 40 * DAY);
+  const now = Date.now();
+  assert.equal(knownRefreshTokenExpiry(8.64e15), null);
+  assert.equal(knownRefreshTokenExpiry(now + 11 * 365 * DAY), null);
+  assert.equal(refreshTokenExpiryView(8.64e15, now), null);
+  const blob = encodeBlob({ name: 'a', type: 'oauth', accountUuid: 'u', orgUuid: 'o' }, { accessToken: 'at', refreshToken: 'rt', expiresAt: now + 8 * H }, { now, by: 'box' });
+  assert.equal('refreshTokenExpiresAt' in /** @type {object} */ (decodeBlob(JSON.stringify({ ...blob, refreshTokenExpiresAt: 8.64e15 }))), false);
 });

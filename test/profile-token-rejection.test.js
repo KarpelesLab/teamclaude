@@ -241,6 +241,27 @@ test('the renewal an import needs goes through the renew the caller hands in', a
   assert.equal(profile.error, undefined);
 });
 
+// The renewal an import makes is a rotation of the token it came with: the
+// refresh token's date stays, unless the response states an earlier one. A
+// renewal that brings no date (a token another install stored, say) is another
+// family, and the date the import came with is not copied onto it (#674).
+test('an import renewed first keeps the date its refresh token came with; a renewal that brings none keeps none', async () => {
+  const held = Date.now() + 6 * 86_400_000;
+  const up = upstream({
+    profiles: { 'new-at': identified },
+    refresh: () => reply(200, { access_token: 'new-at', refresh_token: 'new-rt', expires_in: 3600 }),
+  });
+  const creds = { accessToken: 'old-at', refreshToken: 'old-rt', expiresAt: Date.now() - 60_000, refreshTokenExpiresAt: held };
+  const { creds: rotated } = await withFetch(up.fetch, () => profileForCredentials(creds));
+  assert.equal(rotated.refreshToken, 'new-rt');
+  assert.equal(rotated.refreshTokenExpiresAt, held);
+
+  const renew = async () => ({ accessToken: 'new-at', refreshToken: 'their-rt', expiresAt: Date.now() + 3600_000 });
+  const { creds: theirs } = await withFetch(upstream({ profiles: { 'new-at': identified } }).fetch, () => profileForCredentials(creds, null, { renew }));
+  assert.equal(theirs.refreshToken, 'their-rt');
+  assert.equal('refreshTokenExpiresAt' in theirs, false);
+});
+
 // Under a lock that lapses, the grant may not go out once its time is spent.
 test('a refresh with its budget spent is never sent, and a retry is not sent past it', async () => {
   const up = upstream({ refresh: () => reply(503, {}) });

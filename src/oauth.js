@@ -11,7 +11,7 @@ import { LOGIN_TIMEOUT_MS, codeRace, openBrowser, pasteFromTerminal } from './lo
 import { safeLine } from './safe-text.js';
 import { resetRetryAt } from './reset-readings.js';
 import { anthropicLink } from './account-refusal.js';
-import { refreshTokenExpiryFromResponse, withFamilyExpiry, signInRefreshTokenExpiry } from './refresh-token-expiry.js';
+import { refreshTokenExpiryFromResponse, withFamilyExpiry, signInRefreshTokenExpiry, statesRefreshTokenExpiry } from './refresh-token-expiry.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
 const execFileAsync = promisify(execFile);
@@ -390,7 +390,8 @@ export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_
  * for the two spellings read and why. It is what THIS response said: a caller
  * refreshing a token it already has a date for keeps the earlier of the two
  * (withFamilyExpiry), and a new Claude sign-in takes it as it is, or assumes
- * one when none was stated (signInRefreshTokenExpiry, in exchangeCodeForTokens).
+ * one when the response stated none at all (signInRefreshTokenExpiry and
+ * statesRefreshTokenExpiry, in exchangeCodeForTokens).
  */
 export function tokenPairFromResponse(data, { previousRefreshToken = undefined, now = Date.now() } = {}) {
   const accessToken = data?.access_token;
@@ -921,14 +922,35 @@ const OAUTH_AUTHORIZE = 'https://claude.ai/oauth/authorize';
 const OAUTH_SCOPES = 'org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload';
 const MANUAL_LOGIN_REDIRECT_URI = 'https://console.anthropic.com/oauth/code/callback';
 // What `claude setup-token` asks for, and nothing else: the same flow on the
-// same client id and URLs, with the scope `user:inference` alone and
+// same client id and token endpoint, with the scope `user:inference` alone and
 // `expires_in` of one year (in seconds) on the code exchange. A token on that
 // scope serves inference only; see long-lived.js for what that leaves out.
 const LONG_LIVED_SCOPES = 'user:inference';
 const LONG_LIVED_EXPIRES_IN = 365 * 24 * 3600;
 
 /**
- * Exchange an OAuth authorization code for access/refresh tokens.
+ * The account a code exchange's response says its token was issued to, in the
+ * fields a profile fills (accountUuid, orgUuid, orgName): `account.uuid` and
+ * `organization.uuid`, with `organization.name`. A long-lived token cannot
+ * read its profile (long-lived.js), so this is the only identity its sign-in
+ * has. Empty unless the answer names both the account and its organization:
+ * findUpsertTarget takes an organization it is not told for a match, so an
+ * account alone would land on whichever of that person's organizations'
+ * entries came first. Such an answer is taken as naming no account.
+ * @param {any} data  the parsed response body
+ * @returns {{ accountUuid?: string, orgUuid?: string, orgName?: string }}
+ */
+function tokenResponseIdentity(data) {
+  const accountUuid = data?.account?.uuid;
+  const orgUuid = data?.organization?.uuid;
+  if (typeof accountUuid !== 'string' || !accountUuid || typeof orgUuid !== 'string' || !orgUuid) return {};
+  const orgName = data.organization.name;
+  return { accountUuid, orgUuid, ...(typeof orgName === 'string' && orgName && { orgName }) };
+}
+
+/**
+ * Exchange an OAuth authorization code for access/refresh tokens, with the
+ * account the response names as `issuedTo` (see tokenResponseIdentity).
  * Shared by both browser-callback and manual/paste login paths. With
  * `expiresIn`, asks for that lifetime and fails unless the expiry granted is
  * within a day of it, which absorbs rounding and clock skew on `expires_at`.
@@ -974,9 +996,12 @@ async function exchangeCodeForTokens(code, state, codeVerifier, redirectUri, tok
       : 'no usable expiry';
     throw new Error(`Token exchange granted ${granted}, short of the ${expiresIn}s requested`);
   }
-  // A sign-in dates its refresh token even when the response does not, as
-  // Claude Code does; see signInRefreshTokenExpiry.
-  return signInRefreshTokenExpiry(tokens);
+  // A sign-in dates its refresh token even when the response does not, with
+  // the 30-day fallback Claude Code uses; see signInRefreshTokenExpiry. One
+  // whose response states a lifetime keeps what it states, which is no date
+  // when that could not be believed.
+  const dated = statesRefreshTokenExpiry(data) ? tokens : signInRefreshTokenExpiry(tokens);
+  return { ...dated, issuedTo: tokenResponseIdentity(data) };
 }
 
 /**
@@ -1110,7 +1135,10 @@ function isLoopbackAddress(text, port) {
  * @param {boolean} [opts.longLived]  the `claude setup-token` request: a one-year
  *   token on LONG_LIVED_SCOPES, returned marked `longLived` and without any
  *   refresh token the response carries. Such a token is not refreshed, and a
- *   refresh would replace the year-long access token with a short one
+ *   refresh would replace the year-long access token with a short one. It
+ *   carries the account the response names, if it names it with its
+ *   organization (tokenResponseIdentity: accountUuid, orgUuid, orgName): its
+ *   sign-in has no other way to know which it is
  * @param {string} [opts.tokenEndpoint]
  */
 export async function startOAuthLogin({ loopback = true, routing = null, signal = null, timeoutMs = LOGIN_TIMEOUT_MS, exchange = exchangeCodeForTokens, longLived = false, tokenEndpoint = DEFAULT_TOKEN_ENDPOINT } = {}) {
@@ -1147,7 +1175,7 @@ export async function startOAuthLogin({ loopback = true, routing = null, signal 
   const tokens = race.result.then(answer => {
     console.log('Exchanging authorization code for tokens...');
     return exchange(answer.code, answer.state, codeVerifier, answer.redirectUri, tokenEndpoint, routing, longLived ? LONG_LIVED_EXPIRES_IN : undefined);
-  }).then(creds => (longLived ? { accessToken: creds.accessToken, expiresAt: creds.expiresAt, longLived: true } : creds));
+  }).then(creds => (longLived ? { accessToken: creds.accessToken, expiresAt: creds.expiresAt, ...creds.issuedTo, longLived: true } : creds));
   // Awaited by every caller; this only stops one that failed before awaiting
   // from leaving a later rejection unhandled, which would end the process.
   tokens.catch(() => {});

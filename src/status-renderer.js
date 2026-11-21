@@ -634,8 +634,9 @@ export function unavailableLine(account, paint) {
 
 /**
  * When the account's refresh token lapses and a new sign-in is due — only for
- * an account whose provider or imported credential file stated the date
- * (#674); most rows have none and get no line. Yellow, with the command, once
+ * an account with a known date: one its provider or imported credential file
+ * stated (#674), or the 30 days a Claude sign-in that stated none is given; a
+ * row with none gets no line. Yellow, with the command, once
  * it is within the warning window or past. A long-lived account gets the same
  * row for the token itself, which lapses a year after its login.
  * @param {any} account
