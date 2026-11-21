@@ -1368,8 +1368,10 @@ export class AccountManager {
    * With the preference in the fleet there are two answers. `fallback: false`
    * when the chosen account can serve normally: the operator's choice is in
    * charge, so the preference stands aside (_preferredExtraUsage) and the
-   * ordinary walk serves from it. `fallback: true` when it is past its
-   * threshold and is itself one of the accounts the preference would spend on
+   * ordinary walk serves from it, except where new conversations do not read
+   * the choice (_manualChoiceUnread): there this answers null and the
+   * preference stays. `fallback: true` when it is past its threshold and is
+   * itself one of the accounts the preference would spend on
    * (_preferredFallbackTier): the switch then keeps traffic on it rather than
    * on another preferred subscription. The switch never widens what may be
    * spent. A target without `preferExtraUsage`, one outranked by an API
@@ -1394,9 +1396,40 @@ export class AccountManager {
     if (this.accounts[account.index] !== account
         || this._currentIndexForProvider(provider) !== account.index) return null;
     if (exclude?.has(account.index)) return null;
-    if (this._isAvailable(account, model, advisorModel)) return { account, paid: false, fallback: false };
+    if (this._isAvailable(account, model, advisorModel)) {
+      return this._manualChoiceUnread(exclude, model, advisorModel, provider) ? null : { account, paid: false, fallback: false };
+    }
     const tier = this._preferredFallbackTier(account, exclude, model, advisorModel, provider);
     return tier ? { account, paid: tier === 'paid', fallback: true } : null;
+  }
+
+  /**
+   * Whether the operator's manual choice is one that new conversations do not
+   * read, in a fleet with `preferExtraUsage`. With distributeSessions on they
+   * are placed within the best priority tier, so an available choice that an
+   * account of strictly higher priority outranks for this request takes no
+   * new conversation; eligibility() reports such a switch as not taking
+   * effect, asking without a model, so for a model a route keeps off that
+   * account the two can differ.
+   *
+   * Such a choice does not set the preference aside (_manualSelection), or
+   * new conversations would move off the preferred subscription onto the
+   * higher-priority account's API capacity. And the preference's pick leaves
+   * the cursor where it is (_activateFallback), as placement does, so the
+   * recorded choice is still there if distribution is turned off.
+   *
+   * @param {Set<number>|null} exclude
+   * @param {string|null} model
+   * @param {string|null} advisorModel
+   * @param {string} provider
+   * @returns {boolean} */
+  _manualChoiceUnread(exclude, model, advisorModel, provider) {
+    const account = this._manualAccount;
+    if (!this.distributeSessions || !account || !this.accounts.some(a => a.preferExtraUsage)) return false;
+    if (providerOf(account) !== provider || this.accounts[account.index] !== account
+        || this._currentIndexForProvider(provider) !== account.index) return false;
+    if (exclude?.has(account.index) || !this._isAvailable(account, model, advisorModel)) return false;
+    return !!this._outrankedByPriority(account, model, advisorModel, this._excludeOtherProviders(exclude, provider));
   }
 
   /**
@@ -1990,7 +2023,8 @@ export class AccountManager {
    * names — so no other cursor behaviour changes, and to the account being
    * unavailable for ANY model, so an account barred only for one family keeps
    * the cursor (#276). The destination is what rotation would pick for general traffic,
-   * through the same helpers selectActiveAccount uses.
+   * through the same helpers selectActiveAccount uses: the preferred pool's
+   * pick where the extra-usage preference applies.
    *
    * @param {string} provider
    */
@@ -2003,7 +2037,14 @@ export class AccountManager {
     const partition = this._excludeOtherProviders(null, provider);
     const extra = this._preferredExtraUsage(partition, null, null, provider);
     if (extra && !extra.has(parked.index)) return;
-    const best = /** @type {Record<string, any>|null} */ (this._pickBestAvailable(partition, null));
+    // Where the preference applies, general traffic goes to its pool rather
+    // than to the best account that can serve normally (previewRouteIndex
+    // reads it the same way). Asked of _pickBestAvailable alone, a status
+    // read moved the cursor to an API key, and logged the switch, while the
+    // next request went to a preferred subscription.
+    const best = /** @type {Record<string, any>|null} */ (extra
+      ? this._pickFallback(extra, null, provider, null, true)?.account ?? null
+      : this._pickBestAvailable(partition, null));
     if (!best) return;
     // The shared slot is this provider's only when it names one of its own
     // accounts; otherwise the provider's cursor is its own entry, and moving
@@ -2445,7 +2486,7 @@ export class AccountManager {
     const manual = this._manualSelection(exclude, model, advisorModel, provider);
     if (!eligiblePin && manual?.fallback) return this._activateFallback(manual, exclude, model, provider, advisorModel);
     const extra = this._preferredExtraUsage(exclude, model, advisorModel, provider);
-    if (extra) return this._selectFallback(extra, model, advisorModel, true);
+    if (extra) return this._selectFallback(extra, model, advisorModel, true, exclude);
     if (sessionId && this.distributeSessions && !pinned) {
       const account = this._pickLeastLoaded(exclude, model, advisorModel);
       if (account) return account;
@@ -2648,7 +2689,11 @@ export class AccountManager {
       // candidate rather than the bucket's pin alone, since a session sitting on
       // another family's account is just as stuck, and a rollover re-ranks so
       // that pressure picks the destination.
-      if (this.expiryRouting.enabled && this.expiryRouting.preempt
+      // Not asked of a pin the preference serves past its threshold, as the
+      // reclaim window below is not: the destination is picked among accounts
+      // that can serve normally, so the move took the conversation onto API
+      // capacity for good while the preference still named its subscription.
+      if (!fallback && this.expiryRouting.enabled && this.expiryRouting.preempt
           && this._pinRolledOver(sessionId, pinned, model)) {
         // Whether to move is decided on the burndown score, so the placement
         // scoring never changes which sessions lose their cache.
@@ -3641,17 +3686,20 @@ export class AccountManager {
    * nor restarts this one. A switch within the scope — another account, or the
    * same one stepping from free quota onto paid — is announced and ramped like
    * any switch (see _noteFallback).
-   * An explicitly preferred pool can be used while API capacity remains.
+   * An explicitly preferred pool can be used while API capacity remains. It
+   * arrives as an `exclude` naming every account outside the pool, so the
+   * request's own exclusions come separately as `requestExclude`.
    * @param {Set<number>|null} [exclude]
    * @param {string|null} [model]
    * @param {string|null} [advisorModel]
    * @param {boolean} [preferExtraUsage]
+   * @param {Set<number>|null} [requestExclude]
    */
-  _selectFallback(exclude = null, model = null, advisorModel = null, preferExtraUsage = false) {
+  _selectFallback(exclude = null, model = null, advisorModel = null, preferExtraUsage = false, requestExclude = exclude) {
     const provider = this._selectingProvider ?? DEFAULT_PROVIDER;
     const pick = this._pickFallback(exclude, model, provider, advisorModel, preferExtraUsage);
     if (!pick) return null;
-    return this._activateFallback(pick, exclude, model, provider, advisorModel, preferExtraUsage);
+    return this._activateFallback(pick, exclude, model, provider, advisorModel, preferExtraUsage, requestExclude);
   }
 
   /**
@@ -3663,14 +3711,23 @@ export class AccountManager {
    * `preferExtraUsage` says the pick came from the preferred pool; otherwise
    * the episode is marked preferred when the account is one the preference
    * would have chosen anyway, which is what lets the sweep keep it.
+   *
+   * "Barred for this model only" is judged on the request's own exclusions
+   * (`requestExclude`). The preferred pool's `exclude` names every account
+   * outside the pool, the current one included, so judged on it a Fable-only
+   * diversion onto a preferred subscription moved the cursor and the Opus
+   * traffic followed it there (#276). Nor does the cursor move off a manual
+   * choice new conversations do not read (_manualChoiceUnread).
    * @param {{ account: Record<string, any>, paid: boolean }} pick
    * @param {Set<number>|null} exclude
    * @param {string|null} model
    * @param {string} provider
    * @param {string|null} [advisorModel]
-   * @param {boolean} [preferExtraUsage] */
-  _activateFallback(pick, exclude, model, provider, advisorModel = null, preferExtraUsage = false) {
-    if (!this._currentBarredOnlyFor(model, null, exclude)) this._setCurrent(pick.account);
+   * @param {boolean} [preferExtraUsage]
+   * @param {Set<number>|null} [requestExclude] */
+  _activateFallback(pick, exclude, model, provider, advisorModel = null, preferExtraUsage = false, requestExclude = exclude) {
+    if (!this._currentBarredOnlyFor(model, null, requestExclude)
+        && !this._manualChoiceUnread(requestExclude, model, advisorModel, provider)) this._setCurrent(pick.account);
     const preferred = preferExtraUsage || this._preferredFallbackCandidates(exclude, model, advisorModel, provider).includes(pick.account);
     if (this._noteFallback(this._cursorKey(model, null, provider), pick, model, false, advisorModel, preferred)) this._beginRamp(pick.account);
     return pick.account;
@@ -3990,7 +4047,10 @@ export class AccountManager {
 
   /** The available account with a strictly lower priority value, whether or not
    * `account` is the operator's manual choice.
-   * @param {Record<string, any>} account */
+   * @param {Record<string, any>} account
+   * @param {string|null} [model]
+   * @param {string|null} [advisorModel]
+   * @param {Set<number>|null} [exclude] */
   _outrankedByPriority(account, model = null, advisorModel = null, exclude = null) {
     return this.accounts.find(a => this._isAvailable(a, model, advisorModel)
       && !exclude?.has(a.index)
