@@ -371,6 +371,14 @@ Add `--no-browser` to print the URL instead of opening one, and `--name` to
 label the account yourself (it defaults to the email on the login). Over SSH,
 or on Linux with no display, no browser is opened.
 
+A login updates the row of the ChatGPT account (workspace) and user it signs
+in as. One email in two workspaces, such as a Personal plan and a Business
+workspace, is two accounts: the second one added without `--name` is named
+`email (plan)`, for example `me@example.com (plus)`, or `email (2)` when the
+plan is unknown or that name is taken too. A row that has no account id yet,
+such as one that imports `~/.codex/auth.json` (below), is still matched by its
+name: give it a name other than the email, or sign in with `--name`.
+
 On a terminal you can finish the sign-in from another device. Open the URL
 there and sign in. The browser is then sent to
 `http://localhost:1455/auth/callback`, which does not load on that device:
