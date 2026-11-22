@@ -373,12 +373,13 @@ export function windowsOf(a) {
  * `escaped` holds the accounts left while rolled, and a reading moved onto one
  * of them is `uncertain`, since the manager may restore an older reading there.
  * That older reading has rolled, so it refuses a first sight onto the next
- * account, and the doubt moves with the reading.
- * @typedef {{ on: string|null, windows: Map<string, number>, escaped: Set<string>, uncertain: boolean }} Obs
+ * account, and the doubt moves with the reading. `stale` holds the windows the
+ * reading took past their reset, which the manager still held when it read.
+ * @typedef {{ on: string|null, windows: Map<string, number>, escaped: Set<string>, uncertain: boolean, stale: Set<string> }} Obs
  */
 
 /** @returns {Obs} */
-export const newObs = () => ({ on: null, windows: new Map(), escaped: new Set(), uncertain: false });
+export const newObs = () => ({ on: null, windows: new Map(), escaped: new Set(), uncertain: false, stale: new Set() });
 
 /** Whether any window `a` presents jumped past the reading (_anyJumped).
  * @param {Obs} obs @param {Fed} a */
@@ -397,6 +398,7 @@ function moveObs(obs, a, fed) {
   if (leaving && anyRolled(obs, leaving)) obs.escaped.add(leaving.id);
   obs.on = a.id;
   obs.windows = windowsOf(a);
+  obs.stale = new Set();
   obs.uncertain = obs.escaped.has(a.id);
 }
 
@@ -423,18 +425,34 @@ export function rolledSince(obs, a, model) {
 
 /** Takes the reading at the start of a request, as _restOn does when nothing
  * is handed back. Returns whether the governing window had rolled.
- * @param {Obs} obs @param {Fed} a @param {string} model @param {Map<string, Fed>} fed */
-export function restOn(obs, a, model, fed) {
-  if (obs.on !== a.id) { moveObs(obs, a, fed); return false; }
+ * @param {Obs} obs @param {Fed} a @param {string} model @param {Map<string, Fed>} fed
+ * @param {Map<string, number>} [lapsed] windows of `a` past their reset that the manager still holds */
+export function restOn(obs, a, model, fed, lapsed) {
+  if (obs.on !== a.id) { moveObs(obs, a, fed); takeLapsed(obs, lapsed); return false; }
   const g = governing(a, model);
-  if (g.reset == null) return false;
-  if (rolledSince(obs, a, model)) return true;
+  if (g.reset == null) { takeLapsed(obs, lapsed); return false; }
+  if (rolledSince(obs, a, model)) {
+    // docs/routing.md:411 and :417 do not say whether a window already past
+    // its reset counts as read, so a jump from one is neither a roll nor not one.
+    if (!obs.stale.has(g.window)) return true;
+    obs.uncertain = true;
+    return false;
+  }
   obs.windows.set(g.window, g.reset);
+  obs.stale.delete(g.window);
   for (const [w, r] of windowsOf(a)) if (!obs.windows.has(w)) obs.windows.set(w, r);
+  takeLapsed(obs, lapsed);
   // A doubt carried in by a first sight settles at a rest that finds no window
   // moved: whichever reading the manager held, it is on this account now.
   if (obs.uncertain && !obs.escaped.has(a.id) && !anyRolled(obs, a)) obs.uncertain = false;
   return false;
+}
+
+/** The manager reads before it clears expired windows, so its reading keeps
+ * the old reset of a window that lapsed unread.
+ * @param {Obs} obs @param {Map<string, number>} [lapsed] */
+function takeLapsed(obs, lapsed) {
+  for (const [w, r] of lapsed ?? []) if (!obs.windows.has(w)) { obs.windows.set(w, r); obs.stale.add(w); }
 }
 
 /**
@@ -489,6 +507,10 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
     fableRouted: !h.fableRoute || h.fableRoute.includes(a.id), disabled: false, cordoned: false,
     u5h: null, r5h: null, u7d: null, r7d: null, f: null, fr: null,
   }]));
+  // Windows past their reset that the manager has not cleared: a request's
+  // walk clears every account, and a fresh reading replaces its own windows.
+  /** @type {Map<string, Map<string, number>>} */
+  const lapsed = new Map(h.accounts.map(a => [a.id, new Map()]));
   const configRows = () => h.accounts.map(a => ({
     id: a.id, name: a.id, type: 'oauth', accessToken: `synthetic-${a.id}`, refreshToken: `synthetic-r-${a.id}`,
     expiresAt: h.start + 30 * 24 * H, accountUuid: `uuid-${a.id}`,
@@ -516,12 +538,13 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
     f.u5h = x.u5h; f.r5h = x.r5h;
     if (what.weekly) {
       usage.sevenDay = { utilization: x.u7d, ...(x.clockless7d ? {} : { resetAt: x.r7d }) };
-      f.u7d = x.u7d; if (!x.clockless7d) f.r7d = x.r7d;
+      f.u7d = x.u7d; if (!x.clockless7d) { f.r7d = x.r7d; lapsed.get(x.id)?.delete('unified7d'); }
     }
     if (what.fable && x.F != null) {
       usage.sevenDayFable = { utilization: x.F, ...(x.clocklessF ? {} : { resetAt: x.FR }) };
       // A family reading replaces its reset, with none when it names none.
       f.f = x.F; f.fr = x.clocklessF ? null : x.FR;
+      lapsed.get(x.id)?.delete('unified7dFable');
     }
     am.applyUsageData(byId(x.id).index, usage);
     noteReading(x.id);
@@ -609,8 +632,8 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
       while (x.FR != null && x.FR <= now) { x.FR += WEEK; x.F = 0; fable = true; }
       while (x.r5h <= now) { x.r5h += 5 * H; x.u5h = 0; }
       const f = /** @type {Fed} */ (fed.get(x.id));
-      if (f.r7d != null && now >= f.r7d) { f.u7d = null; f.r7d = null; }
-      if (f.fr != null && now >= f.fr) { f.f = null; f.fr = null; }
+      if (f.r7d != null && now >= f.r7d) { lapsed.get(f.id)?.set('unified7d', f.r7d); f.u7d = null; f.r7d = null; }
+      if (f.fr != null && now >= f.fr) { lapsed.get(f.id)?.set('unified7dFable', f.fr); f.f = null; f.fr = null; }
       // A reading the manager holds is refreshed when its window rolls; one it
       // has never been told stays unknown until a response reveals it.
       if ((weekly && (f.u7d != null || !x.hidden7d)) || (fable && f.f != null)) {
@@ -657,13 +680,13 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
       // The readings _pickActiveAccount takes before it decides.
       let curRolled = false;
       let pinRolled = false;
-      if (preempting && cur != null) curRolled = restOn(curObs, /** @type {Fed} */ (fed.get(cur)), model, fed);
+      if (preempting && cur != null) curRolled = restOn(curObs, /** @type {Fed} */ (fed.get(cur)), model, fed, lapsed.get(cur));
       const pinNow = conv?.pins.get(bucket);
       let pinUncertain = false;
       if (preempting && conv && pinNow != null) {
         let o = conv.obs.get(bucket);
         if (!o) { o = newObs(); conv.obs.set(bucket, o); }
-        pinRolled = restOn(o, /** @type {Fed} */ (fed.get(pinNow)), model, fed);
+        pinRolled = restOn(o, /** @type {Fed} */ (fed.get(pinNow)), model, fed, lapsed.get(pinNow));
         pinUncertain = o.uncertain;
       }
       const ctx = {
@@ -680,6 +703,7 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
       };
       const carried = tagged ? am.observedGeneration(c, model) : null;
       const acc = am.getActiveAccount(null, model, null, tagged ? c : null);
+      for (const l of lapsed.values()) l.clear();
       const d = acc?.id ?? '-';
       ctx.d = d;
       check(ctx);
@@ -752,6 +776,7 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
       if (!ex.enabled) sessionResets = new Set();
       if (row.persist || driver.restoreAlways) next.restoreAffinityState(saved.affinity);
       next.selectActiveAccount();
+      for (const l of lapsed.values()) l.clear();
       // The constructor reads its first account before any quota is restored;
       // startup's own pick reads restored quota.
       const first = next.accounts[next.currentIndex]?.id ?? null;
