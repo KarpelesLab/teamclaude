@@ -175,10 +175,12 @@ const cmp = (/** @type {number[]} */ a, /** @type {number[]} */ b) => {
 };
 
 /** The adaptive tier _pickAdaptive scores: the band's top priority, without
- * the spent ones unless every one is.
+ * the spent ones unless every one is. Spent is judged within that priority:
+ * the band's bar is the best pressure of the top tier (docs/routing.md:407).
  * @param {any} ctx @param {any[]} cands */
 function adaptiveTier(ctx, cands) {
-  const { ranked, spent } = rankedTier(cands, ctx);
+  const { ranked } = rankedTier(cands, ctx);
+  const spent = heldOff(ranked, ctx.model, ctx.now, ctx.ex);
   const above = ranked.filter(a => !spent.get(a.id));
   return above.length ? above : ranked;
 }
