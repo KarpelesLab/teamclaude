@@ -109,7 +109,15 @@ class Broken extends Error {
 /** @param {import('node:test').TestContext} t */
 function hermetic(t) {
   t.mock.timers.enable({ apis: ['Date'], now: 0 });
-  for (const m of /** @type {const} */ (['log', 'info', 'warn', 'error'])) t.mock.method(console, m, () => {});
+  // Not t.mock.method: a mock keeps every call until its test ends. The
+  // differentials, and U4 on a deep run, play every seed over many rows in
+  // one test, so the manager's log calls would grow the heap with the seed
+  // count.
+  for (const m of /** @type {const} */ (['log', 'info', 'warn', 'error'])) {
+    const real = console[m];
+    console[m] = () => {};
+    t.after(() => { console[m] = real; });
+  }
 }
 
 /**
