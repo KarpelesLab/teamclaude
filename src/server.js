@@ -40,6 +40,8 @@ import { ConfigOpError, setThreshold, thresholdRatio } from './config-ops.js';
 import { envVar, legacyControlUrl } from './brand.js';
 import { recordRequest } from './usage/record.js';
 import { handleUsageRoute } from './usage/routes.js';
+import { limitCostMicro } from './anthropic-pricing.js';
+import { clientLimitStatus, limitRefusal, WeeklyLimiter } from './usage/limits.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
 
@@ -825,6 +827,10 @@ export function usageCallerLabel(client, isLocal, proxyConfig) {
  *   also holds (drain.js), so a graceful shutdown waits on the same count the listener keeps.
  */
 export function createProxyServer(accountManager, config, hooks = {}, sx = null, clientUsage = null, dimensionUsage = null, { bindHost = null, drain: sharedDrain = null, usageStore = NO_USAGE_STORE } = {}) {
+  // Weekly spend per client key (proxy.clientKeys[].weeklyUsd), one counter for
+  // the server and its MITM listeners, picked up from usage history on start.
+  const limiter = new WeeklyLimiter();
+  limiter.seed(usageStore);
   const boundHost = () => bindHost || config.proxy?.host;
   const drain = sharedDrain ?? createDrainState();
   const upstream = config.upstream || 'https://api.anthropic.com';
@@ -1018,7 +1024,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         res.writeHead(200, { 'Content-Type': 'application/json' });
         // Counters only: how full the upstream admission gate is (see
         // upstream-fetch.js), never which origins or requests.
-        res.end(JSON.stringify({ ...extra, ...status, caller: callerView(req.tcClient, auth.scope), upstreamPool: upstreamPoolStatus(), drain: drain.status() }, null, 2));
+        res.end(JSON.stringify({ ...extra, ...status, caller: callerView(req.tcClient, auth.scope), clientLimits: clientLimitStatus(limiter, config.proxy), upstreamPool: upstreamPoolStatus(), drain: drain.status() }, null, 2));
         return;
       }
 
@@ -1589,7 +1595,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
   // Opt-in egress pin: null unless config.egress.pin is set, and then shared by
   // the base listener and the MITM one so both honour the same hold.
   const egress = createEgressGuard(config, logLine);
-  const forward = createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config, egress, clientUsage, dimensionUsage, drain, usageStore });
+  const forward = createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config, egress, clientUsage, dimensionUsage, drain, usageStore, limiter });
   const server = http.createServer(requestHandler);
   server.keepAliveTimeout = KEEP_ALIVE_TIMEOUT_MS;
 
@@ -1637,7 +1643,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
     const c = await certsPromise;
     return { key: c.leafKeyPem, cert: c.leafCertPem };
   };
-  server.on('connect', createConnectHandler({ config, accountManager, ensureLeaf, leafHosts: mitmHostList, logDir, hooks, log: logLine, sx, egress, clientUsage, dimensionUsage, drain, usageStore }));
+  server.on('connect', createConnectHandler({ config, accountManager, ensureLeaf, leafHosts: mitmHostList, logDir, hooks, log: logLine, sx, egress, clientUsage, dimensionUsage, drain, usageStore, limiter }));
   // Remote Control's real-time channel is a WebSocket, not a request/response
   // call — Node fires 'upgrade' for that handshake, never 'request', so it
   // needs its own listener (base-URL routing path; the MITM path wires the
@@ -2210,9 +2216,10 @@ let lastRequestId = 0;
  * @param {string|null} [opts.forcedClient]
  * @param {Object|null} [opts.dimensionUsage]
  * @param {any} [opts.usageStore]  SQLite usage store (src/usage/db.js); defaults to the disabled sentinel
+ * @param {WeeklyLimiter} [opts.limiter]  the weekly key-limit counter, shared with the server's MITM listeners
  * @param {import('./drain.js').DrainState|null} [opts.drain]  the shared drain state (drain.js); a listener made without one keeps its own, which never drains
  */
-export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null, holdMs = 0, config = {}, forcedPin = null, egress = null, clientUsage = null, forcedClient = null, dimensionUsage = null, drain = null, usageStore = NO_USAGE_STORE }) {
+export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null, holdMs = 0, config = {}, forcedPin = null, egress = null, clientUsage = null, forcedClient = null, dimensionUsage = null, drain = null, usageStore = NO_USAGE_STORE, limiter = new WeeklyLimiter() }) {
   const drainState = drain ?? createDrainState();
   return async (req, res) => {
     // Set before anything else, so every response from this listener carries the
@@ -2536,6 +2543,27 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         return;
       }
 
+      // A client key at its weekly limit (proxy.clientKeys[].weeklyUsd) is
+      // refused before an account is chosen or a session opened. `client`
+      // covers both doors into this listener: the per-request key and the MITM
+      // listener's forcedClient. 403, not 429: Claude Code retries a 429.
+      const limitClient = req.tcClient ?? forcedClient ?? null;
+      const overLimit = limitRefusal(limiter, /** @type {any} */ (config).proxy, limitClient, Date.now());
+      if (overLimit) {
+        if (!res.headersSent) {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ type: 'error', error: { type: 'permission_error', message: overLimit } }));
+        }
+        recordEarlyOutcome(accountManager, { pinKey, sessionId }, req.url, true);
+        openEntry = null;   // this path owns the close below; the outer catch must not repeat it
+        if (!hideActivity) {
+          const proxyConfig = /** @type {any} */ (config).proxy;
+          recordRequest(usageStore, { caller: usageCallerLabel(limitClient, loopbackExempt(req.headers, req.socket?.remoteAddress, proxyConfig), proxyConfig), model, account: null, status: 403, capped: true });
+          hooks.onRequestEnd?.(reqId, { callerRequestId: callerId, method: req.method, path: req.url, account: '(over weekly limit)', status: 403, model, effort, sessionId, client: limitClient });
+        }
+        return;
+      }
+
       // compactBeforeSwitch (issue #709, off unless set): a long conversation
       // whose account is about to reach a switch threshold is answered once
       // with the API's own "prompt is too long" 400, so Claude Code compacts it
@@ -2659,7 +2687,6 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         // marked open would send the outer catch to call that same throwing hook
         // a second time for one request.
         openEntry = null;
-        if (!hideActivity) hooks.onRequestEnd?.(reqId, { callerRequestId: callerId, method: req.method, path: req.url, account: ctx.account, status: ctx.status, model: ctx.model, effort, sessionId, pinned: ctx.pinnedIndex != null, client, attempts: ctx.attempt || 0, cacheUsage: ctx.cacheUsage, errorType: ctx.errorType });
         // One SQLite row per request, written here because this is the one
         // place every terminal outcome of forwardRequest already funnels
         // through — success, a hop that exhausted retries, the pool-exhausted
@@ -2675,14 +2702,24 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         const settled = ctx;
         // A telemetry batch the activity log hides (eventLogging) is not usage
         // either: it would add a zero-token row under no model for every batch.
-        const served = /** @type {any[]} */ (/** @type {any} */ (accountManager).accounts).some(a => a.name === settled.account);
+        // What the reply cost against a weekly key limit, priced from the raw
+        // usage block (it carries the cache-write split, tier and geo) at the
+        // model the last attempt sent (ctx.sentModel). Booked and recorded
+        // before the activity hook, which can throw.
+        const servedBy = /** @type {any[]} */ (/** @type {any} */ (accountManager).accounts).find(a => a.name === settled.account);
+        const costMicro = limitCostMicro(settled.sentModel ?? ctx.model, settled.cacheUsage);
+        limiter.book(client, costMicro, Date.now());
         if (!hideActivity) recordRequest(usageStore, {
           caller,
-          account: served ? settled.account : null,
+          account: servedBy ? settled.account : null,
           model: ctx.model,
           status: settled.proxyClosed && (settled.status ?? 200) < 300 ? 502 : settled.status,
+          // only a named key's spend is read back at start, so only it is stored:
+          // a key may be named "(shared)" like the rows of unnamed traffic.
+          costMicro: client ? costMicro : 0,
           ...ctx.usage,
         });
+        if (!hideActivity) hooks.onRequestEnd?.(reqId, { callerRequestId: callerId, method: req.method, path: req.url, account: ctx.account, status: ctx.status, model: ctx.model, effort, sessionId, pinned: ctx.pinnedIndex != null, client, attempts: ctx.attempt || 0, cacheUsage: ctx.cacheUsage, errorType: ctx.errorType });
       }
     } catch (err) {
       reportFailure('[TeamClaude] Unhandled error:', err);
@@ -4767,6 +4804,10 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // Every rewrite below runs inside rewriteRequestBody (exported for tests);
   // Content-Length is refreshed below because the body can shrink.
   let sendBody = rewriteRequestBody(body, account, req.url, req.headers['content-type']);
+  // The model this attempt names upstream after the account's modelMap, read
+  // now so a reload during the reply cannot change what it is priced at.
+  ctx.sentModel = typeof ctx.model === 'string' && account.modelMap && Object.hasOwn(account.modelMap, ctx.model) && typeof account.modelMap[ctx.model] === 'string'
+    ? account.modelMap[ctx.model] : ctx.model;
   // If the body changed length (sanitize, model rewrite, or field strip), update
   // Content-Length so the upstream doesn't receive a mismatched framing and
   // truncate or stall.

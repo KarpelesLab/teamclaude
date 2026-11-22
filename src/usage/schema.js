@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
 // Group keys precede ts in usage_group so the 5h aggregate reads one index
 // range per group instead of building a temporary B-tree. usage_ts is what the
@@ -44,11 +44,22 @@ CREATE TABLE IF NOT EXISTS usage_hourly (
 ) WITHOUT ROWID;
 `;
 
+// What a request cost against a weekly key limit, and whether it was refused
+// for being over one. ADD COLUMN with a default rewrites no rows. `capped` is
+// its own column because an upstream 403 lands in `status` too. Rows written
+// before this carry cost 0, so the week of the upgrade is under-counted.
+const V2 = `
+ALTER TABLE usage ADD COLUMN cost_micro INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE usage ADD COLUMN capped INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE usage_hourly ADD COLUMN capped INTEGER NOT NULL DEFAULT 0;
+`;
+
 // Index i takes a database at user_version i to i+1. Append only: an entry that
 // has ever shipped has already run against a file somebody still has.
 /** @type {((db: import('node:sqlite').DatabaseSync) => void)[]} */
 const MIGRATIONS = [
   (db) => db.exec(V1),
+  (db) => db.exec(V2),
 ];
 
 export class SchemaTooNewError extends Error {

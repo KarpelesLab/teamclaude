@@ -438,9 +438,25 @@ The gates are the ones every other route passes, plus the MCP endpoint's rule fo
 
 Each request forwarded to an account becomes one row: when, which consumer, model and account, the input, cache-read, cache-write and output tokens, and the status. A request the pool could not serve is a row too, with status `429` and the account `(unknown)`. Calls that go straight to the client's own login (its identity and control-plane calls, token refreshes), plain forward-proxy traffic and WebSocket channels are not recorded, and neither are the telemetry batches the activity log hides (`eventLogging`). A `GET` that the [scope-denial retry](routing.md#token-scope-denials) passes on to the client's login is, under the account `(unknown)` with no tokens. A consumer is a `proxy.clientKeys` name, so give each of your machines and integrations its own key to tell them apart. Traffic without a named key is booked as `(shared)` (`proxy.apiKey`), `(local)` (a key-exempt caller on the proxy's own machine) or `(open)` (a proxy with no key at all). Accounts are booked by name. Nothing of a request's content is stored.
 
-`GET /teamclaude/usage?window=5h|7d|30d` answers with `totals` and the same measures per consumer (`callers`), per consumer and model (`callerModels`), per model (`models`) and per account (`accounts`): `requests`, `tokens`, `input`, `cacheRead`, `cacheWrite`, `output`, and `refusals` (requests answered `429`). `5h` is read from the raw rows; `7d` and `30d` from an hourly rollup, snapped to whole hours, with `since` and `until` saying what the window covers. Any other window is a 400. The route sits behind the same gates as `/teamclaude/status`.
+`GET /teamclaude/usage?window=5h|7d|30d` answers with `totals` and the same measures per consumer (`callers`), per consumer and model (`callerModels`), per model (`models`) and per account (`accounts`): `requests`, `tokens`, `input`, `cacheRead`, `cacheWrite`, `output`, `refusals` (requests answered `429`) and `capped` (requests refused by a [weekly key limit](#weekly-spending-limit-per-client-key)). `5h` is read from the raw rows; `7d` and `30d` from an hourly rollup, snapped to whole hours, with `since` and `until` saying what the window covers. Any other window is a 400. The route sits behind the same gates as `/teamclaude/status`.
 
 The file sits beside the config, named after it: `config.usage.db` for `config.json`, and like the config it is readable by its owner only. Raw rows are kept 90 days and the hourly rollup 400 days, pruned once a day. History never fails or delays a request. A row that cannot be written, a locked file included, is logged and skipped. A file that cannot be opened at start turns history off, says so in the log, and the route then answers `available: false`; a file found corrupt at start is moved aside and a new one started instead. History needs `node:sqlite`: Node 22.13 or later, or 22.5 to 22.12 started with `--experimental-sqlite`. On an older Node the route answers `available: false` the same way.
+
+## Weekly spending limit per client key
+
+A `proxy.clientKeys` entry can carry `weeklyUsd`, a limit on what that key may spend in a week. It is meant for one of your own agents that runs unattended: a loop that goes wrong stops at the figure instead of using up the week of every account.
+
+```json
+{ "proxy": { "clientKeys": [{ "name": "nightly-agent", "key": "tc-…", "scope": "inference", "weeklyUsd": 200 }] } }
+```
+
+The spend is an estimate at API list prices, from the usage block of each reply the pool serves the key, priced with the same table as the [prepaid-credit estimate](quota.md#prepaid-api-credit) at the model the account was sent (after its `modelMap`). A reply the table cannot price, such as an unknown model, Priority Tier or a Codex reply, is charged the highest rate the table has in each category. A reply with no usage block costs nothing.
+
+The week starts Monday 00:00 UTC. Each request to the pool is checked before an account is chosen: a key at or over its figure gets `403` with a `permission_error` naming the limit, the spend and the reset time. (Not `429`, which Claude Code retries.) Requests already running when the key crosses the figure finish, so the spend can end above it by what they cost. Requests that do not go to the pool, such as the client's own login calls, and requests without a named key are not limited.
+
+`/teamclaude/status` lists each key with a limit under `clientLimits`, with `weeklyUsd`, `spentUsd`, `remainingUsd` and `resetsAt`, or `invalid: true` for a figure that cannot be read. With [usage history](#usage-history) on, the usage route counts refused requests under `capped`.
+
+The spend is kept in memory. With usage history on, a restart reads the current week back from the recorded rows. Rows written before this feature carry no cost, so the week of the upgrade starts low. Without usage history a restart starts the week from zero.
 
 ## Auto-update
 

@@ -60,6 +60,8 @@ export function dimId(store, kind, value) {
  * @property {unknown} [cacheWrite]
  * @property {unknown} [output]
  * @property {number|null} [status]  absent or null is booked as 0: no answer was sent, which is not a success
+ * @property {unknown} [costMicro]  what the reply cost against a weekly key limit, in millionths of a dollar
+ * @property {boolean} [capped]  the request was refused for being over its key's weekly limit
  */
 
 /**
@@ -80,6 +82,8 @@ export function recordRequest(store, entry = {}) {
     const tokens = input + cacheRead + cacheWrite + output;
     const status = Number.isFinite(entry.status) ? Math.trunc(/** @type {number} */ (entry.status)) : 0;
     const refusal = status === 429 ? 1 : 0;
+    const costMicro = whole(entry.costMicro);
+    const capped = entry.capped === true ? 1 : 0;
 
     const callerId = dimId(store, 'caller', entry.caller);
     const modelId = dimId(store, 'model', entry.model);
@@ -88,8 +92,8 @@ export function recordRequest(store, entry = {}) {
 
     store.db?.exec('BEGIN IMMEDIATE');
     try {
-      store.stmts.insertUsage.run(ts, callerId, modelId, accountId, tokens, input, cacheRead, cacheWrite, output, status);
-      store.stmts.upsertHourly.run(callerId, modelId, accountId, hour, tokens, input, cacheRead, cacheWrite, output, refusal);
+      store.stmts.insertUsage.run(ts, callerId, modelId, accountId, tokens, input, cacheRead, cacheWrite, output, status, costMicro, capped);
+      store.stmts.upsertHourly.run(callerId, modelId, accountId, hour, tokens, input, cacheRead, cacheWrite, output, refusal, capped);
       store.db?.exec('COMMIT');
     } catch (err) {
       try { store.db?.exec('ROLLBACK'); } catch { /* the failure already ended the transaction */ }
