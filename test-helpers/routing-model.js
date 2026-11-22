@@ -705,10 +705,11 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
           // The walk consumes the cursor's flag, and a move re-arms probing on
           // an account whose weekly reset is still unknown (_selectNext).
           // A session-reset switch can move the cursor before the walk reads the
-          // flag, which then stays. Which of the two happened is not observable,
-          // so the flag is kept: the invariants read it only to excuse a move.
-          const switched = row.sessionReset && ctx.sessionResets.size > 0 && acc.id !== ctx.cur;
-          if (ctx.cur != null && !switched) requalify.delete(ctx.cur);
+          // flag, which then stays, also when the walk then picks the cursor's
+          // account again. Which of the two happened is not observable, so the
+          // flag is kept: the invariants read it only to excuse a move.
+          const mayHaveSwitched = row.sessionReset && [...ctx.sessionResets].some(id => id !== ctx.cur);
+          if (ctx.cur != null && !mayHaveSwitched) requalify.delete(ctx.cur);
           if (acc.id !== ctx.cur) {
             if (/** @type {Fed} */ (fed.get(acc.id)).r7d == null) probing.add(acc.id); else probing.delete(acc.id);
           }
