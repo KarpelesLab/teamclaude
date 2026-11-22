@@ -274,6 +274,15 @@ export function unavailable(a, model, threshold) {
   return null;
 }
 
+/** Whether startup's pick, which names no model, can take `a`: no route or
+ * family bucket applies to it.
+ * @param {Fed} a @param {any} threshold */
+export function startable(a, threshold) {
+  if (a.disabled || a.cordoned || atCap(a, OPUS)) return false;
+  if (a.u5h != null && a.u5h >= thresholdOf(threshold, 'unified5h')) return false;
+  return !(a.u7d != null && a.u7d >= thresholdOf(threshold, 'unified7d'));
+}
+
 /** @param {Fed} a @param {string} model */
 export function atCap(a, model) {
   const hit = (/** @type {number|null} */ cap, /** @type {number|null} */ used) => cap != null && (cap <= 0 || (used != null && used >= cap));
@@ -777,13 +786,15 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
       if (row.persist || driver.restoreAlways) next.restoreAffinityState(saved.affinity);
       next.selectActiveAccount();
       for (const l of lapsed.values()) l.clear();
-      // The constructor reads its first account before any quota is restored;
-      // startup's own pick reads restored quota.
+      // The constructor's own reading is dropped once its settings are
+      // applied, so the reading is startup's pick, of restored quota, even when
+      // the pick stays on the constructor's account. A pick that finds nothing
+      // available moves nothing and leaves no reading; the first request takes it.
       const first = next.accounts[next.currentIndex]?.id ?? null;
       curObs = newObs();
       if (first != null) {
         curObs.on = first;
-        if (first !== next.accounts[0].id) curObs.windows = windowsOf(/** @type {Fed} */ (fed.get(first)));
+        if ([...fed.values()].some(a => startable(a, row.threshold))) curObs.windows = windowsOf(/** @type {Fed} */ (fed.get(first)));
       }
       check({ restart: true, i, now, row, before: saved.affinity, after: next.exportAffinityState(), convs });
       am = next;
