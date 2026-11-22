@@ -372,6 +372,8 @@ export function windowsOf(a) {
  * the account traffic was last found resting on. Hand-backs are not modeled:
  * `escaped` holds the accounts left while rolled, and a reading moved onto one
  * of them is `uncertain`, since the manager may restore an older reading there.
+ * That older reading has rolled, so it refuses a first sight onto the next
+ * account, and the doubt moves with the reading.
  * @typedef {{ on: string|null, windows: Map<string, number>, escaped: Set<string>, uncertain: boolean }} Obs
  */
 
@@ -405,7 +407,9 @@ export function firstSight(obs, a, fed) {
   if (obs.on === a.id) return;
   const leaving = obs.on == null ? null : fed.get(obs.on);
   if (leaving && anyRolled(obs, leaving)) { obs.escaped.add(leaving.id); return; }
+  const doubt = obs.uncertain;
   moveObs(obs, a, fed);
+  obs.uncertain ||= doubt;
 }
 
 /** Whether the governing window of `a` jumped past the reading (_jumped).
@@ -427,6 +431,9 @@ export function restOn(obs, a, model, fed) {
   if (rolledSince(obs, a, model)) return true;
   obs.windows.set(g.window, g.reset);
   for (const [w, r] of windowsOf(a)) if (!obs.windows.has(w)) obs.windows.set(w, r);
+  // A doubt carried in by a first sight settles at a rest that finds no window
+  // moved: whichever reading the manager held, it is on this account now.
+  if (obs.uncertain && !obs.escaped.has(a.id) && !anyRolled(obs, a)) obs.uncertain = false;
   return false;
 }
 
