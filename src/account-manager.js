@@ -2,7 +2,7 @@ import { refreshAccessToken, isTokenExpiringSoon, isTokenExpired, isRefreshRejec
 import { providerOf, DEFAULT_PROVIDER, isSubscriptionAccount, canServeProvider } from './provider.js';
 import { refreshCodexToken } from './codex-auth.js';
 import { parseCodexQuota, parseCodexPlanType, parseCodexActiveLimit } from './codex-quota.js';
-import { sameIdentity, sameOrg } from './identity.js';
+import { sameIdentity, sameOrg, distinctAccounts } from './identity.js';
 import { weeklyBucketForModel, modelGlobMatches, modelFamily, gatingUtilization, resolveMaxUsage, spendCapReached, resolveSwitchThreshold, sanitizeSwitchThreshold, WEEKLY_BUCKET_KEYS } from './model.js';
 import { SessionTracker } from './session-tracker.js';
 import { SessionPins, MAX_SESSION_PINS } from './session-pins.js';
@@ -1385,6 +1385,9 @@ export class AccountManager {
       const account = identities.get(ref.id);
       return account && providerOf(account) === ref.provider ? account.index : null;
     });
+    // Nothing survives the knob being off, as setExpiryRouting applies it.
+    const { enabled, preempt } = /** @type {{enabled: boolean, preempt: boolean}} */ (this.expiryRouting);
+    if (!enabled || !preempt) this.sessionTracker.clearObservations();
   }
 
   _affinityAccounts() {
@@ -7816,19 +7819,26 @@ export class AccountManager {
       // The local credit ledger (api-credit.js), only on an account with a
       // credit setting: a fleet without one writes the file it always wrote.
       const credit = exportCreditState(a);
-      return { accountUuid: a.accountUuid, accountId: a.accountId, userId: a.userId, provider: providerOf(a), orgUuid: a.orgUuid, orgName: a.orgName, name: a.name, profile, quota, adaptive, outsideSpend, ...(credit ? { credit } : {}) };
+      return { id: a.id, accountUuid: a.accountUuid, accountId: a.accountId, userId: a.userId, provider: providerOf(a), orgUuid: a.orgUuid, orgName: a.orgName, name: a.name, profile, quota, adaptive, outsideSpend, ...(credit ? { credit } : {}) };
     });
   }
 
   /**
    * Restore quota learned in a previous run. Matches saved entries to accounts
-   * by identity. Stale windows are not special-cased here — _clearExpiredQuotas
-   * wipes any restored window whose reset time has already passed on first use.
+   * by entry id, else by identity. Stale windows are not special-cased here —
+   * _clearExpiredQuotas wipes any restored window whose reset time has already
+   * passed on first use.
    */
   restoreQuotaState(saved) {
     if (!Array.isArray(saved)) return;
+    const held = new Set(this.accounts.map(a => a.id).filter(id => typeof id === 'string' && id));
     for (const account of this.accounts) {
-      const match = saved.find(s => sameIdentity(s, account));
+      // The entry id first, as affinity restores, so a restored pin is read
+      // against the quota its own entry saved: a name changes with a relabel,
+      // and sameIdentity accepts a row with no organization for the same
+      // person's entry in another one.
+      const match = saved.find(s => typeof s?.id === 'string' && s.id === account.id && !distinctAccounts(s, account))
+        ?? saved.find(s => !(typeof s?.id === 'string' && held.has(s.id)) && sameIdentity(s, account));
       if (!match || !match.quota) continue;
       for (const f of PERSISTED_QUOTA_FIELDS) {
         if (match.quota[f] != null) account.quota[f] = match.quota[f];

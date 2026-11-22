@@ -18,7 +18,7 @@ test('exportQuotaState carries only persistable fields and identity, no credenti
     Object.keys(entry).sort(),
     // `outsideSpend` is learned state like `adaptive` (#475): per-window sums,
     // never a token or an activity stamp.
-    ['accountUuid', 'accountId', 'userId', 'provider', 'name', 'orgName', 'orgUuid', 'profile', 'quota', 'adaptive', 'outsideSpend'].sort(),
+    ['id', 'accountUuid', 'accountId', 'userId', 'provider', 'name', 'orgName', 'orgUuid', 'profile', 'quota', 'adaptive', 'outsideSpend'].sort(),
   );
   assert.equal(entry.accountUuid, 'p1');
   assert.equal(entry.provider, 'anthropic');
@@ -94,6 +94,70 @@ test('restore matches by identity, not array position', () => {
 
   assert.equal(am2.accounts[0].quota.unified7d, 0.9); // Personal
   assert.equal(am2.accounts[1].quota.unified7d, 0.1); // Acme
+});
+
+const H = 3600_000;
+const OPUS = 'claude-opus-5';
+const roundTrip = value => JSON.parse(JSON.stringify(value));
+const freeze = t => t.mock.timers.enable({ apis: ['Date'], now: Date.UTC(2026, 10, 21, 12) });
+// Entries with config ids and no upstream ids, so only the id or the name can pair a row.
+const entries = list => list.map(([id, name]) => oauth(name, { id }));
+function serve(am, sessionId, exclude = null) {
+  am.beginSession(sessionId);
+  const account = am.getActiveAccount(exclude, OPUS, null, sessionId);
+  if (account) am.recordSession(sessionId, account.index, OPUS);
+  am.endSession(sessionId);
+  return account;
+}
+
+test('two entries that swap names each restore the quota their own entry saved, and a pin stays', t => {
+  freeze(t);
+  const opts = { distributeSessions: true, expiryRouting: { enabled: true, preempt: true } };
+  const resets = { a: Date.now() + 8 * H, b: Date.now() + 155 * H };
+  const source = new AccountManager(entries([['a', 'alice'], ['b', 'bob']]), 0.98, opts);
+  for (const account of source.accounts) {
+    Object.assign(account.quota, { unified7d: 0.4, unified7dReset: resets[account.id] });
+    account.probing = false;
+  }
+  assert.equal(serve(source, 'alpha', new Set([1])).id, 'a');
+  const restored = new AccountManager(entries([['a', 'bob'], ['b', 'alice']]), 0.98, opts);
+  restored.restoreQuotaState(roundTrip(source.exportQuotaState()));
+  restored.restoreAffinityState(roundTrip(source.exportAffinityState()));
+  for (const account of restored.accounts) assert.equal(account.quota.unified7dReset, resets[account.id], account.id);
+  const live = serve(source, 'alpha').id;
+  assert.equal(live, 'a');
+  assert.equal(serve(restored, 'alpha').id, live, 'the pin is read against its own entry reset');
+});
+
+test('a renamed entry restores its own row, and a new entry under its old name takes nothing', t => {
+  freeze(t);
+  const source = new AccountManager(entries([['a', 'alice'], ['b', 'bob']]), 0.98);
+  source.accounts[0].quota.unified7d = 0.1;
+  source.accounts[1].quota.unified7d = 0.9;
+  const restored = new AccountManager(entries([['a', 'alice'], ['b', 'carol'], ['c', 'bob']]), 0.98);
+  restored.restoreQuotaState(roundTrip(source.exportQuotaState()));
+  assert.deepEqual(restored.accounts.map(a => a.quota.unified7d), [0.1, 0.9, null]);
+});
+
+test('a row saved without an entry id restores by identity', t => {
+  freeze(t);
+  const source = new AccountManager(entries([['a', 'alice'], ['b', 'bob']]), 0.98);
+  source.accounts[0].quota.unified7d = 0.1;
+  source.accounts[1].quota.unified7d = 0.9;
+  const legacy = roundTrip(source.exportQuotaState()).map(({ id: _id, ...row }) => row);
+  const restored = new AccountManager(entries([['b', 'bob'], ['a', 'alice']]), 0.98);
+  restored.restoreQuotaState(legacy);
+  assert.deepEqual(restored.accounts.map(a => a.quota.unified7d), [0.9, 0.1]);
+});
+
+test('a row whose entry id now names another upstream account is dropped alone', t => {
+  freeze(t);
+  const source = new AccountManager([oauth('alice', { id: 'a', accountUuid: 'p1' }), oauth('bob', { id: 'b', accountUuid: 'p2' })], 0.98);
+  source.accounts[0].quota.unified7d = 0.1;
+  source.accounts[1].quota.unified7d = 0.9;
+  const restored = new AccountManager([oauth('alice', { id: 'a', accountUuid: 'p3' }), oauth('bob', { id: 'b', accountUuid: 'p2' })], 0.98);
+  restored.restoreQuotaState(roundTrip(source.exportQuotaState()));
+  assert.deepEqual(restored.accounts.map(a => a.quota.unified7d), [null, 0.9]);
 });
 
 test('a restored window whose reset already passed is cleared on first use', () => {
