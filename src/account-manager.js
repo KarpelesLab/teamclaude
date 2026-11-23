@@ -5165,7 +5165,7 @@ export class AccountManager {
       if (obs.idx == null) {
         const back = findHeld(obs.unescaped, h => h.idx === account.index);
         if (back) {
-          // Both kinds are handed back alike; the switch only keeps the kinds exhaustive.
+          // Both kinds are handed back alike; the switch makes a new kind fail the typecheck here.
           switch (back.kind) {
             case 'preemption':
             case 'hand-back':
@@ -5249,7 +5249,7 @@ export class AccountManager {
       // at a null index for _anyJumped to have rolled.
       const owed = findHeld(obs.unescaped, h => h.idx === account.index);
       if (owed) {
-        // Both kinds are handed back alike; the switch only keeps the kinds exhaustive.
+        // Both kinds are handed back alike; the switch makes a new kind fail the typecheck here.
         switch (owed.kind) {
           case 'preemption':
           case 'hand-back':
