@@ -1840,9 +1840,9 @@ test('a rest on the nameless reading a removal left is handed the roll it still 
 });
 
 test('a rest on a nameless reading hands back a hand-back\'s roll as it does a preemption\'s', () => {
-  // Built by hand: the request sequences in this file leave only a
-  // preemption's roll on a nameless reading, so none would show a rest that
-  // ignored a hand-back.
+  // Production reaches this state through 429 fail-backs followed by removing
+  // the account the reading names. No request sequence in this file does, so
+  // it is built by hand.
   const am = mgr(['a', 'b'], ON);
   for (const [i, hours] of [[0, 10], [1, 20]]) bucket(am, i, 'unified7d', 0.4, hours);
   am.selectActiveAccount();

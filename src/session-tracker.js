@@ -132,12 +132,18 @@ function setAndReturn(map, key, value) {
 }
 
 /**
- * A rollover reading held for an account traffic left after it rolled, until a
- * served request releases it or a fail-back hands it back. A preemption holds
- * the roll it pushed traffic off; a hand-back holds the roll the account it
- * leaves gained. One hold per escaped account, chained newest first, so a
- * second escape taken before the first is settled holds both readings. A
- * hold's kind is what created it, and decides which stay may release it.
+ * A rollover reading held for an account traffic left after it rolled. A
+ * preemption holds the roll it pushed traffic off; a hand-back holds the roll
+ * the account it leaves gained. One hold per escaped account, chained newest
+ * first, so a second escape taken before the first is settled holds both
+ * readings.
+ *
+ * A hold of either kind ends when its fleet confirms a serve on the account
+ * it is held for (`_releaseHeld`), or when traffic returns to that
+ * account and the reading is handed back (`_restOn`, `_firstSightOn`). A
+ * preemption's hold also ends when a serve is confirmed under its gen
+ * (`_releaseHeld`, subject to its fleet rule). That last release is the only
+ * one the kind decides.
  *
  * @typedef {PreemptionHold | HandBackHold} Hold
  */
@@ -147,18 +153,18 @@ function setAndReturn(map, key, value) {
  * @property {number} idx the account the held reading was taken on
  * @property {Map<string, number>} windows window name to that window's reset, in epoch ms
  * @property {string|null} provider the fleet whose reading this preserves, null while no walk has moved it
- * @property {number} gen the stamp of the move that escaped this roll; only a stay served under it releases the hold
+ * @property {number} gen the observation's gen at the move that escaped this roll
  * @property {Hold|null} prev the escape still outstanding behind this one, null at the tail
  */
 /**
- * No stamp: the move that leaves this roll is a move back, so no stay under a
- * move's stamp is evidence about it.
+ * No gen: the move that leaves this roll is a move back, so a serve confirmed
+ * under a move's gen is no evidence about it.
  *
  * @typedef {Object} HandBackHold
  * @property {'hand-back'} kind
  * @property {number} idx the account the held reading was taken on
  * @property {Map<string, number>} windows window name to that window's reset, in epoch ms
- * @property {string|null} provider the fleet whose reading this preserves
+ * @property {string|null} provider the fleet whose reading this preserves, null when no fleet was known at the hand-back
  * @property {Hold|null} prev the escape still outstanding behind this one, null at the tail
  */
 /**

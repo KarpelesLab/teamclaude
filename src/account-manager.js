@@ -5165,6 +5165,7 @@ export class AccountManager {
       if (obs.idx == null) {
         const back = findHeld(obs.unescaped, h => h.idx === account.index);
         if (back) {
+          // Both kinds are handed back alike; the switch only keeps the kinds exhaustive.
           switch (back.kind) {
             case 'preemption':
             case 'hand-back':
@@ -5248,6 +5249,7 @@ export class AccountManager {
       // at a null index for _anyJumped to have rolled.
       const owed = findHeld(obs.unescaped, h => h.idx === account.index);
       if (owed) {
+        // Both kinds are handed back alike; the switch only keeps the kinds exhaustive.
         switch (owed.kind) {
           case 'preemption':
           case 'hand-back':
@@ -7786,7 +7788,7 @@ export class AccountManager {
       // away is the only one whose roll the removal settles, so what it was
       // holding for the others moves onto a fresh reading. That reading names no
       // account and has no windows, which is evidence about nobody, while every
-      // hold under it keeps its stamp and, on a preemption, its gen.
+      // hold under it keeps its fleet and, on a preemption, its gen.
       const held = remapHeld(this._currentObs.unescaped, remap);
       this._currentObs = moved != null
         ? { ...this._currentObs, idx: moved, unescaped: held }
