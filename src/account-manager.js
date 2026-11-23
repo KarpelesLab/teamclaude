@@ -5165,6 +5165,12 @@ export class AccountManager {
       if (obs.idx == null) {
         const back = findHeld(obs.unescaped, h => h.idx === account.index);
         if (back) {
+          switch (back.kind) {
+            case 'preemption':
+            case 'hand-back':
+              break;
+            default: assertNever(back, '_restOn');
+          }
           this._moveObs(obs, account.index);
           obs.windows = back.windows;
           obs.handedBack = new Map(Object.entries(this._accountWindows(account)));
@@ -5187,7 +5193,7 @@ export class AccountManager {
       // push takes the stamp of the move that escaped the roll, and only a stay
       // under that stamp releases it. At most one roll per account, the newest:
       // a later escape was read after the earlier one's window had rolled.
-      if (owed) obs.unescaped = { ...owed, gen: obs.gen, prev: dropHeld(obs.unescaped, owed.idx) };
+      if (owed) obs.unescaped = { kind: 'preemption', ...owed, gen: obs.gen, prev: dropHeld(obs.unescaped, owed.idx) };
       // Established whole, from every window the account presents, so a window
       // that comes back is a first sight rather than a stale value read as a jump.
       obs.windows = new Map(Object.entries(this._accountWindows(account)));
@@ -5242,6 +5248,12 @@ export class AccountManager {
       // at a null index for _anyJumped to have rolled.
       const owed = findHeld(obs.unescaped, h => h.idx === account.index);
       if (owed) {
+        switch (owed.kind) {
+          case 'preemption':
+          case 'hand-back':
+            break;
+          default: assertNever(owed, '_firstSightOn');
+        }
         // The account the hand-back LEAVES may have rolled under the traffic that
         // rested on it, and the restore below replaces its reading. That roll is
         // an escape like any other, so it is chained rather than discarded.
@@ -5264,7 +5276,7 @@ export class AccountManager {
         // served at the account it returns to is no evidence about the one it
         // left. Only a stay served on that account releases it, or a return that
         // restores it, which is matched on index and needs no stamp.
-        if (displaced) obs.unescaped = { ...displaced, gen: null, prev: dropHeld(obs.unescaped, displaced.idx) };
+        if (displaced) obs.unescaped = { kind: 'hand-back', ...displaced, prev: dropHeld(obs.unescaped, displaced.idx) };
         return;
       }
       if (this._anyJumped(obs.windows, this.accounts[obs.idx])) return;
@@ -5364,7 +5376,13 @@ export class AccountManager {
   _releaseHeld(obs, account, carried, provider) {
     if (!obs || carried == null) return;
     if (obs.idx !== account.index || obs.gen !== carried) return;
-    const owed = findHeld(obs.unescaped, h => h.gen === carried);
+    const owed = findHeld(obs.unescaped, h => {
+      switch (h.kind) {
+        case 'preemption': return h.gen === carried;
+        case 'hand-back': return false;
+        default: return assertNever(h, '_releaseHeld');
+      }
+    });
     // A serve settles a roll held against the very account it was served at,
     // whatever move stamped it: a borrowed walk can leave the reading resting on
     // an account the chain still owes without any move of ours, and being served
@@ -7768,7 +7786,7 @@ export class AccountManager {
       // away is the only one whose roll the removal settles, so what it was
       // holding for the others moves onto a fresh reading. That reading names no
       // account and has no windows, which is evidence about nobody, while every
-      // hold under it keeps its own stamp and gen.
+      // hold under it keeps its stamp and, on a preemption, its gen.
       const held = remapHeld(this._currentObs.unescaped, remap);
       this._currentObs = moved != null
         ? { ...this._currentObs, idx: moved, unescaped: held }

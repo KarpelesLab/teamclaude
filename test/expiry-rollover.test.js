@@ -2075,7 +2075,8 @@ test('a roll displaced by a restore onto a reading no walk established still nam
   assert.equal(serve(am, 's1', OPUS).name, 'a', 'c\'s roll did not send the pin back to a');
   const held = am.sessionTracker.refsFor('s1', 'unified7d').unescaped;
   assert.equal(held.idx, 1, 'the restore held nothing for c');
-  assert.equal(held.gen, null, 'a hand-back\'s roll took a stamp');
+  assert.equal(held.kind, 'hand-back', 'the restore held c\'s roll as something other than a hand-back');
+  assert.ok(!('gen' in held), 'a hand-back\'s roll took a stamp');
   assert.equal(held.provider, 'anthropic',
     'the roll the restore displaced names no fleet, so no stay can settle it');
 
