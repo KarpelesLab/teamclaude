@@ -46,7 +46,7 @@ import assert from 'node:assert/strict';
 import { AccountManager } from '../src/account-manager.js';
 import { validateAdaptiveConfig } from '../src/adaptive-distribution.js';
 import {
-  H, MIN, OPUS, coveringArray, generate, play, prng, productCells, shrink, toRow,
+  FABLE, H, MIN, OPUS, coveringArray, generate, play, prng, productCells, shrink, toRow,
 } from '../test-helpers/routing-model.js';
 import { catalog } from '../test-helpers/routing-invariants.js';
 
@@ -87,12 +87,20 @@ const rows = cells.map(c => toRow(c, profileNames.get(JSON.stringify(c)))).filte
 
 /** @type {Map<string, number>} */
 const applied = new Map();
+// Per row: how many histories it played, and in how many of them each
+// invariant applied, for the floors that are a share of a row's runs.
+/** @type {Map<string, number>} */
+const runsOf = new Map();
+/** @type {Map<string, number>} */
+const appliedRuns = new Map();
 /** @type {Map<string, { count: number, first: string|null }>} */
-const gaps = new Map([['G1', { count: 0, first: null }], ['G2', { count: 0, first: null }]]);
+const gaps = new Map([['G1', { count: 0, first: null }], ['G2', { count: 0, first: null }], ['G4', { count: 0, first: null }]]);
 
-/** The steps after which a seed's restarts happen, in order.
- * @param {number} seed @param {number} steps */
-function restartPoints(seed, steps) {
+/** The steps after which a seed's restarts happen, in order. They fall among
+ * the random events, since one inside a closing episode only cuts it short.
+ * @param {number} seed @param {History} h */
+function restartPoints(seed, h) {
+  const steps = h.events ?? h.steps.length;
   const rand = prng(seed ^ 0x5bd1e995);
   return Array.from({ length: RESTART_POINTS }, () => Math.floor(rand() * (steps - 2))).sort((a, b) => a - b);
 }
@@ -123,17 +131,23 @@ function hermetic(t) {
 /**
  * Plays one history and checks it. Gap breaches are tallied when `tally` is
  * set; any other breach throws Broken. `only` limits the check to one
- * invariant.
+ * invariant. `perRun` counts the run toward the row's per-run floors.
  * @param {import('node:test').TestContext} t @param {Row} row @param {History} history
- * @param {number[]} restarts @param {{ only?: string, tally?: boolean, label?: string, unchecked?: boolean }} [opts]
+ * @param {number[]} restarts @param {{ only?: string, tally?: boolean, perRun?: boolean, label?: string, unchecked?: boolean }} [opts]
  */
 function run(t, row, history, restarts, opts = {}) {
   const invariants = opts.unchecked ? [] : catalog().filter(inv => inv.holds(row) && (!opts.only || inv.id === opts.only));
+  /** @type {Set<string>} */
+  const hit = new Set();
   const check = (/** @type {any} */ ctx) => {
     for (const inv of invariants) {
       const r = inv.check(ctx);
       if (r === undefined) continue;
-      if (r === true) { if (opts.tally) applied.set(inv.id, (applied.get(inv.id) ?? 0) + 1); continue; }
+      if (r === true) {
+        if (opts.tally) applied.set(inv.id, (applied.get(inv.id) ?? 0) + 1);
+        hit.add(inv.id);
+        continue;
+      }
       if (inv.gap) {
         if (!opts.tally) continue;
         const g = /** @type {{ count: number, first: string|null }} */ (gaps.get(inv.id));
@@ -144,7 +158,12 @@ function run(t, row, history, restarts, opts = {}) {
       throw new Broken(inv.id, inv.doc, r, ctx);
     }
   };
-  return play({ AccountManager, validateAdaptiveConfig, t, history, row, restarts, check });
+  const trace = play({ AccountManager, validateAdaptiveConfig, t, history, row, restarts, check });
+  if (opts.perRun) {
+    runsOf.set(row.name, (runsOf.get(row.name) ?? 0) + 1);
+    for (const id of hit) appliedRuns.set(`${id}\t${row.name}`, (appliedRuns.get(`${id}\t${row.name}`) ?? 0) + 1);
+  }
+  return trace;
 }
 
 /** The failure message: the breach, where it happened, the shrunk history and
@@ -172,9 +191,9 @@ function explain(t, /** @type {Broken} */ err, /** @type {Row} */ row, /** @type
  * @param {import('node:test').TestContext} t @param {Row} row @param {number} seed */
 function runSeed(t, row, seed) {
   const h = generate(seed);
-  for (const restarts of [[], restartPoints(seed, h.steps.length)]) {
+  for (const restarts of [[], restartPoints(seed, h)]) {
     try {
-      const trace = run(t, row, h, restarts, { tally: true, label: restarts.length ? ` (restart after step ${restarts})` : '' });
+      const trace = run(t, row, h, restarts, { tally: true, perRun: true, label: restarts.length ? ` (restart after step ${restarts})` : '' });
       if (ONLY_SEED != null) {
         t.diagnostic(`restarts [${restarts}]`);
         for (const d of trace) t.diagnostic(JSON.stringify(d));
@@ -198,7 +217,7 @@ test('U4: the same seed and row give the same decisions twice', t => {
   for (const row of rows) {
     for (const seed of DEEP ? seeds : seeds.slice(0, 1)) {
       const h = generate(seed);
-      const [p] = restartPoints(seed, h.steps.length);
+      const [p] = restartPoints(seed, h);
       const a = run(t, row, h, [p], { unchecked: true });
       const b = run(t, row, h, [p], { unchecked: true });
       assert.deepEqual(b, a, `U4 broken: row ${row.name}, seed ${seed}`);
@@ -218,7 +237,7 @@ function differential(id, /** @type {(row: Row) => Row|null} */ partner, /** @ty
     for (const [a, b] of pairs) {
       for (const seed of seeds) {
         const h = generate(seed);
-        const restarts = restartPoints(seed, h.steps.length).slice(0, 1);
+        const restarts = restartPoints(seed, h).slice(0, 1);
         const why = judge(run(t, a, h, restarts, { unchecked: true }), run(t, b, h, restarts, { unchecked: true }));
         if (why) {
           assert.fail(`${id} broken: ${why}\nrows: ${a.name} | ${b.name}\nseed ${seed} (restart after step ${restarts})\n`
@@ -259,13 +278,15 @@ differential('O9 pressure scoring never decides a move',
     const i = firstDiff(a, b);
     if (i < 0) return null;
     const x = a[i]; const y = b[i];
-    if (x.op === 'request' && (x.pin == null || (x.d !== x.pin && y.d !== y.pin))) return null;
+    if (x.op !== 'untagged' && (x.pin == null || (x.d !== x.pin && y.d !== y.pin))) return null;
+    // Both hopped off the same account after a 429; the hop's destination is
+    // the difference.
+    if (x.op === 'throttle' && x.d === y.d && x.to != null && y.to != null) return null;
     return `step ${x.i}: ${JSON.stringify(x)} vs ${JSON.stringify(y)}`;
   });
 
-// The generated histories rarely reach a session-reset switch that moves
-// traffic, so one is built by hand here; its checks count toward the floor
-// below.
+// A session-reset switch built by hand, so that one is played whatever seeds
+// run; its checks count toward the floor below.
 test('O13b: a 5h reset moves traffic to the account that reset (three accounts)', t => {
   hermetic(t);
   const start = Date.UTC(2030, 2, 10, 12);
@@ -305,6 +326,38 @@ test('O13b: a 5h reset moves traffic to the account that reset (three accounts)'
   assert.equal((applied.get('O13b') ?? 0) - before, 1, 'O13b did not judge the switch');
 });
 
+// Built by hand: at the default seed count no restart starts on the
+// constructor's account and then sees that account roll before the next request.
+test('O2: a roll between a restart and the next request is read on the account startup picked', t => {
+  hermetic(t);
+  const start = Date.UTC(2030, 2, 10, 12);
+  const acct = (/** @type {string} */ id, /** @type {number} */ r7d) => ({
+    id, priority: 0, org: 'org-1', maxUsage: /** @type {any} */ (null), endsAt: null, hidden7d: false, clockless7d: false, clocklessF: false,
+    u5h: 0.1, r5h: start + 4 * H, u7d: 0.3, r7d: start + r7d, F: 0.1, FR: start + 150 * H,
+  });
+  // The restart takes the accounts in reverse, so it starts on `d`, the
+  // constructor's own account. `d` then rolls. The advised request cannot be
+  // preempted off it, since `a` is at its Fable cap, and the next one is.
+  const history = {
+    seed: 0, start, fableRoute: null,
+    accounts: [{ ...acct('a', 100 * H), maxUsage: { unified7dFable: 0.5 }, F: 0.6 }, acct('d', 20 * H)],
+    steps: [
+      { at: start + MIN, op: 'request', c: 'c0', model: OPUS, restart: true },
+      { at: start + 2 * MIN, op: 'roll', id: 'd', fable: false },
+      { at: start + 3 * MIN, op: 'request', c: 'c1', model: OPUS, advisor: FABLE },
+      { at: start + 4 * MIN, op: 'request', c: 'c2', model: OPUS },
+    ],
+  };
+  const row = toRow({ ...base, ...on(1, true, '0'), advisorEligibility: 'strict' });
+  /** @type {any[]} */
+  let trace = [];
+  try { trace = run(t, row, history, [], { only: 'O2' }); } catch (e) {
+    if (e instanceof Broken) assert.fail(explain(t, e, row, history, []));
+    throw e;
+  }
+  assert.deepEqual(trace.map(d => d.d), ['d', 'd', 'a'], 'the scenario did not route as built');
+});
+
 test('every invariant holds in a row and is applied there', { skip: ONLY_ROW || ONLY_SEED != null ? 'filtered run' : false }, t => {
   t.diagnostic(`${rows.length} rows, ${seeds.length} seeds each, ${RESTART_POINTS} restart points per seed`);
   t.diagnostic(`checks applied: ${[...applied].map(([k, n]) => `${k}=${n}`).join(' ')}`);
@@ -312,9 +365,16 @@ test('every invariant holds in a row and is applied there', { skip: ONLY_ROW || 
   assert.deepEqual(dead, [], `hold in no row: ${dead}; each holds(row) must read an option that some row sets`);
   const vacuous = catalog().filter(inv => !inv.gap && rows.some(r => inv.holds(r)) && !(applied.get(inv.id) > 0)).map(inv => inv.id);
   assert.deepEqual(vacuous, [], `vacuous: ${vacuous} (applied: ${JSON.stringify(Object.fromEntries(applied))})`);
+  // A share of a few seeds says nothing, so fewer seeds than CI runs skip it.
+  const thin = SEEDS < DEFAULT_SEEDS ? [] : catalog().filter(inv => inv.runFloor != null).flatMap(inv => rows.filter(r => inv.holds(r)).flatMap(r => {
+    const runs = runsOf.get(r.name) ?? 0;
+    const hits = appliedRuns.get(`${inv.id}\t${r.name}`) ?? 0;
+    return hits < /** @type {number} */ (inv.runFloor) * runs ? [`${inv.id} applied in ${hits} of ${runs} runs (floor ${inv.runFloor}): ${r.name}`] : [];
+  }));
+  assert.deepEqual(thin, [], `below the per-run floor:\n${thin.join('\n')}`);
 });
 
-// The behaviors below contradict docs/routing.md on the current code. Each is
+// The behaviors below contradict the docs on the current code. Each is
 // a todo test that asserts what the docs say; once the code matches, dropping
 // `todo` turns it into a regular invariant.
 
@@ -354,4 +414,32 @@ test('G2: a pin moves at most once per rollover (matrix)',
   { todo: 'docs/routing.md:409 says at most one cache-miss turn per pin per rollover; a hand-back can move a pin twice on one roll' }, () => {
     const g = /** @type {{ count: number, first: string|null }} */ (gaps.get('G2'));
     assert.equal(g.count, 0, `${g.count} second moves; first:\n${g.first}`);
+  });
+
+test('G4: a 429 hops to an untried, unpaused idle account (matrix)',
+  { todo: 'docs/routing.md:126 says a rate-limit 429 takes "**one** failover hop, onto an account that is not already tried and not inside its own 429 pause"; the hop takes only the best pick, and none when that pick is paused' }, () => {
+    const g = /** @type {{ count: number, first: string|null }} */ (gaps.get('G4'));
+    assert.equal(g.count, 0, `${g.count} 429s took no hop while an untried, unpaused account was idle; first:\n${g.first}`);
+  });
+
+// Built by hand: at the default seed count no history reaches the probe with
+// an account at its advisor cap, so a matrix check would judge nothing.
+test('G3: the probe skips an account at its advisor-family cap under "strict"',
+  { todo: 'docs/quota.md:276 says an advisor request checks the advisor family cap on the exhausted-fleet probe; under "strict" the probe runs in the pass that has dropped the advisor' }, t => {
+    hermetic(t);
+    const start = Date.UTC(2030, 2, 10, 12);
+    const acct = (/** @type {string} */ id, /** @type {number} */ u7d) => ({
+      id, priority: 0, org: 'org-1', maxUsage: /** @type {any} */ (null), endsAt: null, hidden7d: false, clockless7d: false, clocklessF: false,
+      u5h: 0.1, r5h: start + 4 * H, u7d, r7d: start + 100 * H, F: 0.1, FR: start + 90 * H,
+    });
+    // Both read past the threshold, so the request goes to the probe, which
+    // takes the less used account; that is `a`, whose Fable cap is spent.
+    const history = {
+      seed: 0, start, fableRoute: null,
+      accounts: [{ ...acct('a', 0.985), maxUsage: { unified7dFable: 0.5 }, F: 0.6 }, acct('b', 0.995)],
+      steps: [{ at: start + MIN, op: 'request', c: 'c', model: OPUS, advisor: FABLE }],
+    };
+    const row = toRow({ ...base, advisorEligibility: 'strict' });
+    const [only] = play({ AccountManager, validateAdaptiveConfig, t, history, row });
+    assert.equal(only.d, 'b', `the probe went to ${only.d}, at its Fable cap`);
   });

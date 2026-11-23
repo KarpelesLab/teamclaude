@@ -2,17 +2,19 @@
 // judged against the independent model in routing-model.js and never against
 // a decision function of the code under test.
 //
-// An invariant is `{ id, doc, holds(row), gap?, check(ctx) }`. `check` returns
-// undefined where it does not apply, true where it applied and held, and a
-// string saying what broke otherwise. The count of `true` results is the
-// vacuity floor: an invariant that never applied in a row where it holds
-// proves nothing. A `gap` invariant states what docs/routing.md says where
-// the code does otherwise; its breaches are tallied for a todo test instead of
-// failing the row.
+// An invariant is `{ id, doc, holds(row), gap?, runFloor?, check(ctx) }`.
+// `check` returns undefined where it does not apply, true where it applied and
+// held, and a string saying what broke otherwise. The count of `true` results
+// is the vacuity floor: an invariant that never applied in a row where it holds
+// proves nothing. `runFloor`, where set, is the share of each such row's runs
+// in which it must apply at least once. A `gap` invariant states what
+// docs/routing.md says where the code does otherwise; its breaches are tallied
+// for a todo test instead of failing the row.
 
 import {
   FABLE, SOONER_MARGIN, band, bucketOf, capOf, deadline, governing, heldOff,
-  pressure, recentOn, activeOn, thresholdOf, unavailable, atCap,
+  pressure, recentOn, activeOn, thresholdOf, unavailable, atCap, routeOf, globMatches,
+  familyCapped, servesAdvisor,
 } from './routing-model.js';
 
 const ADAPTIVE_MAX_BURN_BOOST = 4;
@@ -24,6 +26,8 @@ const EPS = 1e-9;
 
 const distOn = (/** @type {any} */ row) => row.dist !== 'off';
 const pressureScoring = (/** @type {any} */ row) => row.dist.startsWith('adaptive-pressure');
+const layered = (/** @type {any} */ row) => row.routes === 'layered';
+const advising = (/** @type {any} */ row) => row.advisorEligibility === 'strict' || row.advisorEligibility === 'prefer';
 
 /**
  * Everything the invariants derive from one request's state, computed once.
@@ -34,7 +38,9 @@ export function view(ctx) {
   const { row, model, now, ex, fed } = ctx;
   /** @type {any[]} */
   const all = [...fed.values()];
-  const reason = (/** @type {any} */ a) => unavailable(a, model, row.threshold);
+  // An advisor's family cap keeps selection off an account as the request's
+  // own reasons do (_withoutAdvisorCapped), in every judged path.
+  const reason = (/** @type {any} */ a) => unavailable(a, model, row.threshold) ?? (ctx.adv?.excluded.has(a.id) ? 'advisor-capped' : null);
   const av = all.filter(a => reason(a) == null);
   const top = av.length ? Math.min(...av.map(a => a.priority)) : null;
   const B = band(av, model, now, ex);
@@ -70,8 +76,8 @@ function softOf(av, ctx) {
  * Which path a tagged request under distribution takes, by the order
  * _pickActiveAccount and _selectForSession ask: a cordon keeps what is on it;
  * the bucket's pin, then the conversation's other pins, are kept when
- * available and not outranked, a rolled bucket pin is re-decided, and with no
- * usable pin the request is a placement.
+ * available and not outranked, a pin the bucket's reading finds rolled is
+ * re-decided, and with no usable pin the request is a placement.
  * @param {any} ctx @param {any} v
  * @returns {{ kind: 'untagged'|'cordon'|'rolled'|'pin'|'placement'|'none', q?: string }}
  */
@@ -88,14 +94,17 @@ function classify(ctx, { av, reason, outranked, p }) {
     for (const id of keeps) {
       const a = fed.get(id);
       if (!a.cordoned || reason(a) !== 'cordoned') continue;
-      if (ctx.ex.enabled && ctx.ex.preempt && id === p && ctx.pinRolled) return { kind: 'none' };
+      if (ctx.ex.enabled && ctx.ex.preempt && id === ctx.readOn && ctx.readRolled) return { kind: 'none' };
       if (!av.some((/** @type {any} */ b) => b.priority < a.priority)) return { kind: 'cordon', q: id };
     }
   }
   for (const id of p != null ? [p, ...others] : others) {
     const a = fed.get(id);
     if (reason(a) != null) continue;
-    if (ctx.ex.enabled && ctx.ex.preempt && id === p && (ctx.pinRolled || ctx.pinUncertain)) {
+    // An uncertain reading may be the older one restored on an account left
+    // while rolled, which refuses a first sight elsewhere and stays there.
+    if (ctx.ex.enabled && ctx.ex.preempt && ctx.pinUncertain && ctx.readEscaped?.has(id)) return { kind: 'none' };
+    if (ctx.ex.enabled && ctx.ex.preempt && id === ctx.readOn && (ctx.readRolled || ctx.pinUncertain)) {
       return ctx.pinUncertain ? { kind: 'none' } : { kind: 'rolled', q: id };
     }
     if (outranked(a)) continue;
@@ -231,25 +240,122 @@ function reclaimable(ctx, v, q, a) {
 
 /**
  * A fresh catalog for one played history: G2 counts across steps.
- * @returns {Array<{ id: string, doc: string, gap?: string, holds: (row: any) => boolean, check: (ctx: any) => true|string|undefined }>}
+ * @returns {Array<{ id: string, doc: string, gap?: string, runFloor?: number, holds: (row: any) => boolean, check: (ctx: any) => true|string|undefined }>}
  */
 export function catalog() {
   /** @type {Map<string, number>} */
   const movesPerRoll = new Map();
+  // Only the advisor invariants judge a request whose advisor narrows its
+  // candidates, since every other one reads the candidates as the request's
+  // model alone leaves them.
+  const anyRequest = (/** @type {(ctx: any, v: any) => true|string|undefined} */ f) =>
+    (/** @type {any} */ ctx) => (ctx.restart || ctx.hop ? undefined : f(ctx, view(ctx)));
   const request = (/** @type {(ctx: any, v: any) => true|string|undefined} */ f) =>
-    (/** @type {any} */ ctx) => (ctx.restart ? undefined : f(ctx, view(ctx)));
+    (/** @type {any} */ ctx) => (ctx.adv && !ctx.adv.plain ? undefined : anyRequest(f)(ctx));
+  const advised = (/** @type {(ctx: any, v: any, adv: any) => true|string|undefined} */ f) =>
+    anyRequest((ctx, v) => (ctx.adv ? f(ctx, v, ctx.adv) : undefined));
+  const ids = (/** @type {any[]} */ xs) => `[${xs.map(a => a.id)}]`;
+  // Where a request went, as the advisor invariants read it: a candidate, or
+  // a cordoned account holding one of the conversation's pins, which keeps
+  // what is on it (docs/routing.md:21).
+  const tookOneOf = (/** @type {any} */ ctx, /** @type {any} */ v, /** @type {any[]} */ set, needsAdvisor = false) => {
+    if (set.some(a => a.id === ctx.d)) return true;
+    const a = ctx.fed.get(ctx.d);
+    return !!a && v.pins.includes(ctx.d) && v.reason(a) === 'cordoned'
+      && (!needsAdvisor || servesAdvisor(a, ctx.adv.advisor, ctx.row.threshold));
+  };
   return [
     {
       id: 'U1', doc: 'docs/routing.md:21',
       holds: () => true,
-      check: request((ctx, v) => {
+      check: anyRequest((ctx, v) => {
         if (ctx.d === '-') return undefined;
         const a = ctx.fed.get(ctx.d);
         if (a.disabled) return `${ctx.d} is disabled`;
         if (atCap(a, ctx.model)) return `${ctx.d} is at a maxUsage cap`;
-        if (ctx.model === FABLE && !a.fableRouted) return `${ctx.d} is excluded by a route`;
+        if (a.barred.has(ctx.model)) return `${ctx.d} is excluded by a route`;
         if (a.cordoned && !v.pins.includes(ctx.d)) return `${ctx.d} is cordoned and holds none of this conversation's pins`;
         return true;
+      }),
+    },
+    {
+      // The deciding route is the first whose globs match, so every account
+      // it lists, or every account when it lists none, stays a candidate, and
+      // the routes after it bar nothing.
+      id: 'O19', doc: 'docs/routing.md:210',
+      holds: layered,
+      check: request((ctx, v) => {
+        const matching = ctx.routes.filter((/** @type {any} */ r) => r.match.some((/** @type {string} */ g) => globMatches(g, ctx.model)));
+        if (matching.length < 2) return undefined;
+        const first = matching[0];
+        const allows = (/** @type {string} */ id) => !first.accounts?.length || first.accounts.includes(id);
+        if (ctx.d !== '-' && !allows(ctx.d)) return `${ctx.model} went to ${ctx.d}, which its first matching route ${first.name} does not list`;
+        if (ctx.d === '-' && v.av.length) return `${ctx.model} routed nowhere; its first matching route ${first.name} admits [${v.av.map((/** @type {any} */ a) => a.id)}]`;
+        return true;
+      }),
+    },
+    {
+      // A route restricts only the models it matches: a model none matches
+      // may go to any account, and a route matching no request model changes
+      // nothing.
+      id: 'O20', doc: 'docs/routing.md:201',
+      holds: layered,
+      check: request((ctx, v) => {
+        if (routeOf(ctx.routes, ctx.model)) return undefined;
+        if (ctx.d === '-' && v.av.length) return `${ctx.model} matches no route, yet routed nowhere while [${v.av.map((/** @type {any} */ a) => a.id)}] are available`;
+        return true;
+      }),
+    },
+    {
+      // A reloaded table routes the next request.
+      id: 'O21', doc: 'docs/routing.md:215',
+      holds: layered,
+      check: request((ctx, v) => {
+        if (!ctx.reloaded) return undefined;
+        if (ctx.d !== '-' && ctx.fed.get(ctx.d).barred.has(ctx.model)) return `after the reload ${ctx.model} went to ${ctx.d}, which the reloaded table bars`;
+        if (ctx.d === '-' && v.av.length) return `after the reload ${ctx.model} routed nowhere while the reloaded table admits [${v.av.map((/** @type {any} */ a) => a.id)}]`;
+        return true;
+      }),
+    },
+    {
+      // "strict": an account that can serve both models takes the request
+      // whenever one is available; one whose advisor bucket is spent, capped
+      // or barred by a route does not.
+      id: 'O22', doc: 'docs/routing.md:190',
+      holds: row => row.advisorEligibility === 'strict',
+      check: advised((ctx, v, adv) => {
+        if (!adv.both.length) return undefined;
+        if (ctx.d === '-') return `nothing routed while ${ids(adv.both)} can serve ${ctx.model} and its advisor`;
+        if (tookOneOf(ctx, v, adv.both, true)) return true;
+        return `${ctx.d} cannot serve the advisor ${adv.advisor}, yet ${ids(adv.both)} can serve both`;
+      }),
+    },
+    {
+      // With no account able to serve the advisor, the request is routed by
+      // its main model, in either mode.
+      id: 'O23', doc: 'docs/routing.md:193',
+      holds: advising,
+      check: advised((ctx, v, adv) => {
+        if (adv.both.length || !adv.cands.length) return undefined;
+        if (ctx.d === '-') return `nothing routed while ${ids(adv.cands)} can serve ${ctx.model}`;
+        return tookOneOf(ctx, v, adv.cands) ? true : `${ctx.d} took the request; ${ids(adv.cands)} can serve ${ctx.model}`;
+      }),
+    },
+    {
+      // Judged on selection, the path its doc line names
+      // (_withoutAdvisorCapped), in both modes. docs/quota.md:276 says the cap
+      // does not apply under "prefer"; that sentence is about the paths that
+      // skip selection (capBars: a pin, the exhausted-fleet probe, the paid
+      // fallback), which a G3 test in routing-config-model.test.js judges on
+      // the probe.
+      id: 'O24', doc: 'docs/routing.md:195',
+      holds: advising,
+      check: advised((ctx, v, adv) => {
+        if (!adv.cands.length) return undefined;
+        if (ctx.d === '-') return `nothing routed while ${ids(adv.cands)} can serve ${ctx.model}`;
+        if (!familyCapped(ctx.fed.get(ctx.d), adv.advisor)) return true;
+        if (!adv.excluded.size) return true;
+        return `${ctx.d} is at its ${adv.advisor} cap while ${ids(adv.cands)} can serve the request`;
       }),
     },
     {
@@ -362,6 +468,8 @@ export function catalog() {
     {
       id: 'O13b', doc: 'docs/routing.md:25',
       holds: row => row.dist === 'off' && row.sessionReset && !row.soonest && row.expiry?.enabled !== true,
+      // The generator's session-reset episode reaches a switch in most runs.
+      runFloor: 0.5,
       check: request((ctx, v) => {
         const cur = ctx.cur;
         if (cur == null || !ctx.sessionResets.size || ctx.d === cur || ctx.d === '-') return undefined;
@@ -562,6 +670,52 @@ export function catalog() {
       }),
     },
     {
+      id: 'O17', doc: 'docs/routing.md:126',
+      holds: () => true,
+      check: ctx => {
+        if (!ctx.hop) return undefined;
+        const { idle, paused } = hopCandidates(ctx);
+        // A rate-limit 429 "does not switch" (docs/routing.md:57): the hop
+        // detours one request.
+        if (ctx.cursorAfter !== ctx.cursorBefore) return `the hop moved the cursor from ${ctx.cursorBefore} to ${ctx.cursorAfter}`;
+        if (ctx.to == null) {
+          // A paused best pick leaves the 429 unhopped; G4 counts those.
+          if (idle.length && !idle.some(a => paused(a.id))) return `a 429 on ${ctx.from} took no hop while [${idle.map(a => a.id)}] were idle and none paused`;
+          return true;
+        }
+        const a = idle.find(x => x.id === ctx.to);
+        if (!a) return `the hop went to ${ctx.to}, which is the 429's account, rolled off or unavailable`;
+        if (paused(a.id)) return `the hop went to ${ctx.to}, inside its own 429 pause`;
+        const top = Math.min(...idle.filter(x => !paused(x.id)).map(x => x.priority));
+        return a.priority === top ? true : `the hop went to ${ctx.to} at priority ${a.priority}; ${top} is idle and unpaused`;
+      },
+    },
+    {
+      id: 'O18', doc: 'docs/routing.md:240 and :409, inferred',
+      // No docs line states this rule. It is inferred from docs/routing.md:240,
+      // where a new conversation is pinned to the account it is routed to, and
+      // :409, where a pin stops being honored once its account has failed in
+      // the same request, and which names the four writers of a pin map.
+      // A pin decides routing only under distribution.
+      holds: distOn,
+      check: ctx => {
+        if (!ctx.hop) return undefined;
+        const pinsOf = (/** @type {any} */ snap) => new Map((snap?.sessions ?? []).map((/** @type {any} */ x) =>
+          [x.key, x.pins.map((/** @type {any} */ p) => `${p.bucket}=${p.account.id}`).sort().join(',')]));
+        const before = pinsOf(ctx.pinsBefore);
+        const after = pinsOf(ctx.pinsAfter);
+        for (const [k, pins] of before) {
+          if (k !== ctx.c && after.get(k) !== pins) return `the 429 on ${ctx.from} moved conversation ${k} from ${pins} to ${after.get(k) ?? 'none'}`;
+        }
+        // The account the request was tried on and refused is no longer the
+        // pin's: the pin is where the request went.
+        const own = (ctx.pinsAfter?.sessions ?? []).find((/** @type {any} */ x) => x.key === ctx.c);
+        const pin = own?.pins.find((/** @type {any} */ p) => p.bucket === ctx.bucket)?.account.id ?? null;
+        const want = ctx.to ?? ctx.from;
+        return pin === want ? true : `conversation ${ctx.c} is pinned to ${pin} after the 429 on ${ctx.from}, not to ${want}, where it went`;
+      },
+    },
+    {
       id: 'G1', doc: 'docs/routing.md:232',
       gap: 'docs/routing.md:232 says a conversation is forgotten after an hour idle; its own next request revives its pins',
       // Pins decide routing only under distribution.
@@ -588,7 +742,28 @@ export function catalog() {
         return n === 1 ? true : `pin ${p} of ${ctx.c} moved ${n} times on one roll of its ${governing(a, ctx.model).window} window`;
       }),
     },
+    {
+      id: 'G4', doc: 'docs/routing.md:126',
+      gap: 'docs/routing.md:126 says a rate-limit 429 takes "**one** failover hop, onto an account that is not already tried and not inside its own 429 pause"; the hop takes only the best pick, and none when that pick is paused',
+      holds: () => true,
+      check: ctx => {
+        if (!ctx.hop || ctx.to != null) return undefined;
+        const { idle, paused } = hopCandidates(ctx);
+        const open = idle.filter(a => !paused(a.id));
+        return open.length ? `a 429 on ${ctx.from} took no hop while [${open.map(a => a.id)}] were idle and unpaused` : true;
+      },
+    },
   ];
+}
+
+/** The accounts a hop could go to: neither the 429's nor rolled off, and
+ * available for the request's model. @param {any} ctx */
+function hopCandidates(ctx) {
+  const { fed, model, now } = ctx;
+  const paused = (/** @type {string} */ id) => (ctx.pausedUntil.get(id) ?? -Infinity) > now;
+  const idle = [...fed.values()].filter((/** @type {any} */ a) => a.id !== ctx.from && !ctx.rolledOff.includes(a.id)
+    && unavailable(a, model, ctx.row.threshold) == null);
+  return { idle: /** @type {any[]} */ (idle), paused };
 }
 
 /** Whether a placement oracle cannot be judged here because a reading sits on

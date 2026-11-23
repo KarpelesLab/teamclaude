@@ -21,19 +21,36 @@ export const LOAD_WINDOW = 10 * MIN;
 export const ROLL_JUMP = H;
 export const SOONER_MARGIN = MIN;
 const STEPS = 40;
+// The share of random Opus requests that declare a Fable advisor, in the rows
+// that send one.
+const ADVISED_RATE = 0.4;
 const EPISODE_RATE = 0.35;
 const ROLL_EPISODE_RATE = 0.3;
 const SERVE_BURN = 0.004;
 const SERVE_BURN_5H = 0.02;
+// server.js RATE_LIMIT_ABSORB_MAX_SECONDS, which caps a per-minute 429's pause.
+const RATE_LIMIT_ABSORB_MAX = 60;
+// Past that cap, so a 429 with nowhere to hop goes back to the client at once
+// rather than waiting to retry the same account.
+const RETRY_AFTER = 90;
 const LETTERS = 'abcdef';
+// An account name a route may list that no account in the pool has.
+const GONE = 'gone';
 
 /**
  * @typedef {{ id: string, priority: number, org: string|null, maxUsage: any, endsAt: number|null,
  *   hidden7d: boolean, clockless7d: boolean, clocklessF: boolean,
  *   u5h: number, r5h: number, u7d: number, r7d: number, F: number|null, FR: number|null }} PoolAccount
+ * A `throttle` step is a request whose first attempt draws a per-minute 429.
  * @typedef {{ at: number, op: string, c?: string, model?: string, id?: string, u7d?: number,
- *   f?: number|null, u5h?: number, fable?: boolean, kind?: string, restart?: boolean }} Step
- * @typedef {{ seed: number, start: number, accounts: PoolAccount[], fableRoute: string[]|null, steps: Step[] }} History
+ *   f?: number|null, u5h?: number, fable?: boolean, kind?: string, restart?: boolean, reload?: boolean,
+ *   advisor?: string }} Step
+ * `events` counts the steps before the closing episodes.
+ * @typedef {{ name: string, match: string[], accounts?: string[] }} Route
+ * `routeTables` is what the rows with several routes configure: `first` from
+ * the start, `next` after the step marked `reload`.
+ * @typedef {{ seed: number, start: number, accounts: PoolAccount[], fableRoute: string[]|null, steps: Step[], events?: number,
+ *   routeTables?: { first: Route[], next: Route[] } }} History
  * @typedef {{ name: string, dist: string, expiry: any, soonest: boolean, sessionReset: boolean,
  *   persist: boolean, threshold: any, [option: string]: any }} Row
  */
@@ -109,13 +126,21 @@ export function generate(seed) {
   // differential that judges it can only read a decision taken before the two
   // scorings first place a conversation apart.
   const extra2 = prng(seed ^ 0x6c8e9cf5);
+  // Which requests declare an advisor, from a stream of its own, so that the
+  // rows that send none play the same history.
+  const advised = prng(seed ^ 0x2f2b8a17);
   const rollAt = extra2() < ROLL_EPISODE_RATE ? 0 : -1;
   for (let i = 0; i < STEPS; i++) {
     if (i === episodeAt) at = priorityEpisode(steps, accounts, convs, at, extra);
     if (i === rollAt) at = rollEpisode(steps, accounts, convs, at, extra2);
     at += int(1, 30) * SEC;
     const r = rand();
-    if (r < 0.5) steps.push({ at, op: 'request', c: convs[int(0, convs.length - 1)], model: model() });
+    if (r < 0.5) {
+      /** @type {Step} */
+      const s = { at, op: 'request', c: convs[int(0, convs.length - 1)], model: model() };
+      if (s.model === OPUS && advised() < ADVISED_RATE) s.advisor = FABLE;
+      steps.push(s);
+    }
     else if (r < 0.56) steps.push({ at, op: 'untagged', model: model() });
     else if (r < 0.66) steps.push({ at, op: 'usage', id: pick(), u7d: r2(rand() * 0.99), f: rand() < 0.5 ? r2(rand() * 0.99) : null });
     else if (r < 0.72) steps.push({ at, op: 'five', id: pick(), u5h: r2(0.6 + rand() * 0.39) });
@@ -127,7 +152,197 @@ export function generate(seed) {
       steps.push({ at, op: 'idle' });
     } else steps.push({ at, op: 'fault', id: pick(), kind: rand() < 0.6 ? 'disable' : 'cordon' });
   }
-  return { seed, start, accounts, fableRoute, steps };
+  // The closing episodes follow the random events, so that they change none
+  // of them. A session-reset switch needs an account whose 5h window resets
+  // while another is the cursor, both cleared of the re-rank flag, and
+  // random events almost never line that up.
+  const events = steps.length;
+  throttleEpisode(steps, convs, prng(seed ^ 0x7feb352d));
+  sessionResetEpisode(steps, accounts, convs, prng(seed ^ 0x1b873593));
+  advisorCapEpisode(steps, accounts, convs, prng(seed ^ 0x4cf5ad43));
+  const extra3 = prng(seed ^ 0x3c6ef372);
+  const shape = Math.floor(extra3() * 3);
+  const routeTables = { first: routeTable(accounts, extra3, shape), next: routeTable(accounts, extra3, (shape + 1 + Math.floor(extra3() * 2)) % 3) };
+  steps[Math.floor(extra3() * (events - 1))].reload = true;
+  return { seed, start, accounts, fableRoute, steps, events, routeTables };
+}
+
+/** One route table of several routes over the pool, in one of three shapes
+ * docs/routing.md 'Model routes' describes: a Fable route ahead of a broader
+ * route that matches Fable as well, so the first one decides; a first route
+ * that lists no accounts ahead of a route that would restrict the same model;
+ * and a Fable route ahead of one that matches no request model. No
+ * route matches the Opus model, so the bulk of the traffic is unrestricted and
+ * judged as in the other rows. The listed sets are disjoint, and a route that
+ * must decide nothing lists only an account the pool does not have, so a
+ * request held to the wrong route's list lands where the deciding route bars
+ * it, or nowhere.
+ * @param {PoolAccount[]} accounts @param {() => number} rand @param {number} shape
+ * @returns {Route[]} */
+function routeTable(accounts, rand, shape) {
+  const ids = accounts.map(a => a.id);
+  for (let i = ids.length - 1; i > 0; i--) {
+    const j = Math.floor(rand() * (i + 1));
+    [ids[i], ids[j]] = [ids[j], ids[i]];
+  }
+  const cut = 1 + Math.floor(rand() * (ids.length - 1));
+  const one = ids.slice(0, cut); const two = ids.slice(cut);
+  // Matching each glob against the request's model on every availability
+  // check is most of these rows' cost, so the tables hold no more globs
+  // than the rules need. A route matching nothing leads two of the shapes,
+  // so that the deciding route is not the first.
+  const idle = { name: 'idle', match: ['*sonnet*'], accounts: [GONE] };
+  if (shape === 0) return [idle, { name: 'fable', match: ['claude-fable-*'], accounts: one }, { name: 'claude', match: ['*fable*'], accounts: two }];
+  if (shape === 1) return [idle, { name: 'open', match: ['*fable*'] }, { name: 'fable', match: ['claude-fable-5'], accounts: [GONE] }];
+  return [{ name: 'fable', match: ['*fable*'], accounts: one }, { name: 'old', match: ['claude-opus-4*'], accounts: [GONE] }];
+}
+
+/** Appends the throttle episode: two conversations take turns, each drawing a
+ * per-minute 429 twice and coming back in between, closer together than a
+ * pause lasts, so that a hop meets accounts inside their pause.
+ * @param {Step[]} steps @param {string[]} convs @param {() => number} rand */
+function throttleEpisode(steps, convs, rand) {
+  let at = steps.length ? steps[steps.length - 1].at : 0;
+  const x = convs[Math.floor(rand() * convs.length)];
+  const others = convs.filter(k => k !== x);
+  const y = others[Math.floor(rand() * others.length)];
+  for (const [op, c] of /** @type {const} */ ([['throttle', x], ['request', y], ['request', x], ['throttle', y], ['throttle', x], ['request', y], ['request', x]])) {
+    at += (2 + Math.floor(rand() * 19)) * SEC;
+    steps.push({ at, op, c, model: rand() < 0.7 ? OPUS : FABLE });
+  }
+}
+
+/** What a played history leaves of the facts the episodes steer by: each
+ * account's weekly reset as of the last step, and which accounts the fault
+ * steps left disabled or cordoned, by play's rule for a fault.
+ * @param {Step[]} steps @param {PoolAccount[]} accounts */
+function replayFacts(steps, accounts) {
+  const r7d = new Map(accounts.map(a => [a.id, a.r7d]));
+  const disabled = new Set(); const cordoned = new Set();
+  for (const s of steps) {
+    for (const a of accounts) {
+      let r = /** @type {number} */ (r7d.get(a.id));
+      while (r <= s.at) r += WEEK;
+      r7d.set(a.id, r);
+    }
+    const a = accounts.find(x => x.id === s.id);
+    if (!a) continue;
+    if (s.op === 'roll' && !(s.fable && a.F != null)) r7d.set(a.id, /** @type {number} */ (r7d.get(a.id)) + WEEK);
+    if (s.op === 'fault') {
+      const down = accounts.filter(x => disabled.has(x.id) || cordoned.has(x.id)).length;
+      const room = down < Math.floor(accounts.length / 2);
+      if (s.kind === 'disable' && (disabled.has(a.id) || room)) { if (!disabled.delete(a.id)) disabled.add(a.id); }
+      else if (s.kind === 'cordon' && (cordoned.has(a.id) || room)) { if (!cordoned.delete(a.id)) cordoned.add(a.id); }
+    }
+  }
+  return { r7d, disabled, cordoned };
+}
+
+/** Appends the advisor-cap episode: a top-tier account with a Fable cap
+ * takes the traffic while every other reads past any threshold, its Fable
+ * bucket then reaches the cap, the others recover, and advised requests
+ * follow. Only that cap keeps them off it, and random readings almost never
+ * line it up. Nothing is appended without a top-tier account that has a Fable
+ * cap and reading.
+ * @param {Step[]} steps @param {PoolAccount[]} accounts @param {string[]} convs
+ * @param {() => number} rand */
+function advisorCapEpisode(steps, accounts, convs, rand) {
+  const top = Math.min(...accounts.map(a => a.priority));
+  const pool = accounts.filter(a => a.priority === top && a.F != null && capOf(a.maxUsage, 'unified7dFable') != null);
+  if (!pool.length) return;
+  const p = pool[Math.floor(rand() * pool.length)];
+  const facts = replayFacts(steps, accounts);
+  const cap = /** @type {number} */ (capOf(p.maxUsage, 'unified7dFable'));
+  const [c, k] = [convs[Math.floor(rand() * convs.length)], convs[Math.floor(rand() * convs.length)]];
+  let at = steps.length ? steps[steps.length - 1].at : 0;
+  const push = (/** @type {Omit<Step, 'at'>} */ s) => { at += (1 + Math.floor(rand() * 10)) * SEC; steps.push({ at, ...s }); };
+  if (facts.disabled.has(p.id)) push({ op: 'fault', id: p.id, kind: 'disable' });
+  if (facts.cordoned.has(p.id)) push({ op: 'fault', id: p.id, kind: 'cordon' });
+  push({ op: 'usage', id: p.id, u7d: 0.1, f: Math.max(0, r2(cap - 0.2)) });
+  push({ op: 'five', id: p.id, u5h: 0.1 });
+  for (const a of accounts) if (a !== p) push({ op: 'usage', id: a.id, u7d: 0.99, f: null });
+  push({ op: 'request', c, model: OPUS });
+  push({ op: 'usage', id: p.id, u7d: 0.1, f: Math.min(0.99, r2(cap + 0.05)) });
+  for (const a of accounts) if (a !== p) push({ op: 'usage', id: a.id, u7d: r2(rand() * 0.35), f: null });
+  for (const x of [c, k, c]) push({ op: 'request', c: x, model: OPUS, advisor: FABLE });
+}
+
+/** The first reset of a window of `period` after `t`, from one at `r`.
+ * @param {number} r @param {number} t @param {number} period */
+const nextReset = (r, t, period) => (r > t ? r : r + period * (Math.floor((t - r) / period) + 1));
+
+/** Appends the session-reset episode: `p` takes the traffic and serves, `q`
+ * takes it from `p` at `p`'s 5h wall and serves, `p`'s 5h window resets, and
+ * one more request comes. Three histories in four have `p`'s deadline sooner than
+ * `q`'s, so the switch moves the traffic back, and the rest have it later, so the
+ * traffic stays. A third account `r`, read only after the reset so that it
+ * has none pending, holds a deadline sooner than `q`'s where the pool allows:
+ * the switch must not take it. Every other account reads past any threshold
+ * throughout. Nothing is appended without two top-tier accounts whose weekly
+ * reset is known.
+ * @param {Step[]} steps @param {PoolAccount[]} accounts @param {string[]} convs
+ * @param {() => number} rand */
+function sessionResetEpisode(steps, accounts, convs, rand) {
+  const facts = replayFacts(steps, accounts);
+  const top = Math.min(...accounts.map(a => a.priority));
+  const pool = accounts.filter(a => a.priority === top && !a.clockless7d);
+  if (pool.length < 2) return;
+  const sooner = rand() < 0.75;
+  const c = convs[Math.floor(rand() * convs.length)];
+  const t0 = steps.length ? steps[steps.length - 1].at : 0;
+  const deadlineAt = (/** @type {PoolAccount} */ a, /** @type {number} */ t) => {
+    const r = nextReset(/** @type {number} */ (facts.r7d.get(a.id)), t, WEEK);
+    return a.endsAt != null && a.endsAt > t ? Math.min(r, a.endsAt) : r;
+  };
+  /** @param {PoolAccount} p @param {PoolAccount} q @param {PoolAccount|undefined} r */
+  const build = (p, q, r) => {
+    /** @type {Step[]} */
+    const out = [];
+    let at = t0;
+    const push = (/** @type {Omit<Step, 'at'>} */ s, gap = 5 * SEC) => { at += gap; out.push({ at, ...s }); };
+    const ask = () => push({ op: 'request', c, model: OPUS });
+    const recover = (/** @type {PoolAccount} */ a) => {
+      push({ op: 'usage', id: a.id, u7d: 0.1, f: null });
+      push({ op: 'five', id: a.id, u5h: 0.1 });
+    };
+    for (const a of [p, q, r]) {
+      if (!a) continue;
+      if (facts.disabled.has(a.id)) push({ op: 'fault', id: a.id, kind: 'disable' });
+      if (facts.cordoned.has(a.id)) push({ op: 'fault', id: a.id, kind: 'cordon' });
+    }
+    recover(p);
+    for (const a of accounts) if (a !== p) push({ op: 'usage', id: a.id, u7d: 0.99, f: null });
+    // The first request moves the cursor to `p`, the second spends the re-rank
+    // flag its first weekly reading set; the same again for `q`.
+    ask(); ask();
+    recover(q);
+    // Clear of a reset that would land between the wall and the move to `q`.
+    if (nextReset(p.r5h, at, 5 * H) - at < 2 * MIN) push({ op: 'idle' }, nextReset(p.r5h, at, 5 * H) - at + SEC);
+    push({ op: 'five', id: p.id, u5h: 0.99 });
+    const wall = nextReset(p.r5h, at, 5 * H);
+    ask(); ask();
+    push({ op: 'idle' }, Math.max(SEC, wall - at + 10 * SEC));
+    if (r) recover(r);
+    ask();
+    return { out, end: at };
+  };
+  // Candidate pairs in a seeded order; the first whose deadlines fall the way
+  // `sooner` says is played, else the first.
+  const pairs = pool.flatMap(p => pool.filter(q => q !== p).map(q => [p, q]));
+  for (let i = pairs.length - 1; i > 0; i--) {
+    const j = Math.floor(rand() * (i + 1));
+    [pairs[i], pairs[j]] = [pairs[j], pairs[i]];
+  }
+  let chosen = null;
+  for (const [p, q] of pairs) {
+    const trial = build(p, q, undefined);
+    const dp = deadlineAt(p, trial.end); const dq = deadlineAt(q, trial.end);
+    if (sooner ? dp < dq : dp > dq) { chosen = [p, q]; break; }
+  }
+  const [p, q] = chosen ?? pairs[0];
+  const { end } = build(p, q, undefined);
+  const r = pool.filter(a => a !== p && a !== q).sort((x, y) => deadlineAt(x, end) - deadlineAt(y, end))[0];
+  steps.push(...build(p, q, r).out);
 }
 
 /** Appends the priority episode: every top-tier account reads past any
@@ -203,6 +418,7 @@ export function managerOptions(row, validateAdaptiveConfig) {
     preferSoonestWeeklyReset: row.soonest,
     switchOnSessionReset: row.sessionReset,
     routes: undefined,
+    ...(row.advisorEligibility === 'strict' || row.advisorEligibility === 'prefer' ? { advisorEligibility: row.advisorEligibility } : {}),
     familyStaleMs: 365 * 24 * H,
     statusStaleMs: 365 * 24 * H,
     throttleProbeFloorMs: 60_000,
@@ -237,12 +453,49 @@ export function thresholdOf(threshold, bucket) {
 }
 export const bucketOf = (/** @type {string} */ model) => (model === FABLE ? 'unified7dFable' : 'unified7d');
 
+/** Whether a shell-style glob, `*` its only wildcard, matches all of `s`.
+ * @param {string} glob @param {string} s */
+export function globMatches(glob, s) {
+  const parts = glob.split('*');
+  if (parts.length === 1) return glob === s;
+  const head = parts[0]; const tail = parts[parts.length - 1];
+  if (!s.startsWith(head) || s.length < head.length + tail.length || !s.endsWith(tail)) return false;
+  let at = head.length;
+  for (const p of parts.slice(1, -1)) {
+    const k = s.indexOf(p, at);
+    if (k < 0 || k + p.length > s.length - tail.length) return false;
+    at = k + p.length;
+  }
+  return true;
+}
+
+/** The first route whose globs match `model`, which alone decides it.
+ * @param {Route[]} table @param {string} model */
+export function routeOf(table, model) {
+  return table.find(r => r.match.some(g => globMatches(g, model))) ?? null;
+}
+
+/** Whether the table keeps `id` off `model`: its first matching route lists
+ * accounts and `id` is not one of them.
+ * @param {Route[]} table @param {string} id @param {string} model */
+export function routeBars(table, id, model) {
+  const r = routeOf(table, model);
+  return !!(r?.accounts?.length && !r.accounts.includes(id));
+}
+
+/** The route table a row configures for a history.
+ * @param {Row} row @param {History} h @returns {Route[]} */
+export function routesFor(row, h) {
+  if (row.routes === 'layered') return /** @type {{ first: Route[] }} */ (h.routeTables).first;
+  return h.fableRoute ? [{ name: 'fable', match: ['*fable*'], accounts: h.fableRoute }] : [];
+}
+
 /**
  * What the manager has been told about one account, plus the pool facts it was
  * configured with. Readings go null when their reset passes, as
  * _clearExpiredQuotas does.
  * @typedef {{ id: string, priority: number, org: string|null, maxUsage: any, endsAt: number|null,
- *   fableRouted: boolean, disabled: boolean, cordoned: boolean,
+ *   barred: Set<string>, disabled: boolean, cordoned: boolean,
  *   u5h: number|null, r5h: number|null, u7d: number|null, r7d: number|null, f: number|null, fr: number|null }} Fed
  */
 
@@ -269,7 +522,7 @@ export function unavailable(a, model, threshold) {
   if (a.u5h != null && a.u5h >= thresholdOf(threshold, 'unified5h')) return 'quota';
   const weekly = model === FABLE && a.f != null ? Math.max(a.f, a.u7d ?? -Infinity) : a.u7d;
   if (weekly != null && weekly >= thresholdOf(threshold, bucketOf(model))) return 'quota';
-  if (model === FABLE && !a.fableRouted) return 'route';
+  if (a.barred.has(model)) return 'route';
   if (a.cordoned) return 'cordoned';
   return null;
 }
@@ -283,14 +536,63 @@ export function startable(a, threshold) {
   return !(a.u7d != null && a.u7d >= thresholdOf(threshold, 'unified7d'));
 }
 
+const hit = (/** @type {number|null} */ cap, /** @type {number|null} */ used) => cap != null && (cap <= 0 || (used != null && used >= cap));
+
 /** @param {Fed} a @param {string} model */
 export function atCap(a, model) {
-  const hit = (/** @type {number|null} */ cap, /** @type {number|null} */ used) => cap != null && (cap <= 0 || (used != null && used >= cap));
   if (a.maxUsage == null) return false;
   if (hit(capOf(a.maxUsage, 'unified5h'), a.u5h)) return true;
   if (hit(capOf(a.maxUsage, 'unified7d'), a.u7d)) return true;
   return model === FABLE && hit(capOf(a.maxUsage, 'unified7dFable'), a.f);
 }
+
+/** Whether a maxUsage cap on `model`'s own family bucket bars `a`; the
+ * shared buckets are not this check's, as the executor's caps cover them.
+ * @param {Fed} a @param {string} model */
+export function familyCapped(a, model) {
+  return a.maxUsage != null && model === FABLE && hit(capOf(a.maxUsage, 'unified7dFable'), a.f);
+}
+
+/** Whether `a` can also serve an advisor on `advisor` (docs/routing.md:180):
+ * its bucket for that family is not spent or capped, and no route bars it.
+ * @param {Fed} a @param {string} advisor @param {any} threshold */
+export function servesAdvisor(a, advisor, threshold) {
+  if (familyCapped(a, advisor) || a.barred.has(advisor)) return false;
+  return !(advisor === FABLE && a.f != null && a.f >= thresholdOf(threshold, 'unified7dFable'));
+}
+
+/**
+ * How docs/routing.md:178-195 routes a request on `model` that declares an
+ * advisor on `advisor`. `excluded` holds the accounts whose advisor-family cap
+ * keeps selection off them, which is all such accounts while another can serve
+ * the request, else none; `cands` the accounts that can serve the request
+ * outside it, and `both` those of them that can serve the advisor too.
+ * `routed` is the advisor that selection is held to: none where 'prefer' sets a
+ * narrowing advisor aside. `plain` is where the advisor changes no decision,
+ * so the request is judged as one that declared none: set aside, or every
+ * account a request could be sent to, a cordoned one holding it included,
+ * serves the advisor as well.
+ * @param {Map<string, Fed>} fed @param {string} model @param {string} advisor @param {Row} row
+ */
+export function advisorRouting(fed, model, advisor, row) {
+  const all = [...fed.values()];
+  const reason = (/** @type {Fed} */ a) => unavailable(a, model, row.threshold);
+  const capped = all.filter(a => familyCapped(a, advisor)).map(a => a.id);
+  const excluded = new Set(all.some(a => reason(a) == null && !capped.includes(a.id)) ? capped : []);
+  const cands = all.filter(a => reason(a) == null && !excluded.has(a.id));
+  const both = cands.filter(a => servesAdvisor(a, advisor, row.threshold));
+  const narrows = both.length > 0 && both.length < cands.length;
+  const routed = row.advisorEligibility === 'prefer' && narrows ? null : advisor;
+  const plain = routed == null || all.every(a => excluded.has(a.id) || (reason(a) != null && reason(a) !== 'cordoned')
+    || servesAdvisor(a, advisor, row.threshold));
+  return { advisor, excluded, cands, both, narrows, routed, plain };
+}
+
+/** The key the manager keeps a model's diversion under (_cursorKey): an
+ * advisor that selection was held to keys it apart from requests that name
+ * none.
+ * @param {string} model @param {string|null} advisor */
+export const cursorKeyOf = (model, advisor) => (advisor && advisor !== model ? `${model}+${advisor}` : model);
 
 /** The room under the caps on the governing window (_spendLimit), 1 with none.
  * @param {Fed} a @param {string} model */
@@ -467,7 +769,7 @@ function takeLapsed(obs, lapsed) {
 /**
  * @typedef {{ pins: Map<string, string>, pinAt: Map<string, number>, lastSeen: number,
  *   obs: Map<string, Obs> }} Conv
- * @typedef {{ i: number, op: string, c?: string, model?: string, d: string, pin?: string|null, kind?: string }} Decision
+ * @typedef {{ i: number, op: string, c?: string, model?: string, d: string, pin?: string|null, kind?: string, to?: string }} Decision
  */
 
 /** Conversations counted as load on `id` (activeCountFor): one whose pin on
@@ -513,7 +815,7 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
   /** @type {Map<string, Fed>} */
   const fed = new Map(h.accounts.map(a => [a.id, {
     id: a.id, priority: a.priority, org: a.org, maxUsage: a.maxUsage, endsAt: a.endsAt,
-    fableRouted: !h.fableRoute || h.fableRoute.includes(a.id), disabled: false, cordoned: false,
+    barred: new Set(), disabled: false, cordoned: false,
     u5h: null, r5h: null, u7d: null, r7d: null, f: null, fr: null,
   }]));
   // Windows past their reset that the manager has not cleared: a request's
@@ -530,9 +832,14 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
     ...(fed.get(a.id)?.disabled ? { disabled: true } : {}),
     ...(fed.get(a.id)?.cordoned ? { cordoned: true } : {}),
   }));
+  let routes = routesFor(row, h);
+  const bar = () => {
+    for (const f of fed.values()) f.barred = new Set([OPUS, FABLE].filter(m => routeBars(routes, f.id, m)));
+  };
+  bar();
   const options = () => ({
     ...managerOptions(row, validateAdaptiveConfig),
-    ...(h.fableRoute ? { routes: [{ name: 'fable', match: ['*fable*'], accounts: h.fableRoute }] } : {}),
+    ...(routes.length ? { routes } : {}),
   });
   let am = new AccountManager(configRows(), row.threshold, options());
   const byId = (/** @type {string} */ id) => am.accounts.find((/** @type {any} */ a) => a.id === id);
@@ -584,6 +891,7 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
   /** @type {Decision[]} */
   const out = [];
   let life = 0;
+  let reloaded = false;
   /** @type {string|null} */
   let cur = null;
   // Accounts whose 5h reset the manager has noticed and not yet acted on. It
@@ -591,6 +899,9 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
   // expired one first raises nothing.
   /** @type {Set<string>} */
   let sessionResets = new Set();
+  // When each account's per-minute pause ends, which the manager does not save.
+  /** @type {Map<string, number>} */
+  let pausedUntil = new Map();
   const noticeResets = () => {
     for (const f of fed.values()) {
       if (f.r5h != null && Date.now() >= f.r5h) {
@@ -614,12 +925,14 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
   // only for its model is diverted without moving it.
   const cursor = () => am.accounts[am.currentIndex]?.id ?? null;
   cur = cursor();
-  // Where each model was last routed. The manager keeps a family diverted off
-  // a cursor that cannot serve it on that account (_divertedFor); this is the
-  // same record, taken from the decisions rather than from the manager's
-  // private state, and like the manager's it is not saved across a restart.
+  // Where each model was last routed, under the manager's key for it. The
+  // manager keeps a family diverted off a cursor that cannot serve it on that
+  // account (_divertedFor); this is the same record, taken from the decisions
+  // rather than from the manager's private state, and like the manager's it is
+  // not saved across a restart.
   /** @type {Map<string, string>} */
   let lastRouted = new Map();
+  const advising = row.advisorEligibility === 'strict' || row.advisorEligibility === 'prefer';
 
   const serve = (/** @type {any} */ acc, /** @type {string} */ model, /** @type {boolean} */ burn) => {
     const x = /** @type {PoolAccount} */ (truth.get(acc.id));
@@ -630,6 +943,39 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
     }
     am.updateQuota(acc.index, headersOf(x, model), model, 200);
     noteReading(acc.id);
+  };
+
+  /** The rest of a throttle step once its first attempt is sent to `acc`, in
+   * the server's order: the 429's readings, the pause, at most one hop to an
+   * account outside its own pause, which is sent the request and serves it,
+   * and the request's end. Checks the hop, and returns the account it went to.
+   * @param {any} acc @param {{ rolledOff?: Set<number> }} selection @param {any} ctx @param {Obs|null} sighted */
+  const throttle = (acc, selection, ctx, sighted) => {
+    const { model, c, now } = ctx;
+    am.updateQuota(acc.index, headersOf(/** @type {PoolAccount} */ (truth.get(acc.id)), model), model, 429);
+    noteReading(acc.id);
+    // A load of 0 teaches the concurrency learner nothing: the load the server
+    // passes comes from admission, which is not played.
+    am.pauseAccount(acc.index, Math.min(RETRY_AFTER, RATE_LIMIT_ABSORB_MAX), 0);
+    pausedUntil.set(acc.id, now + Math.min(RETRY_AFTER, RATE_LIMIT_ABSORB_MAX) * SEC);
+    const pinsBefore = am.exportAffinityState();
+    const cursorBefore = cursor();
+    const alt = am.pickAlternate(new Set([acc.index, ...(selection.rolledOff ?? [])]), model, null);
+    const to = alt && !am.isPaused(alt.index) ? alt : null;
+    if (to) {
+      am.recordSession(c, to.index, model);
+      if (sighted) firstSight(sighted, /** @type {Fed} */ (fed.get(to.id)), fed);
+    }
+    check({
+      ...ctx, hop: true, from: acc.id, to: to?.id ?? null, pausedUntil: new Map(pausedUntil),
+      rolledOff: [...(selection.rolledOff ?? [])].map(k => am.accounts[k].id),
+      cursorBefore, cursorAfter: cursor(), pinsBefore, pinsAfter: am.exportAffinityState(), view: undefined,
+    });
+    if (to) {
+      serve(to, model, true);
+      am.confirmStay(to, null, c, 'anthropic');
+    }
+    return to;
   };
 
   h.steps.forEach((s, i) => {
@@ -668,9 +1014,9 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
       } else if (s.kind === 'cordon' && (f.cordoned || down < Math.floor(fed.size / 2))) {
         f.cordoned = !f.cordoned; am.setCordoned(byId(f.id).index, f.cordoned);
       }
-    } else if (s.op === 'untagged' || s.op === 'request') {
+    } else if (s.op === 'untagged' || s.op === 'request' || s.op === 'throttle') {
       const model = /** @type {string} */ (s.model);
-      const tagged = s.op === 'request';
+      const tagged = s.op !== 'untagged';
       const c = /** @type {string} */ (s.c);
       /** @type {Conv|undefined} */
       let conv = tagged ? convs.get(c) : undefined;
@@ -686,37 +1032,62 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
       }
       const bucket = bucketOf(model);
       noticeResets();
+      // Throttle steps declare no advisor, so a hop is judged on the request model.
+      const adv = s.advisor && s.op === 'request' && advising ? advisorRouting(fed, model, s.advisor, row) : null;
+      const key = cursorKeyOf(model, adv?.routed ?? null);
       // The readings _pickActiveAccount takes before it decides.
       let curRolled = false;
       let pinRolled = false;
       if (preempting && cur != null) curRolled = restOn(curObs, /** @type {Fed} */ (fed.get(cur)), model, fed, lapsed.get(cur));
       const pinNow = conv?.pins.get(bucket);
       let pinUncertain = false;
+      // The account the bucket's reading names, and whether its governing
+      // window rolled since: the walk checks it for every pin it tries
+      // (_pinRolledOver).
+      /** @type {string|null} */
+      let readOn = null;
+      let readRolled = false;
+      /** @type {Set<string>} */
+      let readEscaped = new Set();
       if (preempting && conv && pinNow != null) {
         let o = conv.obs.get(bucket);
         if (!o) { o = newObs(); conv.obs.set(bucket, o); }
-        pinRolled = restOn(o, /** @type {Fed} */ (fed.get(pinNow)), model, fed, lapsed.get(pinNow));
+        // A pin the request may not be sent to is not read (_restOnPin), so the
+        // reading can still name another of the conversation's pins.
+        if (!adv?.excluded.has(pinNow)) pinRolled = restOn(o, /** @type {Fed} */ (fed.get(pinNow)), model, fed, lapsed.get(pinNow));
         pinUncertain = o.uncertain;
+        readOn = o.on;
+        readEscaped = new Set(o.escaped);
+        if (o.on != null) {
+          const r = /** @type {Fed} */ (fed.get(o.on));
+          if (rolledSince(o, r, model)) {
+            if (o.stale.has(governing(r, model).window)) pinUncertain = true;
+            else readRolled = true;
+          }
+        }
       }
       const ctx = {
-        i, now, row, ex, model, bucket, tagged, c, revived, cur, life, curRolled, pinRolled, pinUncertain,
+        i, now, row, ex, model, bucket, tagged, c, revived, cur, life, curRolled, pinRolled, pinUncertain, readOn, readRolled, readEscaped,
         curUncertain: curObs.uncertain || (row.sessionReset && sessionResets.size > 0),
         curObsUncertain: curObs.uncertain,
         // With distribution off a family stays where it was last routed while
         // the cursor cannot serve it.
-        famCur: lastRouted.get(model) ?? null,
+        famCur: lastRouted.get(key) ?? null,
+        adv,
         // Live: the check runs before the decision is served.
         fed,
         conv: conv ? { pins: new Map(conv.pins), pinAt: new Map(conv.pinAt), lastSeen: conv.lastSeen } : null,
-        convs, routed, sessionResets: new Set(sessionResets), requalify: new Set(requalify), history: h, d: '-',
+        convs, routed, sessionResets: new Set(sessionResets), requalify: new Set(requalify), history: h, routes, reloaded, d: '-',
       };
       const carried = tagged ? am.observedGeneration(c, model) : null;
-      const acc = am.getActiveAccount(null, model, null, tagged ? c : null);
+      /** @type {{ rolledOff?: Set<number> }} */
+      const selection = {};
+      const acc = am.getActiveAccount(null, model, adv?.advisor ?? null, tagged ? c : null, undefined, selection);
       for (const l of lapsed.values()) l.clear();
       const d = acc?.id ?? '-';
       ctx.d = d;
       check(ctx);
-      if (acc) lastRouted.set(model, d);
+      if (acc) lastRouted.set(key, d);
       cur = cursor();
       // Moving the cursor takes a first reading of its new account (_setCurrent).
       // A session-reset switch earlier in the same walk may have taken one too,
@@ -726,11 +1097,17 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
       // not be sent to the account, or not to the cursor (refreshExpiredQuotas).
       if (!ex.enabled) sessionResets = new Set();
       else {
-        const usable = (/** @type {string|null} */ id) => id != null && unavailable(/** @type {Fed} */ (ctx.fed.get(id)), model, row.threshold) == null;
+        // An advised request settles the event on both its models, outside the
+        // advisor-capped accounts, while some account can serve both.
+        const both = adv?.routed != null && adv.both.length > 0;
+        const usable = (/** @type {string|null} */ id) => id != null && unavailable(/** @type {Fed} */ (ctx.fed.get(id)), model, row.threshold) == null
+          && !adv?.excluded.has(id) && (!both || servesAdvisor(/** @type {Fed} */ (ctx.fed.get(id)), /** @type {any} */ (adv).advisor, row.threshold));
         if (usable(ctx.cur)) for (const id of [...sessionResets]) if (usable(id)) sessionResets.delete(id);
       }
       /** @type {Obs|null} */
       let sighted = null;
+      /** @type {any} */
+      let hop = null;
       if (acc) {
         if (tagged) am.recordSession(c, acc.index, model);
         const kept = tagged && conv && [...conv.pins.values()].includes(acc.id) && fed.get(acc.id)?.cordoned;
@@ -751,12 +1128,17 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
           sighted = conv?.obs.get(bucket) ?? newObs();
           firstSight(sighted, /** @type {Fed} */ (fed.get(d)), fed);
         }
-        serve(acc, model, tagged);
-        if (tagged) am.confirmStay(acc, carried, c, 'anthropic');
+        if (s.op === 'throttle') {
+          hop = throttle(acc, selection, ctx, sighted);
+        } else {
+          serve(acc, model, tagged);
+          if (tagged) am.confirmStay(acc, carried, c, 'anthropic');
+        }
       }
       if (tagged) am.endSession(c);
       /** @type {Decision} */
       const rec = { i, op: s.op, model, d };
+      if (hop) rec.to = hop.id;
       if (tagged) {
         rec.c = c;
         rec.pin = conv?.pins.get(bucket) ?? null;
@@ -766,6 +1148,10 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
           conv.pinAt.set(bucket, now);
           if (sighted) conv.obs.set(bucket, sighted);
           /** @type {number[]} */ (routed.get(d)).push(now);
+          if (hop) {
+            conv.pins.set(bucket, hop.id);
+            /** @type {number[]} */ (routed.get(hop.id)).push(now);
+          }
         } else {
           // endRequest ages the newest pin to now whether or not it was served.
           let newest = null;
@@ -775,6 +1161,14 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
         conv.lastSeen = now;
       }
       out.push(rec);
+    }
+    if (s.reload && row.routes === 'layered') {
+      // The server's reload re-applies every setting; only the table differs
+      // here, so only it is set.
+      routes = /** @type {{ next: Route[] }} */ (h.routeTables).next;
+      reloaded = true;
+      am.setRoutes(routes);
+      bar();
     }
     if (s.restart || restarts.includes(i)) {
       const saved = JSON.parse(JSON.stringify({ quota: am.exportQuotaState(), affinity: am.exportAffinityState() }));
@@ -801,6 +1195,7 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
       life++;
       cur = cursor();
       lastRouted = new Map();
+      pausedUntil = new Map();
       requalify = new Set();
       probing = new Set(h.accounts.map(a => a.id));
       // The load ring is not saved.
@@ -831,6 +1226,12 @@ export const DIMENSIONS = {
   sessionReset: [true, false],
   persist: [false, true],
   threshold: ['0.98', 'per-bucket'],
+  // `fable`: the history's own single Fable route, or none; `layered`: its
+  // tables of several routes, swapped by a reload.
+  routes: ['fable', 'layered'],
+  // `none`: no request declares an advisor; otherwise a share of the Opus
+  // requests declare a Fable one, routed under that setting.
+  advisorEligibility: ['none', 'strict', 'prefer'],
 };
 const EXPIRY_ONLY = ['tolerance', 'preempt', 'reclaim'];
 // The dimensions toRow reshapes or names by hand. Any other passes to the Row
@@ -864,9 +1265,9 @@ export function toRow(cell, profile) {
 /** @param {Cell} cell */
 const validCell = cell => EXPIRY_ONLY.every(k => (cell.expiry === 'on') === (cell[k] != null));
 
-/** Every pair of dimension values a valid row can hold, as keys. */
-function allPairs() {
-  const dims = Object.keys(DIMENSIONS);
+/** Every pair of values of `dims` a valid row can hold, as keys.
+ * @param {string[]} dims */
+function allPairs(dims) {
   /** @type {string[]} */
   const out = [];
   dims.forEach((a, i) => dims.slice(i + 1).forEach(b => {
@@ -881,14 +1282,19 @@ function allPairs() {
   return out;
 }
 
-/** @param {Cell} cell */
-function pairsOf(cell) {
-  const dims = Object.keys(DIMENSIONS).filter(d => cell[d] != null);
+/** @param {Cell} cell @param {string[]} dims */
+function pairsOf(cell, dims) {
+  const set = dims.filter(d => cell[d] != null);
   /** @type {string[]} */
   const out = [];
-  dims.forEach((a, i) => dims.slice(i + 1).forEach(b => out.push(`${a}=${cell[a]}|${b}=${cell[b]}`)));
+  set.forEach((a, i) => set.slice(i + 1).forEach(b => out.push(`${a}=${cell[a]}|${b}=${cell[b]}`)));
   return out;
 }
+
+// Options grown onto the rows the others make, in this order, rather than
+// built into them: adding one leaves the earlier rows, and so the seeds on
+// which they catch a broken rule, as they were.
+const GROWN = ['advisorEligibility'];
 
 /**
  * A covering array over DIMENSIONS: the given rows first, then rows added
@@ -896,14 +1302,18 @@ function pairsOf(cell) {
  * candidate row starts from one pair still missing and takes, dimension by
  * dimension, the value that covers the most missing pairs; of the candidates
  * started from the first few missing pairs the one covering most is kept.
- * Ties go to the first, so the array is the same on every run.
+ * Ties go to the first, so the array is the same on every run. A GROWN option
+ * is then given to each added row, the value covering the most of its missing
+ * pairs, and rows are added as before for the pairs still missing; the given
+ * rows leave it unset.
  * @param {Cell[]} seeds @returns {Cell[]}
  */
 export function coveringArray(seeds) {
-  const dims = Object.keys(DIMENSIONS);
-  const missing = new Set(allPairs());
+  const all = Object.keys(DIMENSIONS);
+  let dims = all.filter(d => !GROWN.includes(d));
+  let missing = new Set(allPairs(dims));
   const rows = [...seeds];
-  for (const r of rows) for (const k of pairsOf(r)) missing.delete(k);
+  for (const r of rows) for (const k of pairsOf(r, dims)) missing.delete(k);
   /** @param {string} first */
   const build = first => {
     /** @type {Cell} */
@@ -918,22 +1328,40 @@ export function coveringArray(seeds) {
       if (EXPIRY_ONLY.includes(d) && cell.expiry !== 'on') { cell[d] = null; continue; }
       let best = null; let bestGain = -1;
       for (const v of /** @type {any} */ (DIMENSIONS)[d]) {
-        const gain = pairsOf({ ...cell, [d]: v }).filter(k => missing.has(k)).length;
+        const gain = pairsOf({ ...cell, [d]: v }, dims).filter(k => missing.has(k)).length;
         if (gain > bestGain) { best = v; bestGain = gain; }
       }
       cell[d] = best;
     }
     return cell;
   };
-  while (missing.size) {
-    let best = null; let bestGain = -1;
-    for (const first of [...missing].slice(0, 24)) {
-      const cell = build(first);
-      const gain = pairsOf(cell).filter(k => missing.has(k)).length;
-      if (gain > bestGain) { best = cell; bestGain = gain; }
+  const fill = () => {
+    while (missing.size) {
+      let best = null; let bestGain = -1;
+      for (const first of [...missing].slice(0, 24)) {
+        const cell = build(first);
+        const gain = pairsOf(cell, dims).filter(k => missing.has(k)).length;
+        if (gain > bestGain) { best = cell; bestGain = gain; }
+      }
+      for (const k of pairsOf(/** @type {Cell} */ (best), dims)) missing.delete(k);
+      rows.push(/** @type {Cell} */ (best));
     }
-    for (const k of pairsOf(/** @type {Cell} */ (best))) missing.delete(k);
-    rows.push(/** @type {Cell} */ (best));
+  };
+  fill();
+  for (const g of GROWN) {
+    const covered = new Set(allPairs(dims));
+    dims = all.filter(d => d === g || dims.includes(d));
+    missing = new Set(allPairs(dims).filter(k => !covered.has(k)));
+    for (const r of rows.slice(seeds.length)) {
+      let best = null; let bestGain = -1;
+      for (const v of /** @type {any} */ (DIMENSIONS)[g]) {
+        const gain = pairsOf({ ...r, [g]: v }, dims).filter(k => missing.has(k)).length;
+        if (gain > bestGain) { best = v; bestGain = gain; }
+      }
+      r[g] = best;
+      for (const k of pairsOf(r, dims)) missing.delete(k);
+    }
+    fill();
   }
   return rows;
 }
