@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AccountManager } from '../src/account-manager.js';
+import { newObservation } from '../src/rollover.js';
 import { TUI } from '../src/tui.js';
 
 const H = 3600_000;
@@ -1836,6 +1837,28 @@ test('a rest on the nameless reading a removal left is handed the roll it still 
   assert.equal(ownerReq().name, 'a', 'the first rest spent the week the key had gained');
   assert.equal(am._currentRolledOver(am.accounts[1], OPUS), true,
     'the roll the chain owed the key was first-sighted away');
+});
+
+test('a rest on a nameless reading hands back a hand-back\'s roll as it does a preemption\'s', () => {
+  // Built by hand: the request sequences in this file leave only a
+  // preemption's roll on a nameless reading, so none would show a rest that
+  // ignored a hand-back.
+  const am = mgr(['a', 'b'], ON);
+  for (const [i, hours] of [[0, 10], [1, 20]]) bucket(am, i, 'unified7d', 0.4, hours);
+  am.selectActiveAccount();
+  assert.equal(am.currentIndex, 0, 'the fixture must rest on a');
+  const preRoll = new Map(Object.entries(am._accountWindows(am.accounts[0])));
+  rollWindow(am, 0);
+  am._currentObs = {
+    ...newObservation(),
+    unescaped: { kind: 'hand-back', idx: 0, windows: preRoll, provider: 'anthropic', prev: null },
+  };
+
+  assert.equal(am.getActiveAccount(null, OPUS, null, null, 'anthropic').name, 'b',
+    'the rest spent the week a had gained');
+  assert.equal(am._currentRolledOver(am.accounts[0], OPUS), true,
+    'the roll the chain owed a was first-sighted away');
+  assert.equal(am._currentObs.unescaped, null, 'the hand-back stayed on the chain after it was handed back');
 });
 
 test('a confirmed serve releases a roll held against the account it rests on', () => {
