@@ -33,6 +33,13 @@ const RATE_LIMIT_ABSORB_MAX = 60;
 // Past that cap, so a 429 with nowhere to hop goes back to the client at once
 // rather than waiting to retry the same account.
 const RETRY_AFTER = 90;
+// docs/routing.md:70-71.
+const BILLING_COOLDOWN = 5 * MIN;
+// docs/routing.md:88; the last applies to every later denial.
+const ENTITLEMENT_COOLDOWNS = [5 * MIN, 15 * MIN, H];
+// The probes of a cooldown's end, by their offset from it in ms.
+const PROBE_AT = new Map([[-1, 'end-1ms'], [0, 'end'], [1, 'end+1ms']]);
+const DENIAL = 'OAuth authentication is currently not allowed for this organization.';
 const LETTERS = 'abcdef';
 // An account name a route may list that no account in the pool has.
 const GONE = 'gone';
@@ -42,9 +49,19 @@ const GONE = 'gone';
  *   hidden7d: boolean, clockless7d: boolean, clocklessF: boolean,
  *   u5h: number, r5h: number, u7d: number, r7d: number, F: number|null, FR: number|null }} PoolAccount
  * A `throttle` step is a request whose first attempt draws a per-minute 429.
+ * A `fault` step that names a conversation instead of an account is a request
+ * whose first attempt draws the refusal its `kind` names: `billing`,
+ * `entitled` (an OAuth entitlement denial) or `refused` (an account refusal).
+ * A `remove` step removes its account from the fleet while a response that
+ * account served is still in flight; `pin` places an operator's route pin
+ * against it, as a removal machine event names the place. A `late` step is an
+ * entitlement denial to a request sent before the account's last one. `who`
+ * names a step's account by what the play has made of it: `cursor`, the
+ * accounts on either side of it (`under-cursor`, `over-cursor`), or the first
+ * account in the hold state it names.
  * @typedef {{ at: number, op: string, c?: string, model?: string, id?: string, u7d?: number,
  *   f?: number|null, u5h?: number, fable?: boolean, kind?: string, restart?: boolean, reload?: boolean,
- *   advisor?: string }} Step
+ *   advisor?: string, who?: string, pin?: string }} Step
  * `events` counts the steps before the closing episodes.
  * @typedef {{ name: string, match: string[], accounts?: string[] }} Route
  * `routeTables` is what the rows with several routes configure: `first` from
@@ -493,9 +510,13 @@ export function routesFor(row, h) {
 /**
  * What the manager has been told about one account, plus the pool facts it was
  * configured with. Readings go null when their reset passes, as
- * _clearExpiredQuotas does.
+ * _clearExpiredQuotas does. `billedUntil` and `deniedUntil` are the ends of
+ * the billing and entitlement cooldowns, `denials` the entitlement denials
+ * since the last completion the account served, and `refused` an account
+ * refusal, which nothing in a history lifts.
  * @typedef {{ id: string, priority: number, org: string|null, maxUsage: any, endsAt: number|null,
  *   barred: Set<string>, disabled: boolean, cordoned: boolean,
+ *   billedUntil: number|null, deniedUntil: number|null, denials: number, refused: boolean,
  *   u5h: number|null, r5h: number|null, u7d: number|null, r7d: number|null, f: number|null, fr: number|null }} Fed
  */
 
@@ -519,6 +540,8 @@ export function deadline(a, reset, now) {
 export function unavailable(a, model, threshold) {
   if (a.disabled) return 'disabled';
   if (atCap(a, model)) return 'capped';
+  const hold = held(a);
+  if (hold) return hold;
   if (a.u5h != null && a.u5h >= thresholdOf(threshold, 'unified5h')) return 'quota';
   const weekly = model === FABLE && a.f != null ? Math.max(a.f, a.u7d ?? -Infinity) : a.u7d;
   if (weekly != null && weekly >= thresholdOf(threshold, bucketOf(model))) return 'quota';
@@ -527,11 +550,21 @@ export function unavailable(a, model, threshold) {
   return null;
 }
 
+/** The hold keeping `a` out of rotation, or null. The driver ends a cooldown
+ * at its exact end, as the manager's lazy expiry does on its next read.
+ * @param {Fed} a */
+export function held(a) {
+  if (a.deniedUntil != null) return 'entitlement';
+  if (a.billedUntil != null) return 'billing';
+  if (a.refused) return 'error';
+  return null;
+}
+
 /** Whether startup's pick, which names no model, can take `a`: no route or
  * family bucket applies to it.
  * @param {Fed} a @param {any} threshold */
 export function startable(a, threshold) {
-  if (a.disabled || a.cordoned || atCap(a, OPUS)) return false;
+  if (a.disabled || a.cordoned || held(a) || atCap(a, OPUS)) return false;
   if (a.u5h != null && a.u5h >= thresholdOf(threshold, 'unified5h')) return false;
   return !(a.u7d != null && a.u7d >= thresholdOf(threshold, 'unified7d'));
 }
@@ -587,6 +620,13 @@ export function advisorRouting(fed, model, advisor, row) {
     || servesAdvisor(a, advisor, row.threshold));
   return { advisor, excluded, cands, both, narrows, routed, plain };
 }
+
+/** The mode a row's advised requests are routed under, or null where they
+ * send no advisor. `default` sends the advisor with the setting left out,
+ * which docs/configuration.md:76 makes "strict".
+ * @param {Row} row @returns {'strict'|'prefer'|null} */
+export const advisorMode = row => (row.advisorEligibility === 'default' ? 'strict'
+  : row.advisorEligibility === 'strict' || row.advisorEligibility === 'prefer' ? row.advisorEligibility : null);
 
 /** The key the manager keeps a model's diversion under (_cursorKey): an
  * advisor that selection was held to keys it apart from requests that name
@@ -686,11 +726,21 @@ export function windowsOf(a) {
  * That older reading has rolled, so it refuses a first sight onto the next
  * account, and the doubt moves with the reading. `stale` holds the windows the
  * reading took past their reset, which the manager still held when it read.
- * @typedef {{ on: string|null, windows: Map<string, number>, escaped: Set<string>, uncertain: boolean, stale: Set<string> }} Obs
+ * `owed` maps each account a rest left while rolled to the windows read
+ * there. Only a served request can end that hold (docs/routing.md:411), so an
+ * entry lasts until a later request is served, and a return before then is
+ * handed that reading back. `handed` marks a reading restored that way, whose
+ * next escape the manager holds only for windows rolled since. `left` maps
+ * each account a hand-back left while rolled to the windows it showed then.
+ * `traded` maps each account whose roll the model lost track of to the windows
+ * it showed then.
+ * @typedef {{ on: string|null, windows: Map<string, number>, escaped: Set<string>, uncertain: boolean, stale: Set<string>,
+ *   owed: Map<string, { windows: Map<string, number>, step: number }>, handed: boolean,
+ *   left: Map<string, Map<string, number>>, traded: Map<string, Map<string, number>> }} Obs
  */
 
 /** @returns {Obs} */
-export const newObs = () => ({ on: null, windows: new Map(), escaped: new Set(), uncertain: false, stale: new Set() });
+export const newObs = () => ({ on: null, windows: new Map(), escaped: new Set(), uncertain: false, stale: new Set(), owed: new Map(), handed: false, left: new Map(), traded: new Map() });
 
 /** Whether any window `a` presents jumped past the reading (_anyJumped).
  * @param {Obs} obs @param {Fed} a */
@@ -702,22 +752,62 @@ function anyRolled(obs, a) {
   return false;
 }
 
-/** Moves the reading onto `a`, noting a roll left behind.
- * @param {Obs} obs @param {Fed} a @param {Map<string, Fed>} fed */
-function moveObs(obs, a, fed) {
+/** Moves the reading onto `a`, noting a roll left behind. A move made at a
+ * rest, in request `step`, holds that roll.
+ * @param {Obs} obs @param {Fed} a @param {Map<string, Fed>} fed @param {number|null} [step] */
+function moveObs(obs, a, fed, step = null) {
   const leaving = obs.on == null ? null : fed.get(obs.on);
-  if (leaving && anyRolled(obs, leaving)) obs.escaped.add(leaving.id);
+  if (leaving && anyRolled(obs, leaving)) {
+    obs.escaped.add(leaving.id);
+    if (step != null && !obs.handed) obs.owed.set(leaving.id, { windows: new Map(obs.windows), step });
+  }
+  // Arriving without a hand-back leaves the manager's hold in place, and
+  // whether a later return restores it is no longer known.
+  obs.owed.delete(a.id);
   obs.on = a.id;
   obs.windows = windowsOf(a);
   obs.stale = new Set();
   obs.uncertain = obs.escaped.has(a.id);
+  obs.handed = false;
+}
+
+/** Restores the reading held for `a` when traffic returns to it before a
+ * request was served (docs/routing.md:417), as _firstSightOn does. Returns
+ * whether it did.
+ * @param {Obs} obs @param {Fed} a @param {Map<string, Fed>} fed */
+function handBack(obs, a, fed) {
+  const owed = obs.owed.get(a.id);
+  if (!owed || obs.uncertain || obs.on === a.id) return false;
+  const leaving = obs.on == null ? null : fed.get(obs.on);
+  if (leaving && anyRolled(obs, leaving)) {
+    obs.escaped.add(leaving.id);
+    obs.left.set(leaving.id, windowsOf(leaving));
+  }
+  obs.on = a.id;
+  obs.windows = new Map(owed.windows);
+  obs.stale = new Set();
+  obs.escaped.delete(a.id);
+  obs.owed.delete(a.id);
+  obs.handed = true;
+  return true;
+}
+
+/** Notes the rolls the model loses track of when traffic arrives at an account
+ * a hand-back left: the manager hands that account's roll back too, which the
+ * model does not follow.
+ * @param {Obs} obs @param {Fed} a @param {Map<string, Fed>} fed */
+function loseTrack(obs, a, fed) {
+  if (!obs.left.delete(a.id)) return;
+  obs.traded.set(a.id, windowsOf(a));
+  if (obs.on != null) obs.traded.set(obs.on, windowsOf(/** @type {Fed} */ (fed.get(obs.on))));
 }
 
 /** The reading recordSession takes of a pin's new account (_firstSightOn):
  * none while the account left behind has an unsettled roll.
  * @param {Obs} obs @param {Fed} a @param {Map<string, Fed>} fed */
 export function firstSight(obs, a, fed) {
-  if (obs.on === a.id) return;
+  if (obs.on === a.id || handBack(obs, a, fed)) return;
+  loseTrack(obs, a, fed);
   const leaving = obs.on == null ? null : fed.get(obs.on);
   if (leaving && anyRolled(obs, leaving)) { obs.escaped.add(leaving.id); return; }
   const doubt = obs.uncertain;
@@ -734,12 +824,30 @@ export function rolledSince(obs, a, model) {
   return seen != null && g.reset != null && g.reset - seen > ROLL_JUMP;
 }
 
-/** Takes the reading at the start of a request, as _restOn does when nothing
- * is handed back. Returns whether the governing window had rolled.
+/** Whether the governing window of `a` is one whose roll the model lost track
+ * of, not rolled since.
+ * @param {Obs} obs @param {Fed} a @param {string} model */
+export function tradedRoll(obs, a, model) {
+  const g = governing(a, model);
+  const then = obs.traded.get(a.id)?.get(g.window);
+  return then != null && g.reset != null && g.reset - then <= ROLL_JUMP;
+}
+
+/** Takes the reading at the start of request `step`, as _restOn does.
+ * Returns whether the governing window had rolled.
  * @param {Obs} obs @param {Fed} a @param {string} model @param {Map<string, Fed>} fed
- * @param {Map<string, number>} [lapsed] windows of `a` past their reset that the manager still holds */
-export function restOn(obs, a, model, fed, lapsed) {
-  if (obs.on !== a.id) { moveObs(obs, a, fed); takeLapsed(obs, lapsed); return false; }
+ * @param {Map<string, number>|undefined} lapsed windows of `a` past their reset that the manager still holds
+ * @param {number} step */
+export function restOn(obs, a, model, fed, lapsed, step) {
+  if (obs.on !== a.id) {
+    // A reading naming no account was offered nothing by a cursor move, so
+    // the rest is where a removal's leftover hands a roll back.
+    if (obs.on == null && handBack(obs, a, fed)) return false;
+    loseTrack(obs, a, fed);
+    moveObs(obs, a, fed, step);
+    takeLapsed(obs, lapsed);
+    return false;
+  }
   const g = governing(a, model);
   if (g.reset == null) { takeLapsed(obs, lapsed); return false; }
   if (rolledSince(obs, a, model)) {
@@ -803,11 +911,12 @@ export function recentOn(routed, id, now) {
  * @param {Row} p.row
  * @param {number[]} [p.restarts]  step indices after which the daemon restarts,
  *   besides the steps marked `restart`
- * @param {(ctx: any) => void} [p.check]
+ * @param {(ctx: any) => Set<string>|void} [p.check]  returns the invariants that judged the step
  * @param {{ restoreAlways?: boolean }} [p.driver]
+ * @param {Set<string>} [p.taken]  collects the transition-table keys the play takes
  * @returns {Decision[]}
  */
-export function play({ AccountManager, validateAdaptiveConfig, t, history: h, row, restarts = [], check = () => {}, driver = {} }) {
+export function play({ AccountManager, validateAdaptiveConfig, t, history: h, row, restarts = [], check = () => {}, driver = {}, taken }) {
   const ex = expiryOf(row);
   t.mock.timers.setTime(h.start);
   /** @type {Map<string, PoolAccount>} */
@@ -816,13 +925,17 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
   const fed = new Map(h.accounts.map(a => [a.id, {
     id: a.id, priority: a.priority, org: a.org, maxUsage: a.maxUsage, endsAt: a.endsAt,
     barred: new Set(), disabled: false, cordoned: false,
+    billedUntil: null, deniedUntil: null, denials: 0, refused: false,
     u5h: null, r5h: null, u7d: null, r7d: null, f: null, fr: null,
   }]));
   // Windows past their reset that the manager has not cleared: a request's
   // walk clears every account, and a fresh reading replaces its own windows.
   /** @type {Map<string, Map<string, number>>} */
   const lapsed = new Map(h.accounts.map(a => [a.id, new Map()]));
-  const configRows = () => h.accounts.map(a => ({
+  // Accounts removed from the fleet; the config holds no row for them.
+  /** @type {Set<string>} */
+  const gone = new Set();
+  const configRows = () => h.accounts.filter(a => !gone.has(a.id)).map(a => ({
     id: a.id, name: a.id, type: 'oauth', accessToken: `synthetic-${a.id}`, refreshToken: `synthetic-r-${a.id}`,
     expiresAt: h.start + 30 * 24 * H, accountUuid: `uuid-${a.id}`,
     ...(a.org ? { orgUuid: a.org } : {}),
@@ -899,6 +1012,9 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
   // expired one first raises nothing.
   /** @type {Set<string>} */
   let sessionResets = new Set();
+  // The accounts whose hold ended since the last request, and which hold.
+  /** @type {Map<string, string>} */
+  const released = new Map();
   // When each account's per-minute pause ends, which the manager does not save.
   /** @type {Map<string, number>} */
   let pausedUntil = new Map();
@@ -932,10 +1048,50 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
   // not saved across a restart.
   /** @type {Map<string, string>} */
   let lastRouted = new Map();
-  const advising = row.advisorEligibility === 'strict' || row.advisorEligibility === 'prefer';
+  const advising = advisorMode(row) != null;
+  // The transition-table keys (routing-transitions.js), with each state read
+  // off the model's record, never off the manager.
+  const stateOf = (/** @type {Fed} */ f) => (f.refused ? 'error' : f.deniedUntil != null ? `denied${Math.min(f.denials, 3)}`
+    : f.billedUntil != null ? 'billed' : f.denials > 0 ? `released${Math.min(f.denials, 3)}` : 'free');
+  const note = (/** @type {string} */ machine, /** @type {string} */ state, /** @type {string} */ event, /** @type {boolean|null} */ adv = null) => {
+    taken?.add(`${machine}|${state}|${event}|${adv == null ? '' : adv ? 'advisor' : 'plain'}`);
+  };
+  // A removal's outcome shows only on a later request. Its keys wait for the
+  // request whose judgment `done` names: noted at the removal, a step dropped
+  // from a path would leave the row counted and its outcome unjudged.
+  /** @type {Array<{ key: [string, string, string], done: (ctx: any, ok: Set<string>, probed: Map<string, string>) => boolean }>} */
+  let pending = [];
+  const judged = (/** @type {any} */ ctx, /** @type {Set<string>|void} */ ok, /** @type {Map<string, string>} */ probed) => {
+    pending = pending.filter(p => {
+      if (!ok || !p.done(ctx, ok, probed)) return true;
+      note(...p.key);
+      return false;
+    });
+  };
+  // The epoch each account's last entitlement denial was sent under.
+  /** @type {Map<string, number>} */
+  const sentUnder = new Map();
+  /** The account a `who` names, or null. @param {string} who */
+  const whoIs = who => {
+    const k = am.currentIndex;
+    if (who === 'cursor' || who === 'under-cursor' || who === 'over-cursor') {
+      return am.accounts[who === 'cursor' ? k : who === 'under-cursor' ? k - 1 : k + 1]?.id ?? null;
+    }
+    return [...fed.values()].find(f => stateOf(f).startsWith(who))?.id ?? null;
+  };
 
+  // The request being played. A request served after the one whose rest held
+  // a roll may be the stay that releases it, so the hold is no longer known.
+  let step = -1;
+  const settle = () => {
+    for (const o of [curObs, ...[...convs.values()].flatMap(x => [...x.obs.values()])]) {
+      for (const [id, e] of o.owed) if (e.step !== step) o.owed.delete(id);
+    }
+  };
   const serve = (/** @type {any} */ acc, /** @type {string} */ model, /** @type {boolean} */ burn) => {
+    settle();
     const x = /** @type {PoolAccount} */ (truth.get(acc.id));
+    note('hold', stateOf(/** @type {Fed} */ (fed.get(acc.id))), 'success');
     if (burn) {
       x.u7d = r3(x.u7d + SERVE_BURN);
       x.u5h = r3(x.u5h + SERVE_BURN_5H);
@@ -943,6 +1099,67 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
     }
     am.updateQuota(acc.index, headersOf(x, model), model, 200);
     noteReading(acc.id);
+    // A completion to a request sent after the last entitlement denial clears
+    // the count that lengthens the next cooldown (docs/routing.md:90). It
+    // clears a billing cooldown too, which no docs line covers.
+    am.clearBillingRejected(acc.index);
+    am.clearEntitlementDenied(acc, acc.entitlementEpoch);
+    const f = /** @type {Fed} */ (fed.get(acc.id));
+    f.billedUntil = null; f.denials = 0;
+  };
+
+  /** The rest of a refusing fault step once its first attempt is sent to
+   * `acc`, in the server's order: the hold the refusal arms, then the failover
+   * that excludes the refused account, which is sent the request and serves
+   * it. @param {any} acc @param {string} kind @param {any} ctx @param {Obs|null} sighted */
+  const refuse = (acc, kind, ctx, sighted) => {
+    const { model, c, now } = ctx;
+    const f = /** @type {Fed} */ (fed.get(acc.id));
+    note('hold', stateOf(f), kind, !!ctx.adv);
+    // Read before the request is sent. A denial to a request sent before the
+    // last one does not count (docs/routing.md:88).
+    const epoch = acc.entitlementEpoch;
+    if (kind === 'billing') {
+      am.markBillingRejected(acc.index);
+      f.billedUntil = now + BILLING_COOLDOWN;
+    } else if (kind === 'entitled') {
+      am.markEntitlementDenied(acc.index, { detail: DENIAL, epoch });
+      sentUnder.set(acc.id, epoch);
+      f.denials++;
+      const until = now + ENTITLEMENT_COOLDOWNS[Math.min(f.denials, ENTITLEMENT_COOLDOWNS.length) - 1];
+      f.deniedUntil = Math.max(f.deniedUntil ?? 0, until);
+    } else {
+      am.markRefused(acc, { code: 'verification_required', message: 'Identity verification is required.', link: null });
+      f.refused = true;
+    }
+    /** @type {{ rolledOff?: Set<number> }} */
+    const selection = {};
+    // Every attempt re-reads the stamp before it selects (docs/routing.md:415),
+    // the failover included.
+    const carried = am.observedGeneration(c, model);
+    // The retry passes the request's advisor (docs/routing.md:195), read
+    // again now that the refused account is held.
+    const adv = ctx.adv ? advisorRouting(fed, model, ctx.adv.advisor, row) : null;
+    const alt = am.getActiveAccount(new Set([acc.index]), model, adv?.advisor ?? null, c, undefined, selection);
+    if (!ctx.edge) check({ ...ctx, failover: true, kind, from: acc.id, d: alt?.id ?? '-', adv, view: undefined });
+    // A walk that moves the cursor takes its first reading and arms probing
+    // there before the failover is sent, so before its response is read.
+    const was = cur;
+    cur = cursor();
+    if (cur != null && cur !== was) {
+      if (preempting) firstSight(curObs, /** @type {Fed} */ (fed.get(cur)), fed);
+      if (row.dist === 'off') {
+        if (was != null) requalify.delete(was);
+        if (/** @type {Fed} */ (fed.get(cur)).r7d == null) probing.add(cur); else probing.delete(cur);
+      }
+    }
+    if (alt) {
+      am.recordSession(c, alt.index, model);
+      if (sighted) firstSight(sighted, /** @type {Fed} */ (fed.get(alt.id)), fed);
+      serve(alt, model, true);
+      am.confirmStay(alt, carried, c, 'anthropic');
+    }
+    return alt;
   };
 
   /** The rest of a throttle step once its first attempt is sent to `acc`, in
@@ -966,7 +1183,7 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
       am.recordSession(c, to.index, model);
       if (sighted) firstSight(sighted, /** @type {Fed} */ (fed.get(to.id)), fed);
     }
-    check({
+    if (!ctx.edge) check({
       ...ctx, hop: true, from: acc.id, to: to?.id ?? null, pausedUntil: new Map(pausedUntil),
       rolledOff: [...(selection.rolledOff ?? [])].map(k => am.accounts[k].id),
       cursorBefore, cursorAfter: cursor(), pinsBefore, pinsAfter: am.exportAffinityState(), view: undefined,
@@ -979,14 +1196,32 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
   };
 
   h.steps.forEach((s, i) => {
+    step = i;
     t.mock.timers.setTime(s.at);
     const now = s.at;
+    const id = s.who ? whoIs(s.who) : s.id;
+    // A request at the instant a cooldown ends is not judged: no docs line
+    // says whether the cooldown still holds then.
+    let edge = false;
+    /** @type {Map<string, string>} */
+    const probed = new Map();
+    if (s.op === 'request' || s.op === 'untagged' || s.op === 'throttle' || s.op === 'fault') {
+      for (const f of fed.values()) {
+        const end = f.deniedUntil ?? f.billedUntil;
+        const probe = end == null ? null : PROBE_AT.get(now - end);
+        if (probe) { note('hold', stateOf(f), `request@${probe}`); probed.set(f.id, probe); }
+        if (end === now) edge = true;
+        if (f.refused) note('hold', 'error', 'request');
+      }
+    }
     for (const x of truth.values()) {
       let weekly = false; let fable = false;
       while (x.r7d <= now) { x.r7d += WEEK; x.u7d = 0; weekly = true; }
       while (x.FR != null && x.FR <= now) { x.FR += WEEK; x.F = 0; fable = true; }
       while (x.r5h <= now) { x.r5h += 5 * H; x.u5h = 0; }
       const f = /** @type {Fed} */ (fed.get(x.id));
+      if (f.billedUntil != null && now >= f.billedUntil) { f.billedUntil = null; released.set(f.id, 'billing'); }
+      if (f.deniedUntil != null && now >= f.deniedUntil) { f.deniedUntil = null; released.set(f.id, 'entitlement'); }
       if (f.r7d != null && now >= f.r7d) { lapsed.get(f.id)?.set('unified7d', f.r7d); f.u7d = null; f.r7d = null; }
       if (f.fr != null && now >= f.fr) { lapsed.get(f.id)?.set('unified7dFable', f.fr); f.f = null; f.fr = null; }
       // A reading the manager holds is refreshed when its window rolls; one it
@@ -995,8 +1230,8 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
         feedUsage(x, { weekly: weekly && (f.u7d != null || !x.hidden7d), fable: fable && f.f != null });
       }
     }
-    const x = s.id ? /** @type {PoolAccount} */ (truth.get(s.id)) : null;
-    const f = s.id ? /** @type {Fed} */ (fed.get(s.id)) : null;
+    const x = id ? /** @type {PoolAccount} */ (truth.get(id)) : null;
+    const f = id ? /** @type {Fed} */ (fed.get(id)) : null;
     if (s.op === 'usage' && x && f) {
       x.u7d = /** @type {number} */ (s.u7d);
       if (s.f != null && x.F != null) x.F = s.f;
@@ -1014,7 +1249,127 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
       } else if (s.kind === 'cordon' && (f.cordoned || down < Math.floor(fed.size / 2))) {
         f.cordoned = !f.cordoned; am.setCordoned(byId(f.id).index, f.cordoned);
       }
-    } else if (s.op === 'untagged' || s.op === 'request' || s.op === 'throttle') {
+    } else if (s.op === 'late' && f) {
+      // docs/routing.md:88: it does not count as another denial.
+      note('hold', stateOf(f), 'entitled-in-flight');
+      am.markEntitlementDenied(byId(f.id).index, { detail: DENIAL, epoch: sentUnder.get(f.id) });
+    } else if (s.op === 'remove' && x && f) {
+      const acc = byId(x.id);
+      const before = cur;
+      const quotas = () => new Map(am.accounts.map((/** @type {any} */ a) => [a.id, JSON.stringify(a.quota)]));
+      // Taken before the removal, as the in-flight request read its account.
+      const headers = headersOf(x, /** @type {string} */ (s.model));
+      // An operator's route pin, above the removed account unless the step
+      // places it, so that the removal has a pin to renumber. Nothing else in a
+      // history pins a route, so it is cleared once the removal is judged.
+      const pinOn = s.pin === 'remove-at' ? [acc]
+        : am.accounts.filter((/** @type {any} */ a) => (s.pin === 'remove-above' ? a.index < acc.index : a.index > acc.index));
+      const pinned = pinOn.find((/** @type {any} */ a) => am.setRoutePin('fable', a.index).ok)?.id ?? null;
+      // The manager keys its route cursors by route, which the model does not
+      // track. The accounts they name are taken as the removal finds them.
+      const named = (/** @type {Map<string, number>} */ m) => new Map([...m].map(([k, idx]) => [k, am.accounts[idx]?.id ?? null]));
+      const routeCursors = named(am.routeCursors);
+      const providerCursors = named(am.providerCursors);
+      const pinsBefore = am.exportAffinityState();
+      const where = (/** @type {number} */ k) => (acc.index < k ? 'remove-below' : acc.index === k ? 'remove-at' : 'remove-above');
+      const indexOf = (/** @type {string|null} */ k) => (k == null ? -1 : byId(k)?.index ?? -1);
+      // A removed account is judged on the next request (R1); a kept one at the
+      // request that shows it kept its state: the next request for one in
+      // rotation or in error, the probe 1 ms before its cooldown ends for one
+      // held, and for one with denials counted, that probe of the cooldown its
+      // next denial arms, whose length the count sets (docs/routing.md:88).
+      for (const g of fed.values()) {
+        const st = stateOf(g);
+        const by = g.id === x.id || st === 'free' ? 'R1' : st === 'error' ? 'H3' : st === 'billed' ? 'H1' : 'H2';
+        const atProbe = by === 'H1' || by === 'H2';
+        pending.push({
+          key: ['hold', st, g.id === x.id ? 'remove-self' : 'remove-other'],
+          done: (ctx, ok, probed) => ok.has(by) && (!atProbe || probed.get(g.id) === 'end-1ms'),
+        });
+      }
+      note('removal', 'cursor', where(am.currentIndex));
+      for (const k of am.routeCursors.values()) note('removal', 'route-cursor', where(k));
+      for (const k of am.providerCursors.values()) note('removal', 'provider-cursor', where(k));
+      if (pinned != null) note('removal', 'route-pin', where(indexOf(pinned)));
+      for (const conv of convs.values()) for (const k of conv.pins.values()) note('removal', 'session-pin', where(indexOf(k)));
+      for (const g of fed.values()) if (g.u7d != null || g.u5h != null || g.f != null || g.id === x.id) note('removal', 'quota-reading', where(indexOf(g.id)));
+      // A kept reading is judged when its account's roll is read on a request
+      // O25 judges; a held roll, when traffic returns to the rolled account.
+      if (preempting && curObs.on != null) {
+        const on = curObs.on;
+        const at = where(indexOf(on));
+        if (at === 'remove-at') note('removal', 'rollover-reading', at);
+        else pending.push({ key: ['removal', 'rollover-reading', at], done: (ctx, ok) => ok.has('O25') && ctx.cur === on && ctx.curRolled });
+      }
+      if (curObs.on === x.id && curObs.owed.size) {
+        const owed = [...curObs.owed.keys()];
+        pending.push({ key: ['removal', 'held-roll', 'remove-at'], done: (ctx, ok) => ok.has('O25') && owed.includes(ctx.cur) });
+      }
+      for (const [c, conv] of convs) {
+        for (const [b, o] of conv.obs) {
+          if (o.on === x.id && o.owed.size) {
+            pending.push({ key: ['removal', 'pin-held-roll', 'remove-at'], done: (ctx, ok) => ok.has('O15') && ctx.c === c && ctx.bucket === b });
+          }
+        }
+      }
+      am.removeAccount(acc.index);
+      const kept = quotas();
+      am.updateQuota(acc.index, headers, s.model, 200);
+      gone.add(x.id);
+      for (const m of [truth, fed, lapsed, pausedUntil, released]) m.delete(x.id);
+      for (const set of [sessionResets, requalify, probing]) set.delete(x.id);
+      for (const [k, id] of [...lastRouted]) if (id === x.id) lastRouted.delete(k);
+      bar();
+      // A reading naming the removed account goes nameless if it holds rolls
+      // owed to others, and away if not; every reading drops the roll it owed
+      // the removed account. A doubt about which reading the manager holds
+      // stays after the account the model's reading named is removed, so a
+      // doubtful one is kept, nameless, whatever it holds.
+      /** @param {Obs} o @returns {Obs|null} */
+      const unname = o => {
+        o.escaped.delete(x.id);
+        o.owed.delete(x.id);
+        o.left.delete(x.id);
+        o.traded.delete(x.id);
+        if (o.on !== x.id) return o;
+        return o.escaped.size || o.uncertain ? { ...newObs(), escaped: o.escaped, uncertain: o.uncertain, owed: o.owed, left: o.left, traded: o.traded } : null;
+      };
+      for (const conv of convs.values()) {
+        for (const [b, id] of [...conv.pins]) if (id === x.id) { conv.pins.delete(b); conv.pinAt.delete(b); }
+        for (const [b, o] of [...conv.obs]) {
+          const left = unname(o);
+          if (left) conv.obs.set(b, left); else conv.obs.delete(b);
+        }
+      }
+      const held = unname(curObs);
+      curObs = held ?? newObs();
+      // No docs line says where a cursor on the removed account goes, and there
+      // the model follows the manager. Any other cursor stays on its account
+      // (docs/routing.md:19).
+      cur = before === x.id ? cursor() : before;
+      // A roll moves the sticky current account only with preempt on
+      // (docs/routing.md:409); without it the moved cursor is plain
+      // stickiness (docs/routing.md:19), judged as any other.
+      if (preempting && before === x.id) {
+        // A cursor moved by the removal is offered the reading its account's
+        // removal left. docs/routing.md:417 lists the first placements whose
+        // roll is not detected and does not name this one, and no other docs
+        // line covers it, so its first roll is left unjudged.
+        // A reading handed back there is the one read before its roll.
+        const back = held != null && held.on == null && cur != null && handBack(curObs, /** @type {Fed} */ (fed.get(cur)), fed);
+        if (!back) {
+          if (held && held.on == null && cur != null) firstSight(curObs, /** @type {Fed} */ (fed.get(cur)), fed);
+          curObs.uncertain = true;
+        }
+      }
+      const pinAfter = pinned == null ? null : am.getRoutePin('fable')?.id ?? null;
+      check({
+        removal: true, i, now, row, removed: x.id, cursorBefore: before, cursorAfter: cursor(), kept, after: quotas(),
+        routeCursors, routeCursorsAfter: named(am.routeCursors), providerCursors, providerCursorsAfter: named(am.providerCursors),
+        pinned, pinAfter, pinsBefore, pinsAfter: am.exportAffinityState(), left: am.accounts.length,
+      });
+      if (pinned != null) am.clearRoutePin('fable');
+    } else if (s.op === 'untagged' || s.op === 'request' || s.op === 'throttle' || s.op === 'fault') {
       const model = /** @type {string} */ (s.model);
       const tagged = s.op !== 'untagged';
       const c = /** @type {string} */ (s.c);
@@ -1033,12 +1388,12 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
       const bucket = bucketOf(model);
       noticeResets();
       // Throttle steps declare no advisor, so a hop is judged on the request model.
-      const adv = s.advisor && s.op === 'request' && advising ? advisorRouting(fed, model, s.advisor, row) : null;
+      const adv = s.advisor && (s.op === 'request' || s.op === 'fault') && advising ? advisorRouting(fed, model, s.advisor, row) : null;
       const key = cursorKeyOf(model, adv?.routed ?? null);
       // The readings _pickActiveAccount takes before it decides.
       let curRolled = false;
       let pinRolled = false;
-      if (preempting && cur != null) curRolled = restOn(curObs, /** @type {Fed} */ (fed.get(cur)), model, fed, lapsed.get(cur));
+      if (preempting && cur != null) curRolled = restOn(curObs, /** @type {Fed} */ (fed.get(cur)), model, fed, lapsed.get(cur), i);
       const pinNow = conv?.pins.get(bucket);
       let pinUncertain = false;
       // The account the bucket's reading names, and whether its governing
@@ -1047,27 +1402,35 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
       /** @type {string|null} */
       let readOn = null;
       let readRolled = false;
+      let readTraded = false;
       /** @type {Set<string>} */
       let readEscaped = new Set();
-      if (preempting && conv && pinNow != null) {
+      if (preempting && conv) {
         let o = conv.obs.get(bucket);
-        if (!o) { o = newObs(); conv.obs.set(bucket, o); }
-        // A pin the request may not be sent to is not read (_restOnPin), so the
-        // reading can still name another of the conversation's pins.
-        if (!adv?.excluded.has(pinNow)) pinRolled = restOn(o, /** @type {Fed} */ (fed.get(pinNow)), model, fed, lapsed.get(pinNow));
-        pinUncertain = o.uncertain;
-        readOn = o.on;
-        readEscaped = new Set(o.escaped);
-        if (o.on != null) {
-          const r = /** @type {Fed} */ (fed.get(o.on));
-          if (rolledSince(o, r, model)) {
-            if (o.stale.has(governing(r, model).window)) pinUncertain = true;
-            else readRolled = true;
+        if (pinNow != null) {
+          if (!o) { o = newObs(); conv.obs.set(bucket, o); }
+          // A pin the request may not be sent to is not read (_restOnPin), so the
+          // reading can still name another of the conversation's pins.
+          if (!adv?.excluded.has(pinNow)) pinRolled = restOn(o, /** @type {Fed} */ (fed.get(pinNow)), model, fed, lapsed.get(pinNow), i);
+        }
+        // A bucket whose pin a removal dropped keeps its reading unread, and
+        // the walk still checks it against the conversation's other pins.
+        if (o) {
+          pinUncertain = o.uncertain;
+          readOn = o.on;
+          readEscaped = new Set(o.escaped);
+          if (o.on != null) {
+            const r = /** @type {Fed} */ (fed.get(o.on));
+            if (rolledSince(o, r, model)) {
+              if (o.stale.has(governing(r, model).window)) pinUncertain = true;
+              else readRolled = true;
+            }
+            readTraded = tradedRoll(o, r, model);
           }
         }
       }
       const ctx = {
-        i, now, row, ex, model, bucket, tagged, c, revived, cur, life, curRolled, pinRolled, pinUncertain, readOn, readRolled, readEscaped,
+        i, now, row, ex, model, bucket, tagged, c, revived, cur, life, curRolled, pinRolled, pinUncertain, readOn, readRolled, readEscaped, readTraded,
         curUncertain: curObs.uncertain || (row.sessionReset && sessionResets.size > 0),
         curObsUncertain: curObs.uncertain,
         // With distribution off a family stays where it was last routed while
@@ -1078,7 +1441,9 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
         fed,
         conv: conv ? { pins: new Map(conv.pins), pinAt: new Map(conv.pinAt), lastSeen: conv.lastSeen } : null,
         convs, routed, sessionResets: new Set(sessionResets), requalify: new Set(requalify), history: h, routes, reloaded, d: '-',
+        released: new Map(released), edge,
       };
+      if (!edge) released.clear();
       const carried = tagged ? am.observedGeneration(c, model) : null;
       /** @type {{ rolledOff?: Set<number> }} */
       const selection = {};
@@ -1086,7 +1451,7 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
       for (const l of lapsed.values()) l.clear();
       const d = acc?.id ?? '-';
       ctx.d = d;
-      check(ctx);
+      if (!edge) judged(ctx, check(ctx), probed);
       if (acc) lastRouted.set(key, d);
       cur = cursor();
       // Moving the cursor takes a first reading of its new account (_setCurrent).
@@ -1120,7 +1485,9 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
           // flag is kept: the invariants read it only to excuse a move.
           const mayHaveSwitched = row.sessionReset && [...ctx.sessionResets].some(id => id !== ctx.cur);
           if (ctx.cur != null && !mayHaveSwitched) requalify.delete(ctx.cur);
-          if (acc.id !== ctx.cur) {
+          // The re-rank a flagged cursor runs (_selectNext) re-arms probing on
+          // whatever it picks, the cursor's own account included.
+          if (acc.id !== ctx.cur || ctx.requalify.has(acc.id)) {
             if (/** @type {Fed} */ (fed.get(acc.id)).r7d == null) probing.add(acc.id); else probing.delete(acc.id);
           }
         }
@@ -1130,6 +1497,11 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
         }
         if (s.op === 'throttle') {
           hop = throttle(acc, selection, ctx, sighted);
+        } else if (s.op === 'fault') {
+          hop = refuse(acc, /** @type {string} */ (s.kind), ctx, sighted);
+          // The failover is a selection of its own, and the manager records
+          // the family's diversion on the account it goes to.
+          if (hop) lastRouted.set(key, hop.id);
         } else {
           serve(acc, model, tagged);
           if (tagged) am.confirmStay(acc, carried, c, 'anthropic');
@@ -1193,11 +1565,13 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
       check({ restart: true, i, now, row, before: saved.affinity, after: next.exportAffinityState(), convs });
       am = next;
       life++;
+      // A restart rebuilds the readings a wait may name.
+      pending = [];
       cur = cursor();
       lastRouted = new Map();
       pausedUntil = new Map();
       requalify = new Set();
-      probing = new Set(h.accounts.map(a => a.id));
+      probing = new Set(h.accounts.filter(a => !gone.has(a.id)).map(a => a.id));
       // The load ring is not saved.
       for (const v of routed.values()) v.length = 0;
       if (!row.persist && !driver.restoreAlways) convs = new Map();

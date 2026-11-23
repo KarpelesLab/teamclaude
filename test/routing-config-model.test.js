@@ -41,6 +41,7 @@
 // the history shrunk to the steps that still break it, with the command that
 // replays it.
 
+import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AccountManager } from '../src/account-manager.js';
@@ -49,6 +50,7 @@ import {
   FABLE, H, MIN, OPUS, coveringArray, generate, play, prng, productCells, shrink, toRow,
 } from '../test-helpers/routing-model.js';
 import { catalog } from '../test-helpers/routing-invariants.js';
+import { QUOTES, TRANSITIONS, takes, transitionPaths } from '../test-helpers/routing-transitions.js';
 
 /** @typedef {import('../test-helpers/routing-model.js').Row} Row */
 /** @typedef {import('../test-helpers/routing-model.js').History} History */
@@ -87,6 +89,9 @@ const rows = cells.map(c => toRow(c, profileNames.get(JSON.stringify(c)))).filte
 
 /** @type {Map<string, number>} */
 const applied = new Map();
+// How often a check that may abstain did, so a reader sees what it left unjudged.
+/** @type {Map<string, number>} */
+const abstained = new Map([['O15', 0]]);
 // Per row: how many histories it played, and in how many of them each
 // invariant applied, for the floors that are a share of a row's runs.
 /** @type {Map<string, number>} */
@@ -133,19 +138,26 @@ function hermetic(t) {
  * set; any other breach throws Broken. `only` limits the check to one
  * invariant. `perRun` counts the run toward the row's per-run floors.
  * @param {import('node:test').TestContext} t @param {Row} row @param {History} history
- * @param {number[]} restarts @param {{ only?: string, tally?: boolean, perRun?: boolean, label?: string, unchecked?: boolean }} [opts]
+ * @param {number[]} restarts @param {{ only?: string, tally?: boolean, perRun?: boolean, label?: string, unchecked?: boolean, taken?: Set<string> }} [opts]
  */
 function run(t, row, history, restarts, opts = {}) {
   const invariants = opts.unchecked ? [] : catalog().filter(inv => inv.holds(row) && (!opts.only || inv.id === opts.only));
   /** @type {Set<string>} */
   const hit = new Set();
   const check = (/** @type {any} */ ctx) => {
+    /** @type {Set<string>} */
+    const ok = new Set();
     for (const inv of invariants) {
       const r = inv.check(ctx);
       if (r === undefined) continue;
+      if (r === null) {
+        if (opts.tally) abstained.set(inv.id, (abstained.get(inv.id) ?? 0) + 1);
+        continue;
+      }
       if (r === true) {
         if (opts.tally) applied.set(inv.id, (applied.get(inv.id) ?? 0) + 1);
         hit.add(inv.id);
+        ok.add(inv.id);
         continue;
       }
       if (inv.gap) {
@@ -157,8 +169,9 @@ function run(t, row, history, restarts, opts = {}) {
       }
       throw new Broken(inv.id, inv.doc, r, ctx);
     }
+    return ok;
   };
-  const trace = play({ AccountManager, validateAdaptiveConfig, t, history, row, restarts, check });
+  const trace = play({ AccountManager, validateAdaptiveConfig, t, history, row, restarts, check, taken: opts.taken });
   if (opts.perRun) {
     runsOf.set(row.name, (runsOf.get(row.name) ?? 0) + 1);
     for (const id of hit) appliedRuns.set(`${id}\t${row.name}`, (appliedRuns.get(`${id}\t${row.name}`) ?? 0) + 1);
@@ -279,9 +292,9 @@ differential('O9 pressure scoring never decides a move',
     if (i < 0) return null;
     const x = a[i]; const y = b[i];
     if (x.op !== 'untagged' && (x.pin == null || (x.d !== x.pin && y.d !== y.pin))) return null;
-    // Both hopped off the same account after a 429; the hop's destination is
-    // the difference.
-    if (x.op === 'throttle' && x.d === y.d && x.to != null && y.to != null) return null;
+    // Both hopped off the same account after a 429, or failed over off the
+    // same refused one; the destination is the difference.
+    if ((x.op === 'throttle' || x.op === 'fault') && x.d === y.d && x.to != null && y.to != null) return null;
     return `step ${x.i}: ${JSON.stringify(x)} vs ${JSON.stringify(y)}`;
   });
 
@@ -358,9 +371,97 @@ test('O2: a roll between a restart and the next request is read on the account s
   assert.deepEqual(trace.map(d => d.d), ['d', 'd', 'a'], 'the scenario did not route as built');
 });
 
+// Built by hand to catch a manager that drops the bucket's reading with its
+// pin: no matrix history removes an account, and no removal path removes a
+// pin's account while that reading holds an unsettled roll on another of the
+// conversation's pins.
+test('a removal keeps the roll its bucket\'s reading holds for the conversation\'s other pin', t => {
+  hermetic(t);
+  const start = Date.UTC(2030, 2, 10, 12);
+  const acct = (/** @type {string} */ id, /** @type {number} */ r7d, /** @type {number} */ u7d) => ({
+    id, priority: 0, org: 'org-1', maxUsage: /** @type {any} */ (null), endsAt: null, hidden7d: false, clockless7d: false, clocklessF: false,
+    u5h: 0.1, r5h: start + 4 * H, u7d, r7d: start + r7d, F: null, FR: null,
+  });
+  // c0 is placed on `a` for both buckets, and `a` rolls. With `b` and `c`
+  // disabled and `x` outside the band, the rolled `a` keeps the next request,
+  // which a billing refusal fails over to `x`. That writes nothing while the
+  // roll is unsettled, and the Opus bucket's reading still names `a` before
+  // its roll. Removing `x` drops the Opus pin and keeps that reading. Once `b` is
+  // back and the billing hold is over, the roll the reading holds still moves
+  // the Opus request off `a`, which keeps only the Fable pin.
+  const history = {
+    seed: 0, start, fableRoute: null,
+    accounts: [acct('a', 30 * H, 0.2), acct('b', 40 * H, 0.2), acct('c', 45 * H, 0.2), acct('x', 160 * H, 0.9)],
+    steps: [
+      { at: start + MIN, op: 'request', c: 'c0', model: OPUS },
+      { at: start + 2 * MIN, op: 'request', c: 'c0', model: FABLE },
+      { at: start + 3 * MIN, op: 'fault', id: 'b', kind: 'disable' },
+      { at: start + 4 * MIN, op: 'fault', id: 'c', kind: 'disable' },
+      { at: start + 5 * MIN, op: 'roll', id: 'a', fable: false },
+      { at: start + 6 * MIN, op: 'fault', kind: 'billing', c: 'c0', model: OPUS },
+      { at: start + 7 * MIN, op: 'remove', id: 'x', model: OPUS },
+      { at: start + 8 * MIN, op: 'fault', id: 'b', kind: 'disable' },
+      { at: start + 20 * MIN, op: 'request', c: 'c0', model: OPUS },
+    ],
+  };
+  const row = toRow(PROFILES['expiry-preempt'], 'expiry-preempt');
+  /** @type {any[]} */
+  let trace = [];
+  try { trace = run(t, row, history, []); } catch (e) {
+    if (e instanceof Broken) assert.fail(explain(t, e, row, history, []));
+    throw e;
+  }
+  assert.deepEqual(trace.slice(0, 3).map(d => [d.d, d.to]), [['a', undefined], ['a', undefined], ['a', 'x']], 'the scenario did not route as built');
+  // docs/routing.md:411 holds the roll until a stay is served at the
+  // destination, and :417 moves traffic that returns before then off the
+  // rolled account as soon as anywhere better is available.
+  assert.notEqual(trace[3].d, 'a', 'the request returned to a, whose unsettled roll the reading holds');
+});
+
+// The hold and removal tables' paths play under every row and are judged by
+// the same invariants as the matrix.
+/** @type {Set<string>} */
+const taken = new Set();
+const reachable = TRANSITIONS.filter(r => r.reachable === true);
+// No matrix row sends an advisor with the setting left out, as Claude Code
+// with config.example.json does, so the paths also run that way.
+const pathRows = [...rows, toRow({ ...base, advisorEligibility: 'default' }, 'defaults')].filter(r => !ONLY_ROW || r.name.includes(ONLY_ROW));
+test('transitions: every reachable row of the hold and removal tables is taken', t => {
+  hermetic(t);
+  for (const row of pathRows) {
+    for (const h of transitionPaths(Date.UTC(2030, 2, 10, 12))) {
+      try { run(t, row, h, [], { tally: true, taken }); } catch (e) {
+        if (e instanceof Broken) assert.fail(`${explain(t, e, row, h, [])}\npath: ${h.name}`);
+        throw e;
+      }
+    }
+  }
+  if (ONLY_ROW) return;
+  assert.deepEqual(reachable.filter(r => !takes(taken, r)).map(r => r.id), [], 'rows no path took');
+});
+
+test('transitions covered', t => {
+  t.diagnostic(`transitions covered ${reachable.filter(r => takes(taken, r)).length}/${reachable.length}`);
+});
+
+// A row's citation ties its outcome to the docs. A docs edit that moves the
+// sentence must move the citation too.
+test('every quoted docs sentence starts on the line its row cites', () => {
+  const norm = (/** @type {string} */ s) => s.replace(/\s+/g, ' ').trim();
+  const missed = TRANSITIONS.filter(r => typeof r.docs === 'string').filter(r => {
+    const [file, n] = /** @type {string} */ (r.docs).split(':');
+    const lines = readFileSync(new URL(`../${file}`, import.meta.url), 'utf8').split('\n');
+    // The sentence may start late on its line and wrap onto the next ones.
+    const at = norm(lines.slice(Number(n) - 1, Number(n) + 5).join(' ')).indexOf(norm(QUOTES[r.id]));
+    return !(at >= 0 && at < norm(lines[Number(n) - 1]).length);
+  }).map(r => r.id);
+  assert.deepEqual(missed, [], 'rows whose sentence is not on the cited line');
+});
+
 test('every invariant holds in a row and is applied there', { skip: ONLY_ROW || ONLY_SEED != null ? 'filtered run' : false }, t => {
   t.diagnostic(`${rows.length} rows, ${seeds.length} seeds each, ${RESTART_POINTS} restart points per seed`);
   t.diagnostic(`checks applied: ${[...applied].map(([k, n]) => `${k}=${n}`).join(' ')}`);
+  t.diagnostic(`checks abstained: ${[...abstained].map(([k, n]) => `${k}=${n}`).join(' ')}`);
   const dead = catalog().filter(inv => !inv.gap && !rows.some(r => inv.holds(r))).map(inv => inv.id);
   assert.deepEqual(dead, [], `hold in no row: ${dead}; each holds(row) must read an option that some row sets`);
   const vacuous = catalog().filter(inv => !inv.gap && rows.some(r => inv.holds(r)) && !(applied.get(inv.id) > 0)).map(inv => inv.id);

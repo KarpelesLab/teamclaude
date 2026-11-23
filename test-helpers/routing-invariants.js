@@ -4,7 +4,8 @@
 //
 // An invariant is `{ id, doc, holds(row), gap?, runFloor?, check(ctx) }`.
 // `check` returns undefined where it does not apply, true where it applied and
-// held, and a string saying what broke otherwise. The count of `true` results
+// held, null where it applied but abstains, and a string saying what broke
+// otherwise. The count of `true` results
 // is the vacuity floor: an invariant that never applied in a row where it holds
 // proves nothing. `runFloor`, where set, is the share of each such row's runs
 // in which it must apply at least once. A `gap` invariant states what
@@ -14,7 +15,7 @@
 import {
   FABLE, SOONER_MARGIN, band, bucketOf, capOf, deadline, governing, heldOff,
   pressure, recentOn, activeOn, thresholdOf, unavailable, atCap, routeOf, globMatches,
-  familyCapped, servesAdvisor,
+  familyCapped, servesAdvisor, held, advisorMode,
 } from './routing-model.js';
 
 const ADAPTIVE_MAX_BURN_BOOST = 4;
@@ -27,7 +28,7 @@ const EPS = 1e-9;
 const distOn = (/** @type {any} */ row) => row.dist !== 'off';
 const pressureScoring = (/** @type {any} */ row) => row.dist.startsWith('adaptive-pressure');
 const layered = (/** @type {any} */ row) => row.routes === 'layered';
-const advising = (/** @type {any} */ row) => row.advisorEligibility === 'strict' || row.advisorEligibility === 'prefer';
+const advising = (/** @type {any} */ row) => advisorMode(row) != null;
 
 /**
  * Everything the invariants derive from one request's state, computed once.
@@ -240,20 +241,24 @@ function reclaimable(ctx, v, q, a) {
 
 /**
  * A fresh catalog for one played history: G2 counts across steps.
- * @returns {Array<{ id: string, doc: string, gap?: string, runFloor?: number, holds: (row: any) => boolean, check: (ctx: any) => true|string|undefined }>}
+ * @returns {Array<{ id: string, doc: string, gap?: string, runFloor?: number, holds: (row: any) => boolean, check: (ctx: any) => true|string|null|undefined }>}
  */
 export function catalog() {
   /** @type {Map<string, number>} */
   const movesPerRoll = new Map();
+  // A failover is a selection too, so what bars an account from every
+  // selection judges it as well.
+  const anySelection = (/** @type {(ctx: any, v: any) => true|string|null|undefined} */ f) =>
+    (/** @type {any} */ ctx) => (ctx.restart || ctx.removal || ctx.hop ? undefined : f(ctx, view(ctx)));
   // Only the advisor invariants judge a request whose advisor narrows its
   // candidates, since every other one reads the candidates as the request's
   // model alone leaves them.
-  const anyRequest = (/** @type {(ctx: any, v: any) => true|string|undefined} */ f) =>
-    (/** @type {any} */ ctx) => (ctx.restart || ctx.hop ? undefined : f(ctx, view(ctx)));
-  const request = (/** @type {(ctx: any, v: any) => true|string|undefined} */ f) =>
+  const anyRequest = (/** @type {(ctx: any, v: any) => true|string|null|undefined} */ f) =>
+    (/** @type {any} */ ctx) => (ctx.failover ? undefined : anySelection(f)(ctx));
+  const request = (/** @type {(ctx: any, v: any) => true|string|null|undefined} */ f) =>
     (/** @type {any} */ ctx) => (ctx.adv && !ctx.adv.plain ? undefined : anyRequest(f)(ctx));
-  const advised = (/** @type {(ctx: any, v: any, adv: any) => true|string|undefined} */ f) =>
-    anyRequest((ctx, v) => (ctx.adv ? f(ctx, v, ctx.adv) : undefined));
+  const advised = (/** @type {(ctx: any, v: any, adv: any) => true|string|undefined} */ f, failover = false) =>
+    (failover ? anySelection : anyRequest)((ctx, v) => (ctx.adv ? f(ctx, v, ctx.adv) : undefined));
   const ids = (/** @type {any[]} */ xs) => `[${xs.map(a => a.id)}]`;
   // Where a request went, as the advisor invariants read it: a candidate, or
   // a cordoned account holding one of the conversation's pins, which keeps
@@ -264,11 +269,101 @@ export function catalog() {
     return !!a && v.pins.includes(ctx.d) && v.reason(a) === 'cordoned'
       && (!needsAdvisor || servesAdvisor(a, ctx.adv.advisor, ctx.row.threshold));
   };
+  // Every attempt keeps off an account the hold `kind` holds, a failover
+  // included; applied only while some account is so held.
+  const keepsOff = (/** @type {string} */ kind) => (/** @type {any} */ ctx) => {
+    if (ctx.restart || ctx.removal || ctx.hop) return undefined;
+    const holding = [...ctx.fed.values()].filter(a => held(a) === kind);
+    if (!holding.length) return undefined;
+    if (ctx.d !== '-' && held(ctx.fed.get(ctx.d)) === kind) {
+      return `${ctx.failover ? `the failover from ${ctx.from}` : 'the request'} went to ${ctx.d}, inside its ${kind} hold`;
+    }
+    return true;
+  };
+  // "The next request after the cooldown retries the account"
+  // (docs/routing.md:81) means the account is back in rotation, not that the
+  // request goes to it: where it goes is still the ordinary choice
+  // (docs/routing.md:19). So this checks only that the request after a hold
+  // of `kind` ends is served while the released account can take it.
+  const returns = (/** @type {string} */ kind) => (/** @type {any} */ ctx) => {
+    if (ctx.restart || ctx.removal || ctx.hop || ctx.failover || !ctx.released?.size) return undefined;
+    const back = [...ctx.released].filter(([id, k]) => k === kind && unavailable(ctx.fed.get(id), ctx.model, ctx.row.threshold) == null);
+    if (!back.length) return undefined;
+    return ctx.d === '-' ? `nothing served after the ${kind} hold of [${back.map(([id]) => id)}] ended` : true;
+  };
+  /** @type {Set<string>} */
+  const removed = new Set();
   return [
+    {
+      // "a running account whose entry is gone from the file is dropped from
+      // the fleet", and a removal from the TUI "takes effect at once".
+      id: 'R1', doc: 'docs/accounts.md:156',
+      holds: () => true,
+      check: ctx => {
+        if (ctx.removal) { removed.add(ctx.removed); return undefined; }
+        if (ctx.restart || !removed.size) return undefined;
+        const to = ctx.hop ? ctx.to : ctx.d;
+        return removed.has(to) ? `${ctx.failover ? 'the failover' : 'the request'} went to ${to}, removed from the fleet` : true;
+      },
+    },
+    {
+      // No docs line says where the reading of a response goes when its
+      // account was removed while the response was in flight. Readings come
+      // "off the responses that flow through" the proxy (docs/quota.md:7), so
+      // R2 holds that reading to no account: it changes no other account's
+      // readings.
+      id: 'R2', doc: 'docs/quota.md:7, inferred',
+      holds: () => true,
+      check: ctx => {
+        if (!ctx.removal) return undefined;
+        const moved = [...ctx.after].filter(([id, q]) => ctx.kept.get(id) !== q).map(([id]) => id);
+        return moved.length ? `a response ${ctx.removed} served before its removal changed the readings of [${moved}]` : true;
+      },
+    },
+    {
+      // The current account stays where it is (docs/routing.md:19), and the
+      // removal of another account gives rotation no reason to move it. No
+      // docs line covers a removal's renumbering, so this holds the cursor,
+      // every route and provider cursor, a route pin and every conversation's
+      // pin to the account each named, wherever that account now sits. A pin
+      // on the removed account goes with it (docs/routing.md:409), and a
+      // cursor on it moves to an account still in the fleet.
+      id: 'R3', doc: 'docs/routing.md:19, inferred',
+      holds: () => true,
+      check: ctx => {
+        if (!ctx.removal) return undefined;
+        const gone = `removing ${ctx.removed}`;
+        if (ctx.cursorBefore != null && ctx.cursorBefore !== ctx.removed && ctx.cursorAfter !== ctx.cursorBefore) {
+          return `${gone} moved the cursor from ${ctx.cursorBefore} to ${ctx.cursorAfter}`;
+        }
+        if (ctx.left && (ctx.cursorAfter == null || ctx.cursorAfter === ctx.removed)) return `${gone} left the cursor on ${ctx.cursorAfter}`;
+        for (const [what, before, after] of [['route', ctx.routeCursors, ctx.routeCursorsAfter], ['provider', ctx.providerCursors, ctx.providerCursorsAfter]]) {
+          for (const [k, id] of before) {
+            if (id === ctx.removed) continue;
+            const now = after.get(k) ?? null;
+            if (now !== id) return `${gone} moved the ${k} ${what} cursor from ${id} to ${now}`;
+          }
+        }
+        const pin = ctx.pinned === ctx.removed ? null : ctx.pinned;
+        if (ctx.pinned != null && ctx.pinAfter !== pin) return `${gone} moved the fable route pin from ${ctx.pinned} to ${ctx.pinAfter}`;
+        const pins = (/** @type {any} */ state) => new Map(state.sessions.flatMap((/** @type {any} */ x) => x.pins.map((/** @type {any} */ p) => [`${x.key} ${p.bucket}`, p.account.id])));
+        const after = pins(ctx.pinsAfter);
+        for (const [k, id] of pins(ctx.pinsBefore)) {
+          const now = after.get(k) ?? null;
+          if (now !== (id === ctx.removed ? null : id)) return `${gone} moved the pin of ${k} from ${id} to ${now}`;
+        }
+        return true;
+      },
+    },
+    { id: 'H1', doc: 'docs/routing.md:70-71', holds: () => true, check: keepsOff('billing') },
+    { id: 'H2', doc: 'docs/routing.md:88', holds: () => true, check: keepsOff('entitlement') },
+    { id: 'H3', doc: 'docs/routing.md:108', holds: () => true, check: keepsOff('error') },
+    { id: 'H4', doc: 'docs/routing.md:81', holds: () => true, check: returns('billing') },
+    { id: 'H5', doc: 'docs/routing.md:88', holds: () => true, check: returns('entitlement') },
     {
       id: 'U1', doc: 'docs/routing.md:21',
       holds: () => true,
-      check: anyRequest((ctx, v) => {
+      check: anySelection((ctx, v) => {
         if (ctx.d === '-') return undefined;
         const a = ctx.fed.get(ctx.d);
         if (a.disabled) return `${ctx.d} is disabled`;
@@ -322,7 +417,7 @@ export function catalog() {
       // whenever one is available; one whose advisor bucket is spent, capped
       // or barred by a route does not.
       id: 'O22', doc: 'docs/routing.md:190',
-      holds: row => row.advisorEligibility === 'strict',
+      holds: row => advisorMode(row) === 'strict',
       check: advised((ctx, v, adv) => {
         if (!adv.both.length) return undefined;
         if (ctx.d === '-') return `nothing routed while ${ids(adv.both)} can serve ${ctx.model} and its advisor`;
@@ -355,19 +450,22 @@ export function catalog() {
         if (ctx.d === '-') return `nothing routed while ${ids(adv.cands)} can serve ${ctx.model}`;
         if (!familyCapped(ctx.fed.get(ctx.d), adv.advisor)) return true;
         if (!adv.excluded.size) return true;
-        return `${ctx.d} is at its ${adv.advisor} cap while ${ids(adv.cands)} can serve the request`;
-      }),
+        return `${ctx.failover ? `the failover from ${ctx.from}: ` : ''}${ctx.d} is at its ${adv.advisor} cap while ${ids(adv.cands)} can serve the request`;
+      }, true),
     },
     {
+      // A refusal fails the request over (docs/routing.md:71, :88, :108), so
+      // the failover is judged as the request is.
       id: 'U2', doc: 'docs/routing.md:19',
       holds: () => true,
-      check: request((ctx, v) => {
+      check: ctx => (ctx.failover ? anySelection : request)((ctx, v) => {
         if (!v.av.length) return undefined;
-        if (ctx.d === '-') return `nothing routed while [${v.av.map((/** @type {any} */ a) => a.id)}] are available`;
+        const what = ctx.failover ? `the failover from ${ctx.from}: ` : '';
+        if (ctx.d === '-') return `${what}nothing routed while [${v.av.map((/** @type {any} */ a) => a.id)}] are available`;
         const r = v.reason(ctx.fed.get(ctx.d));
         if (r == null || (r === 'cordoned' && v.pins.includes(ctx.d))) return true;
-        return `${ctx.d} is unavailable (${r}) while [${v.av.map((/** @type {any} */ a) => a.id)}] are available`;
-      }),
+        return `${what}${ctx.d} is unavailable (${r}) while [${v.av.map((/** @type {any} */ a) => a.id)}] are available`;
+      })(ctx),
     },
     {
       id: 'O14', doc: 'docs/routing.md:240',
@@ -434,8 +532,25 @@ export function catalog() {
         if (v.kind.kind !== 'rolled') return undefined;
         const q = ctx.fed.get(v.kind.q);
         if (inBand(v.B, q, ctx.model, ctx.now) !== false) return undefined;
+        // The model does not follow the roll handed back when traffic reaches an
+        // account a hand-back left, so it cannot tell that roll from a live one.
+        if (ctx.readTraded) return null;
         return ctx.d !== v.kind.q ? true
           : `pin ${v.kind.q} rolled and is outside the band [${[...v.B.ids]}], yet it kept the request`;
+      }),
+    },
+    {
+      // O15 for the sticky current account, which the same sentence names.
+      id: 'O25', doc: 'docs/routing.md:409',
+      holds: row => row.dist === 'off' && row.expiry?.enabled === true && row.expiry.preempt !== false,
+      check: request((ctx, v) => {
+        const cur = ctx.cur;
+        if (cur == null || !ctx.curRolled || ctx.curUncertain) return undefined;
+        const c = ctx.fed.get(cur);
+        if (v.reason(c) != null || v.outranked(c)) return undefined;
+        if (inBand(v.B, c, ctx.model, ctx.now) !== false) return undefined;
+        return ctx.d !== cur ? true
+          : `current account ${cur} rolled and is outside the band [${[...v.B.ids]}], yet it kept the request`;
       }),
     },
     {
