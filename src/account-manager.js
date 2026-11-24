@@ -7825,20 +7825,21 @@ export class AccountManager {
 
   /**
    * Restore quota learned in a previous run. Matches saved entries to accounts
-   * by entry id, else by identity. Stale windows are not special-cased here —
-   * _clearExpiredQuotas wipes any restored window whose reset time has already
-   * passed on first use.
+   * by entry id, else, for a row saved without one, by identity. Stale windows
+   * are not special-cased here — _clearExpiredQuotas wipes any restored window
+   * whose reset time has already passed on first use.
    */
   restoreQuotaState(saved) {
     if (!Array.isArray(saved)) return;
-    const held = new Set(this.accounts.map(a => a.id).filter(id => typeof id === 'string' && id));
     for (const account of this.accounts) {
       // The entry id first, as affinity restores, so a restored pin is read
       // against the quota its own entry saved: a name changes with a relabel,
       // and sameIdentity accepts a row with no organization for the same
       // person's entry in another one.
+      // A row saved with an id restores onto no other entry: sameIdentity can
+      // match by name alone, and a new account can reuse a removed entry's name.
       const match = saved.find(s => typeof s?.id === 'string' && s.id === account.id && !distinctAccounts(s, account))
-        ?? saved.find(s => !(typeof s?.id === 'string' && held.has(s.id)) && sameIdentity(s, account));
+        ?? saved.find(s => !(typeof s?.id === 'string' && s.id) && sameIdentity(s, account));
       if (!match || !match.quota) continue;
       for (const f of PERSISTED_QUOTA_FIELDS) {
         if (match.quota[f] != null) account.quota[f] = match.quota[f];

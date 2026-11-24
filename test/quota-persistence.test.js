@@ -139,6 +139,74 @@ test('a renamed entry restores its own row, and a new entry under its old name t
   assert.deepEqual(restored.accounts.map(a => a.quota.unified7d), [0.1, 0.9, null]);
 });
 
+test('a removed entry\'s row does not pass to a new namesake', t => {
+  freeze(t);
+  const source = new AccountManager(entries([['a', 'alice'], ['b', 'bob']]), 0.98);
+  source.accounts[0].quota.unified7d = 0.1;
+  source.accounts[1].quota.unified7d = 0.9;
+  const restored = new AccountManager(entries([['a', 'alice'], ['c', 'bob']]), 0.98);
+  restored.restoreQuotaState(roundTrip(source.exportQuotaState()));
+  assert.deepEqual(restored.accounts.map(a => a.quota.unified7d), [0.1, null]);
+});
+
+test('an upstream account added back as a new entry starts with no readings', t => {
+  freeze(t);
+  const source = new AccountManager([oauth('alice', { id: 'a', accountUuid: 'p1' }), oauth('bob', { id: 'b', accountUuid: 'p2' })], 0.98);
+  source.accounts[0].quota.unified7d = 0.1;
+  source.accounts[1].quota.unified7d = 0.9;
+  const restored = new AccountManager([oauth('alice', { id: 'a', accountUuid: 'p1' }), oauth('robert', { id: 'c', accountUuid: 'p2' })], 0.98);
+  restored.restoreQuotaState(roundTrip(source.exportQuotaState()));
+  assert.deepEqual(restored.accounts.map(a => a.quota.unified7d), [0.1, null]);
+});
+
+test('a Codex account added back as a new entry starts with no readings', t => {
+  freeze(t);
+  const source = new AccountManager([oauth('bob', { id: 'b', provider: 'codex', accountId: 'w1', userId: 'u1' })], 0.98);
+  source.accounts[0].quota.unified7d = 0.9;
+  const restored = new AccountManager([oauth('robert', { id: 'c', provider: 'codex', accountId: 'w1', userId: 'u1' })], 0.98);
+  restored.restoreQuotaState(roundTrip(source.exportQuotaState()));
+  assert.equal(restored.accounts[0].quota.unified7d, null);
+});
+
+test('a new Codex entry takes no removed entry\'s row, by name or by workspace', t => {
+  freeze(t);
+  const source = new AccountManager([oauth('ann', { id: 'a', provider: 'codex' }), oauth('bob', { id: 'b', provider: 'codex', accountId: 'w1' })], 0.98);
+  source.accounts[0].quota.unified7d = 0.1;
+  source.accounts[1].quota.unified7d = 1;
+  const restored = new AccountManager([oauth('ann', { id: 'c', provider: 'codex', accountId: 'w1', userId: 'u1' })], 0.98);
+  restored.restoreQuotaState(roundTrip(source.exportQuotaState()));
+  assert.equal(restored.accounts[0].quota.unified7d, null);
+});
+
+test('a removed entry\'s row does not pass to a new namesake whose upstream id is not known yet', t => {
+  freeze(t);
+  const source = new AccountManager([oauth('alice', { id: 'a', accountUuid: 'p1' }), oauth('bob', { id: 'b', accountUuid: 'p2' })], 0.98);
+  source.accounts[0].quota.unified7d = 0.1;
+  source.accounts[1].quota.unified7d = 0.9;
+  const restored = new AccountManager([oauth('alice', { id: 'a', accountUuid: 'p1' }), oauth('bob', { id: 'c' })], 0.98);
+  restored.restoreQuotaState(roundTrip(source.exportQuotaState()));
+  assert.deepEqual(restored.accounts.map(a => a.quota.unified7d), [0.1, null]);
+});
+
+test('a removed entry\'s row with no organization does not pass to a new entry in an organization', t => {
+  freeze(t);
+  const source = new AccountManager([oauth('bob', { id: 'w' }), oauth('bob', { id: 'p', accountUuid: 'p1' })], 0.98);
+  source.accounts[0].quota.unified7d = 0.08;
+  source.accounts[1].quota.unified7d = 1;
+  const restored = new AccountManager([oauth('bob', { id: 'n', accountUuid: 'p1', orgUuid: 'o1' })], 0.98);
+  restored.restoreQuotaState(roundTrip(source.exportQuotaState()));
+  assert.equal(restored.accounts[0].quota.unified7d, null);
+});
+
+test('a live entry\'s row does not pass to a new entry of the same upstream account', t => {
+  freeze(t);
+  const source = new AccountManager([oauth('bob', { id: 'a', accountUuid: 'p1' })], 0.98);
+  source.accounts[0].quota.unified7d = 0.9;
+  const restored = new AccountManager([oauth('bob', { id: 'a', accountUuid: 'p1' }), oauth('bob2', { id: 'c', accountUuid: 'p1' })], 0.98);
+  restored.restoreQuotaState(roundTrip(source.exportQuotaState()));
+  assert.deepEqual(restored.accounts.map(a => a.quota.unified7d), [0.9, null]);
+});
+
 test('a row saved without an entry id restores by identity', t => {
   freeze(t);
   const source = new AccountManager(entries([['a', 'alice'], ['b', 'bob']]), 0.98);
