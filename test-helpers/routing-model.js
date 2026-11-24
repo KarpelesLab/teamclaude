@@ -1260,18 +1260,30 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
    * synchronously while one is free. Each slot is given back unanswered, so
    * nothing is learned from it. A call that finds no slot waits on a timer
    * until the test yields, which a row's test never does, so the probe stops
-   * at the first such call and never asks past what it judges.
+   * at the first such call and never asks past what it judges. That call's
+   * timer is cleared, since it would hold the manager until the test ends.
    * @param {any} acc @param {number} limit */
   const admitted = (acc, limit) => {
-    let done = false;
+    /** @type {ReturnType<typeof setTimeout>[]} */
+    const waits = [];
+    const set = globalThis.setTimeout;
+    globalThis.setTimeout = /** @type {any} */ ((/** @type {() => void} */ fn, /** @type {number} */ ms) => {
+      const w = set(fn, ms);
+      waits.push(w);
+      return w;
+    });
     let n = 0;
-    while (n < limit) {
-      const before = acc.inFlight;
-      am.admit(acc.index, () => done);
-      if (acc.inFlight === before) break;
-      n++;
+    try {
+      while (n < limit) {
+        const before = acc.inFlight;
+        am.admit(acc.index, () => false);
+        if (acc.inFlight === before) break;
+        n++;
+      }
+    } finally {
+      globalThis.setTimeout = set;
     }
-    done = true;
+    for (const w of waits) clearTimeout(w);
     for (let k = 0; k < n; k++) am.release(acc.index, { successful: false });
     return n;
   };
