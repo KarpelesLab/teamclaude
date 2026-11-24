@@ -47,10 +47,11 @@ import assert from 'node:assert/strict';
 import { AccountManager } from '../src/account-manager.js';
 import { validateAdaptiveConfig } from '../src/adaptive-distribution.js';
 import {
-  FABLE, H, MIN, OPUS, coveringArray, generate, play, prng, productCells, shrink, toRow,
+  FABLE, H, LOAD_WINDOW, MIN, OPUS, coveringArray, generate, play, prng, productCells, shrink, toRow,
 } from '../test-helpers/routing-model.js';
 import { catalog } from '../test-helpers/routing-invariants.js';
 import { QUOTES, TRANSITIONS, takes, transitionPaths } from '../test-helpers/routing-transitions.js';
+import { ROLLOVER, ROLLOVER_QUOTES, rolloverMarks } from '../test-helpers/routing-rollover.js';
 
 /** @typedef {import('../test-helpers/routing-model.js').Row} Row */
 /** @typedef {import('../test-helpers/routing-model.js').History} History */
@@ -83,15 +84,17 @@ const ONLY_SEED = env.ROUTING_MODEL_SEED != null && env.ROUTING_MODEL_SEED !== '
 const ONLY_ROW = env.ROUTING_MODEL_ROW || null;
 const seeds = ONLY_SEED != null ? [ONLY_SEED] : Array.from({ length: SEEDS }, (_, i) => i + 1);
 
+// Rows an invariant needs that no pair of option values forces, appended after
+// the covering array so that its rows stay as they are. O29 judges the re-rank
+// under load only with preemption on and no reclaim window.
+const NEEDED = [{ ...base, dist: 'load', ...on(1.5, true, '0') }];
+
 const profileNames = new Map(Object.entries(PROFILES).map(([k, v]) => [JSON.stringify(v), k]));
-const cells = env.ROUTING_MODEL_MATRIX === 'product' ? productCells() : coveringArray(Object.values(PROFILES));
+const cells = env.ROUTING_MODEL_MATRIX === 'product' ? productCells() : [...coveringArray(Object.values(PROFILES)), ...NEEDED];
 const rows = cells.map(c => toRow(c, profileNames.get(JSON.stringify(c)))).filter(r => !ONLY_ROW || r.name.includes(ONLY_ROW));
 
 /** @type {Map<string, number>} */
 const applied = new Map();
-// How often a check that may abstain did, so a reader sees what it left unjudged.
-/** @type {Map<string, number>} */
-const abstained = new Map([['O15', 0]]);
 // Per row: how many histories it played, and in how many of them each
 // invariant applied, for the floors that are a share of a row's runs.
 /** @type {Map<string, number>} */
@@ -99,7 +102,11 @@ const runsOf = new Map();
 /** @type {Map<string, number>} */
 const appliedRuns = new Map();
 /** @type {Map<string, { count: number, first: string|null }>} */
-const gaps = new Map([['G1', { count: 0, first: null }], ['G2', { count: 0, first: null }], ['G4', { count: 0, first: null }]]);
+const gaps = new Map([['G1', { count: 0, first: null }], ['G2', { count: 0, first: null }], ['G6', { count: 0, first: null }], ['G7', { count: 0, first: null }], ['G4', { count: 0, first: null }]]);
+
+// The rollover rows the matrix runs take (test-helpers/routing-rollover.js).
+/** @type {Set<string>} */
+const rolled = new Set();
 
 /** The steps after which a seed's restarts happen, in order. They fall among
  * the random events, since one inside a closing episode only cuts it short.
@@ -138,22 +145,19 @@ function hermetic(t) {
  * set; any other breach throws Broken. `only` limits the check to one
  * invariant. `perRun` counts the run toward the row's per-run floors.
  * @param {import('node:test').TestContext} t @param {Row} row @param {History} history
- * @param {number[]} restarts @param {{ only?: string, tally?: boolean, perRun?: boolean, label?: string, unchecked?: boolean, taken?: Set<string> }} [opts]
+ * @param {number[]} restarts @param {{ only?: string, tally?: boolean, perRun?: boolean, label?: string, unchecked?: boolean, taken?: Set<string>, marks?: boolean }} [opts]
  */
 function run(t, row, history, restarts, opts = {}) {
   const invariants = opts.unchecked ? [] : catalog().filter(inv => inv.holds(row) && (!opts.only || inv.id === opts.only));
   /** @type {Set<string>} */
   const hit = new Set();
+  const mark = opts.marks ? rolloverMarks() : null;
   const check = (/** @type {any} */ ctx) => {
     /** @type {Set<string>} */
     const ok = new Set();
     for (const inv of invariants) {
       const r = inv.check(ctx);
       if (r === undefined) continue;
-      if (r === null) {
-        if (opts.tally) abstained.set(inv.id, (abstained.get(inv.id) ?? 0) + 1);
-        continue;
-      }
       if (r === true) {
         if (opts.tally) applied.set(inv.id, (applied.get(inv.id) ?? 0) + 1);
         hit.add(inv.id);
@@ -169,6 +173,7 @@ function run(t, row, history, restarts, opts = {}) {
       }
       throw new Broken(inv.id, inv.doc, r, ctx);
     }
+    if (mark) for (const id of mark(ctx, ok)) opts.taken?.add(id);
     return ok;
   };
   const trace = play({ AccountManager, validateAdaptiveConfig, t, history, row, restarts, check, taken: opts.taken });
@@ -206,7 +211,7 @@ function runSeed(t, row, seed) {
   const h = generate(seed);
   for (const restarts of [[], restartPoints(seed, h)]) {
     try {
-      const trace = run(t, row, h, restarts, { tally: true, perRun: true, label: restarts.length ? ` (restart after step ${restarts})` : '' });
+      const trace = run(t, row, h, restarts, { tally: true, perRun: true, taken: rolled, marks: true, label: restarts.length ? ` (restart after step ${restarts})` : '' });
       if (ONLY_SEED != null) {
         t.diagnostic(`restarts [${restarts}]`);
         for (const d of trace) t.diagnostic(JSON.stringify(d));
@@ -418,6 +423,215 @@ test('a removal keeps the roll its bucket\'s reading holds for the conversation\
   assert.notEqual(trace[3].d, 'a', 'the request returned to a, whose unsettled roll the reading holds');
 });
 
+// Built by hand to catch a manager whose serve in one bucket releases a roll
+// held in another: no matrix history serves the conversation's other bucket
+// between a move off a roll and the return to it.
+test('a serve in one bucket keeps the roll held in the conversation\'s other bucket', t => {
+  hermetic(t);
+  const start = Date.UTC(2030, 2, 10, 12);
+  const acct = (/** @type {string} */ id, /** @type {number} */ r7d, /** @type {number} */ u7d) => ({
+    id, priority: 0, org: 'org-1', maxUsage: /** @type {any} */ (null), endsAt: null, hidden7d: false, clockless7d: false, clocklessF: false,
+    u5h: 0.1, r5h: start + 4 * H, u7d, r7d: start + r7d, F: null, FR: null,
+  });
+  // c0 rests on `a` in both buckets and `a` rolls. The Opus request moves
+  // off it to `x`, and the next one rests there, which holds the roll. The
+  // Fable request follows, and `x` serves it before any Opus request is
+  // served under the move's stamp. With `x` full, the Opus request returns to
+  // `a` and gets the held reading back, so once `x` recovers O15 judges the
+  // next one.
+  const history = {
+    seed: 0, start, fableRoute: null,
+    accounts: [acct('a', 30 * H, 0.2), acct('x', 40 * H, 0.2), acct('z', 160 * H, 0.99)],
+    steps: [
+      { at: start + MIN, op: 'fault', id: 'x', kind: 'disable' },
+      { at: start + 2 * MIN, op: 'request', c: 'c0', model: OPUS },
+      { at: start + 3 * MIN, op: 'request', c: 'c0', model: FABLE },
+      { at: start + 4 * MIN, op: 'roll', id: 'a', fable: false },
+      { at: start + 5 * MIN, op: 'fault', id: 'x', kind: 'disable' },
+      { at: start + 6 * MIN, op: 'request', c: 'c0', model: OPUS },
+      { at: start + 7 * MIN, op: 'request', c: 'c0', model: OPUS },
+      { at: start + 8 * MIN, op: 'request', c: 'c0', model: FABLE },
+      { at: start + 9 * MIN, op: 'usage', id: 'x', u7d: 0.99, f: null },
+      { at: start + 10 * MIN, op: 'request', c: 'c0', model: OPUS },
+      { at: start + 11 * MIN, op: 'usage', id: 'x', u7d: 0.2, f: null },
+      { at: start + 12 * MIN, op: 'request', c: 'c0', model: OPUS },
+    ],
+  };
+  const row = toRow({ ...base, dist: 'adaptive-pressure', ...on(1.5, true, '0') });
+  const judged = () => applied.get('O15') ?? 0;
+  const before = judged();
+  /** @type {any[]} */
+  let trace = [];
+  try { trace = run(t, row, history, [], { tally: true }); } catch (e) {
+    if (e instanceof Broken) assert.fail(explain(t, e, row, history, []));
+    throw e;
+  }
+  assert.deepEqual(trace.slice(0, 6).map(d => d.d), ['a', 'a', 'x', 'x', 'x', 'a'], 'the scenario did not route as built');
+  const all = judged() - before;
+  const mid = judged();
+  run(t, row, { ...history, steps: history.steps.slice(0, -1) }, [], { tally: true });
+  assert.equal(all - (judged() - mid), 1, 'O15 did not judge the last request');
+});
+
+// Built by hand: no matrix history re-ranks a rolled pin under load while a
+// contender's request is about LOAD_WINDOW old.
+test('the load re-rank counts a request inside LOAD_WINDOW and none past it', t => {
+  hermetic(t);
+  const start = Date.UTC(2030, 2, 10, 12);
+  const acct = (/** @type {string} */ id, /** @type {number} */ r7d) => ({
+    id, priority: 0, org: 'org-1', maxUsage: /** @type {any} */ (null), endsAt: null, hidden7d: false, clockless7d: false, clocklessF: false,
+    u5h: 0.1, r5h: start + 4 * H, u7d: 0.2, r7d: start + r7d, F: null, FR: null,
+  });
+  // c0 is placed on `a` and c1 on `x`, then `a` rolls. While c1's request
+  // counts, `x` has more requests and the re-rank keeps c0 on `a`; once
+  // it is past LOAD_WINDOW, the two tie on load and the even keys pick `x`.
+  // The docs' "last ten minutes" leaves a request exactly LOAD_WINDOW old
+  // undecided, so that case is not played.
+  for (const [late, to] of [[-1, 'a'], [1, 'x']]) {
+    const history = {
+      seed: 0, start, fableRoute: null,
+      accounts: [acct('a', 30 * H), acct('x', 190 * H)],
+      steps: [
+        { at: start + MIN, op: 'fault', id: 'x', kind: 'disable' },
+        { at: start + 2 * MIN, op: 'request', c: 'c0', model: OPUS },
+        { at: start + 3 * MIN, op: 'fault', id: 'x', kind: 'disable' },
+        { at: start + 3 * MIN, op: 'fault', id: 'a', kind: 'disable' },
+        { at: start + 4 * MIN, op: 'request', c: 'c1', model: OPUS },
+        { at: start + 5 * MIN, op: 'fault', id: 'a', kind: 'disable' },
+        { at: start + 5 * MIN, op: 'roll', id: 'a', fable: false },
+        { at: start + 4 * MIN + LOAD_WINDOW + late, op: 'request', c: 'c0', model: OPUS },
+      ],
+    };
+    const row = toRow({ ...base, dist: 'load', ...on(1.5, true, '0') });
+    /** @type {any[]} */
+    let trace = [];
+    try { trace = run(t, row, history, []); } catch (e) {
+      if (e instanceof Broken) assert.fail(explain(t, e, row, history, []));
+      throw e;
+    }
+    assert.deepEqual(trace.map(d => d.d), ['a', 'x', to], `c1's request ${LOAD_WINDOW + late} ms old: the scenario did not route as built`);
+  }
+});
+
+// Built by hand: at the default seed count no request is diverted off a
+// cursor whose Fable bucket alone is spent, as its own bucket or its
+// advisor's. A reload that bars the cursor from Fable at that point leaves a
+// route bar, which is not judged.
+test('O27: a request diverted off a cursor that serves other models ramps its destination', t => {
+  hermetic(t);
+  const start = Date.UTC(2030, 2, 10, 12);
+  const acct = (/** @type {string} */ id, /** @type {number} */ r7d) => ({
+    id, priority: 0, org: 'org-1', maxUsage: /** @type {any} */ (null), endsAt: null, hidden7d: false, clockless7d: false, clocklessF: false,
+    u5h: 0.1, r5h: start + 4 * H, u7d: 0.2, r7d: start + r7d, F: 0.1, FR: start + 150 * H,
+  });
+  const fable = (/** @type {string[]} */ accounts) => [{ name: 'fable', match: ['*fable*'], accounts }];
+  // c1 is served on the cursor `a` until `a`'s Fable bucket is spent. Its
+  // next request goes to `b` while the cursor stays on `a`, which still
+  // serves Opus.
+  const cases = [
+    { name: 'own bucket', cell: base, req: { model: FABLE }, judged: 1 },
+    { name: 'advisor bucket', cell: { ...base, advisorEligibility: 'strict' }, req: { model: OPUS, advisor: FABLE }, judged: 1 },
+    { name: 'reload', cell: { ...base, routes: 'layered' }, req: { model: FABLE }, routeTables: { first: fable(['a', 'b']), next: fable(['b']) }, judged: 0 },
+  ];
+  for (const k of cases) {
+    const history = {
+      seed: 0, start, fableRoute: null, routeTables: k.routeTables,
+      accounts: [acct('a', 50 * H), acct('b', 100 * H)],
+      steps: [
+        { at: start + MIN, op: 'request', c: 'c0', model: OPUS },
+        { at: start + 2 * MIN, op: 'request', c: 'c1', ...k.req },
+        { at: start + 3 * MIN, op: 'usage', id: 'a', u7d: 0.2, f: 0.99, reload: k.routeTables != null },
+        { at: start + 4 * MIN, op: 'request', c: 'c1', ...k.req },
+        { at: start + 5 * MIN, op: 'request', c: 'c0', model: OPUS },
+      ],
+    };
+    const row = toRow(k.cell);
+    const before = applied.get('O27') ?? 0;
+    /** @type {any[]} */
+    let trace = [];
+    try { trace = run(t, row, history, [], { tally: true }); } catch (e) {
+      if (e instanceof Broken) assert.fail(explain(t, e, row, history, []));
+      throw e;
+    }
+    assert.deepEqual(trace.map(d => d.d), ['a', 'a', 'b', 'a'], `${k.name}: the scenario did not route as built`);
+    assert.equal((applied.get('O27') ?? 0) - before, k.judged, `${k.name}: O27 judged the diversion ${(applied.get('O27') ?? 0) - before} times`);
+  }
+});
+
+// Built by hand to catch a manager that skips the ramp when the diversion's
+// destination is the conversation's own pin: with distribution off that pin
+// does not keep the conversation, so the move is a switch.
+test('O27: a request diverted onto its conversation\'s pin ramps the destination', t => {
+  hermetic(t);
+  const start = Date.UTC(2030, 2, 10, 12);
+  const acct = (/** @type {string} */ id, /** @type {number} */ r7d) => ({
+    id, priority: 0, org: 'org-1', maxUsage: /** @type {any} */ (null), endsAt: null, hidden7d: false, clockless7d: false, clocklessF: false,
+    u5h: 0.1, r5h: start + 4 * H, u7d: 0.2, r7d: start + r7d, F: 0.1, FR: start + 150 * H,
+  });
+  // c1's first Fable request is diverted to `b`, which pins it there. Once
+  // `a` serves Fable again and c2 brings the family back to it, `a`'s Fable
+  // bucket is spent and c1's next Fable request is diverted to `b` again.
+  const history = {
+    seed: 0, start, fableRoute: null,
+    accounts: [acct('a', 50 * H), acct('b', 100 * H)],
+    steps: [
+      { at: start + MIN, op: 'request', c: 'c0', model: OPUS },
+      { at: start + 2 * MIN, op: 'usage', id: 'a', u7d: 0.2, f: 0.99 },
+      { at: start + 3 * MIN, op: 'request', c: 'c1', model: FABLE },
+      { at: start + 4 * MIN, op: 'usage', id: 'a', u7d: 0.2, f: 0.1 },
+      { at: start + 5 * MIN, op: 'request', c: 'c2', model: FABLE },
+      { at: start + 6 * MIN, op: 'usage', id: 'a', u7d: 0.2, f: 0.99 },
+      { at: start + 7 * MIN, op: 'request', c: 'c1', model: FABLE },
+      { at: start + 8 * MIN, op: 'request', c: 'c0', model: OPUS },
+    ],
+  };
+  const row = toRow(base, 'defaults');
+  const before = applied.get('O27') ?? 0;
+  /** @type {any[]} */
+  let trace = [];
+  try { trace = run(t, row, history, [], { tally: true }); } catch (e) {
+    if (e instanceof Broken) assert.fail(explain(t, e, row, history, []));
+    throw e;
+  }
+  assert.deepEqual(trace.map(d => d.d), ['a', 'b', 'a', 'b', 'a'], 'the scenario did not route as built');
+  assert.equal((applied.get('O27') ?? 0) - before, 1, 'O27 did not judge the diversion onto the pin');
+});
+
+// Built by hand: a cordoned account keeps a conversation through its pin in
+// another bucket, and no matrix history plays that keep with distribution off.
+test('O27: a request kept on a cordoned account through another bucket\'s pin is no switch', t => {
+  hermetic(t);
+  const start = Date.UTC(2030, 2, 10, 12);
+  const acct = (/** @type {string} */ id, /** @type {number} */ r7d) => ({
+    id, priority: 0, org: 'org-1', maxUsage: /** @type {any} */ (null), endsAt: null, hidden7d: false, clockless7d: false, clocklessF: false,
+    u5h: 0.1, r5h: start + 4 * H, u7d: 0.2, r7d: start + r7d, F: 0.1, FR: start + 150 * H,
+  });
+  // c's only pin is its Opus pin on `d`, which is then cordoned, so the
+  // cursor moves to `a`. Once `a`'s Fable bucket is spent, c's first Fable
+  // request stays on `d`.
+  const history = {
+    seed: 0, start, fableRoute: null,
+    accounts: [acct('d', 30 * H), acct('a', 50 * H), acct('b', 100 * H), acct('e', 160 * H)],
+    steps: [
+      { at: start + MIN, op: 'request', c: 'c', model: OPUS },
+      { at: start + 2 * MIN, op: 'fault', id: 'd', kind: 'cordon' },
+      { at: start + 3 * MIN, op: 'request', c: 'c2', model: OPUS },
+      { at: start + 4 * MIN, op: 'request', c: 'c3', model: FABLE },
+      { at: start + 5 * MIN, op: 'usage', id: 'a', u7d: 0.2, f: 0.99 },
+      { at: start + 6 * MIN, op: 'request', c: 'c3', model: FABLE },
+      { at: start + 7 * MIN, op: 'request', c: 'c', model: FABLE },
+    ],
+  };
+  const row = toRow(base, 'defaults');
+  /** @type {any[]} */
+  let trace = [];
+  try { trace = run(t, row, history, []); } catch (e) {
+    if (e instanceof Broken) assert.fail(explain(t, e, row, history, []));
+    throw e;
+  }
+  assert.deepEqual(trace.map(d => d.d), ['d', 'a', 'a', 'b', 'd'], 'the scenario did not route as built');
+});
+
 // The hold and removal tables' paths play under every row and are judged by
 // the same invariants as the matrix.
 /** @type {Set<string>} */
@@ -444,15 +658,50 @@ test('transitions covered', t => {
   t.diagnostic(`transitions covered ${reachable.filter(r => takes(taken, r)).length}/${reachable.length}`);
 });
 
+// The rollover rows the episodes do not take yet, each with why. They stay
+// reachable, so the covered line below counts them as missed.
+const UNTAKEN = [
+  // No episode plays the event in the row's state.
+  'RO-unread', 'RO-body-fail', 'RO-retry-same', 'RO-retry-confirms', 'RO-inflight', 'RO-scoped-family', 'RO-knob-off',
+  'RO-knob-on', 'RO-route-pin', 'RO-extra-usage', 'PIN-remove-held', 'PIN-release', 'DR-keep', 'DR-roll-preempt',
+  'DR-roll-nopreempt', 'CU-borrow', 'RC-sooner', 'RC-several', 'RC-third-move',
+  // Not credited from random events. RC-fivehour: a conversation idle past
+  // an hour, which the docs say is forgotten and the code keeps (G1), passes
+  // for one reclaimed onto A that waited out A's 5-hour window.
+  // PIN-restart-persist: U5 compares only the restored pins, not the held roll
+  // a restart drops.
+  'RC-fivehour', 'PIN-restart-persist',
+  // Driven, but no invariant judges the outcome.
+  'RO-pressure-dest', 'RO-two-preempts', 'RO-left-by-handback', 'RO-stay-on-owed', 'RO-first-arrival', 'PIN-restart-idle', 'RA-window',
+  // Driven, but at 16 seeds the invariant that judges the outcome never
+  // returns true there: G6 counts the docs' outcome as a gap, O1 does not
+  // judge the stay after a second move, and G1 never sees a revived
+  // conversation without its pins.
+  'RO-other-window', 'RO-handback-once', 'PIN-idle',
+];
+const rolloverReachable = ROLLOVER.filter(r => r.reachable === true);
+test('transitions: every reachable rollover row but the listed ones is taken', { skip: ONLY_ROW || ONLY_SEED != null ? 'filtered run' : false }, () => {
+  assert.deepEqual(rolloverReachable.filter(r => !rolled.has(r.id) && !UNTAKEN.includes(r.id)).map(r => r.id), [], 'rollover rows no episode took');
+});
+
+test('rollover transitions covered', t => {
+  t.diagnostic(`rollover transitions covered ${rolloverReachable.filter(r => rolled.has(r.id)).length}/${rolloverReachable.length}`);
+});
+
+test('rollover rows no episode takes yet', { todo: UNTAKEN.join(', ') || false }, () => {
+  assert.deepEqual(UNTAKEN, []);
+});
+
 // A row's citation ties its outcome to the docs. A docs edit that moves the
 // sentence must move the citation too.
 test('every quoted docs sentence starts on the line its row cites', () => {
   const norm = (/** @type {string} */ s) => s.replace(/\s+/g, ' ').trim();
-  const missed = TRANSITIONS.filter(r => typeof r.docs === 'string').filter(r => {
+  const quotes = { ...QUOTES, ...ROLLOVER_QUOTES };
+  const missed = [...TRANSITIONS, ...ROLLOVER].filter(r => typeof r.docs === 'string').filter(r => {
     const [file, n] = /** @type {string} */ (r.docs).split(':');
     const lines = readFileSync(new URL(`../${file}`, import.meta.url), 'utf8').split('\n');
     // The sentence may start late on its line and wrap onto the next ones.
-    const at = norm(lines.slice(Number(n) - 1, Number(n) + 5).join(' ')).indexOf(norm(QUOTES[r.id]));
+    const at = norm(lines.slice(Number(n) - 1, Number(n) + 5).join(' ')).indexOf(norm(quotes[r.id]));
     return !(at >= 0 && at < norm(lines[Number(n) - 1]).length);
   }).map(r => r.id);
   assert.deepEqual(missed, [], 'rows whose sentence is not on the cited line');
@@ -461,7 +710,6 @@ test('every quoted docs sentence starts on the line its row cites', () => {
 test('every invariant holds in a row and is applied there', { skip: ONLY_ROW || ONLY_SEED != null ? 'filtered run' : false }, t => {
   t.diagnostic(`${rows.length} rows, ${seeds.length} seeds each, ${RESTART_POINTS} restart points per seed`);
   t.diagnostic(`checks applied: ${[...applied].map(([k, n]) => `${k}=${n}`).join(' ')}`);
-  t.diagnostic(`checks abstained: ${[...abstained].map(([k, n]) => `${k}=${n}`).join(' ')}`);
   const dead = catalog().filter(inv => !inv.gap && !rows.some(r => inv.holds(r))).map(inv => inv.id);
   assert.deepEqual(dead, [], `hold in no row: ${dead}; each holds(row) must read an option that some row sets`);
   const vacuous = catalog().filter(inv => !inv.gap && rows.some(r => inv.holds(r)) && !(applied.get(inv.id) > 0)).map(inv => inv.id);
@@ -515,6 +763,18 @@ test('G2: a pin moves at most once per rollover (matrix)',
   { todo: 'docs/routing.md:409 says at most one cache-miss turn per pin per rollover; a hand-back can move a pin twice on one roll' }, () => {
     const g = /** @type {{ count: number, first: string|null }} */ (gaps.get('G2'));
     assert.equal(g.count, 0, `${g.count} second moves; first:\n${g.first}`);
+  });
+
+test('G6: a roll is handed back once, also after another window rolls (matrix)',
+  { todo: 'docs/routing.md:411 says a roll is handed back once, and a reading restored from a hold is held again only for a window that has rolled since; held again for another window, it hands this window\'s roll back a second time' }, () => {
+    const g = /** @type {{ count: number, first: string|null }} */ (gaps.get('G6'));
+    assert.equal(g.count, 0, `${g.count} third moves; first:\n${g.first}`);
+  });
+
+test('G7: a roll is handed back once, also with a reclaim window (matrix)',
+  { todo: 'docs/routing.md:411 says a roll is handed back once; with a reclaim window a pin moves a third time on one roll, by reclaim or by a hand-back, which no reading in the model separates' }, () => {
+    const g = /** @type {{ count: number, first: string|null }} */ (gaps.get('G7'));
+    assert.equal(g.count, 0, `${g.count} third moves; first:\n${g.first}`);
   });
 
 test('G4: a 429 hops to an untried, unpaused idle account (matrix)',

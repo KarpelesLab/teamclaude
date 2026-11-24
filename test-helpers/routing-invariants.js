@@ -4,8 +4,7 @@
 //
 // An invariant is `{ id, doc, holds(row), gap?, runFloor?, check(ctx) }`.
 // `check` returns undefined where it does not apply, true where it applied and
-// held, null where it applied but abstains, and a string saying what broke
-// otherwise. The count of `true` results
+// held, and a string saying what broke otherwise. The count of `true` results
 // is the vacuity floor: an invariant that never applied in a row where it holds
 // proves nothing. `runFloor`, where set, is the share of each such row's runs
 // in which it must apply at least once. A `gap` invariant states what
@@ -15,7 +14,7 @@
 import {
   FABLE, SOONER_MARGIN, band, bucketOf, capOf, deadline, governing, heldOff,
   pressure, recentOn, activeOn, thresholdOf, unavailable, atCap, routeOf, globMatches,
-  familyCapped, servesAdvisor, held, advisorMode,
+  familyCapped, servesAdvisor, held, advisorMode, rampOf, BURST, startable,
 } from './routing-model.js';
 
 const ADAPTIVE_MAX_BURN_BOOST = 4;
@@ -138,7 +137,7 @@ function switchTakers(ctx, c) {
 
 /** Whether `a` is in band `b`, or too close to its floor to say.
  * @returns {boolean|null} */
-function inBand(/** @type {any} */ b, /** @type {any} */ a, /** @type {string} */ model, /** @type {number} */ now) {
+export function inBand(/** @type {any} */ b, /** @type {any} */ a, /** @type {string} */ model, /** @type {number} */ now) {
   if (b.ids.has(a.id)) {
     if (b.floor == null) return true;
     const pr = pressure(a, model, now);
@@ -221,7 +220,7 @@ function fiveHourFactor(a, ctx) {
 /** The reclaim conditions of docs/routing.md:427-436 for moving a pin on `q`
  * to `a`, or why not. Null when a reading sits on an edge.
  * @param {any} ctx @param {any} v @param {any} q @param {any} a */
-function reclaimable(ctx, v, q, a) {
+export function reclaimable(ctx, v, q, a) {
   const { model, now, ex } = ctx;
   const inB = inBand(v.B, a, model, now);
   if (inB === null) return null;
@@ -241,21 +240,52 @@ function reclaimable(ctx, v, q, a) {
 
 /**
  * A fresh catalog for one played history: G2 counts across steps.
- * @returns {Array<{ id: string, doc: string, gap?: string, runFloor?: number, holds: (row: any) => boolean, check: (ctx: any) => true|string|null|undefined }>}
+ * @returns {Array<{ id: string, doc: string, gap?: string, runFloor?: number, holds: (row: any) => boolean, check: (ctx: any) => true|string|undefined }>}
  */
 export function catalog() {
   /** @type {Map<string, number>} */
   const movesPerRoll = new Map();
+  /** @type {Map<string, number>} */
+  const handBacksPerRoll = new Map();
+  /** @type {Map<string, number>} */
+  const reheldPerRoll = new Map();
+  /** @type {Map<string, number>} */
+  const reclaimedPerRoll = new Map();
+  // The resets of the pin's other windows at the first move off each roll.
+  // Only O26 writes it, so G6 and G7 must follow O26 in the catalog.
+  /** @type {Map<string, string>} */
+  const othersAtFirst = new Map();
+  const otherResets = (/** @type {any} */ a, /** @type {string} */ model) => {
+    const g = governing(a, model).window;
+    return [['unified7d', a.r7d], ['unified7dFable', a.fr]].filter(([w]) => w !== g).map(([w, r]) => `${w}=${r}`).join(',');
+  };
+  // The moves off an available pin, with no available account of a better
+  // priority, whose reading saw it roll, each keyed by the roll it answers.
+  // Only a `request` step counts: a throttle or refusal step is judged on its
+  // first attempt, and its hop or failover can land back on the pin.
+  const rollMove = (/** @type {any} */ ctx, /** @type {any} */ v) => {
+    const p = v.p;
+    if (ctx.op !== 'request' || p == null || ctx.d === p || ctx.d === '-') return null;
+    const a = ctx.fed.get(p);
+    if (v.reason(a) != null || v.outranked(a)) return null;
+    if (!(ctx.pinRolled || ctx.pinUncertain)) return null;
+    return { p, a, key: `${ctx.life}|${ctx.c}|${ctx.bucket}|${p}|${governing(a, ctx.model).reset}` };
+  };
+  // A move off a roll that a reclaim (docs/routing.md:427-436) could have
+  // made, which no reading in the model separates from a hand-back.
+  const reclaimShaped = (/** @type {any} */ ctx, /** @type {any} */ v, /** @type {any} */ m) =>
+    ctx.ex.reclaimHours > 0 && !ctx.pinRolled && inBand(v.B, m.a, ctx.model, ctx.now) === false
+      && reclaimable(ctx, v, m.a, ctx.fed.get(ctx.d)) === '';
   // A failover is a selection too, so what bars an account from every
   // selection judges it as well.
-  const anySelection = (/** @type {(ctx: any, v: any) => true|string|null|undefined} */ f) =>
+  const anySelection = (/** @type {(ctx: any, v: any) => true|string|undefined} */ f) =>
     (/** @type {any} */ ctx) => (ctx.restart || ctx.removal || ctx.hop ? undefined : f(ctx, view(ctx)));
   // Only the advisor invariants judge a request whose advisor narrows its
   // candidates, since every other one reads the candidates as the request's
   // model alone leaves them.
-  const anyRequest = (/** @type {(ctx: any, v: any) => true|string|null|undefined} */ f) =>
+  const anyRequest = (/** @type {(ctx: any, v: any) => true|string|undefined} */ f) =>
     (/** @type {any} */ ctx) => (ctx.failover ? undefined : anySelection(f)(ctx));
-  const request = (/** @type {(ctx: any, v: any) => true|string|null|undefined} */ f) =>
+  const request = (/** @type {(ctx: any, v: any) => true|string|undefined} */ f) =>
     (/** @type {any} */ ctx) => (ctx.adv && !ctx.adv.plain ? undefined : anyRequest(f)(ctx));
   const advised = (/** @type {(ctx: any, v: any, adv: any) => true|string|undefined} */ f, failover = false) =>
     (failover ? anySelection : anyRequest)((ctx, v) => (ctx.adv ? f(ctx, v, ctx.adv) : undefined));
@@ -526,15 +556,36 @@ export function catalog() {
       }),
     },
     {
+      // A pin the reading returned to keeps the request once the move off its
+      // roll was served at the destination: "Traffic that returns after a serve
+      // finds the roll released and reads the origin whole" (docs/routing.md:417).
+      // Served only under a later stamp, "the roll stays held" (:411): the
+      // reading restored on the return has rolled, and the pin is re-ranked as
+      // O29 judges a rolled pin.
+      id: 'O28', doc: 'docs/routing.md:411 and :417',
+      holds: row => distOn(row) && row.expiry?.enabled === true && row.expiry.preempt !== false,
+      check: request((ctx, v) => {
+        if (ctx.pinHeld) {
+          if (!placementRanked(ctx) || v.p == null || bandEdge(ctx, v)) return undefined;
+          const a = ctx.fed.get(v.p);
+          if (v.reason(a) != null || v.outranked(a) || [...ctx.fed.values()].some((/** @type {any} */ x) => x.cordoned)) return undefined;
+          const r = argminOK(ctx, [...v.av].filter(x => v.B.ids.has(x.id)), placementKey(ctx));
+          return typeof r === 'string' ? `pin ${v.p} was returned to while its roll was held, and the re-rank sent the request to ${ctx.d}: ${r}` : r;
+        }
+        if (!ctx.pinReturned || v.kind.kind !== 'pin' || v.kind.q !== v.p) return undefined;
+        const q = v.kind.q;
+        if (ctx.d === q) return true;
+        if (ctx.ex.reclaimHours > 0 && inBand(v.B, ctx.fed.get(q), ctx.model, ctx.now) !== true) return undefined;
+        return `pin ${q} was returned to after its roll was settled, yet the request went to ${ctx.d}`;
+      }),
+    },
+    {
       id: 'O15', doc: 'docs/routing.md:409',
       holds: row => distOn(row) && row.expiry?.enabled === true && row.expiry.preempt !== false,
       check: request((ctx, v) => {
         if (v.kind.kind !== 'rolled') return undefined;
         const q = ctx.fed.get(v.kind.q);
         if (inBand(v.B, q, ctx.model, ctx.now) !== false) return undefined;
-        // The model does not follow the roll handed back when traffic reaches an
-        // account a hand-back left, so it cannot tell that roll from a live one.
-        if (ctx.readTraded) return null;
         return ctx.d !== v.kind.q ? true
           : `pin ${v.kind.q} rolled and is outside the band [${[...v.B.ids]}], yet it kept the request`;
       }),
@@ -663,6 +714,77 @@ export function catalog() {
         if (bandEdge(ctx, v)) return undefined;
         return argminOK(ctx, [...v.av].filter(a => v.B.ids.has(a.id)), a => [
           recentOn(ctx.routed, a.id, ctx.now), activeOn(ctx.convs, a.id, ctx.now, ctx.tagged ? ctx.c : null)]);
+      }),
+    },
+    {
+      // A rolled pin is re-ranked, and stays only where "the re-rank ran and
+      // the account it was on still ranked best" (docs/routing.md:417): under
+      // even and load that re-rank is the placement pick over the band with the
+      // pin in it. The adaptive modes decide the move on a burndown score this
+      // model does not compute, and a reclaim window can move the pin on its own
+      // terms, so neither is judged here.
+      id: 'O29', doc: 'docs/routing.md:417',
+      holds: row => (row.dist === 'even' || row.dist === 'load') && row.expiry?.enabled === true && row.expiry.preempt !== false
+        && !(row.expiry.reclaimHours > 0),
+      // Random rolls leave a rolled pin in place in about a third of the runs.
+      runFloor: 0.2,
+      check: request((ctx, v) => {
+        if (v.kind.kind !== 'rolled' || ctx.d !== v.kind.q || bandEdge(ctx, v)) return undefined;
+        const r = argminOK(ctx, [...v.av].filter(a => v.B.ids.has(a.id)), placementKey(ctx));
+        return typeof r === 'string' ? `rolled pin ${v.kind.q} kept the request: ${r}` : r;
+      }),
+    },
+    {
+      // Requests "onto a just-switched-to account are paced: concurrency
+      // starts at" startConc, and storm control off sends "the full burst
+      // immediately" (docs/routing.md:155, :166). A switch here is a cursor
+      // move with distribution off, a request diverted off a cursor whose
+      // family bucket or cap, or its advisor's, bars only this request (:174,
+      // :178), and a pin's move off its roll or into a reclaim window, which
+      // :436 paces "as after any other move". Other moves, the cursor move a
+      // cordon or a disable makes between requests, a move off a cursor a
+      // route bars for the request or its advisor, a family's first
+      // diversion since start, restart or removal, and the ramp a pause arms,
+      // are not judged: the docs do not say they ramp, and the first
+      // diversion moves no traffic of the family off an account.
+      // A request routed to a cordoned account is not a switch, since a
+      // cordoned account takes no new work (:21).
+      id: 'O27', doc: 'docs/routing.md:155',
+      holds: () => true,
+      check: anyRequest((ctx, v) => {
+        if (ctx.d === '-') return undefined;
+        // A request whose advisor narrows the candidates is judged only with
+        // distribution off, and not on a cursor move.
+        const narrowed = ctx.adv != null && !ctx.adv.plain;
+        if (narrowed && ctx.row.dist !== 'off') return undefined;
+        const ramp = rampOf(ctx.row);
+        if (!ramp.enabled) {
+          const n = ctx.admits(BURST);
+          if (n == null) return undefined;
+          return n >= BURST ? true : `storm control is off, yet ${ctx.d} admitted ${n} of ${BURST} requests at once`;
+        }
+        const k = v.kind.kind;
+        const was = ctx.curBefore == null ? null : ctx.fed.get(ctx.curBefore);
+        // A request held to its advisor is barred by the advisor's spent
+        // family bucket too, which v.reason does not read.
+        const adv = ctx.adv?.routed != null && ctx.adv.both.length > 0 ? ctx.adv.advisor : null;
+        const advSpent = adv != null && was != null && !familyCapped(was, adv) && !was.barred.has(adv) && !servesAdvisor(was, adv, ctx.row.threshold);
+        // A spent bucket is reported ahead of a route bar, so the bar is read
+        // on its own.
+        const moved = ctx.row.dist === 'off'
+          ? (!narrowed && ctx.curAfter === ctx.d && ctx.curBefore !== ctx.d && ctx.cur !== ctx.d && ctx.famCur !== ctx.d && !was?.barred.has(ctx.model))
+            || (ctx.curAfter === ctx.curBefore && was != null && ctx.d !== was.id && ctx.famCur != null && ctx.d !== ctx.famCur
+              && !ctx.fed.get(ctx.d)?.cordoned && !was.barred.has(ctx.model)
+              && startable(was, ctx.row.threshold) && (['quota', 'capped', 'advisor-capped'].includes(v.reason(was)) || (v.reason(was) == null && advSpent)))
+          : ctx.tagged && (k === 'rolled' || k === 'pin') && ctx.d !== v.kind.q
+            && (k === 'rolled' || (ctx.ex.reclaimHours > 0 && inBand(v.B, ctx.fed.get(v.kind.q), ctx.model, ctx.now) === false));
+        if (!moved) return undefined;
+        // One request past startConc is asked for, so a cap above it shows.
+        const n = ctx.admits(ramp.startConc + 1);
+        if (n == null) return undefined;
+        if (n < ramp.startConc) return `traffic switched to ${ctx.d}, which admitted ${n} requests at once; the ramp starts at ${ramp.startConc}`;
+        if (ctx.rampFrom() !== ctx.now) return `traffic switched to ${ctx.d}, whose ramp does not start at the switch`;
+        return n === ramp.startConc ? true : `traffic switched to ${ctx.d}, which admitted ${n} requests at once; the ramp starts at ${ramp.startConc}`;
       }),
     },
     {
@@ -846,15 +968,58 @@ export function catalog() {
       gap: 'docs/routing.md:409 says at most one cache-miss turn per pin per rollover; a hand-back can move a pin twice on one roll',
       holds: row => distOn(row) && row.expiry?.enabled === true && row.expiry.preempt !== false,
       check: request((ctx, v) => {
-        const p = v.p;
-        if (!ctx.tagged || p == null || ctx.d === p || ctx.d === '-') return undefined;
-        const a = ctx.fed.get(p);
-        if (v.reason(a) != null || v.outranked(a)) return undefined;
-        if (!(ctx.pinRolled || ctx.pinUncertain)) return undefined;
-        const key = `${ctx.life}|${ctx.c}|${ctx.bucket}|${p}|${governing(a, ctx.model).reset}`;
-        const n = (movesPerRoll.get(key) ?? 0) + 1;
-        movesPerRoll.set(key, n);
-        return n === 1 ? true : `pin ${p} of ${ctx.c} moved ${n} times on one roll of its ${governing(a, ctx.model).window} window`;
+        const m = rollMove(ctx, v);
+        if (!m) return undefined;
+        const n = (movesPerRoll.get(m.key) ?? 0) + 1;
+        movesPerRoll.set(m.key, n);
+        return n === 1 ? true : `pin ${m.p} of ${ctx.c} moved ${n} times on one roll of its ${governing(m.a, ctx.model).window} window`;
+      }),
+    },
+    {
+      // The second move G2 counts is the hand-back, and "A roll is handed back
+      // once": no third move answers the same roll.
+      id: 'O26', doc: 'docs/routing.md:411',
+      holds: row => distOn(row) && row.expiry?.enabled === true && row.expiry.preempt !== false,
+      check: request((ctx, v) => {
+        const m = rollMove(ctx, v);
+        if (!m) return undefined;
+        const n = (handBacksPerRoll.get(m.key) ?? 0) + 1;
+        handBacksPerRoll.set(m.key, n);
+        if (n === 1) othersAtFirst.set(m.key, otherResets(m.a, ctx.model));
+        // Held again for another window that rolled since the hand-back, the
+        // reading still holds this window's old reset; G6 counts those.
+        if (n > 2 && othersAtFirst.get(m.key) !== otherResets(m.a, ctx.model)) return undefined;
+        // A third move shaped like a reclaim may be one; G7 counts those.
+        if (n > 2 && reclaimShaped(ctx, v, m)) return undefined;
+        return n <= 2 ? true : `pin ${m.p} of ${ctx.c} moved ${n} times on one roll of its ${governing(m.a, ctx.model).window} window, though a roll is handed back once`;
+      }),
+    },
+    {
+      id: 'G6', doc: 'docs/routing.md:411',
+      gap: 'docs/routing.md:411 says a roll is handed back once, and a reading restored from a hold is held again only for a window that has rolled since; held again for another window, it hands this window\'s roll back a second time',
+      holds: row => distOn(row) && row.expiry?.enabled === true && row.expiry.preempt !== false,
+      check: request((ctx, v) => {
+        const m = rollMove(ctx, v);
+        if (!m) return undefined;
+        const n = (reheldPerRoll.get(m.key) ?? 0) + 1;
+        reheldPerRoll.set(m.key, n);
+        if (n <= 2) return true;
+        return othersAtFirst.get(m.key) === otherResets(m.a, ctx.model) ? true
+          : `pin ${m.p} of ${ctx.c} moved ${n} times on one roll of its ${governing(m.a, ctx.model).window} window after another window rolled`;
+      }),
+    },
+    {
+      id: 'G7', doc: 'docs/routing.md:411',
+      gap: 'docs/routing.md:411 says a roll is handed back once; with a reclaim window a pin moves a third time on one roll, by reclaim or by a hand-back, which no reading in the model separates',
+      holds: row => distOn(row) && row.expiry?.enabled === true && row.expiry.preempt !== false && row.expiry.reclaimHours > 0,
+      check: request((ctx, v) => {
+        const m = rollMove(ctx, v);
+        if (!m) return undefined;
+        const n = (reclaimedPerRoll.get(m.key) ?? 0) + 1;
+        reclaimedPerRoll.set(m.key, n);
+        if (n <= 2) return true;
+        if (othersAtFirst.get(m.key) !== otherResets(m.a, ctx.model) || !reclaimShaped(ctx, v, m)) return undefined;
+        return `pin ${m.p} of ${ctx.c} moved ${n} times on one roll of its ${governing(m.a, ctx.model).window} window, by a move a reclaim could have made`;
       }),
     },
     {
@@ -879,6 +1044,18 @@ function hopCandidates(ctx) {
   const idle = [...fed.values()].filter((/** @type {any} */ a) => a.id !== ctx.from && !ctx.rolledOff.includes(a.id)
     && unavailable(a, model, ctx.row.threshold) == null);
   return { idle: /** @type {any[]} */ (idle), paused };
+}
+
+/** Whether a rolled pin's re-rank is the placement pick, which O29 and O28
+ * judge. @param {any} ctx */
+function placementRanked(ctx) {
+  return (ctx.row.dist === 'even' || ctx.row.dist === 'load') && !(ctx.ex.reclaimHours > 0);
+}
+
+/** The placement key under even or load. @param {any} ctx */
+function placementKey(ctx) {
+  const load = (/** @type {any} */ a) => activeOn(ctx.convs, a.id, ctx.now, ctx.tagged ? ctx.c : null);
+  return ctx.row.dist === 'even' ? (/** @type {any} */ a) => [load(a)] : (/** @type {any} */ a) => [recentOn(ctx.routed, a.id, ctx.now), load(a)];
 }
 
 /** Whether a placement oracle cannot be judged here because a reading sits on

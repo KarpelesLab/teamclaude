@@ -21,6 +21,8 @@ export const LOAD_WINDOW = 10 * MIN;
 export const ROLL_JUMP = H;
 export const SOONER_MARGIN = MIN;
 const STEPS = 40;
+// More concurrent requests than any ramp in RAMPS admits at a switch.
+export const BURST = 8;
 // The share of random Opus requests that declare a Fable advisor, in the rows
 // that send one.
 const ADVISED_RATE = 0.4;
@@ -177,6 +179,7 @@ export function generate(seed) {
   throttleEpisode(steps, convs, prng(seed ^ 0x7feb352d));
   sessionResetEpisode(steps, accounts, convs, prng(seed ^ 0x1b873593));
   advisorCapEpisode(steps, accounts, convs, prng(seed ^ 0x4cf5ad43));
+  returnEpisode(steps, accounts, convs, prng(seed ^ 0x1d872b41));
   const extra3 = prng(seed ^ 0x3c6ef372);
   const shape = Math.floor(extra3() * 3);
   const routeTables = { first: routeTable(accounts, extra3, shape), next: routeTable(accounts, extra3, (shape + 1 + Math.floor(extra3() * 2)) % 3) };
@@ -227,6 +230,110 @@ function throttleEpisode(steps, convs, rand) {
     at += (2 + Math.floor(rand() * 19)) * SEC;
     steps.push({ at, op, c, model: rand() < 0.7 ? OPUS : FABLE });
   }
+}
+
+/** Appends the return episode: a conversation rests on `p` while every other
+ * account reads past any threshold, `p`'s weekly window rolls, `x` recovers
+ * and takes the conversation off the roll, serves it twice, the second time
+ * under the move's stamp, then reads past the threshold itself, the
+ * conversation returns to `p`, and `x` recovers while it comes back. Further
+ * rolls of `p` are left and returned to before such a serve, so that each is
+ * handed back. Random events almost never serve a move's stay and then
+ * return, or return twice to one roll. Nothing is appended without two
+ * top-priority accounts that have no usage cap and a weekly clock.
+ * @param {Step[]} steps @param {PoolAccount[]} accounts @param {string[]} convs
+ * @param {() => number} rand */
+function returnEpisode(steps, accounts, convs, rand) {
+  const top = Math.min(...accounts.map(a => a.priority));
+  const pool = accounts.filter(a => a.priority === top && a.maxUsage == null && !a.clockless7d);
+  if (pool.length < 2) return;
+  const facts = replayFacts(steps, accounts);
+  const p = pool[Math.floor(rand() * pool.length)];
+  const rest = pool.filter(a => a !== p);
+  const x = rest[Math.floor(rand() * rest.length)];
+  const c = convs[Math.floor(rand() * convs.length)];
+  let at = (steps.length ? steps[steps.length - 1].at : 0) + 20 * MIN;
+  steps.push({ at, op: 'idle' });
+  const push = (/** @type {Omit<Step, 'at'>} */ s) => { at += (2 + Math.floor(rand() * 9)) * SEC; steps.push({ at, ...s }); };
+  for (const a of [p, x]) {
+    if (facts.disabled.has(a.id)) push({ op: 'fault', id: a.id, kind: 'disable' });
+    if (facts.cordoned.has(a.id)) push({ op: 'fault', id: a.id, kind: 'cordon' });
+  }
+  for (const a of accounts) if (a !== p) push({ op: 'usage', id: a.id, u7d: 0.99, f: null });
+  push({ op: 'usage', id: p.id, u7d: 0.1, f: null });
+  push({ op: 'five', id: p.id, u5h: 0.1 });
+  push({ op: 'request', c, model: OPUS });
+  push({ op: 'request', c, model: OPUS });
+  push({ op: 'roll', id: p.id, fable: false });
+  push({ op: 'usage', id: x.id, u7d: r2(0.05 + rand() * 0.2), f: null });
+  push({ op: 'five', id: x.id, u5h: 0.1 });
+  for (let k = 0; k < 3; k++) push({ op: 'request', c, model: OPUS });
+  push({ op: 'usage', id: x.id, u7d: 0.99, f: null });
+  for (let k = 0; k < 2; k++) push({ op: 'request', c, model: OPUS });
+  // With `x` back there is somewhere to go, which a roll still held on `p`
+  // would take the conversation to.
+  push({ op: 'usage', id: x.id, u7d: r2(0.05 + rand() * 0.2), f: null });
+  for (let k = 0; k < 2; k++) push({ op: 'request', c, model: OPUS });
+  // A second roll, which the conversation leaves and comes back to before a
+  // stay is served under the move's stamp, so the roll is handed back and the
+  // conversation moves off it again. A roll is handed back once, so once
+  // that second move is served and the conversation returns, it stays.
+  push({ op: 'usage', id: x.id, u7d: 0.99, f: null });
+  for (let k = 0; k < 2; k++) push({ op: 'request', c, model: OPUS });
+  push({ op: 'roll', id: p.id, fable: false });
+  push({ op: 'usage', id: x.id, u7d: r2(0.05 + rand() * 0.2), f: null });
+  for (let k = 0; k < 2; k++) push({ op: 'request', c, model: OPUS });
+  // The conversation moves away to `y` and back, and `x` then serves under a
+  // later stamp than the move's, which settles nothing. `x` rolls before the
+  // move away, and the reading stays on it under the move's stamp while `y`
+  // serves.
+  const others = accounts.filter(a => a !== p && a !== x);
+  if (others.length) {
+    const y = others[Math.floor(rand() * others.length)];
+    if (facts.disabled.has(y.id)) push({ op: 'fault', id: y.id, kind: 'disable' });
+    if (facts.cordoned.has(y.id)) push({ op: 'fault', id: y.id, kind: 'cordon' });
+    push({ op: 'five', id: p.id, u5h: 0.99 });
+    push({ op: 'roll', id: x.id, fable: false });
+    push({ op: 'usage', id: x.id, u7d: 0.99, f: null });
+    push({ op: 'usage', id: y.id, u7d: 0.1, f: null });
+    push({ op: 'five', id: y.id, u5h: 0.1 });
+    push({ op: 'request', c, model: OPUS });
+    push({ op: 'usage', id: x.id, u7d: r2(0.05 + rand() * 0.2), f: null });
+    push({ op: 'usage', id: y.id, u7d: 0.99, f: null });
+    for (let k = 0; k < 2; k++) push({ op: 'request', c, model: OPUS });
+    push({ op: 'five', id: p.id, u5h: 0.1 });
+  }
+  push({ op: 'usage', id: x.id, u7d: 0.99, f: null });
+  push({ op: 'request', c, model: OPUS });
+  // Past the load window, so that under load as under even the conversation
+  // in flight is all that tells `p` from `x`, and `x` ranks first.
+  at += LOAD_WINDOW;
+  steps.push({ at, op: 'idle' });
+  push({ op: 'usage', id: x.id, u7d: r2(0.05 + rand() * 0.2), f: null });
+  for (let k = 0; k < 2; k++) push({ op: 'request', c, model: OPUS });
+  push({ op: 'usage', id: x.id, u7d: 0.99, f: null });
+  push({ op: 'request', c, model: OPUS });
+  push({ op: 'usage', id: x.id, u7d: r2(0.05 + rand() * 0.2), f: null });
+  for (let k = 0; k < 2; k++) push({ op: 'request', c, model: OPUS });
+  // A third roll, handed back as the second was, after which `p`'s Fable
+  // window rolls too. Leaving `p` then holds that new roll in a reading that
+  // still has the weekly one. The next return hands the weekly roll back a
+  // second time, which G6 counts.
+  if (p.F == null || p.clocklessF) return;
+  push({ op: 'usage', id: x.id, u7d: 0.99, f: null });
+  push({ op: 'usage', id: p.id, u7d: 0.1, f: 0.1 });
+  for (let k = 0; k < 2; k++) push({ op: 'request', c, model: OPUS });
+  push({ op: 'roll', id: p.id, fable: false });
+  for (const fable of [false, true]) {
+    push({ op: 'usage', id: x.id, u7d: r2(0.05 + rand() * 0.2), f: null });
+    for (let k = 0; k < 2; k++) push({ op: 'request', c, model: OPUS });
+    push({ op: 'usage', id: x.id, u7d: 0.99, f: null });
+    push({ op: 'request', c, model: OPUS });
+    if (fable) break;
+    push({ op: 'roll', id: p.id, fable: true });
+  }
+  push({ op: 'usage', id: x.id, u7d: r2(0.05 + rand() * 0.2), f: null });
+  for (let k = 0; k < 2; k++) push({ op: 'request', c, model: OPUS });
 }
 
 /** What a played history leaves of the facts the episodes steer by: each
@@ -416,6 +523,24 @@ function rollEpisode(steps, accounts, convs, at, rand) {
 
 // ---- configuration -----------------------------------------------------------
 
+/** The `stormRamp` block each row value writes. `malformed` holds a 0 and a
+ * quoted number, which docs/routing.md:168 says are ignored field by field. */
+export const RAMPS = /** @type {Record<string, any>} */ ({
+  default: undefined,
+  off: { enabled: false },
+  tuned: { startConc: 2, stepConc: 1, stepMs: 1000, windowMs: 60000 },
+  malformed: { startConc: 0, stepMs: '250' },
+});
+
+/** The ramp a row runs under, as docs/routing.md:153-168 describe it: on, with
+ * one request at once at a switch, unless the block says otherwise in a value
+ * it accepts. @param {Row} row */
+export function rampOf(row) {
+  const raw = RAMPS[row.stormRamp ?? 'default'] ?? {};
+  const ok = (/** @type {any} */ x) => typeof x === 'number' && Number.isFinite(x) && x > 0;
+  return { enabled: raw.enabled !== false, startConc: ok(raw.startConc) ? raw.startConc : 1 };
+}
+
 /** The AccountManager options a row stands for, as src/index.js passes config.
  * The staleness timers are pinned past a history's span so that no environment
  * variable reaches selection and no revalidation the fed view does not model
@@ -436,6 +561,7 @@ export function managerOptions(row, validateAdaptiveConfig) {
     switchOnSessionReset: row.sessionReset,
     routes: undefined,
     ...(row.advisorEligibility === 'strict' || row.advisorEligibility === 'prefer' ? { advisorEligibility: row.advisorEligibility } : {}),
+    ...(RAMPS[row.stormRamp] ? { ramp: RAMPS[row.stormRamp] } : {}),
     familyStaleMs: 365 * 24 * H,
     statusStaleMs: 365 * 24 * H,
     throttleProbeFloorMs: 60_000,
@@ -720,27 +846,57 @@ export function windowsOf(a) {
 
 /**
  * A rollover reading (an Observation in account-manager.js): the windows of
- * the account traffic was last found resting on. Hand-backs are not modeled:
- * `escaped` holds the accounts left while rolled, and a reading moved onto one
- * of them is `uncertain`, since the manager may restore an older reading there.
+ * the account traffic was last found resting on. `escaped` holds the accounts
+ * left while rolled, and a reading moved onto one of them without a hand-back
+ * is `uncertain`, since the manager may still hold an older reading there.
  * That older reading has rolled, so it refuses a first sight onto the next
  * account, and the doubt moves with the reading. `stale` holds the windows the
  * reading took past their reset, which the manager still held when it read.
- * `owed` maps each account a rest left while rolled to the windows read
- * there. Only a served request can end that hold (docs/routing.md:411), so an
- * entry lasts until a later request is served, and a return before then is
- * handed that reading back. `handed` marks a reading restored that way, whose
- * next escape the manager holds only for windows rolled since. `left` maps
- * each account a hand-back left while rolled to the windows it showed then.
- * `traded` maps each account whose roll the model lost track of to the windows
- * it showed then.
+ * `owed` maps each account a rest or a hand-back left while rolled to the
+ * windows read there, when the reading was in no doubt. Only a served
+ * request can end that hold (docs/routing.md:411). An entry lasts until a
+ * later request selecting under this reading is served, and a return before
+ * then is handed that reading back. `handed` holds, for a
+ * reading restored that way, the windows its account showed at the hand-back:
+ * the roll handed back is not held again, and one past them is.
+ * `gen` counts the reading's moves. `stamps` holds, for an escaped account, the
+ * move that left it (docs/routing.md:411), or null where that move was a
+ * return onto an account left while rolled, which no stay settles. An escape
+ * whose move's stay was served is dropped and its account put in `settled`, so
+ * a return there reads it whole (:417), and `returned` says the reading was
+ * moved onto such an account. `held` keeps the reading an escape left behind,
+ * for an escape whose roll the manager is known to hold: stamped, taken from a
+ * reading with no doubt or stale window, and touched since by no hop or
+ * failover. A return onto that account restores it as `restored`.
  * @typedef {{ on: string|null, windows: Map<string, number>, escaped: Set<string>, uncertain: boolean, stale: Set<string>,
- *   owed: Map<string, { windows: Map<string, number>, step: number }>, handed: boolean,
- *   left: Map<string, Map<string, number>>, traded: Map<string, Map<string, number>> }} Obs
+ *   owed: Map<string, { windows: Map<string, number>, step: number }>, handed: Map<string, number>|null,
+ *   gen: number, stamps: Map<string, number|null>, settled: Set<string>, returned: boolean,
+ *   held: Map<string, Map<string, number>>, restored: Map<string, number>|null }} Obs
  */
 
 /** @returns {Obs} */
-export const newObs = () => ({ on: null, windows: new Map(), escaped: new Set(), uncertain: false, stale: new Set(), owed: new Map(), handed: false, left: new Map(), traded: new Map() });
+export const newObs = () => ({
+  on: null, windows: new Map(), escaped: new Set(), uncertain: false, stale: new Set(), owed: new Map(), handed: null,
+  gen: 0, stamps: new Map(), settled: new Set(), returned: false, held: new Map(), restored: null,
+});
+
+/** Settles the escapes stamped `gen`, on a stay served under that stamp where
+ * the reading still rests (confirmStay).
+ * @param {Obs} obs @param {number} gen */
+export function settleMove(obs, gen) {
+  for (const [id, st] of [...obs.stamps]) {
+    if (st !== gen) continue;
+    obs.escaped.delete(id); obs.stamps.delete(id); obs.held.delete(id); obs.settled.add(id);
+  }
+}
+
+/** Drops what the model knows of the rolls held on a reading: a hop, a
+ * failover, a removal or a restart may settle or rebuild them in the manager.
+ * @param {Obs} obs */
+function unsure(obs) {
+  obs.held.clear();
+  obs.restored = null;
+}
 
 /** Whether any window `a` presents jumped past the reading (_anyJumped).
  * @param {Obs} obs @param {Fed} a */
@@ -752,67 +908,98 @@ function anyRolled(obs, a) {
   return false;
 }
 
+/** Whether a window of `a` rolled past the reading other than the roll a
+ * hand-back restored it from (_newRoll).
+ * @param {Obs} obs @param {Fed} a */
+function newRoll(obs, a) {
+  if (!obs.handed) return anyRolled(obs, a);
+  for (const [w, r] of windowsOf(a)) {
+    const seen = obs.windows.get(w);
+    if (seen == null || r - seen <= ROLL_JUMP) continue;
+    const at = obs.handed.get(w);
+    if (at == null || r - at > ROLL_JUMP) return true;
+  }
+  return false;
+}
+
 /** Moves the reading onto `a`, noting a roll left behind. A move made at a
  * rest, in request `step`, holds that roll.
  * @param {Obs} obs @param {Fed} a @param {Map<string, Fed>} fed @param {number|null} [step] */
 function moveObs(obs, a, fed, step = null) {
   const leaving = obs.on == null ? null : fed.get(obs.on);
+  const back = obs.escaped.has(a.id);
+  obs.gen++;
   if (leaving && anyRolled(obs, leaving)) {
     obs.escaped.add(leaving.id);
-    if (step != null && !obs.handed) obs.owed.set(leaving.id, { windows: new Map(obs.windows), step });
+    const fresh = newRoll(obs, leaving);
+    // A reading in doubt may not be the one the manager holds, so a return
+    // there is not handed it back.
+    if (step != null && fresh && !obs.uncertain) obs.owed.set(leaving.id, { windows: new Map(obs.windows), step });
+    obs.stamps.set(leaving.id, back ? null : obs.gen);
+    obs.settled.delete(leaving.id);
+    if (!back && fresh && !obs.uncertain && !obs.stale.size) obs.held.set(leaving.id, new Map(obs.windows));
+    else obs.held.delete(leaving.id);
   }
   // Arriving without a hand-back leaves the manager's hold in place, and
   // whether a later return restores it is no longer known.
   obs.owed.delete(a.id);
+  obs.returned = !back && obs.settled.delete(a.id);
+  obs.restored = back ? obs.held.get(a.id) ?? null : null;
+  obs.held.delete(a.id);
   obs.on = a.id;
   obs.windows = windowsOf(a);
   obs.stale = new Set();
   obs.uncertain = obs.escaped.has(a.id);
-  obs.handed = false;
+  obs.handed = null;
 }
 
 /** Restores the reading held for `a` when traffic returns to it before a
  * request was served (docs/routing.md:417), as _firstSightOn does. Returns
- * whether it did.
- * @param {Obs} obs @param {Fed} a @param {Map<string, Fed>} fed */
-function handBack(obs, a, fed) {
+ * whether it did. The roll of the account it leaves is held from request
+ * `step` under no stamp.
+ * @param {Obs} obs @param {Fed} a @param {Map<string, Fed>} fed @param {number|null} step */
+function handBack(obs, a, fed, step) {
   const owed = obs.owed.get(a.id);
   if (!owed || obs.uncertain || obs.on === a.id) return false;
   const leaving = obs.on == null ? null : fed.get(obs.on);
+  obs.gen++;
+  // The roll a hand-back leaves takes no stamp: the move is a return.
   if (leaving && anyRolled(obs, leaving)) {
-    obs.escaped.add(leaving.id);
-    obs.left.set(leaving.id, windowsOf(leaving));
+    obs.escaped.add(leaving.id); obs.stamps.set(leaving.id, null); obs.held.delete(leaving.id);
+    if (step != null && newRoll(obs, leaving)) obs.owed.set(leaving.id, { windows: new Map(obs.windows), step });
   }
   obs.on = a.id;
   obs.windows = new Map(owed.windows);
   obs.stale = new Set();
   obs.escaped.delete(a.id);
+  obs.stamps.delete(a.id); obs.held.delete(a.id);
+  obs.returned = false; obs.restored = null;
   obs.owed.delete(a.id);
-  obs.handed = true;
+  obs.handed = windowsOf(a);
   return true;
 }
 
-/** Notes the rolls the model loses track of when traffic arrives at an account
- * a hand-back left: the manager hands that account's roll back too, which the
- * model does not follow.
- * @param {Obs} obs @param {Fed} a @param {Map<string, Fed>} fed */
-function loseTrack(obs, a, fed) {
-  if (!obs.left.delete(a.id)) return;
-  obs.traded.set(a.id, windowsOf(a));
-  if (obs.on != null) obs.traded.set(obs.on, windowsOf(/** @type {Fed} */ (fed.get(obs.on))));
-}
-
 /** The reading recordSession takes of a pin's new account (_firstSightOn):
- * none while the account left behind has an unsettled roll.
- * @param {Obs} obs @param {Fed} a @param {Map<string, Fed>} fed */
-export function firstSight(obs, a, fed) {
-  if (obs.on === a.id || handBack(obs, a, fed)) return;
-  loseTrack(obs, a, fed);
+ * none while the account left behind has an unsettled roll. `step` is the
+ * request being played.
+ * @param {Obs} obs @param {Fed} a @param {Map<string, Fed>} fed @param {number|null} step */
+export function firstSight(obs, a, fed, step) {
+  if (obs.on === a.id || handBack(obs, a, fed, step)) return;
   const leaving = obs.on == null ? null : fed.get(obs.on);
   if (leaving && anyRolled(obs, leaving)) { obs.escaped.add(leaving.id); return; }
   const doubt = obs.uncertain;
   moveObs(obs, a, fed);
   obs.uncertain ||= doubt;
+}
+
+/** Whether the reading a return onto `a` restored has rolled in its
+ * governing window, so that the pin is re-ranked (_pinRolledOver).
+ * @param {Obs} obs @param {Fed} a @param {string} model */
+function restoredRolled(obs, a, model) {
+  if (obs.on !== a.id || !obs.restored) return false;
+  const g = governing(a, model);
+  const seen = obs.restored.get(g.window);
+  return seen != null && g.reset != null && g.reset - seen > ROLL_JUMP;
 }
 
 /** Whether the governing window of `a` jumped past the reading (_jumped).
@@ -824,15 +1011,6 @@ export function rolledSince(obs, a, model) {
   return seen != null && g.reset != null && g.reset - seen > ROLL_JUMP;
 }
 
-/** Whether the governing window of `a` is one whose roll the model lost track
- * of, not rolled since.
- * @param {Obs} obs @param {Fed} a @param {string} model */
-export function tradedRoll(obs, a, model) {
-  const g = governing(a, model);
-  const then = obs.traded.get(a.id)?.get(g.window);
-  return then != null && g.reset != null && g.reset - then <= ROLL_JUMP;
-}
-
 /** Takes the reading at the start of request `step`, as _restOn does.
  * Returns whether the governing window had rolled.
  * @param {Obs} obs @param {Fed} a @param {string} model @param {Map<string, Fed>} fed
@@ -842,8 +1020,7 @@ export function restOn(obs, a, model, fed, lapsed, step) {
   if (obs.on !== a.id) {
     // A reading naming no account was offered nothing by a cursor move, so
     // the rest is where a removal's leftover hands a roll back.
-    if (obs.on == null && handBack(obs, a, fed)) return false;
-    loseTrack(obs, a, fed);
+    if (obs.on == null && handBack(obs, a, fed, step)) return false;
     moveObs(obs, a, fed, step);
     takeLapsed(obs, lapsed);
     return false;
@@ -913,7 +1090,7 @@ export function recentOn(routed, id, now) {
  *   besides the steps marked `restart`
  * @param {(ctx: any) => Set<string>|void} [p.check]  returns the invariants that judged the step
  * @param {{ restoreAlways?: boolean }} [p.driver]
- * @param {Set<string>} [p.taken]  collects the transition-table keys the play takes
+ * @param {Set<string>} [p.taken]  collects the transition-table keys the play takes, and the rollover rows it waits on
  * @returns {Decision[]}
  */
 export function play({ AccountManager, validateAdaptiveConfig, t, history: h, row, restarts = [], check = () => {}, driver = {}, taken }) {
@@ -1059,12 +1236,12 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
   // A removal's outcome shows only on a later request. Its keys wait for the
   // request whose judgment `done` names: noted at the removal, a step dropped
   // from a path would leave the row counted and its outcome unjudged.
-  /** @type {Array<{ key: [string, string, string], done: (ctx: any, ok: Set<string>, probed: Map<string, string>) => boolean }>} */
+  /** @type {Array<{ key: [string, string, string]|string, done: (ctx: any, ok: Set<string>, probed: Map<string, string>) => boolean }>} */
   let pending = [];
   const judged = (/** @type {any} */ ctx, /** @type {Set<string>|void} */ ok, /** @type {Map<string, string>} */ probed) => {
     pending = pending.filter(p => {
       if (!ok || !p.done(ctx, ok, probed)) return true;
-      note(...p.key);
+      if (typeof p.key === 'string') taken?.add(p.key); else note(...p.key);
       return false;
     });
   };
@@ -1079,17 +1256,39 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
     }
     return [...fed.values()].find(f => stateOf(f).startsWith(who))?.id ?? null;
   };
+  /** How many of `limit` requests `acc` admits at once: admit() takes a slot
+   * synchronously while one is free. Each slot is given back unanswered, so
+   * nothing is learned from it. A call that finds no slot waits on a timer
+   * until the test yields, which a row's test never does, so the probe stops
+   * at the first such call and never asks past what it judges.
+   * @param {any} acc @param {number} limit */
+  const admitted = (acc, limit) => {
+    let done = false;
+    let n = 0;
+    while (n < limit) {
+      const before = acc.inFlight;
+      am.admit(acc.index, () => done);
+      if (acc.inFlight === before) break;
+      n++;
+    }
+    done = true;
+    for (let k = 0; k < n; k++) am.release(acc.index, { successful: false });
+    return n;
+  };
 
   // The request being played. A request served after the one whose rest held
   // a roll may be the stay that releases it, so the hold is no longer known.
+  // A serve is a stay only for the readings it selected under: the current
+  // account's and its own conversation's pin in the request's bucket.
   let step = -1;
-  const settle = () => {
-    for (const o of [curObs, ...[...convs.values()].flatMap(x => [...x.obs.values()])]) {
-      for (const [id, e] of o.owed) if (e.step !== step) o.owed.delete(id);
+  const settle = (/** @type {string|null} */ c, /** @type {string} */ bucket) => {
+    const conv = c == null ? undefined : convs.get(c);
+    for (const o of [curObs, conv?.obs.get(bucket)]) {
+      if (o) for (const [id, e] of o.owed) if (e.step !== step) o.owed.delete(id);
     }
   };
-  const serve = (/** @type {any} */ acc, /** @type {string} */ model, /** @type {boolean} */ burn) => {
-    settle();
+  const serve = (/** @type {any} */ acc, /** @type {string} */ model, /** @type {boolean} */ burn, /** @type {string|null} */ c) => {
+    settle(c, bucketOf(model));
     const x = /** @type {PoolAccount} */ (truth.get(acc.id));
     note('hold', stateOf(/** @type {Fed} */ (fed.get(acc.id))), 'success');
     if (burn) {
@@ -1147,16 +1346,17 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
     const was = cur;
     cur = cursor();
     if (cur != null && cur !== was) {
-      if (preempting) firstSight(curObs, /** @type {Fed} */ (fed.get(cur)), fed);
+      if (preempting) firstSight(curObs, /** @type {Fed} */ (fed.get(cur)), fed, step);
       if (row.dist === 'off') {
         if (was != null) requalify.delete(was);
         if (/** @type {Fed} */ (fed.get(cur)).r7d == null) probing.add(cur); else probing.delete(cur);
       }
     }
+    if (sighted) unsure(sighted);
     if (alt) {
       am.recordSession(c, alt.index, model);
-      if (sighted) firstSight(sighted, /** @type {Fed} */ (fed.get(alt.id)), fed);
-      serve(alt, model, true);
+      if (sighted) firstSight(sighted, /** @type {Fed} */ (fed.get(alt.id)), fed, step);
+      serve(alt, model, true, ctx.tagged ? c : null);
       am.confirmStay(alt, carried, c, 'anthropic');
     }
     return alt;
@@ -1179,9 +1379,10 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
     const cursorBefore = cursor();
     const alt = am.pickAlternate(new Set([acc.index, ...(selection.rolledOff ?? [])]), model, null);
     const to = alt && !am.isPaused(alt.index) ? alt : null;
+    if (sighted) unsure(sighted);
     if (to) {
       am.recordSession(c, to.index, model);
-      if (sighted) firstSight(sighted, /** @type {Fed} */ (fed.get(to.id)), fed);
+      if (sighted) firstSight(sighted, /** @type {Fed} */ (fed.get(to.id)), fed, step);
     }
     if (!ctx.edge) check({
       ...ctx, hop: true, from: acc.id, to: to?.id ?? null, pausedUntil: new Map(pausedUntil),
@@ -1189,7 +1390,7 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
       cursorBefore, cursorAfter: cursor(), pinsBefore, pinsAfter: am.exportAffinityState(), view: undefined,
     });
     if (to) {
-      serve(to, model, true);
+      serve(to, model, true, ctx.tagged ? c : null);
       am.confirmStay(to, null, c, 'anthropic');
     }
     return to;
@@ -1327,12 +1528,15 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
       // doubtful one is kept, nameless, whatever it holds.
       /** @param {Obs} o @returns {Obs|null} */
       const unname = o => {
+        unsure(o);
         o.escaped.delete(x.id);
         o.owed.delete(x.id);
-        o.left.delete(x.id);
-        o.traded.delete(x.id);
+        o.stamps.delete(x.id);
         if (o.on !== x.id) return o;
-        return o.escaped.size || o.uncertain ? { ...newObs(), escaped: o.escaped, uncertain: o.uncertain, owed: o.owed, left: o.left, traded: o.traded } : null;
+        // The new reading keeps the count of moves, so no later move takes a
+        // stamp an escape kept from before the removal.
+        return o.escaped.size || o.uncertain
+          ? { ...newObs(), escaped: o.escaped, uncertain: o.uncertain, owed: o.owed, stamps: o.stamps, gen: o.gen } : null;
       };
       for (const conv of convs.values()) {
         for (const [b, id] of [...conv.pins]) if (id === x.id) { conv.pins.delete(b); conv.pinAt.delete(b); }
@@ -1356,9 +1560,9 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
         // roll is not detected and does not name this one, and no other docs
         // line covers it, so its first roll is left unjudged.
         // A reading handed back there is the one read before its roll.
-        const back = held != null && held.on == null && cur != null && handBack(curObs, /** @type {Fed} */ (fed.get(cur)), fed);
+        const back = held != null && held.on == null && cur != null && handBack(curObs, /** @type {Fed} */ (fed.get(cur)), fed, step);
         if (!back) {
-          if (held && held.on == null && cur != null) firstSight(curObs, /** @type {Fed} */ (fed.get(cur)), fed);
+          if (held && held.on == null && cur != null) firstSight(curObs, /** @type {Fed} */ (fed.get(cur)), fed, step);
           curObs.uncertain = true;
         }
       }
@@ -1402,9 +1606,12 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
       /** @type {string|null} */
       let readOn = null;
       let readRolled = false;
-      let readTraded = false;
       /** @type {Set<string>} */
       let readEscaped = new Set();
+      let pinReturned = false;
+      let pinHeld = false;
+      // The stamp the request selects under, read before its walk.
+      const carriedGen = conv?.obs.get(bucket)?.gen ?? null;
       if (preempting && conv) {
         let o = conv.obs.get(bucket);
         if (pinNow != null) {
@@ -1412,6 +1619,8 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
           // A pin the request may not be sent to is not read (_restOnPin), so the
           // reading can still name another of the conversation's pins.
           if (!adv?.excluded.has(pinNow)) pinRolled = restOn(o, /** @type {Fed} */ (fed.get(pinNow)), model, fed, lapsed.get(pinNow), i);
+          pinReturned = o.returned && o.on === pinNow;
+          pinHeld = restoredRolled(o, /** @type {Fed} */ (fed.get(pinNow)), model);
         }
         // A bucket whose pin a removal dropped keeps its reading unread, and
         // the walk still checks it against the conversation's other pins.
@@ -1425,12 +1634,11 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
               if (o.stale.has(governing(r, model).window)) pinUncertain = true;
               else readRolled = true;
             }
-            readTraded = tradedRoll(o, r, model);
           }
         }
       }
       const ctx = {
-        i, now, row, ex, model, bucket, tagged, c, revived, cur, life, curRolled, pinRolled, pinUncertain, readOn, readRolled, readEscaped, readTraded,
+        i, op: s.op, now, row, ex, model, bucket, tagged, c, revived, cur, life, curRolled, pinRolled, pinUncertain, pinReturned, pinHeld, readOn, readRolled, readEscaped,
         curUncertain: curObs.uncertain || (row.sessionReset && sessionResets.size > 0),
         curObsUncertain: curObs.uncertain,
         // With distribution off a family stays where it was last routed while
@@ -1445,19 +1653,29 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
       };
       if (!edge) released.clear();
       const carried = tagged ? am.observedGeneration(c, model) : null;
+      // A cordon or a disable moves the cursor between requests; that move is
+      // not this request's.
+      ctx.curBefore = cursor();
       /** @type {{ rolledOff?: Set<number> }} */
       const selection = {};
       const acc = am.getActiveAccount(null, model, adv?.advisor ?? null, tagged ? c : null, undefined, selection);
       for (const l of lapsed.values()) l.clear();
       const d = acc?.id ?? '-';
       ctx.d = d;
+      // Probed before anything is served, at the instant of the decision, and
+      // only when an invariant asks. An account inside its 429 pause holds
+      // every request, so it is not probed. `rampFrom` is when the account's
+      // ramp counts from, which sets its cap past the slots probed.
+      ctx.curAfter = cursor();
+      ctx.admits = (/** @type {number} */ limit) => (acc && !((pausedUntil.get(d) ?? -Infinity) > now) ? admitted(acc, limit) : null);
+      ctx.rampFrom = () => acc?.rampStartedAt ?? null;
       if (!edge) judged(ctx, check(ctx), probed);
       if (acc) lastRouted.set(key, d);
       cur = cursor();
       // Moving the cursor takes a first reading of its new account (_setCurrent).
       // A session-reset switch earlier in the same walk may have taken one too,
       // which curUncertain allows for.
-      if (preempting && cur != null && cur !== ctx.cur) firstSight(curObs, /** @type {Fed} */ (fed.get(cur)), fed);
+      if (preempting && cur != null && cur !== ctx.cur) firstSight(curObs, /** @type {Fed} */ (fed.get(cur)), fed, step);
       // With expiry routing on, a reset stays pending while the request could
       // not be sent to the account, or not to the cursor (refreshExpiredQuotas).
       if (!ex.enabled) sessionResets = new Set();
@@ -1493,7 +1711,7 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
         }
         if (tagged && preempting) {
           sighted = conv?.obs.get(bucket) ?? newObs();
-          firstSight(sighted, /** @type {Fed} */ (fed.get(d)), fed);
+          firstSight(sighted, /** @type {Fed} */ (fed.get(d)), fed, step);
         }
         if (s.op === 'throttle') {
           hop = throttle(acc, selection, ctx, sighted);
@@ -1503,8 +1721,20 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
           // the family's diversion on the account it goes to.
           if (hop) lastRouted.set(key, hop.id);
         } else {
-          serve(acc, model, tagged);
+          serve(acc, model, tagged, tagged ? c : null);
           if (tagged) am.confirmStay(acc, carried, c, 'anthropic');
+          // Only a plain request is settled here: a hop or failover may settle
+          // in the manager too, so throttle() and refuse() call unsure() instead.
+          if (sighted && carriedGen != null && sighted.on === d && sighted.gen === carriedGen) {
+            // The rollover table's settle and later-stamp rows show only when
+            // the conversation returns to the account the move left.
+            const stamps = [...sighted.stamps.values()];
+            const back = (/** @type {string} */ id, /** @type {string} */ seen) =>
+              pending.push({ key: id, done: (x, ok) => ok.has('O28') && x[seen] && x.c === c && x.bucket === bucket });
+            if (stamps.includes(carriedGen)) back('RO-settle', 'pinReturned');
+            if (stamps.some(g => g != null && g < carriedGen)) back('RO-later-stamp', 'pinHeld');
+            settleMove(sighted, carriedGen);
+          }
         }
       }
       if (tagged) am.endSession(c);
@@ -1606,6 +1836,8 @@ export const DIMENSIONS = {
   // `none`: no request declares an advisor; otherwise a share of the Opus
   // requests declare a Fable one, routed under that setting.
   advisorEligibility: ['none', 'strict', 'prefer'],
+  // The config's `stormRamp` block, one of RAMPS.
+  stormRamp: ['default', 'off', 'tuned', 'malformed'],
 };
 const EXPIRY_ONLY = ['tolerance', 'preempt', 'reclaim'];
 // The dimensions toRow reshapes or names by hand. Any other passes to the Row
@@ -1668,7 +1900,7 @@ function pairsOf(cell, dims) {
 // Options grown onto the rows the others make, in this order, rather than
 // built into them: adding one leaves the earlier rows, and so the seeds on
 // which they catch a broken rule, as they were.
-const GROWN = ['advisorEligibility'];
+const GROWN = ['advisorEligibility', 'stormRamp'];
 
 /**
  * A covering array over DIMENSIONS: the given rows first, then rows added
