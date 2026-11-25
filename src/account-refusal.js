@@ -90,18 +90,18 @@ export function accountRefusal(status, body) {
 // this family: another account serves the same request, and this one still
 // serves the other families (AccountManager.markFamilyRefused).
 const CREDITS_REQUIRED_MESSAGE = 'Usage credits are required for this model.';
-// A model name as upstream states it, kept to plain characters.
-const MODEL_NAME = /^[A-Za-z0-9._:\[\]-]{1,64}$/;
+// These options can need credits even on a plan that serves the named model.
+const CREDITED_REQUEST_OPTION = /\b(?:fast[\s_-]+mode|long[\s_-]+context)\b/i;
 
 /**
  * The refusal in an upstream error body that says this account needs usage
- * credits for a model family, or null. Fast mode's refusal ("Usage credits are
- * required for fast mode.") is about a request option and is not one.
+ * credits for a model family, 'request' for an unconfirmed or option-specific
+ * credits refusal, or null for an unrelated error.
  * `reason` is 'allowance-spent' when upstream says the included allowance is
  * used up, else 'not-in-plan'.
  * @param {number} status
  * @param {Uint8Array|null} body
- * @returns {{ model: string|null, reason: 'not-in-plan'|'allowance-spent', detail: string }|null}
+ * @returns {{ model: string|null, reason: 'not-in-plan'|'allowance-spent', detail: string }|'request'|null}
  */
 export function creditsRequiredRefusal(status, body) {
   if (![400, 402, 403, 429].includes(status) || !body) return null;
@@ -110,10 +110,11 @@ export function creditsRequiredRefusal(status, body) {
   try { parsed = JSON.parse(Buffer.from(body).toString('utf8')); } catch { return null; }
   const error = parsed?.error;
   const details = error?.details;
-  const message = typeof error?.message === 'string' ? error.message.trim() : '';
-  if (details?.error_code !== 'credits_required' && message !== CREDITS_REQUIRED_MESSAGE) return null;
-  if (/\bfast mode\b/i.test(message)) return null;
-  const model = typeof details?.model === 'string' && MODEL_NAME.test(details.model) ? details.model : null;
+  const message = typeof error?.message === 'string' ? error.message : '';
+  const model = typeof details?.model === 'string' && details.model.trim() ? details.model : null;
+  const exact = message === CREDITS_REQUIRED_MESSAGE;
+  if (details?.error_code !== 'credits_required') return exact ? 'request' : null;
+  if ((!exact && !model) || CREDITED_REQUEST_OPTION.test(message)) return 'request';
   return {
     model,
     reason: details?.exhausted_included_allowance === true ? 'allowance-spent' : 'not-in-plan',

@@ -165,9 +165,7 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     // (the TUI, the MCP endpoint) is recorded under it.
     if (diskAcct.accountUuid && !mgr.accountUuid) mgr.accountUuid = diskAcct.accountUuid;
     if (diskAcct.orgName && !mgr.orgName) mgr.orgName = diskAcct.orgName;
-    for (const field of /** @type {const} */ (['organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro'])) {
-      if (diskAcct[field] != null) mgr[field] = diskAcct[field];
-    }
+    accountManager.updatePlanMetadata(mgr, diskAcct);
     if (diskAcct.name && mgr.name !== diskAcct.name) {
       // A session pin names its account, so it follows the rename (#543).
       accountManager.sessionPins?.rename(mgr.name, diskAcct.name);
