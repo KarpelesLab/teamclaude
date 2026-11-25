@@ -4348,7 +4348,7 @@ async function relayOnClientCredential(req, res, upstream, sx, route, ctx) {
 /** @param {import('./account-manager.js').AccountManager} am
  * @param {Record<string, any>} account @param {Record<string, any>} ctx */
 function canRecheckFamily(am, account, ctx) {
-  if (!canServeProvider(account, ctx.provider || DEFAULT_PROVIDER)) return false;
+  if (!canServeProvider(account, ctx.provider || DEFAULT_PROVIDER) || am.isPaused(account.index)) return false;
   const reason = am.unavailableReason(account, ctx.model, ctx.advisorModel, { recheckFamily: true });
   return reason == null || (reason === 'cordoned' && am.cordonKeeps(ctx.pinKey, ctx.model).has(account.index));
 }
@@ -4446,8 +4446,11 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // The hop's destination was picked by pickAlternate against this request's
   // own exclusions, and is taken as-is: re-selecting here would walk the fleet
   // cursor onto it, which is exactly the move a detour must not make (#286).
+  // Once the re-check finishes, answer from the pool's hold instead of
+  // walking the fleet again, even if an account became available meanwhile.
   const account = hop != null
     ? hopTo
+    : ctx.creditsRechecked ? null
     : ctx.pinnedIndex != null
       ? (pinned && !pinBar ? pinned : null)
       : accountManager.getActiveAccount(
@@ -4499,34 +4502,36 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // renewed, and nothing else was tried: say that, not a refusal or a quota.
     // Matched by account (recordRefusal).
     const unrenewed = ctx.unrenewedAccounts;
-    if (unrenewed?.size && [...ctx.tried].every(a => unrenewed.has(a))
+    if (!ctx.creditsRechecked && unrenewed?.size && [...ctx.tried].every(a => unrenewed.has(a))
         && (ctx.pinnedIndex != null || (counted.size > 0 && [...counted].every(a => ctx.tried.has(a))))) {
       return respondUnrenewed(res, ctx);
     }
-    // Only this request's own refusal can be relayed. Otherwise send one fresh
-    // request, on the oldest hold, without bypassing other availability gates.
-    const allHeld = [...counted].every(a => ctx.creditsRefused?.has(a)
-      || accountManager.unavailableReason(a, ctx.model, ctx.advisorModel) === 'credits-required');
-    if (allHeld && ctx.creditsRefusal) return respondCreditsRequired(res, ctx, ctx.creditsRefusal);
-    if (allHeld && ctx.pinnedIndex == null && !ctx.creditsRechecked) {
+    // An account-health failure can mask a live family hold in the selection
+    // verdict. Count that hold, but never bypass the health gate to re-check it.
+    if (!ctx.creditsRechecked) {
+      const now = Date.now();
+      let allHeld = true;
       let oldest = Infinity;
       let recheck = null;
-      const now = Date.now();
       for (const a of counted) {
-        if (ctx.tried.has(a) || ctx.rolledOff?.has(a) || !canRecheckFamily(accountManager, a, ctx)) continue;
         const armedAt = Math.min(...[ctx.model, ctx.advisorModel].map(model => {
           const entry = accountManager.familyRefusal(a, model);
           return entry?.until && entry.until > now ? entry.armedAt : Infinity;
         }));
-        if (armedAt < oldest) { oldest = armedAt; recheck = a; }
+        if (armedAt === Infinity && !ctx.creditsRefused?.has(a)) { allHeld = false; break; }
+        if (armedAt >= oldest || ctx.tried.has(a) || ctx.rolledOff?.has(a) || !canRecheckFamily(accountManager, a, ctx)) continue;
+        oldest = armedAt;
+        recheck = a;
       }
-      if (recheck) {
+      // Relay only a refusal from this request, or send one fresh re-check.
+      if (allHeld && ctx.creditsRefusal) return respondCreditsRequired(res, ctx, ctx.creditsRefusal);
+      if (allHeld && recheck && ctx.pinnedIndex == null) {
         ctx.creditsRechecked = true;
         ctx.creditsRecheckTo = recheck;
         return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
       }
     }
-    if (reachable.length && reachable.every(a => accountManager.unavailableReason(a, ctx.model) === 'billing')) {
+    if (!ctx.creditsRechecked && reachable.length && reachable.every(a => accountManager.unavailableReason(a, ctx.model) === 'billing')) {
       ctx.status = 402;
       ctx.account = '(billing unavailable)';
       if (!res.headersSent && !clientGone(res)) {
@@ -4541,7 +4546,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // Every account that could take this request has a ChatGPT plan that does
     // not serve its model. No reset or wait changes a plan, so the answer is
     // upstream's own 400, as the client would have had it from one account.
-    if (reachable.length && reachable.every(a => accountManager.unavailableReason(a, ctx.model) === 'model-unsupported')) {
+    if (!ctx.creditsRechecked && reachable.length && reachable.every(a => accountManager.unavailableReason(a, ctx.model) === 'model-unsupported')) {
       return respondModelUnsupported(res, ctx, reachable);
     }
     // Every candidate was refused by upstream (403). Waiting will not help — the
@@ -4560,7 +4565,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     const allRefused = refused?.size > 0 && (ctx.pinnedIndex != null
       ? refused.has(accountManager.accounts[ctx.pinnedIndex])
       : counted.size > 0 && [...counted].every(a => refused.has(a)));
-    if (allRefused) {
+    if (!ctx.creditsRechecked && allRefused) {
       const rejected = ctx.credentialRejected;
       const names = [...rejected].map(n => `"${n}"`).join(', ');
       // By account too: an entitlement denial and a plain refusal on two
@@ -4626,7 +4631,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     const redeemHook = resetProvider === 'codex' ? hooks.redeemCodexResetForPool
       : resetProvider === DEFAULT_PROVIDER ? hooks.redeemClaudeResetForPool : null;
     const clears = resetProvider === 'codex' ? RESET_CLEARS : CLAUDE_RESET_CLEARS;
-    const resettable = redeemHook && !ctx.resetRedeemTried
+    const resettable = redeemHook && !ctx.creditsRechecked && !ctx.resetRedeemTried
       ? accountManager.accounts.filter((/** @type {Record<string, any>} */ a) =>
         providerOf(a) === resetProvider && !ctx.tried.has(a)
         // A third-party backend is an Anthropic-shaped account with no Anthropic
@@ -4680,7 +4685,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // recovers or the budget (holdSeconds) runs out. Claude Code waits for
     // the first response byte, so this is transparent to the client as long
     // as API_TIMEOUT_MS on the Claude Code side is large enough.
-    if (ctx.holdBudgetMs > 0) {
+    if (!ctx.creditsRechecked && ctx.holdBudgetMs > 0) {
       // Cap the per-poll sleep to 60s so a newly-available account (e.g. one
       // manually enabled or whose quota reset early) is picked up within a
       // minute instead of sleeping the full retryAfter (often 3600s).
@@ -4697,7 +4702,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     }
 
     const exhaustedRetries = ctx.exhaustedRetries || 0;
-    if (exhaustedRetries < 1 && retryAfter <= INLINE_RETRY_AFTER_MAX_SECONDS) {
+    if (!ctx.creditsRechecked && exhaustedRetries < 1 && retryAfter <= INLINE_RETRY_AFTER_MAX_SECONDS) {
       ctx.exhaustedRetries = exhaustedRetries + 1;
       console.log(`[TeamClaude] All accounts exhausted — waiting ${retryAfter}s before retry`);
       await waitForRetry(retryAfter * 1000, ctx.signal);
@@ -4994,21 +4999,26 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         rateLimitHeaders[`anthropic-ratelimit-unified-${w}-status`] === 'rejected');
       if (bytes && credits && (credits === 'request' || !sharedWindowRejected)) {
         const answer = { status, headers: relayableHeaders(upstreamRes.headers, ctx), body: bytes };
-        if (credits === 'request') return respondCreditsRequired(res, ctx, answer);
-        const model = credits.model ?? ctx.model;
-        const until = accountManager.markFamilyRefused(account.index, model, { reason: credits.reason, detail: credits.detail });
-        const family = modelFamily(model);
-        const label = family === 'other' ? safeLine(model, 64) : familyLabel(family);
-        console.log(`[TeamClaude] ${status} on "${safeLine(account.name, 64)}" — ${label} needs usage credits`
-          + (until ? `; out of rotation for ${label} until ${new Date(until).toISOString()}` : ''));
-        if (ctx.pinnedIndex != null || creditsRecheck) return respondCreditsRequired(res, ctx, answer);
+        if (credits !== 'request') {
+          const model = credits.model ?? ctx.model;
+          const until = accountManager.markFamilyRefused(account.index, model, { reason: credits.reason, detail: credits.detail });
+          const family = modelFamily(model);
+          const label = family === 'other' ? safeLine(model, 64) : familyLabel(family);
+          console.log(`[TeamClaude] ${status} on "${safeLine(account.name, 64)}" — ${label} needs usage credits`
+            + (until ? `; out of rotation for ${label} until ${new Date(until).toISOString()}` : ''));
+        } else if (creditsRecheck) {
+          accountManager.deferFamilyRecheck(account, ctx.model, ctx.advisorModel);
+        }
+        if (creditsRecheck && status === 403) return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+        if (credits === 'request' || ctx.pinnedIndex != null || creditsRecheck) return respondCreditsRequired(res, ctx, answer);
         ctx.creditsRefusal = answer;
         (ctx.creditsRefused ??= new Set()).add(account);
         ctx.tried.add(account);
         if (clientGone(res)) { ctx.abandoned = true; return; }
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
       }
-      if (!creditsRecheck && (status === 400 || status === 402) && isBillingError(bytes)) {
+      if ((status === 400 || status === 402) && isBillingError(bytes)) {
+        if (creditsRecheck) accountManager.deferFamilyRecheck(account, ctx.model, ctx.advisorModel);
         accountManager.markBillingRejected(account.index);
         ctx.tried.add(account);
         if (clientGone(res)) { ctx.abandoned = true; return; }
@@ -5016,6 +5026,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       }
       upstreamBody = bytes ? new ReadableStream({ start(c) { c.enqueue(bytes); c.close(); } }) : inspected.body;
     }
+    if (creditsRecheck && status !== 200) accountManager.deferFamilyRecheck(account, ctx.model, ctx.advisorModel);
     if (upstreamRes.status < 400 && isCompletionPath(classificationPath(req.url))) {
       accountManager.clearBillingRejected(account.index);
     }
@@ -5049,7 +5060,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // Other 429s retain their established classification: quota rejection
     // rotates, while a transient throttle pauses and retries.
     // An explicit no-retry response reaches the normal relay untouched instead.
-    if (!creditsRecheck && upstreamRes.status === 429 && !nonRetryable429) {
+    if (upstreamRes.status === 429 && !nonRetryable429) {
       // Clamp Retry-After to a sane window: missing/invalid falls back to 60s,
       // and out-of-range values are bounded to [1, 300]. A negative value would
       // otherwise bypass the wait cap — setTimeout returns immediately and a
@@ -5102,7 +5113,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         || codexAccountSpent;
       const fableRejected = rl['anthropic-ratelimit-unified-7d_oi-status'] === 'rejected' && !generalRejected;
       const codexFamilyRejected = spentCodexWindows.length > 0 && !generalRejected;
-      if ((generalRejected || fableRejected || codexFamilyRejected) && retryCount < maxRetries) {
+      if ((generalRejected || fableRejected || codexFamilyRejected) && (creditsRecheck || retryCount < maxRetries)) {
         // A Fable-only rejection leaves the account fine for other models, so we
         // do NOT throttle it globally — the recorded Fable utilization makes
         // selection skip it for Fable requests only. A general rejection spends a
@@ -5179,6 +5190,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         accountManager.pauseAccount(account.index,
           Math.min(retryAfter, RATE_LIMIT_ABSORB_MAX_SECONDS), admittedLoad);
       }
+
+      // Keep the pause but do not wait or send a second re-check.
+      if (creditsRecheck) return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
 
       // ONE bounded failover hop to an idle sibling (#137, #165, #156).
       //
@@ -5367,7 +5381,12 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // account's cache discovering that. After the hop the response goes to the
     // client as it does today, with its own retry-after intact.
     // Never for a pinned request, as for the 429 hop above.
-    if (!creditsRecheck && ctx.pinnedIndex == null && upstreamRes.status >= 500 && !res.headersSent && !ctx.serverErrorHopped && retryCount < maxRetries) {
+    if (ctx.pinnedIndex == null && upstreamRes.status >= 500 && !res.headersSent
+        && (creditsRecheck || (!ctx.serverErrorHopped && retryCount < maxRetries))) {
+      if (creditsRecheck) {
+        await upstreamBody?.cancel();
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+      }
       // Same exclusion as the 429 hop, and the same cursor-preserving pick.
       const alt = accountManager.pickAlternate(
         indicesOf([...ctx.tried, ...(ctx.rolledOff || []), account]),
@@ -5390,7 +5409,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // An account refusal (account-refusal.js) is about the account: it leaves
     // rotation and the request fails over, like the 403 below. Only a JSON
     // body is read, and it is teed, so an ordinary 400 is relayed whole.
-    if (!creditsRecheck && upstreamRes.status === 400 && account.type === 'oauth' && upstreamBody && !res.headersSent
+    if (upstreamRes.status === 400 && account.type === 'oauth' && upstreamBody && !res.headersSent
         && isJsonContentType(upstreamRes.headers.get('content-type'))) {
       const [peek, rest] = upstreamBody.tee();
       upstreamBody = rest;
@@ -5430,7 +5449,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // own login and asks for a re-login over an account problem it has no part
     // in. Skip the account for the rest of this request and fail over. With no
     // account left, the no-account branch reports a proxy error instead.
-    if (!creditsRecheck && upstreamRes.status === 403 && !res.headersSent) {
+    if (upstreamRes.status === 403 && !res.headersSent) {
       const responseBody = await readErrorBody(upstreamBody);
       // Except a scope 403: the account is fine, its token just cannot reach
       // this endpoint. A `claude setup-token` token is inference-only, so
@@ -5442,7 +5461,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // credential. GET only: those calls are, and a completion never is, so
       // the client's login is never spent on inference. A pin keeps its
       // account for every request, as before.
-      if (req.method === 'GET' && ctx.pinnedIndex == null
+      if (!creditsRecheck && req.method === 'GET' && ctx.pinnedIndex == null
           && account.type === 'oauth' && providerOf(account) === DEFAULT_PROVIDER
           && responseBody != null && isOAuthScopeInsufficient(responseBody)
           && /^Bearer \S/i.test(String(req.headers.authorization || ''))) {
@@ -5486,15 +5505,17 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // token is dead too: ensureTokenFresh marks the account errored, and the
     // retry's status check rotates to another account. Bounded to one re-auth
     // per account per request, so a genuinely dead credential does not loop: a
-    // 401 that comes back goes to the branch below.
-    if (!creditsRecheck && upstreamRes.status === 401 && account.type === 'oauth' && account.refreshToken
-        && retryCount < maxRetries && !ctx.reauthed.has(account)) {
+    // 401 that comes back goes to the branch below. A re-check refreshes for
+    // future requests, then goes straight there without sending again.
+    if (upstreamRes.status === 401 && account.type === 'oauth' && account.refreshToken
+        && (creditsRecheck || retryCount < maxRetries) && !ctx.reauthed.has(account)) {
       ctx.reauthed.add(account);
       await upstreamRes.body?.cancel();
-      console.log(`[TeamClaude] 401 on "${account.name}" — token rejected; forcing refresh and retrying`);
+      upstreamBody = null;
+      console.log(`[TeamClaude] 401 on "${account.name}" — token rejected; forcing refresh${creditsRecheck ? '' : ' and retrying'}`);
       await accountManager.ensureTokenFresh(account.index, true);
       if (clientGone(res)) { ctx.abandoned = true; return; }
-      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+      if (!creditsRecheck) return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
     }
 
     // A 401 the branch above did not take, or one that came BACK after it. The
@@ -5514,8 +5535,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // news — the forced refresh is suppressed for a short floor after a
     // successful one (the refresh-storm guard), so the retry may have gone out
     // on the same token — and a later request gets to try the refresh again.
-    if (!creditsRecheck && upstreamRes.status === 401 && !res.headersSent) {
-      await upstreamRes.body?.cancel();
+    if (upstreamRes.status === 401 && !res.headersSent) {
+      await upstreamBody?.cancel();
       if (account.type !== 'oauth' || !account.refreshToken) {
         accountManager.markCredentialRejected(account.index, account.type !== 'oauth'
           ? 'upstream rejected its API key (401)'
@@ -5523,7 +5544,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       }
       recordRefusal(ctx, account, 401);
       ctx.tried.add(account);
-      console.error(`[TeamClaude] 401 on "${safeLine(account.name, 64)}"; failing over to another account`);
+      console.error(`[TeamClaude] 401 on "${safeLine(account.name, 64)}"; ${creditsRecheck ? 'returning the pool retry-after' : 'failing over to another account'}`);
       if (clientGone(res)) { ctx.abandoned = true; return; }
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
     }
@@ -5747,6 +5768,11 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       return;
     }
 
+    if (creditsRecheck && !res.headersSent) {
+      accountManager.deferFamilyRecheck(account, ctx.model, ctx.advisorModel);
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+    }
+
     // Would failing over dial anywhere else? Only an untried account pointing at
     // a different `upstream` makes that true, and it is what decides whether a
     // name-resolution failure is worth retrying elsewhere.
@@ -5798,7 +5824,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // *response*, never a throw. So don't sideline the account (that would drop
     // a healthy account from rotation until a credential change). Instead skip
     // it for the rest of THIS request only and fail over to another account.
-    if (!creditsRecheck && retryCount < maxRetries && !res.headersSent) {
+    if (retryCount < maxRetries && !res.headersSent) {
       ctx.tried.add(account);
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
     }

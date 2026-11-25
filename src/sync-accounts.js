@@ -165,7 +165,19 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     // (the TUI, the MCP endpoint) is recorded under it.
     if (diskAcct.accountUuid && !mgr.accountUuid) mgr.accountUuid = diskAcct.accountUuid;
     if (diskAcct.orgName && !mgr.orgName) mgr.orgName = diskAcct.orgName;
-    accountManager.updatePlanMetadata(mgr, diskAcct);
+    // Only a disk edit is new information. An unchanged field can be older
+    // than the running value learned from a profile probe.
+    if (cfgAcct) {
+      /** @type {Record<string, any>} */
+      const planChanges = {};
+      for (const field of ['organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro']) {
+        if (diskAcct[field] === cfgAcct[field]) continue;
+        planChanges[field] = diskAcct[field];
+        if (Object.hasOwn(diskAcct, field)) cfgAcct[field] = diskAcct[field];
+        else delete cfgAcct[field];
+      }
+      if (Object.keys(planChanges).length) accountManager.updatePlanMetadata(mgr, planChanges);
+    }
     if (diskAcct.name && mgr.name !== diskAcct.name) {
       // A session pin names its account, so it follows the rename (#543).
       accountManager.sessionPins?.rename(mgr.name, diskAcct.name);

@@ -42,7 +42,7 @@ const account = (name) => ({ name, type: 'oauth', accessToken: `t-${name}`, refr
  * A fake upstream: `refuses(token, model)` returns the refusal to send (headers
  * and body), a function to write the response, or null to answer 200.
  */
-async function withProxy({ names = ['a', 'b'], headers = { 'x-should-retry': 'false', 'request-id': 'req_test' }, refuses }, fn) {
+async function withProxy({ names = ['a', 'b'], headers = { 'x-should-retry': 'false', 'request-id': 'req_test' }, refuses, refreshFn = async () => { throw new Error('no refresh'); } }, fn) {
   const seen = [];
   const upstream = http.createServer((req, res) => {
     let body = '';
@@ -65,7 +65,7 @@ async function withProxy({ names = ['a', 'b'], headers = { 'x-should-retry': 'fa
     });
   });
   const upstreamPort = await listen(upstream);
-  const am = new AccountManager(names.map(account), 0.98, { refreshFn: async () => { throw new Error('no refresh'); } });
+  const am = new AccountManager(names.map(account), 0.98, { refreshFn });
   const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` });
   const proxyPort = await listen(proxy);
   const controllers = new Set();
@@ -160,6 +160,8 @@ for (const [label, body, status] of [
   ['a different sentence without a model', refusal({ model: undefined }, { message: 'You must buy usage credits.' }), 429],
   ['a fast-mode option with a named model', refusal({}, { message: 'Usage credits are required for fast mode.' }), 429],
   ['a long-context option with a named model', refusal({}, { message: 'Usage credits are required for long context.' }), 403],
+  ['a 1M context option with a named model', refusal({}, { message: 'Usage credits are required for 1M context.' }), 429],
+  ['a priority tier option with a named model', refusal({}, { message: 'Usage credits are required for priority tier.' }), 403],
 ]) {
   test(`only the requesting client gets ${label}`, async () => {
     let first = true;
@@ -198,10 +200,10 @@ test('a later Fable request skips the refusing account, and Opus still uses it',
 
 test('all-held requests re-check just the oldest hold and receive a fresh answer', async () => {
   let call = 0;
-  const answerBody = n => refusal({}, { message: `Fable needs usage credits (call ${n}).` });
+  const answerBody = n => refusal({}, { message: `Usage credits are required for this model. (call ${n})` });
   await withProxy({ refuses: () => {
     const n = ++call;
-    return n > 3 ? null : { status: n === 3 ? 403 : 429, body: answerBody(n), headers: { 'request-id': `req_${n}` } };
+    return n > 4 ? null : { status: n === 4 ? 403 : 429, body: answerBody(n), headers: { 'request-id': `req_${n}` } };
   } }, async ({ am, seen, post }) => {
     const first = await post(FABLE);
     assert.equal(first.status, 429);
@@ -211,13 +213,71 @@ test('all-held requests re-check just the oldest hold and receive a fresh answer
     assert.deepEqual(seen, [`a:${FABLE}`, `b:${FABLE}`]);
 
     const again = await post(FABLE);
-    assert.equal(again.status, 403);
+    assert.equal(again.status, 429);
     assert.equal(await again.text(), answerBody(3));
     assert.equal(again.headers.get('request-id'), 'req_3');
     assert.deepEqual(seen.slice(2), [`a:${FABLE}`]);
 
-    assert.deepEqual(await (await post(FABLE)).json(), { served: 'b' }, 'the refusal moved a to the back of the re-check order');
-    assert.equal(am.unavailableReason(am.accounts[1], FABLE), null, 'a successful re-check clears the hold');
+    const forbidden = await post(FABLE);
+    assert.equal(forbidden.status, 429, 'a re-check never relays a 403');
+    assert.ok(Number(forbidden.headers.get('retry-after')) > 0);
+    assert.deepEqual(seen.slice(3), [`b:${FABLE}`], 'the refusal moved a to the back of the re-check order');
+
+    assert.deepEqual(await (await post(FABLE)).json(), { served: 'a' });
+    assert.equal(am.unavailableReason(am.accounts[0], FABLE), null, 'a successful re-check clears the hold');
+  });
+});
+
+for (const [status, code, message, assertMarked] of [
+  [401, null, 'Invalid OAuth token.', (am) => assert.equal(am.accounts[0].errorReason?.code, 'credential_rejected')],
+  [403, 'oauth_not_allowed_for_organization', 'OAuth authentication is currently not allowed for this organization.',
+    (am) => assert.equal(am.unavailableReason(am.accounts[0], OPUS), 'entitlement')],
+  [503, null, 'Service unavailable.', null],
+  [429, null, 'Rate limited.', (am) => assert.equal(am.isPaused(0), true)],
+]) {
+  test(`an all-held re-check with upstream ${status} returns the hold's retry-after and yields its place`, async () => {
+    let held = false;
+    await withProxy({ refuses: (token) => {
+      if (!held) return refusal({ exhausted_included_allowance: true });
+      if (token !== 'a') return null;
+      return {
+        status,
+        ...(status === 429 ? { headers: { 'x-should-retry': 'true', 'retry-after': '5' } } : {}),
+        body: JSON.stringify({ type: 'error', error: { message, ...(code ? { details: { error_code: code } } : {}) } }),
+      };
+    } }, async ({ am, seen, post }) => {
+      am.accounts[0].refreshToken = null;
+      assert.equal((await post(FABLE)).status, 429);
+      assert.deepEqual(seen, [`a:${FABLE}`, `b:${FABLE}`]);
+      held = true;
+      seen.length = 0;
+
+      const answer = await post(FABLE);
+      assert.equal(answer.status, 429);
+      const retryAfter = Number(answer.headers.get('retry-after'));
+      assert.ok(retryAfter >= 3590 && retryAfter <= 3600, `expected the one-hour hold, got ${retryAfter}s`);
+      assertMarked?.(am);
+      assert.deepEqual(seen, [`a:${FABLE}`]);
+      assert.deepEqual(await (await post(FABLE)).json(), { served: 'b' });
+      assert.deepEqual(seen, [`a:${FABLE}`, `b:${FABLE}`]);
+    });
+  });
+}
+
+test('a 401 during a credits re-check refreshes the token without another send', async () => {
+  let held = false;
+  await withProxy({
+    refuses: token => !held ? refusal() : token === 'a' ? { status: 401, body: '{}' } : null,
+    refreshFn: async () => ({ accessToken: 't-a-fresh', refreshToken: 'r-fresh', expiresAt: Date.now() + 3600_000 }),
+  }, async ({ am, seen, post }) => {
+    assert.equal((await post(FABLE)).status, 429);
+    held = true;
+    seen.length = 0;
+    const answer = await post(FABLE);
+    assert.equal(answer.status, 429);
+    assert.ok(Number(answer.headers.get('retry-after')) > 0);
+    assert.equal(am.accounts[0].credential, 't-a-fresh');
+    assert.deepEqual(seen, [`a:${FABLE}`]);
   });
 });
 
@@ -388,6 +448,22 @@ test('plan metadata from a profile and a config reload clears family holds', asy
   am.markFamilyRefused(0, FABLE);
   am.applyProfileData(0, { hasClaudeMax: true });
   assert.equal(am.unavailableReason(a, FABLE), null);
+});
+
+test('an unchanged disk plan does not overwrite a probed tier or clear its family hold', async () => {
+  const row = { ...account('a'), id: 'id-a', accountUuid: 'u-a', rateLimitTier: 'old' };
+  const am = new AccountManager([row], 0.98);
+  const memConfig = { accounts: [row] };
+  const changedRow = { ...row, seatTier: 'new-seat' };
+  await syncAccountsFromDisk({ accounts: [{ ...changedRow }] }, memConfig, am);
+  assert.equal(am.accounts[0].seatTier, 'new-seat');
+
+  am.applyProfileData(0, { rateLimitTier: 'probed-tier', seatTier: 'probed-seat' });
+  am.markFamilyRefused(0, FABLE);
+  await syncAccountsFromDisk({ accounts: [{ ...changedRow }] }, memConfig, am);
+  assert.equal(am.unavailableReason(am.accounts[0], FABLE), 'credits-required');
+  assert.equal(am.accounts[0].rateLimitTier, 'probed-tier');
+  assert.equal(am.accounts[0].seatTier, 'probed-seat');
 });
 
 test('a refusal survives a restart, and status and the TUI say why', () => {

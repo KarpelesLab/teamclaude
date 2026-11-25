@@ -13,6 +13,7 @@ function makeTUI({ accounts = [{ name: 'a', index: 0, type: 'oauth', credential:
     currentIndex: 0,
     switchThreshold: 0.98,
     getRoutes() { return []; },
+    updatePlanMetadata() {},
     addAccount(entry) { calls.added.push(entry); this.accounts.push({ ...entry, index: this.accounts.length }); },
     removeAccount(idx) { calls.removed.push(this.accounts[idx]?.name); this.accounts.splice(idx, 1); },
   };

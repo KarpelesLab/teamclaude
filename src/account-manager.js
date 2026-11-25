@@ -1919,6 +1919,18 @@ export class AccountManager {
     return until;
   }
 
+  /** Move existing holds to the back of the re-check order without extending them.
+   * @param {Record<string, any>} account
+   * @param {...(string|null)} models */
+  deferFamilyRecheck(account, ...models) {
+    const now = Date.now();
+    const armedAt = performance.timeOrigin + performance.now();
+    for (const model of models) {
+      const entry = this.familyRefusal(account, model);
+      if (entry?.until && entry.until > now) entry.armedAt = armedAt;
+    }
+  }
+
   /** A served request sent after the last refusal proves the plan serves it.
    * @param {Record<string, any>} account
    * @param {string|null} model

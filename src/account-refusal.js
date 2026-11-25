@@ -90,8 +90,6 @@ export function accountRefusal(status, body) {
 // this family: another account serves the same request, and this one still
 // serves the other families (AccountManager.markFamilyRefused).
 const CREDITS_REQUIRED_MESSAGE = 'Usage credits are required for this model.';
-// These options can need credits even on a plan that serves the named model.
-const CREDITED_REQUEST_OPTION = /\b(?:fast[\s_-]+mode|long[\s_-]+context)\b/i;
 
 /**
  * The refusal in an upstream error body that says this account needs usage
@@ -114,7 +112,8 @@ export function creditsRequiredRefusal(status, body) {
   const model = typeof details?.model === 'string' && details.model.trim() ? details.model : null;
   const exact = message === CREDITS_REQUIRED_MESSAGE;
   if (details?.error_code !== 'credits_required') return exact ? 'request' : null;
-  if ((!exact && !model) || CREDITED_REQUEST_OPTION.test(message)) return 'request';
+  // A named model alone does not distinguish a plan refusal from a paid option.
+  if (!/required for this model/i.test(message)) return 'request';
   return {
     model,
     reason: details?.exhausted_included_allowance === true ? 'allowance-spent' : 'not-in-plan',
