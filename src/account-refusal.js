@@ -9,7 +9,7 @@
 // `oauth_not_allowed_for_organization` is not here: it has its own cooldown
 // (isOAuthEntitlementDenied in server.js).
 
-import { sanitizeText } from './safe-text.js';
+import { safeLine, sanitizeText } from './safe-text.js';
 
 /** The `error_code` values that refuse the account itself. */
 export const ACCOUNT_REFUSAL_CODES = new Set([
@@ -82,4 +82,41 @@ export function accountRefusal(status, body) {
     : null;
   if (!code) return null;
   return { code, message: sanitizeText(message) || code, link: messageLink(message) };
+}
+
+// A plan that does not include a model family answers a request for it with
+// `error_code: "credits_required"` ("Usage credits are required for this
+// model."), as a 429 with no rate-limit verdict. It is about this account and
+// this family: another account serves the same request, and this one still
+// serves the other families (AccountManager.markFamilyRefused).
+const CREDITS_REQUIRED_MESSAGE = 'Usage credits are required for this model.';
+// A model name as upstream states it, kept to plain characters.
+const MODEL_NAME = /^[A-Za-z0-9._:\[\]-]{1,64}$/;
+
+/**
+ * The refusal in an upstream error body that says this account needs usage
+ * credits for a model family, or null. Fast mode's refusal ("Usage credits are
+ * required for fast mode.") is about a request option and is not one.
+ * `reason` is 'allowance-spent' when upstream says the included allowance is
+ * used up, else 'not-in-plan'.
+ * @param {number} status
+ * @param {Uint8Array|null} body
+ * @returns {{ model: string|null, reason: 'not-in-plan'|'allowance-spent', detail: string }|null}
+ */
+export function creditsRequiredRefusal(status, body) {
+  if (![400, 402, 403, 429].includes(status) || !body) return null;
+  /** @type {any} */
+  let parsed;
+  try { parsed = JSON.parse(Buffer.from(body).toString('utf8')); } catch { return null; }
+  const error = parsed?.error;
+  const details = error?.details;
+  const message = typeof error?.message === 'string' ? error.message.trim() : '';
+  if (details?.error_code !== 'credits_required' && message !== CREDITS_REQUIRED_MESSAGE) return null;
+  if (/\bfast mode\b/i.test(message)) return null;
+  const model = typeof details?.model === 'string' && MODEL_NAME.test(details.model) ? details.model : null;
+  return {
+    model,
+    reason: details?.exhausted_included_allowance === true ? 'allowance-spent' : 'not-in-plan',
+    detail: safeLine(message, 200) || CREDITS_REQUIRED_MESSAGE,
+  };
 }

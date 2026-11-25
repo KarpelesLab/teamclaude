@@ -1,6 +1,6 @@
 import { createWriteStream } from 'node:fs';
 import { RESET_OPEN_TTL_MS } from './reset-readings.js';
-import { gatingUtilization } from './model.js';
+import { gatingUtilization, familyLabel, heldFamilyRefusals } from './model.js';
 import { importCredentials, fetchProfile, formatMoney } from './oauth.js';
 import {
   sameIdentity,
@@ -445,6 +445,9 @@ function creditColor(credit) {
 // not draw.
 /** @type {Record<string, string>} */
 const BLOCKED_MARKS = { Wk: '⊘Wk', Sonnet: '⊘S', Fable: '⊘F' };
+// The quota key behind each family bar (S7, F7).
+/** @type {Record<string, string>} */
+const FAMILY_BAR_KEYS = { Sonnet: 'unified7dSonnet', Fable: 'unified7dFable' };
 
 export function blockedFamilies(quota, threshold) {
   const at = typeof threshold === 'function' ? threshold : () => threshold;
@@ -462,6 +465,25 @@ export function blockedFamilies(quota, threshold) {
     // decision, so deriving it a second way here would be a copy that drifts.
     const gating = gatingUtilization(quota, key);
     if (gating != null && gating >= at(key)) out.push(label);
+  }
+  return out;
+}
+
+/**
+ * blockedFamilies, plus the families the account's plan wants usage credits
+ * for (AccountManager.markFamilyRefused): barred the same way, so marked the
+ * same way, `⊘F` on the Fable bar or a `⊘` tag. A spent shared weekly
+ * already bars every family and stays the one mark.
+ * @param {any} account  a live account or a status payload row
+ * @param {number|((key: string) => number)} threshold
+ * @param {number} [now]
+ */
+export function barredFamilies(account, threshold, now = Date.now()) {
+  const out = blockedFamilies(account.quota, threshold);
+  if (out.includes('Wk')) return out;
+  for (const family of heldFamilyRefusals(account.familyRefusals, now)) {
+    const label = familyLabel(family);
+    if (!out.includes(label)) out.push(label);
   }
   return out;
 }
@@ -3192,8 +3214,11 @@ export class TUI {
       // The weekly bar is drawn wherever _renderAcct draws it: first on a list
       // or row without a session window, else second when two bars fit.
       const tagWFor = (/** @type {boolean} */ familyBars, /** @type {boolean} */ twoBars) => members.reduce((w, a) => {
-        const names = blockedFamilies(a.quota, key => this.am.thresholdFor(key, a))
-          .filter(n => !(n === 'Wk' ? !shortBar || !showSessionRow(a.quota) || twoBars : familyBars));
+        const names = barredFamilies(a, key => this.am.thresholdFor(key, a))
+          .filter(n => !(n === 'Wk' ? !shortBar || !showSessionRow(a.quota) || twoBars
+            // A family bar is drawn only once its bucket is reported, and a
+            // family with no bar of its own (Opus, a refused one) never is.
+            : familyBars && a.quota[FAMILY_BAR_KEYS[n]] != null));
         return names.length ? Math.max(w, 4 + vw(names.join(' '))) : w;
       }, 0);
       // Same rule for the money tag (`$`, or the billed amount with its `/cap`):
@@ -3694,7 +3719,7 @@ export class TUI {
     //
     // The mark replaces the label of the bar it is about (BLOCKED_MARKS); only
     // a bucket whose bar this row does not draw falls back to the `⊘` tag.
-    const blocked = blockedFamilies(q, limFor);
+    const blocked = barredFamilies(a, limFor);
     const marked = new Set();
     const mark = (/** @type {string} */ bucket, /** @type {string} */ label) => {
       if (!blocked.includes(bucket)) return label;

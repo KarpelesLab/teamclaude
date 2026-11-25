@@ -3,7 +3,7 @@ import { providerOf, DEFAULT_PROVIDER, isSubscriptionAccount, canServeProvider }
 import { refreshCodexToken } from './codex-auth.js';
 import { parseCodexQuota, parseCodexPlanType, parseCodexActiveLimit } from './codex-quota.js';
 import { sameIdentity, sameOrg } from './identity.js';
-import { weeklyBucketForModel, modelGlobMatches, modelFamily, gatingUtilization, resolveMaxUsage, spendCapReached, resolveSwitchThreshold, sanitizeSwitchThreshold, WEEKLY_BUCKET_KEYS } from './model.js';
+import { weeklyBucketForModel, familyLabel, modelGlobMatches, modelFamily, gatingUtilization, resolveMaxUsage, spendCapReached, resolveSwitchThreshold, sanitizeSwitchThreshold, WEEKLY_BUCKET_KEYS } from './model.js';
 import { SessionTracker } from './session-tracker.js';
 import { SessionPins, MAX_SESSION_PINS } from './session-pins.js';
 import { normalizeSessionAdvice, decideAdvice } from './session-advice.js';
@@ -122,6 +122,15 @@ const MAX_CODEX_MODEL_LIMITS = 32;
 const MODEL_DENIAL_COOLDOWNS_SECONDS = [5 * 60, 15 * 60, 60 * 60];
 // Also keyed by the model the client asked for.
 const MAX_MODEL_DENIALS = 32;
+// How long an account sits out a model family its plan wants usage credits for
+// (see markFamilyRefused). A plan that does not include the family will not
+// start to soon, so it is asked again once a day. A spent included allowance
+// is closer to a quota window, so it is asked again hourly. Either re-check
+// costs one refused request, which fails over to another account, and a
+// served request for the family ends the hold at once.
+export const FAMILY_REFUSAL_HOLD_SECONDS = { 'not-in-plan': 24 * 60 * 60, 'allowance-spent': 60 * 60 };
+// The families a refusal can be recorded under (modelFamily).
+const REFUSABLE_FAMILIES = new Set(['fable', 'sonnet', 'opus', 'haiku', 'other']);
 
 // How much sooner another account's weekly reset must be before
 // `preferSoonestWeeklyReset` moves traffic to it (see _soonerResetPreemptor).
@@ -256,9 +265,57 @@ const underOne = v => v != null && v < 1;
  * @property {number} epoch  the modelDenialEpoch this denial was counted at
  */
 
+/**
+ * A model family an account's plan answered with "usage credits are required"
+ * (see markFamilyRefused).
+ *
+ * @typedef {object} FamilyRefusal
+ * @property {string} family  modelFamily of the refused model
+ * @property {string|null} model  the model upstream named
+ * @property {'not-in-plan'|'allowance-spent'} reason
+ * @property {string|null} detail  upstream's own message, bounded
+ * @property {number} since  when the first refusal in this run came
+ * @property {number} count  refusals in a row
+ * @property {number|null} until  the end of the hold; null once it lapsed
+ * @property {{ status: number, headers: Record<string, string>, body: Uint8Array }|null} [answer]
+ *   upstream's answer, to give a client when every account refuses the family;
+ *   in memory only
+ */
+
 // A model name a denial may be stored under, kept exact: no case folding or
 // truncation, so no other string from a client's body can share a model's key.
 const MODEL_DENIAL_KEY = /^[A-Za-z0-9._:-]{1,64}$/;
+
+/**
+ * Family refusals read back from the state file, kept only where every field
+ * has the shape markFamilyRefused writes: the file is hand-editable, and a
+ * malformed entry must not bar a family.
+ * @param {unknown} saved
+ * @returns {Record<string, FamilyRefusal>}
+ */
+function restoreFamilyRefusals(saved) {
+  /** @type {Record<string, FamilyRefusal>} */
+  const out = {};
+  if (!Array.isArray(saved)) return out;
+  for (const r of saved) {
+    if (!r || typeof r !== 'object' || !REFUSABLE_FAMILIES.has(r.family)) continue;
+    if (r.reason !== 'not-in-plan' && r.reason !== 'allowance-spent') continue;
+    if (!Number.isFinite(r.since) || !Number.isSafeInteger(r.count) || r.count < 1) continue;
+    if (r.until != null && !Number.isFinite(r.until)) continue;
+    out[r.family] = {
+      family: r.family,
+      model: typeof r.model === 'string' ? safeLine(r.model, 64) || null : null,
+      reason: r.reason,
+      detail: typeof r.detail === 'string' ? safeLine(r.detail, 200) || null : null,
+      // Never past the hold a refusal arms: an edited file cannot bar a family for longer.
+      until: r.until == null ? null : Math.min(r.until, Date.now() + FAMILY_REFUSAL_HOLD_SECONDS[/** @type {FamilyRefusal['reason']} */ (r.reason)] * 1000),
+      since: r.since,
+      count: r.count,
+      answer: null,
+    };
+  }
+  return out;
+}
 
 /** The key a model's denial is stored under: the model exactly as the request
  * named it, or '' when it is not a plain model name.
@@ -733,6 +790,10 @@ function makeAccount(acct, index, listener = null) {
     // Plays entitlementEpoch's part for these denials: bumped by each counted
     // one, and each entry keeps the value that counted it.
     modelDenialEpoch: 0,
+    // Model families this account's plan answers with "usage credits are
+    // required", by family (see markFamilyRefused). Kept across restarts, like
+    // subscriptionLost: it is a fact about the plan, not a passing observation.
+    familyRefusals: /** @type {Record<string, FamilyRefusal>} */ ({}),
     // The account's own routing proxy could not be reached (see
     // markRoutingFailed). Ephemeral for the same reason: a live observation.
     routingFailedUntil: /** @type {number|null} */ (null),
@@ -1309,12 +1370,15 @@ export class AccountManager {
    * @param {string|null} [model]
    * @param {string|null} [advisorModel]
    */
-  capBars(account, model = null, advisorModel = null) {
+  capBars(account, model = null, advisorModel = null, { pinned = false } = {}) {
     return this.capExceeded(account, model)
       || (advisorModel && this.advisorEligibility !== 'prefer' ? this._familyCapExceeded(account, advisorModel) : null)
       // Not a cap, but the same kind of bar, needed on the same paths: these
       // are the paths that skip unavailableReason, which also checks it.
-      || (this._modelDenied(account, model) ? 'model-unsupported' : null);
+      || (this._modelDenied(account, model) ? 'model-unsupported' : null)
+      // Not for a pin: the operator named the account, so the request goes to
+      // it and upstream gives its own answer, and a served one ends the hold.
+      || (!pinned && this._familyRefused(account, model) ? 'credits-required' : null);
   }
 
   /**
@@ -1328,7 +1392,7 @@ export class AccountManager {
    */
   pinBars(account, model = null, advisorModel = null, provider = DEFAULT_PROVIDER) {
     if (!canServeProvider(account, provider)) return 'provider';
-    return this.capBars(account, model, advisorModel);
+    return this.capBars(account, model, advisorModel, { pinned: true });
   }
 
   /** Start (or restart) the ramp window for an account that just became current,
@@ -1810,6 +1874,67 @@ export class AccountManager {
     if (now < entry.until) return true;
     entry.until = null;
     console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" cooldown for model ${entry.model} expired; the next request re-checks it`);
+    return false;
+  }
+
+  /** Keep an account out of rotation for one model family its plan answered
+   * with "usage credits are required" (creditsRequiredRefusal). The plan still
+   * serves the other families, so only this one is barred. Extends a hold,
+   * never shortens it. Returns the expiry timestamp, or null when there is
+   * nothing to hold.
+   * @param {number} index
+   * @param {string|null} model  the refused model
+   * @param {{ reason?: 'not-in-plan'|'allowance-spent', detail?: string|null,
+   *   answer?: FamilyRefusal['answer'] }} [refusal]  upstream's verdict, its
+   *   message (already bounded) and its answer */
+  markFamilyRefused(index, model, { reason = 'not-in-plan', detail = null, answer = null } = {}) {
+    const account = this.accounts[index];
+    if (!account || !model) return null;
+    const family = modelFamily(model);
+    const prior = account.familyRefusals[family];
+    const now = Date.now();
+    const hold = FAMILY_REFUSAL_HOLD_SECONDS[reason] ?? FAMILY_REFUSAL_HOLD_SECONDS['not-in-plan'];
+    const until = Math.max(prior?.until || 0, now + hold * 1000);
+    account.familyRefusals[family] = {
+      family, model, reason, detail: detail || prior?.detail || null,
+      since: prior?.since ?? now, count: (prior?.count || 0) + 1, until,
+      answer: answer || prior?.answer || null,
+    };
+    return until;
+  }
+
+  /** A served request for `model` proves the plan serves its family: forget
+   * the refusal. Takes the account, as clearModelDenied does.
+   * @param {Record<string, any>} account
+   * @param {string|null} model */
+  clearFamilyRefused(account, model) {
+    if (!model || this.accounts[account?.index] !== account) return;
+    const family = modelFamily(model);
+    if (!account.familyRefusals?.[family]) return;
+    delete account.familyRefusals[family];
+    console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" served ${familyLabel(family)}; it is back in rotation for it`);
+  }
+
+  /** The refusal recorded for `model`'s family on `account`, or null.
+   * @param {Record<string, any>|undefined} account
+   * @param {string|null} model
+   * @returns {FamilyRefusal|null} */
+  familyRefusal(account, model) {
+    return (model && account?.familyRefusals?.[modelFamily(model)]) || null;
+  }
+
+  /** True while `account` sits out `model`'s family (see markFamilyRefused).
+   * Expiry is consumed lazily; the entry stays until a served request clears
+   * it, so status still says why the next request re-checks.
+   * @param {Record<string, any>|undefined} account
+   * @param {string|null} model
+   * @param {number} [now] */
+  _familyRefused(account, model, now = Date.now()) {
+    const entry = this.familyRefusal(account, model);
+    if (!entry?.until) return false;
+    if (now < entry.until) return true;
+    entry.until = null;
+    console.log(`[TeamClaude] Account "${safeLine(account?.name, 64)}" hold for ${familyLabel(entry.family)} (usage credits required) expired; the next request re-checks it`);
     return false;
   }
 
@@ -4153,7 +4278,7 @@ export class AccountManager {
    * the refusal was the proxy's own doing (issue #166).
    *
    * Returns one of: 'disabled', 'spend-capped', 'capped', 'throttled', 'error',
-   * 'entitlement', 'model-unsupported', 'exhausted', 'upstream-rejected', 'quota',
+   * 'entitlement', 'model-unsupported', 'credits-required', 'exhausted', 'upstream-rejected', 'quota',
    * 'route', 'routing', 'credential', 'billing', 'advisor-capped', 'advisor-quota',
    * 'advisor-route', 'cordoned'.
    * @param {Record<string, any>|undefined} account
@@ -4190,6 +4315,10 @@ export class AccountManager {
     // This account's ChatGPT plan refused this model a moment ago. Only this
     // model: the plan still serves the others.
     if (this._modelDenied(account, model)) return 'model-unsupported';
+
+    // This account's plan wants usage credits for this model's family. Only
+    // that family: the plan still serves the others.
+    if (this._familyRefused(account, model)) return 'credits-required';
 
     // The account's own routing proxy could not be reached a moment ago.
     if (this._routingDown(account)) return 'routing';
@@ -7216,6 +7345,12 @@ export class AccountManager {
     } else if (plan && now && (plan !== now || (tier && account.rateLimitTier !== tier))) {
       const label = (/** @type {string} */ p, /** @type {string|null} */ t) => `Claude ${p}${t ? ` (${safeLine(t, 64)})` : ''}`;
       console.log(`[TeamClaude] Account "${name}": plan changed from ${label(plan, tier)} to ${label(now, account.rateLimitTier)}`);
+      // Which families need usage credits depends on the plan.
+      const refused = Object.keys(account.familyRefusals);
+      if (refused.length) {
+        account.familyRefusals = {};
+        console.log(`[TeamClaude] Account "${name}": re-admitting ${refused.map(familyLabel).join(', ')}, refused under the old plan for usage credits`);
+      }
     }
   }
 
@@ -7803,6 +7938,8 @@ export class AccountManager {
         hasClaudeMax: a.hasClaudeMax,
         hasClaudePro: a.hasClaudePro,
         subscriptionLost: a.subscriptionLost,
+        // Without upstream's answer, which is for this run's clients only.
+        familyRefusals: Object.values(a.familyRefusals).map(({ answer: _answer, ...kept }) => kept),
       };
       const adaptive = {
         burnRate: this.burnRateLearner.export(a.index),
@@ -7849,6 +7986,7 @@ export class AccountManager {
       for (const field of ['organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro', 'subscriptionLost']) {
         if (match.profile?.[field] != null) account[field] = match.profile[field];
       }
+      account.familyRefusals = restoreFamilyRefusals(match.profile?.familyRefusals);
       this.burnRateLearner.restore(account.index, match.adaptive?.burnRate);
       this.outsideSpend.restore(account.index, match.outsideSpend);
       this.concurrencyLearner.restore(account.index, match.adaptive?.concCap);
@@ -8019,6 +8157,15 @@ export class AccountManager {
           ? new Date(a.entitlementDeniedUntil).toISOString()
           : null,
         entitlementDenial: a.entitlementDenial ? { ...a.entitlementDenial } : null,
+        familyRefusals: Object.values(a.familyRefusals ?? {}).map(r => ({
+          family: r.family,
+          model: r.model,
+          reason: r.reason,
+          detail: r.detail,
+          until: r.until && r.until > Date.now() ? new Date(r.until).toISOString() : null,
+          since: r.since,
+          count: r.count,
+        })),
         modelDenials: [...(a.modelDenials?.values() ?? [])].map(d => ({
           model: d.model,
           until: d.until && d.until > Date.now() ? new Date(d.until).toISOString() : null,

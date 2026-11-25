@@ -12,11 +12,11 @@ import { sanitizeCacheControl, cacheControlSubfieldsToStrip } from './cache-cont
 import { sanitizeContentBlocks, contentBlockTypesToStrip } from './content-block-sanitize.js';
 import { parseRequestModel, parseAdvisorModel, refreshHeldUntil } from './account-manager.js';
 import { isTokenExpired } from './oauth.js';
-import { TopLevelFieldFinder, modelGlobMatches, parseRequestEffort, parseRequestStream } from './model.js';
+import { TopLevelFieldFinder, familyLabel, modelFamily, modelGlobMatches, parseRequestEffort, parseRequestStream } from './model.js';
 import { conversationDigest, pinKeyFor } from './conversation.js';
 import { BodyWriter, truncationNote } from './request-log.js';
 import { upstreamFetch, upstreamPoolStatus, resolveHeadersTimeout } from './upstream-fetch.js';
-import { accountRefusal, isRefused } from './account-refusal.js';
+import { accountRefusal, creditsRequiredRefusal, isRefused } from './account-refusal.js';
 import { applyAuthHeaders, upstreamFor, rewritesBody, defaultHeadersTimeoutFor, providerForPath, providerForHost, interceptHostsFor, providerOf, isSubscriptionAccount, canServeProvider, DEFAULT_PROVIDER, PROVIDERS } from './provider.js';
 import { matchAccounts } from './identity.js';
 import { tunnelTls } from './sx.js';
@@ -1876,7 +1876,7 @@ function advancePinPastBilling(ctx, accountManager) {
     // over.
     const next = ctx.pinChain.shift();
     if (next.index < 0 || next.type !== 'apikey' || providerOf(next) !== providerOf(from)
-        || accountManager.isBillingRejected(next.index) || accountManager.capBars(next, ctx.model, ctx.advisorModel)) continue;
+        || accountManager.isBillingRejected(next.index) || accountManager.capBars(next, ctx.model, ctx.advisorModel, { pinned: true })) continue;
     // Named once per refusal, next to markBillingRejected's line; a request that
     // only passes a cooling account by is not worth a line each.
     if (ctx.tried.has(from)) {
@@ -4252,6 +4252,59 @@ function respondModelUnsupported(res, ctx, denied) {
 }
 
 /**
+ * The answer when every account that could take the request wants usage
+ * credits for its model family (see creditsRequiredRefusal). Upstream's own
+ * answer, status, headers and body, as the client would have had it from one
+ * account: this request's when it drew one, else the last one an account kept,
+ * else rebuilt from the message the refusal kept.
+ * @param {import('node:http').ServerResponse} res
+ * @param {Record<string, any>} ctx
+ * @param {Record<string, any>[]} refused  the accounts refusing this family
+ * @param {import('./account-manager.js').AccountManager} accountManager
+ */
+function respondCreditsRequired(res, ctx, refused, accountManager) {
+  const records = refused.map(a => accountManager.familyRefusal(a, ctx.model));
+  const kept = ctx.creditsRefusal ?? records.find(r => r?.answer)?.answer ?? null;
+  ctx.status = kept?.status ?? 429;
+  ctx.delivered = true;   // a refusal about the plan IS an answer — see answeredStatus
+  ctx.account = `(${refused.map(a => a.name).join(', ')} usage credits required)`;
+  if (res.headersSent || clientGone(res)) return;
+  if (kept) {
+    const headers = Object.fromEntries(Object.entries(kept.headers)
+      .filter(([key]) => !(ctx.stripOverage === true && isOverageHeader(key))));
+    res.writeHead(kept.status, headers);
+    res.end(kept.body);
+    return;
+  }
+  const message = records.find(r => r?.detail)?.detail || 'Usage credits are required for this model.';
+  res.writeHead(429, { 'Content-Type': 'application/json', 'x-should-retry': 'false' });
+  res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message } }));
+}
+
+/**
+ * The upstream response headers a client is given: not the connection-specific
+ * ones (most would make writeHead throw, behind the MITM's h2 server above all;
+ * see CONNECTION_SPECIFIC_HEADERS), not our own correlation header (set before
+ * this head by the listener: an upstream copy would win the merge), not the
+ * encoding and length (fetch may decompress), and not the per-org billing
+ * state when stripOverageHeaders is on (see isOverageHeader).
+ * @param {Headers} headers
+ * @param {Record<string, any>} ctx
+ * @returns {Record<string, string>}
+ */
+function relayableHeaders(headers, ctx) {
+  /** @type {Record<string, string>} */
+  const out = {};
+  for (const [key, value] of headers.entries()) {
+    if (CONNECTION_SPECIFIC_HEADERS.has(key) || key === CORRELATION_HEADER) continue;
+    if (key === 'content-encoding' || key === 'content-length') continue;
+    if (ctx.stripOverage === true && isOverageHeader(key)) continue;
+    out[key] = value;
+  }
+  return out;
+}
+
+/**
  * A GET the pooled token was not scoped for, sent once on the client's own
  * credential (the scope branch of forwardRequest). It takes the forward path's
  * transport, not relayStream's: the admission gate, the fleet upstream proxy,
@@ -4473,6 +4526,13 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // upstream's own 400, as the client would have had it from one account.
     if (reachable.length && reachable.every(a => accountManager.unavailableReason(a, ctx.model) === 'model-unsupported')) {
       return respondModelUnsupported(res, ctx, reachable);
+    }
+    // Every account that could take this request wants usage credits for its
+    // model family: refused it during this request, or is sitting the family
+    // out. No wait changes a plan, so the answer is upstream's own refusal.
+    if (reachable.length && reachable.every(a => ctx.creditsRefused?.has(a)
+        || accountManager.unavailableReason(a, ctx.model) === 'credits-required')) {
+      return respondCreditsRequired(res, ctx, reachable, accountManager);
     }
     // Every candidate was refused by upstream (403). Waiting will not help — the
     // account needs attention, not a retry — so say so plainly rather than
@@ -4845,7 +4905,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // one account each time, which bounds the re-selection. A pin re-enters
     // its own check and is refused there. And for an account another request
     // put in error meanwhile (an account refusal), pins excepted as above.
-    if (accountManager.capBars(account, ctx.model, ctx.advisorModel)
+    if (accountManager.capBars(account, ctx.model, ctx.advisorModel, { pinned: ctx.pinnedIndex != null })
         || (ctx.pinnedIndex == null && account.status === 'error')) {
       accountManager.release(account.index, { successful: false });
       ctx.tried.add(account);
@@ -4953,6 +5013,45 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // _selectProbe) clear its own hold and return the fleet to service.
     if (upstreamRes.status !== 429) accountManager.clearRateLimited(account.index);
 
+    // A plan that wants usage credits for this model's family (Fable on a plan
+    // that does not include it) refuses with a 429 that names no spent window
+    // and may say x-should-retry: false. The refusal is about this account and
+    // this family, not the request and not the account as a whole: another
+    // account serves the same request, and this one still serves the other
+    // families. So the account sits the family out (markFamilyRefused) and the
+    // request moves on, whatever the 429's headers would have done with it:
+    // relayed as a no-retry 429, paused and hopped once, or retried on the
+    // same account. When no account is left, the no-account branch gives the
+    // client this answer. A pinned request never moves: it goes straight there.
+    // Not when a shared window is spent: that 429 bars the whole account, and
+    // the quota path below holds it for that.
+    const accountWideRejected = ['5h', '7d'].some(w => rateLimitHeaders[`anthropic-ratelimit-unified-${w}-status`] === 'rejected')
+      || codexSpentWindows(rateLimitHeaders).some(isAccountWideCodexWindow);
+    if ([400, 402, 403, 429].includes(upstreamRes.status) && upstreamBody && !res.headersSent && !accountWideRejected
+        && isJsonContentType(upstreamRes.headers.get('content-type'))) {
+      const [peek, rest] = upstreamBody.tee();
+      upstreamBody = rest;
+      const peeked = await readErrorBody(peek);
+      const credits = creditsRequiredRefusal(upstreamRes.status, peeked);
+      if (credits && peeked) {
+        await rest.cancel();
+        const model = credits.model ?? ctx.model;
+        // Headers as upstream sent them: the answer can go to another client,
+        // whose own stripOverageHeaders applies when it is given (respondCreditsRequired).
+        const answer = { status: upstreamRes.status, headers: relayableHeaders(upstreamRes.headers, {}), body: peeked };
+        const until = accountManager.markFamilyRefused(account.index, model, { reason: credits.reason, detail: credits.detail, answer });
+        ctx.creditsRefusal = answer;
+        (ctx.creditsRefused ??= new Set()).add(account);
+        ctx.tried.add(account);
+        const family = familyLabel(modelFamily(model));
+        console.log(`[TeamClaude] ${upstreamRes.status} on "${safeLine(account.name, 64)}" — ${family} needs usage credits on this account (${credits.reason === 'allowance-spent' ? 'included allowance spent' : 'not in plan'})`
+          + `${until ? `; out of rotation for ${family} until ${new Date(until).toISOString()}` : ''}`
+          + (ctx.pinnedIndex == null ? ', switching account' : ', pinned: returning it to the client'));
+        if (clientGone(res)) { ctx.abandoned = true; return; }
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+      }
+    }
+
     // Other 429s retain their established classification: quota rejection
     // rotates, while a transient throttle pauses and retries.
     // An explicit no-retry response reaches the normal relay untouched instead.
@@ -4977,10 +5076,10 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // reason) and noise otherwise.
       let refusal = '';
       if (requestScoped) {
-        const raw = await readErrorBody(upstreamRes.body).catch(() => null);
+        const raw = await readErrorBody(upstreamBody).catch(() => null);
         try { refusal = raw ? String(JSON.parse(raw.toString('utf8'))?.error?.message || '') : ''; } catch { refusal = ''; }
       } else {
-        await upstreamRes.body?.cancel();
+        await upstreamBody?.cancel();
       }
 
       // Durable quota exhaustion vs. a transient rate limit. A "rejected" unified
@@ -5341,7 +5440,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // in. Skip the account for the rest of this request and fail over. With no
     // account left, the no-account branch reports a proxy error instead.
     if (upstreamRes.status === 403 && !res.headersSent) {
-      const responseBody = await readErrorBody(upstreamRes.body);
+      const responseBody = await readErrorBody(upstreamBody);
       // Except a scope 403: the account is fine, its token just cannot reach
       // this endpoint. A `claude setup-token` token is inference-only, so
       // Claude Code's bootstrap, settings and connector-registry calls draw one
@@ -5492,22 +5591,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // A request-specific refusal is an answer, not a starving session.
     const deliveredStatus = nonRetryable429 || answeredStatus(upstreamRes.status);
 
-    // Build response headers (skip the connection-specific and encoding
-    // headers). Most connection-specific names would make writeHead throw,
-    // behind the MITM's h2 server above all (see CONNECTION_SPECIFIC_HEADERS).
-    /** @type {Record<string, string>} */
-    const responseHeaders = {};
-    for (const [key, value] of upstreamRes.headers.entries()) {
-      if (CONNECTION_SPECIFIC_HEADERS.has(key)) continue;
-      // Ours, set before this head (see the listener): an upstream copy would win the merge.
-      if (key === CORRELATION_HEADER) continue;
-      // Strip content-encoding/content-length since fetch may auto-decompress
-      if (key === 'content-encoding' || key === 'content-length') continue;
-      // Per-org billing state, dropped when stripOverageHeaders is on (see
-      // isOverageHeader); updateQuota above already saw the full header set.
-      if (ctx.stripOverage === true && isOverageHeader(key)) continue;
-      responseHeaders[key] = value;
-    }
+    // Build response headers (see relayableHeaders). updateQuota above already
+    // saw the full header set.
+    const responseHeaders = relayableHeaders(upstreamRes.headers, ctx);
 
     // A headerless stream is told it is one (see `streamAssumed` above).
     if (streamAssumed) responseHeaders['content-type'] = contentType;
@@ -5620,6 +5706,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         && isCompletionPath(classificationPath(req.url))) {
       accountManager.clearEntitlementDenied(account, entitlementEpoch);
       accountManager.clearModelDenied(account, ctx.model, modelDenialEpoch);
+      accountManager.clearFamilyRefused(account, ctx.model);
     }
   } catch (err) {
     // Two of the things that can throw here are not upstream errors at all:
