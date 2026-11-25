@@ -9,6 +9,9 @@ import { barredFamilies } from '../src/tui.js';
 import { syncAccountsFromDisk } from '../src/sync-accounts.js';
 import { withEnv } from '../test-helpers/env.js';
 
+// Promise.withResolvers is Node 22+; CI still runs Node 20.
+const deferred = () => { let resolve, reject; const promise = new Promise((y, n) => { resolve = y; reject = n; }); return { promise, resolve, reject }; };
+
 // A plan that does not include Fable refuses it with a 429 that names no spent
 // window (captured from Claude Code 2.1.332, request id replaced). Another
 // account serves the same request, and this one still serves other models.
@@ -298,8 +301,8 @@ test('a served Fable request on the account clears its refusal', async () => {
 });
 
 test('a completion dispatched before the refusal does not clear its hold', async () => {
-  const sent = Promise.withResolvers();
-  const finish = Promise.withResolvers();
+  const sent = deferred();
+  const finish = deferred();
   let first = true;
   await withProxy({ refuses: async (token, model) => {
     if (token !== 'a' || model !== FABLE) return null;
@@ -402,7 +405,7 @@ test('retry-after uses the quota reset when the other account needs advisor cred
 });
 
 test('a stalled credits error body is cancelled at the body-idle deadline', { timeout: 5000 }, async () => {
-  const closed = Promise.withResolvers();
+  const closed = deferred();
   let stall = true;
   await withEnv({ TEAMCLAUDE_UPSTREAM_BODY_TIMEOUT_MS: 100 }, () => withProxy({
     names: ['a'], refuses: () => stall ? res => {
