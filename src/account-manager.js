@@ -3,7 +3,7 @@ import { refreshAccessToken, isTokenExpiringSoon, isTokenExpired, isRefreshRejec
 import { providerOf, DEFAULT_PROVIDER, isSubscriptionAccount, canServeProvider } from './provider.js';
 import { refreshCodexToken } from './codex-auth.js';
 import { parseCodexQuota, parseCodexPlanType, parseCodexActiveLimit } from './codex-quota.js';
-import { sameIdentity, sameOrg } from './identity.js';
+import { sameIdentity, sameOrg, distinctAccounts } from './identity.js';
 import { weeklyBucketForModel, familyLabel, modelGlobMatches, modelFamily, gatingUtilization, resolveMaxUsage, spendCapReached, resolveSwitchThreshold, sanitizeSwitchThreshold, WEEKLY_BUCKET_KEYS } from './model.js';
 import { SessionTracker } from './session-tracker.js';
 import { SessionPins, MAX_SESSION_PINS } from './session-pins.js';
@@ -1464,6 +1464,9 @@ export class AccountManager {
       const account = identities.get(ref.id);
       return account && providerOf(account) === ref.provider ? account.index : null;
     });
+    // Nothing survives the knob being off, as setExpiryRouting applies it.
+    const { enabled, preempt } = /** @type {{enabled: boolean, preempt: boolean}} */ (this.expiryRouting);
+    if (!enabled || !preempt) this.sessionTracker.clearObservations();
   }
 
   _affinityAccounts() {
@@ -6623,7 +6626,9 @@ export class AccountManager {
       // otherwise read as the soonest reset and hand a capped account the
       // request, clearing its throttle on the way. The probe skips these too.
       if (this.capBars(account, model, advisorModel)) continue;
-      const resetTime = account.rateLimitedUntil
+      // An active account is under no hold: a deadline left on one is a
+      // leftover, and its passing is no reset of anything.
+      const resetTime = (account.status !== 'active' ? account.rateLimitedUntil : null)
         || account.quota.unified5hReset
         || account.quota.unified7dReset
         || (account.quota.resetsAt ? new Date(account.quota.resetsAt).getTime() : null);
@@ -7898,7 +7903,14 @@ export class AccountManager {
     // refuses, the first request sent to it is refused again and fails over
     // (the account leaves rotation again), and until then status shows it
     // active, without the refusal.
-    if (account.status === 'error') account.status = 'active';
+    // The 429 hold the error replaced goes with it, as on re-enabling
+    // (setDisabled): nothing clears the hold of an account that is not
+    // `throttled`, and once lapsed it read as a quota reset in the
+    // all-unavailable revival (#760).
+    if (account.status === 'error') {
+      account.status = 'active';
+      account.rateLimitedUntil = null;
+    }
     console.log(`[TeamClaude] Updated tokens for account "${safeLine(account.name, 64)}"`);
     // What the account now holds, not what came in: the listener writes these
     // onto the account's config row, and a field left out would blank it there.
@@ -8034,19 +8046,27 @@ export class AccountManager {
       // The local credit ledger (api-credit.js), only on an account with a
       // credit setting: a fleet without one writes the file it always wrote.
       const credit = exportCreditState(a);
-      return { accountUuid: a.accountUuid, accountId: a.accountId, userId: a.userId, provider: providerOf(a), orgUuid: a.orgUuid, orgName: a.orgName, name: a.name, profile, quota, adaptive, outsideSpend, ...(credit ? { credit } : {}) };
+      return { id: a.id, accountUuid: a.accountUuid, accountId: a.accountId, userId: a.userId, provider: providerOf(a), orgUuid: a.orgUuid, orgName: a.orgName, name: a.name, profile, quota, adaptive, outsideSpend, ...(credit ? { credit } : {}) };
     });
   }
 
   /**
    * Restore quota learned in a previous run. Matches saved entries to accounts
-   * by identity. Stale windows are not special-cased here — _clearExpiredQuotas
-   * wipes any restored window whose reset time has already passed on first use.
+   * by entry id, else, for a row saved without one, by identity. Stale windows
+   * are not special-cased here — _clearExpiredQuotas wipes any restored window
+   * whose reset time has already passed on first use.
    */
   restoreQuotaState(saved) {
     if (!Array.isArray(saved)) return;
     for (const account of this.accounts) {
-      const match = saved.find(s => sameIdentity(s, account));
+      // The entry id first, as affinity restores, so a restored pin is read
+      // against the quota its own entry saved: a name changes with a relabel,
+      // and sameIdentity accepts a row with no organization for the same
+      // person's entry in another one.
+      // A row saved with an id restores onto no other entry: sameIdentity can
+      // match by name alone, and a new account can reuse a removed entry's name.
+      const match = saved.find(s => typeof s?.id === 'string' && s.id === account.id && !distinctAccounts(s, account))
+        ?? saved.find(s => !(typeof s?.id === 'string' && s.id) && sameIdentity(s, account));
       if (!match || !match.quota) continue;
       for (const f of PERSISTED_QUOTA_FIELDS) {
         if (match.quota[f] != null) account.quota[f] = match.quota[f];

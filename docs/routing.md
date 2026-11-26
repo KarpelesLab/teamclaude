@@ -278,12 +278,41 @@ Reload does not import an older snapshot. When off, startup ignores saved
 affinity and the next ordinary state save removes that section.
 
 The existing atomic, owner-only (`0600`) state file holds a versioned affinity
-section: opaque conversation keys, optional client-session/conversation ownership,
-last-use times, bucket pins naming stable account entry IDs and providers, and
-up to the newest 32 threaded-message IDs per conversation. At most 10,000
-conversations survive. No prompts, credentials, client/project labels, usage,
-open requests, counters or rollover observations enter this section. Operator
-`switch --session` pins remain runtime-only.
+section: opaque conversation keys, optional client-session/conversation
+ownership, last-use times, bucket pins naming stable account entry IDs and
+providers, and up to the newest 32 threaded-message IDs per conversation. At
+most 10,000 conversations survive. Beside them it holds the last ten minutes of
+routed requests as a count per account entry and minute. No prompts,
+credentials, client/project labels, usage, open requests or other counters enter
+this section. Operator `switch --session` pins remain runtime-only.
+
+With `expiryRouting.preempt` on, each pin also keeps the reading taken on its
+own account (the reset of every weekly window that account presented), so a
+window that rolled while the conversation was quiet still moves it once the
+restarted daemon knows the new reset, as an uninterrupted daemon does. A
+restored reading moves a pin only on a roll an uninterrupted daemon also
+detects. With `distributeSessions: "load"`, the recent request counts that break
+ties in the re-rank after that roll are saved by the minute and restored, so a
+restarted daemon decides that move as an uninterrupted daemon would, except
+where two accounts' recent counts differ by no more than the restored requests
+of the oldest saved minute: there the up-to-a-minute overcount can move a
+restored conversation that an uninterrupted daemon keeps. A
+restored request is counted as if sent at the end of its minute, for ten
+minutes from there, so up to a minute longer than the uninterrupted daemon
+counts it. A saved minute later than the clock at startup, as when the clock
+was stepped back, is counted from the startup time, for ten minutes. An
+uninterrupted daemon counts those requests longer, by up to the step plus a
+minute, and in that interval a restarted daemon can decide a request
+differently, including moving a conversation that an uninterrupted daemon
+keeps. Above `MAX_ROUTED` (50,000) requests in ten minutes, the restored
+ring can evict in a different order than the live one, by up to one minute's
+requests per account. A start with preemption
+off drops the readings. A roll held for an account a preemption pushed the
+conversation off is not kept, so after a restart such a conversation can stay
+on its pin where an uninterrupted daemon moves it, and, more rarely, move once
+where an uninterrupted daemon would have kept it. Nor is a reading on an
+account the conversation has not yet followed kept: a return there after a
+restart reads that account afresh.
 
 The same one-hour **sliding idle lifetime** applies across restarts. Restoring
 never refreshes it: a conversation active for days can survive, while one idle
@@ -292,7 +321,8 @@ for more than an hour is forgotten. A saved time later than the clock at startup
 time, so such a record still expires an hour later.
 
 A pin names its account by config entry ID and provider, so reordering or
-renaming accounts between starts changes nothing. A pin whose account was
+renaming accounts between starts changes a decision only where two accounts tie
+exactly on every ranking key and config order breaks the tie. A pin whose account was
 removed, or whose entry now belongs to another provider, is dropped. A pin on a
 disabled account is saved and restored like any other and stays unused until the
 account is enabled; it is replaced if its conversation is routed elsewhere in
@@ -300,18 +330,26 @@ the meantime. If two running accounts ever carry the same entry ID, neither is
 saved or restored as a pin target. Config loading already gives the later of two
 rows sharing an ID a new one, so a row copied by hand above its original keeps
 the ID and inherits the original's saved pins; the cost is one cache miss per
-affected conversation. Current model, provider, route, quota and hard-pin checks
-still govern every request. Thread ownership can survive a dropped pin, but does
-not make another account capable of continuing the upstream thread.
+affected conversation. Saved request counts name accounts the same way, so they
+return to the account that carried them, and a removed account's are dropped.
+Current model, provider, route, quota and hard-pin checks still govern every
+request. Thread ownership can survive a dropped pin, but does not make another
+account capable of continuing the upstream thread.
 
 A conversation with a request in flight at save time is saved as seen at that
-moment. Request counters are not stored and the stream is not resumed.
+moment. Its in-flight count is not stored and the stream is not resumed.
 
 State is saved on the existing minute tick and on graceful shutdown, including
 once more after an enabled drain completes. Abrupt termination can lose routing
-updates since the last completed save. Missing, corrupt or unrecognized affinity snapshots
-start empty. This retains routing knowledge; it cannot restore an expired
-upstream cache or resume an interrupted stream.
+updates since the last completed save. A pin then restores with the reading
+taken at that save, so if its account rolled and the conversation moved off it
+and back inside that interval, the restarted daemon can move it again where the
+uninterrupted one kept it. Requests routed after that save are not counted.
+Missing, corrupt or unrecognized affinity snapshots start empty. A snapshot an
+older TeamClaude wrote restores its pins without readings and with no request
+counts, a malformed reading is dropped and its pin kept, and a malformed request
+count is dropped alone. This retains routing knowledge; it cannot restore an
+expired upstream cache or resume an interrupted stream.
 
 ### Adaptive distribution
 
@@ -390,7 +428,7 @@ With `"fiveHourSoftMargin": 0.15` in `adaptiveDistribution` (`0`, off, by defaul
 
 The even mode counts conversations, and conversations are not interchangeable: an agent lane in a build-and-test loop sends a request every few seconds, an interactive session sends one a minute. On a pool of 14 Codex accounts with 24 even-placed sessions, one account was measured serving 31% of the requests and six were serving none. The `load` mode places each **new** conversation on the eligible account that served the **fewest requests in the last ten minutes** (`LOAD_WINDOW_MS`), then falls through to the even keys (fewest active conversations, fewest in-flight, expiry pressure, soonest reset) as tie-breaks. The conversation is then pinned exactly as in the other modes, so prompt caching is unaffected; only placement changes.
 
-The count is of requests the proxy forwarded, kept in a bounded ring per account and pruned on read, so it needs no probe and no persisted state; switching into `load` from another mode starts from the traffic of the last ten minutes. `teamclaude status` reports it per account as `recentRequests`. Like the even mode, `load` only moves traffic by placing new conversations: an existing skew drains as long-lived conversations end and are replaced.
+The count is of requests the proxy forwarded, kept in a bounded ring per account and pruned on read, so it needs no probe; with `persistSessionAffinity` on, the window is saved and restored across a restart, with expiry routing off too. Switching into `load` from another mode starts from the traffic of the last ten minutes. `teamclaude status` reports it per account as `recentRequests`. Like the even mode, `load` only moves traffic by placing new conversations: an existing skew drains as long-lived conversations end and are replaced.
 
 ## Expiry-pressure routing
 
