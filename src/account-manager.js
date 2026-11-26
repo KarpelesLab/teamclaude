@@ -2,7 +2,7 @@ import { refreshAccessToken, isTokenExpiringSoon, isTokenExpired, isRefreshRejec
 import { providerOf, DEFAULT_PROVIDER, isSubscriptionAccount, canServeProvider } from './provider.js';
 import { refreshCodexToken } from './codex-auth.js';
 import { parseCodexQuota, parseCodexPlanType, parseCodexActiveLimit } from './codex-quota.js';
-import { sameIdentity, sameOrg } from './identity.js';
+import { sameIdentity, sameOrg, distinctAccounts } from './identity.js';
 import { weeklyBucketForModel, modelGlobMatches, modelFamily, gatingUtilization, resolveMaxUsage, spendCapReached, resolveSwitchThreshold, sanitizeSwitchThreshold, WEEKLY_BUCKET_KEYS } from './model.js';
 import { SessionTracker } from './session-tracker.js';
 import { SessionPins, MAX_SESSION_PINS } from './session-pins.js';
@@ -1178,12 +1178,8 @@ export class AccountManager {
 
     // …and on top of it, the family bucket that meters THIS model, when the
     // family has one. A Fable cap stops Fable and leaves Opus alone.
-    const familyKey = this._weeklyBucketFor(model);
-    if (familyKey !== 'unified7d') {
-      const familyCap = this.capFor(familyKey, account);
-      const familyVal = q[familyKey];
-      if (this._atCap(familyCap, familyVal)) return familyKey;
-    }
+    const family = this._familyCapBucket(account, model);
+    if (family) return family;
 
     const tokensCap = this.capFor('tokens', account);
     if (tokensCap != null && q.tokensLimit != null && q.tokensRemaining != null
@@ -1286,14 +1282,22 @@ export class AccountManager {
       if (this._familySpendCapBinds(account, model)) return 'spend';
     }
     if (account?.maxUsage == null) return null;
-    const key = this._weeklyBucketFor(model);
-    if (key === 'unified7d') return null;
     // As in capExceeded: _withoutAdvisorCapped asks before expired windows are
     // cleared, and a window that has reset is never capped on the old reading.
     this._clearExpiredQuotas(account);
-    const cap = this.capFor(key, account);
-    const val = account.quota[key];
-    return this._atCap(cap, val) ? key : null;
+    return this._familyCapBucket(account, model);
+  }
+
+  /** The family weekly bucket metering `model` that is at its cap, or null:
+   * the family's dedicated bucket, or without one the learned scoped weekly
+   * for the family against the weekly cap, as _governingWeekly reads them.
+   * @param {Record<string, any>} account
+   * @param {string|null} model */
+  _familyCapBucket(account, model) {
+    const key = this._weeklyBucketFor(model);
+    if (key !== 'unified7d') return this._atCap(this.capFor(key, account), account.quota[key]) ? key : null;
+    const scoped = this._scopedWeekly(account, model)?.utilization;
+    return scoped != null && this._atCap(this.capFor('unified7d', account), scoped) ? 'scopedWeekly' : null;
   }
 
   /**
@@ -1388,6 +1392,9 @@ export class AccountManager {
       const account = identities.get(ref.id);
       return account && providerOf(account) === ref.provider ? account.index : null;
     });
+    // Nothing survives the knob being off, as setExpiryRouting applies it.
+    const { enabled, preempt } = /** @type {{enabled: boolean, preempt: boolean}} */ (this.expiryRouting);
+    if (!enabled || !preempt) this.sessionTracker.clearObservations();
   }
 
   _affinityAccounts() {
@@ -5168,6 +5175,13 @@ export class AccountManager {
       if (obs.idx == null) {
         const back = findHeld(obs.unescaped, h => h.idx === account.index);
         if (back) {
+          // Both kinds are handed back alike; the switch makes a new kind fail the typecheck here.
+          switch (back.kind) {
+            case 'preemption':
+            case 'hand-back':
+              break;
+            default: assertNever(back, '_restOn');
+          }
           this._moveObs(obs, account.index);
           obs.windows = back.windows;
           obs.handedBack = new Map(Object.entries(this._accountWindows(account)));
@@ -5190,7 +5204,7 @@ export class AccountManager {
       // push takes the stamp of the move that escaped the roll, and only a stay
       // under that stamp releases it. At most one roll per account, the newest:
       // a later escape was read after the earlier one's window had rolled.
-      if (owed) obs.unescaped = { ...owed, gen: obs.gen, prev: dropHeld(obs.unescaped, owed.idx) };
+      if (owed) obs.unescaped = { kind: 'preemption', ...owed, gen: obs.gen, prev: dropHeld(obs.unescaped, owed.idx) };
       // Established whole, from every window the account presents, so a window
       // that comes back is a first sight rather than a stale value read as a jump.
       obs.windows = new Map(Object.entries(this._accountWindows(account)));
@@ -5245,6 +5259,13 @@ export class AccountManager {
       // at a null index for _anyJumped to have rolled.
       const owed = findHeld(obs.unescaped, h => h.idx === account.index);
       if (owed) {
+        // Both kinds are handed back alike; the switch makes a new kind fail the typecheck here.
+        switch (owed.kind) {
+          case 'preemption':
+          case 'hand-back':
+            break;
+          default: assertNever(owed, '_firstSightOn');
+        }
         // The account the hand-back LEAVES may have rolled under the traffic that
         // rested on it, and the restore below replaces its reading. That roll is
         // an escape like any other, so it is chained rather than discarded.
@@ -5267,7 +5288,7 @@ export class AccountManager {
         // served at the account it returns to is no evidence about the one it
         // left. Only a stay served on that account releases it, or a return that
         // restores it, which is matched on index and needs no stamp.
-        if (displaced) obs.unescaped = { ...displaced, gen: null, prev: dropHeld(obs.unescaped, displaced.idx) };
+        if (displaced) obs.unescaped = { kind: 'hand-back', ...displaced, prev: dropHeld(obs.unescaped, displaced.idx) };
         return;
       }
       if (this._anyJumped(obs.windows, this.accounts[obs.idx])) return;
@@ -5367,7 +5388,13 @@ export class AccountManager {
   _releaseHeld(obs, account, carried, provider) {
     if (!obs || carried == null) return;
     if (obs.idx !== account.index || obs.gen !== carried) return;
-    const owed = findHeld(obs.unescaped, h => h.gen === carried);
+    const owed = findHeld(obs.unescaped, h => {
+      switch (h.kind) {
+        case 'preemption': return h.gen === carried;
+        case 'hand-back': return false;
+        default: return assertNever(h, '_releaseHeld');
+      }
+    });
     // A serve settles a roll held against the very account it was served at,
     // whatever move stamped it: a borrowed walk can leave the reading resting on
     // an account the chain still owes without any move of ours, and being served
@@ -7093,7 +7120,10 @@ export class AccountManager {
     // than merged: a bucket that has dropped out of the payload no longer
     // applies, and keeping a remembered copy would gate on a limit that upstream
     // has stopped reporting.
-    if (usage.scopedWeekly) {
+    // A payload that did not enumerate the caps (a skip_spend reset-status
+    // read without `limits`) proves nothing about them, as for the families
+    // above, and leaves the map alone.
+    if (usage.scopedWeekly && (usage.scopedWeeklyListed !== false || Object.keys(usage.scopedWeekly).length > 0)) {
       q.scopedWeekly = { ...usage.scopedWeekly };
       for (const [family, bucket] of Object.entries(usage.scopedWeekly)) {
         if (bucket?.utilization != null) observed.add(`scoped:${family}`);
@@ -7780,7 +7810,7 @@ export class AccountManager {
       // away is the only one whose roll the removal settles, so what it was
       // holding for the others moves onto a fresh reading. That reading names no
       // account and has no windows, which is evidence about nobody, while every
-      // hold under it keeps its own stamp and gen.
+      // hold under it keeps its fleet and, on a preemption, its gen.
       const held = remapHeld(this._currentObs.unescaped, remap);
       this._currentObs = moved != null
         ? { ...this._currentObs, idx: moved, unescaped: held }
@@ -7828,19 +7858,27 @@ export class AccountManager {
       // The local credit ledger (api-credit.js), only on an account with a
       // credit setting: a fleet without one writes the file it always wrote.
       const credit = exportCreditState(a);
-      return { accountUuid: a.accountUuid, accountId: a.accountId, userId: a.userId, provider: providerOf(a), orgUuid: a.orgUuid, orgName: a.orgName, name: a.name, profile, quota, adaptive, outsideSpend, ...(credit ? { credit } : {}) };
+      return { id: a.id, accountUuid: a.accountUuid, accountId: a.accountId, userId: a.userId, provider: providerOf(a), orgUuid: a.orgUuid, orgName: a.orgName, name: a.name, profile, quota, adaptive, outsideSpend, ...(credit ? { credit } : {}) };
     });
   }
 
   /**
    * Restore quota learned in a previous run. Matches saved entries to accounts
-   * by identity. Stale windows are not special-cased here — _clearExpiredQuotas
-   * wipes any restored window whose reset time has already passed on first use.
+   * by entry id, else, for a row saved without one, by identity. Stale windows
+   * are not special-cased here — _clearExpiredQuotas wipes any restored window
+   * whose reset time has already passed on first use.
    */
   restoreQuotaState(saved) {
     if (!Array.isArray(saved)) return;
     for (const account of this.accounts) {
-      const match = saved.find(s => sameIdentity(s, account));
+      // The entry id first, as affinity restores, so a restored pin is read
+      // against the quota its own entry saved: a name changes with a relabel,
+      // and sameIdentity accepts a row with no organization for the same
+      // person's entry in another one.
+      // A row saved with an id restores onto no other entry: sameIdentity can
+      // match by name alone, and a new account can reuse a removed entry's name.
+      const match = saved.find(s => typeof s?.id === 'string' && s.id === account.id && !distinctAccounts(s, account))
+        ?? saved.find(s => !(typeof s?.id === 'string' && s.id) && sameIdentity(s, account));
       if (!match || !match.quota) continue;
       for (const f of PERSISTED_QUOTA_FIELDS) {
         if (match.quota[f] != null) account.quota[f] = match.quota[f];
