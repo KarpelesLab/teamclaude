@@ -228,5 +228,5 @@ export function limitCost(model, usage) {
   const usd = priced.ok
     ? priced.costMinor / 100
     : tokenUsd(tokenCounts(u), MAX_PRICE) * (u.inference_geo === 'us' ? US_GEO_MULTIPLIER : 1) + searchUsd(u);
-  return { micro: Math.round(usd * 1_000_000), unpriced: priced.ok ? null : { model: priced.model, reason: priced.reason } };
+  return { micro: Math.round(usd * 1_000_000), unpriced: 'reason' in priced ? { model: priced.model, reason: priced.reason } : null };
 }
