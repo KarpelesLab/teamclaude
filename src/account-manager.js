@@ -1288,6 +1288,9 @@ export class AccountManager {
     if (account?.maxUsage == null) return null;
     const key = this._weeklyBucketFor(model);
     if (key === 'unified7d') return null;
+    // As in capExceeded: _withoutAdvisorCapped asks before expired windows are
+    // cleared, and a window that has reset is never capped on the old reading.
+    this._clearExpiredQuotas(account);
     const cap = this.capFor(key, account);
     const val = account.quota[key];
     return this._atCap(cap, val) ? key : null;
