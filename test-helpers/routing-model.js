@@ -1594,10 +1594,9 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
       if (tagged) am.beginSession(c);
       let revived = false;
       if (conv && now - conv.lastSeen > KNOWN_TTL) {
-        // Forgotten per the docs. The manager drops the record only once
-        // something sweeps or reads it, so its own next request can bring the
-        // old pins back; the model follows the manager so that later steps are
-        // judged on the state that is really there.
+        // Forgotten per the docs. Where the manager still holds its pins, the
+        // model follows the manager so that later steps are judged on the
+        // state that is really there, and G1 reports it.
         if (am.sessionTracker.pinnedAccounts(c).length) revived = true;
         else { convs.delete(c); conv = undefined; }
       }

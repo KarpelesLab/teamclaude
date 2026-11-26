@@ -666,8 +666,8 @@ const UNTAKEN = [
   'RO-knob-on', 'RO-route-pin', 'RO-extra-usage', 'PIN-remove-held', 'PIN-release', 'DR-keep', 'DR-roll-preempt',
   'DR-roll-nopreempt', 'CU-borrow', 'RC-sooner', 'RC-several', 'RC-third-move',
   // Not credited from random events. RC-fivehour: a conversation idle past
-  // an hour, which the docs say is forgotten and the code keeps (G1), passes
-  // for one reclaimed onto A that waited out A's 5-hour window.
+  // an hour and placed afresh on A passes for one reclaimed onto A that waited
+  // out A's 5-hour window.
   // PIN-restart-persist: U5 compares only the restored pins, not the held roll
   // a restart drops.
   'RC-fivehour', 'PIN-restart-persist',
@@ -675,8 +675,8 @@ const UNTAKEN = [
   'RO-pressure-dest', 'RO-two-preempts', 'RO-left-by-handback', 'RO-stay-on-owed', 'RO-first-arrival', 'PIN-restart-idle', 'RA-window',
   // Driven, but at 16 seeds the invariant that judges the outcome never
   // returns true there: G6 counts the docs' outcome as a gap, O1 does not
-  // judge the stay after a second move, and G1 never sees a revived
-  // conversation without its pins.
+  // judge the stay after a second move, and G1 credits PIN-idle only on a
+  // conversation that comes back after an hour idle, which none does.
   'RO-other-window', 'RO-handback-once', 'PIN-idle',
 ];
 const rolloverReachable = ROLLOVER.filter(r => r.reachable === true);
@@ -742,41 +742,39 @@ test('every invariant holds in a row and is applied there', { skip: ONLY_ROW || 
   assert.deepEqual(thin, [], `below the per-run floor:\n${thin.join('\n')}`);
 });
 
+test('G1: a conversation idle past the known window is forgotten (matrix)', () => {
+  const g = /** @type {{ count: number, first: string|null }} */ (gaps.get('G1'));
+  assert.equal(g.count, 0, `${g.count} revivals; first:\n${g.first}`);
+});
+
+test('G1: a conversation idle past the known window is forgotten (two accounts)', t => {
+  hermetic(t);
+  const start = Date.UTC(2030, 2, 10, 12);
+  const acct = (/** @type {string} */ id, /** @type {number} */ u7d) => ({
+    id, priority: 0, org: 'org-1', maxUsage: null, endsAt: null, hidden7d: false, clockless7d: false, clocklessF: false,
+    u5h: 0.1, r5h: start + 4 * H, u7d, r7d: start + 100 * H, F: null, FR: null,
+  });
+  // `c` is placed on `a`, whose week resets first, and `a` is then cordoned.
+  // After 61 quiet minutes `c` is a new conversation by the docs, and a
+  // cordoned account takes no new conversation; only its own request comes
+  // in, so nothing has swept the record first.
+  const history = {
+    seed: 0, start, fableRoute: null, accounts: [{ ...acct('a', 0.2), r7d: start + 50 * H }, acct('b', 0.2)],
+    steps: [
+      { at: start + MIN, op: 'request', c: 'c', model: OPUS },
+      { at: start + 2 * MIN, op: 'fault', id: 'a', kind: 'cordon' },
+      { at: start + 62 * MIN, op: 'request', c: 'c', model: OPUS },
+    ],
+  };
+  const row = toRow({ ...base, dist: 'even' });
+  const [first, second] = play({ AccountManager, validateAdaptiveConfig, t, history, row });
+  assert.equal(first.d, 'a', 'c is placed on a');
+  assert.equal(second.d, 'b', `c came back on its cordoned old pin ${second.d}`);
+});
+
 // The behaviors below contradict the docs on the current code. Each is
 // a todo test that asserts what the docs say; once the code matches, dropping
 // `todo` turns it into a regular invariant.
-
-test('G1: a conversation idle past the known window is forgotten (matrix)',
-  { todo: 'docs/routing.md:232 says a conversation is forgotten after an hour idle; its own next request revives its pins' }, () => {
-    const g = /** @type {{ count: number, first: string|null }} */ (gaps.get('G1'));
-    assert.equal(g.count, 0, `${g.count} revivals; first:\n${g.first}`);
-  });
-
-test('G1: a conversation idle past the known window is forgotten (two accounts)',
-  { todo: 'docs/routing.md:409 says a conversation idle past the known window is forgotten' }, t => {
-    hermetic(t);
-    const start = Date.UTC(2030, 2, 10, 12);
-    const acct = (/** @type {string} */ id, /** @type {number} */ u7d) => ({
-      id, priority: 0, org: 'org-1', maxUsage: null, endsAt: null, hidden7d: false, clockless7d: false, clocklessF: false,
-      u5h: 0.1, r5h: start + 4 * H, u7d, r7d: start + 100 * H, F: null, FR: null,
-    });
-    // `c` is placed on `a`, whose week resets first, and `a` is then cordoned.
-    // After 61 quiet minutes `c` is a new conversation by the docs, and a
-    // cordoned account takes no new conversation; only its own request comes
-    // in, so nothing has swept the record first.
-    const history = {
-      seed: 0, start, fableRoute: null, accounts: [{ ...acct('a', 0.2), r7d: start + 50 * H }, acct('b', 0.2)],
-      steps: [
-        { at: start + MIN, op: 'request', c: 'c', model: OPUS },
-        { at: start + 2 * MIN, op: 'fault', id: 'a', kind: 'cordon' },
-        { at: start + 62 * MIN, op: 'request', c: 'c', model: OPUS },
-      ],
-    };
-    const row = toRow({ ...base, dist: 'even' });
-    const [first, second] = play({ AccountManager, validateAdaptiveConfig, t, history, row });
-    assert.equal(first.d, 'a', 'c is placed on a');
-    assert.equal(second.d, 'b', `c came back on its cordoned old pin ${second.d}`);
-  });
 
 test('G2: a pin moves at most once per rollover (matrix)',
   { todo: 'docs/routing.md:409 says at most one cache-miss turn per pin per rollover; a hand-back can move a pin twice on one roll' }, () => {
