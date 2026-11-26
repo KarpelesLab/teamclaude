@@ -951,8 +951,8 @@ export function catalog() {
       },
     },
     {
-      id: 'G1', doc: 'docs/routing.md:232',
-      gap: 'docs/routing.md:232 says a conversation is forgotten after an hour idle, with its pins',
+      id: 'G1', doc: 'docs/routing.md:240',
+      gap: 'docs/routing.md:240 says a conversation is forgotten after an hour idle, with its pins',
       // Pins decide routing only under distribution.
       holds: distOn,
       check: request((ctx, v) => {
