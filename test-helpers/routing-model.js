@@ -1814,13 +1814,32 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
       pausedUntil = new Map();
       requalify = new Set();
       probing = new Set(h.accounts.filter(a => !gone.has(a.id)).map(a => a.id));
-      // The load ring is not saved.
-      for (const v of routed.values()) v.length = 0;
-      if (!row.persist && !driver.restoreAlways) convs = new Map();
+      const restored = row.persist || driver.restoreAlways;
+      // The load ring is saved by the minute (docs/routing.md:285): a request
+      // comes back at the end of its minute, or at startup if that is later.
+      for (const [id, v] of routed) {
+        const kept = restored && !gone.has(id)
+          ? v.filter(at => now - at <= LOAD_WINDOW).map(at => Math.min((Math.floor(at / MIN) + 1) * MIN - 1, now)) : [];
+        v.length = 0;
+        v.push(...kept);
+      }
+      if (!restored) convs = new Map();
       else {
         for (const [k, v] of convs) {
-          if (now - v.lastSeen > KNOWN_TTL) convs.delete(k);
-          else v.obs = new Map();
+          if (now - v.lastSeen > KNOWN_TTL) { convs.delete(k); continue; }
+          // Under preemption a pin keeps the reading on its own account, with
+          // its hand-back windows; held rolls and readings on other accounts
+          // are dropped (docs/routing.md:289).
+          /** @type {Map<string, Obs>} */
+          const kept = new Map();
+          if (preempting) {
+            for (const [b, o] of v.obs) {
+              if (o.on == null || o.on !== v.pins.get(b) || gone.has(o.on)) continue;
+              kept.set(b, { ...newObs(), on: o.on, windows: new Map(o.windows), stale: new Set(o.stale), uncertain: o.uncertain,
+                handed: o.handed && new Map(o.handed) });
+            }
+          }
+          v.obs = kept;
         }
       }
     }
