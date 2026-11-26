@@ -545,7 +545,7 @@ Both endpoints are refused with `403` for a caller holding a [client key](config
 
 ## Pin a session to one account
 
-`TC_ACCT` forces every request onto **one** account, bypassing rotation (and never failing over to another, except along a [list of API-key accounts](#a-list-of-api-key-accounts) when billing refuses one). It works in **both** modes — MITM (the default) and `--no-mitm`:
+`TC_ACCT` forces every request onto **one** account, bypassing rotation (and never failing over to another, except along a [list of API-key accounts](#a-list-of-api-key-accounts) when billing refuses one, or a [list of subscriptions](#a-list-of-subscriptions) when one's quota is spent). It works in **both** modes — MITM (the default) and `--no-mitm`:
 
 ```bash
 # By email — what you'll normally use
@@ -581,11 +581,27 @@ TC_ACCT=credit-one,credit-two,credit-three teamclaude run
 
 The session is pinned to the first. When upstream billing refuses the account a request is on (no API credit left, see [Billing refusals](#billing-refusals)), that request goes to the next account in the list, and later requests pass over a listed account for as long as its billing cooldown lasts. The refusal arrives before the model runs and before anything reaches the client, so the request runs once, on the account that takes it. A listed account serves while it is disabled, as a pinned one does, so accounts kept out of rotation can be spent this way and no other.
 
-That is the only move. A rate limit, a `5xx`, a credential refusal or any other answer is handled as for a pin to one account; a response that has started reaching the client is never moved; and the list never moves a request to or from a subscription, whatever it names. A listed account at its usage cap, or of another provider, is passed over. When no listed account is left, the request ends as a pin to the last one tried does.
+That is the only move. A rate limit, a `5xx`, a credential refusal or any other answer is handled as for a pin to one account; a response that has started reaching the client is never moved; and the list never moves a request to or from a subscription, whatever it names (a list headed by a subscription is [a list of subscriptions](#a-list-of-subscriptions)). A listed account at its usage cap, or of another provider, is passed over. When no listed account is left, the request ends as a pin to the last one tried does.
 
 Every name has to match an account, or the pin is refused as an unknown one is. A value that matches as a whole is still that one account, so a display name with a comma in its org keeps working. Under MITM the list travels as the proxy URL's username (`http://credit-one,credit-two:<key>@127.0.0.1:3456`), under `--no-mitm` in the `/tc-acct/` prefix. The [session pin](#move-one-running-session) names one account.
 
 Each account is usually its own organization, and organizations share no prompt cache, so the first request of each conversation after a move writes its cached prefix again on the next account.
+
+### A list of subscriptions
+
+A list headed by a subscription names the subscriptions a session may use, in the order it should use them:
+
+```bash
+TC_ACCT=work-1,work-2,work-3 teamclaude run
+```
+
+Each request goes to the first listed subscription that can serve it under its [switch threshold](quota.md#switch-threshold). When none can, it goes to the first one held back by the threshold alone, since a pin may spend past the threshold up to [`maxUsage`](quota.md#per-account-usage-caps), as a pin to one account does. A request stays on the account chosen for it; a quota rejection (a `429` with a spent window) there, or a token that could not be renewed, has it chosen again by the same rule among the listed accounts it has not tried, and the rejection's hold keeps later requests off that account until it lifts. Requests return to an earlier account in the list as soon as it can serve again.
+
+So a session can be kept to the accounts that have something the others lack (one organization's access to a model or a feature, its data terms), and a per-account `switchThreshold` below 1 on those accounts leaves the rest of their quota to the sessions that name them: rotation stops at the threshold (bar the one revalidating request an exhausted fleet sends), the list spends on past it. Give it for every weekly bucket the session's models use (`unified7d`, `unified7dSonnet`, `unified7dFable`), since a family model is held to its own bucket's threshold.
+
+The list moves nowhere else. It never reaches an account it does not name, nor an API key it names. Only subscriptions of the first one's provider are used. A transient rate limit, a `5xx` or a response that has started reaching the client is handled as for a pin to one account. A listed subscription serves while disabled or cordoned and whatever routes say, as a pinned one does. One at its usage cap, with a spent window, held by a rate limit or refused upstream is passed over while another listed one can serve; when none can, the request goes to the first one it has not tried, as a pin to that account would. When every listed account has been tried, the request ends as a pin to the last one does.
+
+Before this, a list headed by a subscription pinned the session to that subscription alone. A one-name pin is unchanged, and so is a list headed by an API key.
 
 ### Move one running session
 

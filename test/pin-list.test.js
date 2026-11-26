@@ -9,7 +9,8 @@ import { createProxyRequestListener, createProxyServer, resolvePinList } from '.
 // billing refuses it (no API credit left), that request moves to the next
 // listed API-key account, and later requests skip a listed account while its
 // billing cooldown lasts. Nothing else moves along the list: not another
-// refusal, not a response that has started, never a subscription. A pin that
+// refusal, not a response that has started, never a subscription. A list
+// headed by a subscription is covered at the end of this file. A pin that
 // names one account behaves exactly as before. The CONNECT side of the pin is
 // in mitm-pin.test.js.
 
@@ -75,9 +76,9 @@ async function post(url, body = { model: 'claude-opus-5', max_tokens: 1, message
 
 // The listener a pinned MITM tunnel feeds, minus the TLS: createConnectHandler
 // hands it the CONNECT username as `forcedPin`, as here.
-async function withPin(accounts, pin, reply, run) {
+async function withPin(accounts, pin, reply, run, amOptions = {}) {
   await withUpstream(reply, async ({ seen, url }) => {
-    const am = new AccountManager(accounts, 0.98);
+    const am = new AccountManager(accounts, 0.98, amOptions);
     am._nextProbeAt = Date.now() + 60_000;
     const proxy = http.createServer(createProxyRequestListener({ accountManager: am, upstream: url, config: { upstream: url }, forcedPin: pin }));
     const port = await listen(proxy);
@@ -330,5 +331,151 @@ test('a list in the /tc-acct/ prefix moves on a billing refusal the same way', a
       proxy.closeAllConnections();
       await new Promise(resolve => proxy.close(resolve));
     }
+  });
+});
+
+// A list that names subscriptions of one provider is the same idea for quota
+// instead of credit: the request goes to the first listed subscription that
+// can serve it, preferring one under its switch threshold, and moves on when
+// upstream says a quota window is spent. Never to an account the list does not
+// name, and never to an API key it does name.
+
+const sub = (name, extra = {}) => ({
+  name, type: 'oauth', accessToken: `tok-${name}`, expiresAt: Date.now() + 3600_000, ...extra,
+});
+const QUOTA_SPENT = {
+  'retry-after': '3600',
+  'anthropic-ratelimit-unified-status': 'rejected',
+  'anthropic-ratelimit-unified-5h-status': 'rejected',
+  'anthropic-ratelimit-unified-5h-utilization': '1.0',
+};
+const RATE_LIMITED = { type: 'error', error: { type: 'rate_limit_error', message: 'rate limited' } };
+// `spent` names the subscriptions whose quota upstream rejects; every other
+// one is served, and the answer names its token.
+const quota = (spent) => (req, res) => {
+  const token = req.headers.authorization;
+  if (spent.has(token)) {
+    res.writeHead(429, { 'content-type': 'application/json', ...QUOTA_SPENT });
+    return res.end(JSON.stringify(RATE_LIMITED));
+  }
+  json(res, 200, { ok: true, key: token });
+};
+const weekly = (am, i, used) => Object.assign(am.accounts[i].quota, { unified7d: used, unified7dReset: Date.now() + 86_400_000 });
+
+test('a subscription list moves a quota-rejected request to the next listed subscription', async () => {
+  const spent = new Set(['Bearer tok-b']);
+  await withPin([sub('a'), sub('b'), sub('c')], 'b,c', quota(spent), async ({ am, seen, post }) => {
+    assert.deepEqual(await post(), served('Bearer tok-c'));
+    assert.deepEqual(seen, ['Bearer tok-b', 'Bearer tok-c']);
+    // b is held for its reset now, so the next request goes straight to c.
+    assert.deepEqual(await post(), served('Bearer tok-c'));
+    assert.deepEqual(seen.slice(2), ['Bearer tok-c']);
+    // Once b's window is back, it serves first again.
+    spent.delete('Bearer tok-b');
+    am.clearRateLimited(1);
+    Object.assign(am.accounts[1].quota, { unified5h: 0.1, unifiedStatus: 'allowed' });
+    assert.deepEqual(await post(), served('Bearer tok-b'));
+  });
+});
+
+test('a subscription list prefers the first listed account under its switch threshold', async () => {
+  await withPin([sub('a'), sub('b'), sub('c')], 'b,c', quota(new Set()), async ({ am, seen, post }) => {
+    weekly(am, 1, 0.99);
+    assert.deepEqual(await post(), served('Bearer tok-c'));
+    assert.deepEqual(seen, ['Bearer tok-c']);
+  });
+});
+
+// The threshold is a preference: when every listed account is past it, the
+// list still serves from the first one that has quota, as a one-name pin does,
+// and an unlisted account with room does not take it.
+test('a subscription list spends past the switch threshold before giving up, inside the list only', async () => {
+  await withPin([sub('a'), sub('b', { maxUsage: 0.9 }), sub('c'), sub('d')], 'b,c,d', quota(new Set()), async ({ am, seen, post }) => {
+    weekly(am, 1, 0.95);
+    weekly(am, 2, 0.99);
+    weekly(am, 3, 0.985);
+    // b is at its hard cap, c and d are only past the soft threshold.
+    assert.deepEqual(await post(), served('Bearer tok-c'));
+    assert.deepEqual(seen, ['Bearer tok-c']);
+  });
+});
+
+test('a subscription list that is spent ends as a pin does; an unlisted account is never used', async () => {
+  await withPin([sub('a'), sub('b'), sub('c')], 'b,c', quota(new Set(['Bearer tok-b', 'Bearer tok-c'])), async ({ seen, post }) => {
+    const { status } = await post();
+    assert.equal(status, 429);
+    assert.deepEqual(seen, ['Bearer tok-b', 'Bearer tok-c']);
+  });
+});
+
+// The accounts a list is for are often kept out of rotation; a listed one
+// serves while disabled or cordoned, as a one-name pin does.
+test('a subscription list serves listed accounts that rotation leaves alone', async () => {
+  await withPin([sub('a'), sub('b', { disabled: true }), sub('c', { cordoned: true })], 'b,c', quota(new Set(['Bearer tok-b'])), async ({ seen, post }) => {
+    assert.deepEqual(await post(), served('Bearer tok-c'));
+    assert.deepEqual(seen, ['Bearer tok-b', 'Bearer tok-c']);
+  });
+});
+
+test('a one-name subscription pin still never moves on a quota rejection', async () => {
+  await withPin([sub('a'), sub('b')], 'b', quota(new Set(['Bearer tok-b'])), async ({ seen, post }) => {
+    const { status } = await post();
+    assert.equal(status, 429);
+    assert.deepEqual(seen, ['Bearer tok-b']);
+  });
+});
+
+// A retry on the same account is not a reason to leave it: a transient 429
+// that also reports the account past its threshold is retried where it was, as
+// a pin to that account would, and the next listed one never sees it.
+test('a subscription list keeps a request on its account through a transient 429', async () => {
+  let throttled = 1;
+  await withPin([sub('a'), sub('b'), sub('c')], 'b,c', (req, res) => {
+    const token = req.headers.authorization;
+    if (token === 'Bearer tok-b' && throttled-- > 0) {
+      res.writeHead(429, {
+        'content-type': 'application/json', 'retry-after': '1',
+        'anthropic-ratelimit-unified-5h-status': 'allowed', 'anthropic-ratelimit-unified-5h-utilization': '0.99',
+      });
+      return res.end(JSON.stringify(RATE_LIMITED));
+    }
+    json(res, 200, { ok: true, key: token });
+  }, async ({ seen, post }) => {
+    await post();
+    assert.ok(!seen.includes('Bearer tok-c'), `sent to ${seen.join(', ')}`);
+    assert.equal(seen[0], 'Bearer tok-b');
+  });
+});
+
+// Past the threshold is spendable; a window that reads spent is not.
+test('a subscription list does not spend past the threshold on an account whose window is spent', async () => {
+  await withPin([sub('a'), sub('b'), sub('c')], 'b,c', quota(new Set()), async ({ am, seen, post }) => {
+    Object.assign(am.accounts[1].quota, { unified5h: 1, unified5hReset: Date.now() + 3600_000 });
+    weekly(am, 2, 0.99);
+    assert.deepEqual(await post(), served('Bearer tok-c'));
+    assert.deepEqual(seen, ['Bearer tok-c']);
+  });
+});
+
+test('a subscription list moves on from an account whose expired token could not be renewed', async () => {
+  const expired = { refreshToken: 'r', expiresAt: Date.now() - 1000 };
+  await withPin([sub('a'), sub('b', expired), sub('c')], 'b,c', quota(new Set()), async ({ seen, post }) => {
+    assert.deepEqual(await post(), served('Bearer tok-c'));
+    assert.deepEqual(seen, ['Bearer tok-c']);
+  }, { refreshFn: async () => { throw Object.assign(new Error('refresh 503'), { status: 503 }); } });
+});
+
+test('a subscription list moves on from an account removed while its token was renewed', async () => {
+  const box = {};
+  const expired = { refreshToken: 'r', expiresAt: Date.now() - 1000 };
+  await withPin([sub('a'), sub('b', expired), sub('c')], 'b,c', quota(new Set()), async ({ am, seen, post }) => {
+    box.am = am;
+    assert.deepEqual(await post(), served('Bearer tok-c'));
+    assert.deepEqual(seen, ['Bearer tok-c']);
+  }, {
+    refreshFn: async () => {
+      box.am.removeAccount(box.am.accounts.findIndex(a => a.name === 'b'));
+      return { accessToken: 'tok-b2', refreshToken: 'r2', expiresAt: Date.now() + 3600_000 };
+    },
   });
 });

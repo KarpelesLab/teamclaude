@@ -4330,11 +4330,14 @@ export class AccountManager {
    * @param {string|null} [model]
    * @param {string|null} [advisorModel]
    */
-  unavailableReason(account, model = null, advisorModel = null, { recheckFamily = false } = {}) {
+  unavailableReason(account, model = null, advisorModel = null, { recheckFamily = false, named = false } = {}) {
     if (!account) return 'error';
 
-    // Manually disabled accounts are skipped entirely until re-enabled.
-    if (account.disabled) return 'disabled';
+    // Manually disabled accounts are skipped entirely until re-enabled. With
+    // `named` (a pin names the account), this and the other placement rules an
+    // operator sets for rotation (routes, the cordon) are not asked, as a pin
+    // to one account does not ask them.
+    if (account.disabled && !named) return 'disabled';
 
     // An operator budget cap. Checked here, above every transient state, because
     // it is a decision rather than an estimate — and unlike the switch threshold
@@ -4406,7 +4409,7 @@ export class AccountManager {
     // an exclusive set of accounts; failing that, a per-account `models` claim
     // restricts an owned model to its owners. Either way an account not eligible
     // for this model is skipped so the request never lands somewhere it can't run.
-    if (model && !this._routeAllows(account, model)) return 'route';
+    if (model && !named && !this._routeAllows(account, model)) return 'route';
 
     // An advisor request additionally needs the account to serve the ADVISOR's
     // model: its family bucket must have headroom (the shared buckets were
@@ -4420,7 +4423,7 @@ export class AccountManager {
       if (advisorCap === 'spend') return 'spend-capped';
       if (advisorCap) return 'advisor-capped';
       if (this._modelWeeklyExhausted(account, advisorModel)) return 'advisor-quota';
-      if (!this._routeAllows(account, advisorModel)) return 'advisor-route';
+      if (!named && !this._routeAllows(account, advisorModel)) return 'advisor-route';
     }
 
     // The operator has cordoned it (accounts[].cordoned): no new conversation
@@ -4428,9 +4431,46 @@ export class AccountManager {
     // means the account could serve but for the cordon: a conversation already
     // on it is kept there on exactly that answer (_keepOnCordoned), while
     // every placement path reads it as unavailable, as it reads `disabled`.
-    if (account.cordoned) return 'cordoned';
+    if (account.cordoned && !named) return 'cordoned';
 
     return null;
+  }
+
+  /**
+   * Which of `accounts`, a pin's list of subscriptions in its order, a request
+   * goes to: the first that can serve it under its switch threshold, else the
+   * first held back by that threshold alone, which a pin may spend past up to
+   * its cap. Null when every one is barred by something harder (a cap, a
+   * rate-limit hold, a spent window, upstream's rejection, an error). The placement rules that
+   * a pin does not ask (disabled, cordoned, routes) are not asked here either.
+   * @param {Record<string, any>[]} accounts
+   * @param {string|null} [model]
+   * @param {string|null} [advisorModel]
+   */
+  pinListChoice(accounts, model = null, advisorModel = null) {
+    let past = null;
+    for (const account of accounts) {
+      const reason = this.unavailableReason(account, model, advisorModel, { named: true });
+      if (reason === null) return account;
+      // Past the threshold only: not a window that reads spent, and not one
+      // upstream has already rejected (`quota` is reported ahead of that).
+      if (reason === 'quota' && !past && !this._spentForPin(account, model)) past = account;
+    }
+    return past;
+  }
+
+  /**
+   * Whether a reading says `account` cannot serve `model` at all: its 5-hour
+   * window or the weekly that governs the model at 100%, or upstream's fresh
+   * `rejected` verdict.
+   * @param {Record<string, any>} account
+   * @param {string|null} [model]
+   */
+  _spentForPin(account, model = null) {
+    const q = account.quota;
+    return (q.unified5h != null && q.unified5h >= 1)
+      || (this._governingWeekly(account, model) ?? 0) >= 1
+      || q.unifiedStatus === 'rejected';
   }
 
   /**
