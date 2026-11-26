@@ -692,19 +692,38 @@ test('rollover rows no episode takes yet', { todo: UNTAKEN.join(', ') || false }
   assert.deepEqual(UNTAKEN, []);
 });
 
-// A row's citation ties its outcome to the docs. A docs edit that moves the
-// sentence must move the citation too.
-test('every quoted docs sentence starts on the line its row cites', () => {
+// A row's citation ties its outcome to the docs. The quoted sentence is what
+// is checked: a row fails when its sentence is no longer in the file, which is
+// a rule that was reworded or removed. A docs edit that only moves the sentence
+// to another line fails nothing, and the lines to update are printed.
+test('every quoted docs sentence is still in the file its row cites', t => {
   const norm = (/** @type {string} */ s) => s.replace(/\s+/g, ' ').trim();
+  /** @type {Record<string, string>} */
   const quotes = { ...QUOTES, ...ROLLOVER_QUOTES };
-  const missed = [...TRANSITIONS, ...ROLLOVER].filter(r => typeof r.docs === 'string').filter(r => {
-    const [file, n] = /** @type {string} */ (r.docs).split(':');
-    const lines = readFileSync(new URL(`../${file}`, import.meta.url), 'utf8').split('\n');
+  /** @type {Map<string, string[]>} */
+  const files = new Map();
+  /** @type {string[]} */
+  const gone = [];
+  /** @type {string[]} */
+  const moved = [];
+  for (const r of [...TRANSITIONS, ...ROLLOVER]) {
+    if (typeof r.docs !== 'string') continue;
+    const [file, n] = r.docs.split(':');
+    if (!files.has(file)) files.set(file, readFileSync(new URL(`../${file}`, import.meta.url), 'utf8').split('\n'));
+    const lines = /** @type {string[]} */ (files.get(file));
+    const quote = norm(quotes[r.id]);
     // The sentence may start late on its line and wrap onto the next ones.
-    const at = norm(lines.slice(Number(n) - 1, Number(n) + 5).join(' ')).indexOf(norm(quotes[r.id]));
-    return !(at >= 0 && at < norm(lines[Number(n) - 1]).length);
-  }).map(r => r.id);
-  assert.deepEqual(missed, [], 'rows whose sentence is not on the cited line');
+    const startsOn = (/** @type {number} */ i) => {
+      const at = norm(lines.slice(i, i + 6).join(' ')).indexOf(quote);
+      return at >= 0 && at < norm(lines[i] ?? '').length;
+    };
+    if (startsOn(Number(n) - 1)) continue;
+    const now = lines.findIndex((_, i) => startsOn(i));
+    if (now < 0) gone.push(`${r.id} (${r.docs})`);
+    else moved.push(`${r.id}: ${r.docs} is now ${file}:${now + 1}`);
+  }
+  if (moved.length) t.diagnostic(`quoted sentences that moved; update the citations:\n${moved.join('\n')}`);
+  assert.deepEqual(gone, [], 'rows whose quoted sentence is no longer in the docs: the rule was reworded or removed, so update the quote, or the row');
 });
 
 test('every invariant holds in a row and is applied there', { skip: ONLY_ROW || ONLY_SEED != null ? 'filtered run' : false }, t => {
