@@ -115,6 +115,19 @@ test('a model key nested in conversation content is never mistaken for the reque
 
 // ── configurable routes ───────────────────────────────────────
 
+test('modelGlobMatches gives the same answers past its cache bound', () => {
+  // More distinct globs than the cache keeps, each asked twice: once compiled,
+  // once from the cache or recompiled after it was emptied.
+  for (let pass = 0; pass < 2; pass++) {
+    for (let i = 0; i < 600; i++) {
+      assert.equal(modelGlobMatches(`model-${i}-*`, `model-${i}-x`), true);
+      assert.equal(modelGlobMatches(`model-${i}-*`, `model-${i + 1}-x`), false);
+    }
+  }
+  assert.ok(modelGlobMatches('*fable*', FABLE));
+  assert.ok(!modelGlobMatches('*fable*', OPUS));
+});
+
 test('modelGlobMatches supports * and is case-insensitive, literal otherwise', () => {
   assert.ok(modelGlobMatches('*fable*', FABLE));
   assert.ok(modelGlobMatches('claude-opus-*', OPUS));

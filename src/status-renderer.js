@@ -1,5 +1,5 @@
 import { formatMoney } from './oauth.js';
-import { findFamilyBlock, modelGlobOverlaps, gatingUtilization, resolveMaxUsage, resolveSwitchThreshold, resolveFleetThreshold, switchThresholdDiffs, resolveMaxSpendMinor, spendCapReached } from './model.js';
+import { findFamilyBlock, familyLabel, heldFamilyRefusals, modelGlobOverlaps, gatingUtilization, resolveMaxUsage, resolveSwitchThreshold, resolveFleetThreshold, switchThresholdDiffs, resolveMaxSpendMinor, spendCapReached } from './model.js';
 import { safeLine, sanitizeText } from './safe-text.js';
 import { isRefused } from './account-refusal.js';
 import { ROUTE_COLORS } from './config-ops.js';
@@ -92,6 +92,8 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
     if (denied) lines.push(`  ${denied}`);
     const unserved = modelDenialLine(account, now, paint);
     if (unserved) lines.push(`  ${unserved}`);
+    const credits = familyRefusalLine(account, now, paint);
+    if (credits) lines.push(`  ${credits}`);
     const login = loginExpiryLine(account, paint, now);
     if (login) lines.push(`  ${login}`);
     const token = longLivedLine(account, paint);
@@ -180,6 +182,7 @@ export const UNAVAILABLE_TEXT = {
   'spend-capped': 'extra-usage spend cap reached (maxSpend)',
   'advisor-capped': "advisor model's usage cap reached (maxUsage)",
   entitlement: 'upstream refused this account for the organization (cooldown)',
+  'credits-required': "the plan needs usage credits for this model's family (held, then re-checked)",
   routing: "the account's routing proxy is unreachable (cooldown)",
   billing: 'upstream billing refused usage (cooldown); check billing or purchase credits',
   credential: 'upstream rejected its API key with a 401 (cooldown, then retried)',
@@ -729,6 +732,24 @@ function modelDenialLine(account, now, paint) {
   return `${paint.dim('Models'.padEnd(8))} ${paint.yellow(`plan does not serve ${models.join(', ')}`)}`;
 }
 
+// A family the plan wants usage credits for bars only that family, so the
+// account still reads active above. The entry outlives its hold until a later
+// request for the family is served.
+/** @param {any} account @param {number} now @param {ReturnType<typeof colors>} paint */
+export function familyRefusalLine(account, now, paint) {
+  const refusals = Array.isArray(account?.familyRefusals) ? account.familyRefusals : [];
+  if (!refusals.length) return null;
+  const families = refusals.map((/** @type {any} */ r) => {
+    const until = parseTs(r?.until);
+    // The payload can come from another process: only a whole number is a count.
+    const count = Number.isSafeInteger(r?.count) ? r.count : 1;
+    const why = r?.reason === 'allowance-spent' ? 'included allowance spent' : 'not in plan';
+    const wait = until && until > now ? `re-check in ${formatDuration(until - now)}` : 're-checked on the next request';
+    return `${familyLabel(safeLine(r?.family ?? '', 16) || 'other')} ${why} (usage credits required; ${wait}${count > 1 ? `, ${count} in a row` : ''})`;
+  });
+  return `${paint.dim('Credits'.padEnd(8))} ${paint.yellow(families.join(', '))}`;
+}
+
 /**
  * @param {any} account
  * @param {any} paint
@@ -1144,7 +1165,12 @@ function modelRoutingLine(account, thresholdFor, blocked, now, paint) {
   const sharedOver = overThreshold(q.unified5h, 'unified5h') || overCap(q.unified5h, 'unified5h')
     || overCap(q.unified7d, 'unified7d');
 
+  const credits = heldFamilyRefusals(account.familyRefusals, now);
   const cell = (label, bucketKey, reset) => {
+    // A plan that wants usage credits for the family cannot serve it either.
+    if (credits.has(label.toLowerCase())) {
+      return `${label} ${paint.red('⊘')}${paint.dim(' needs credits')}`;
+    }
     // The blocklist outranks quota: a blocked family cannot be served however
     // much headroom the account has, so it must not read ✓. Reporting quota
     // alone is what made a fully-blocked model look available.

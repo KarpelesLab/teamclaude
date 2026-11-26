@@ -9,7 +9,7 @@
 // `oauth_not_allowed_for_organization` is not here: it has its own cooldown
 // (isOAuthEntitlementDenied in server.js).
 
-import { sanitizeText } from './safe-text.js';
+import { safeLine, sanitizeText } from './safe-text.js';
 
 /** The `error_code` values that refuse the account itself. */
 export const ACCOUNT_REFUSAL_CODES = new Set([
@@ -82,4 +82,41 @@ export function accountRefusal(status, body) {
     : null;
   if (!code) return null;
   return { code, message: sanitizeText(message) || code, link: messageLink(message) };
+}
+
+// A plan that does not include a model family answers a request for it with
+// `error_code: "credits_required"` ("Usage credits are required for this
+// model."), as a 429 with no rate-limit verdict. It is about this account and
+// this family: another account serves the same request, and this one still
+// serves the other families (AccountManager.markFamilyRefused).
+const CREDITS_REQUIRED_MESSAGE = 'Usage credits are required for this model.';
+
+/**
+ * The refusal in an upstream error body that says this account needs usage
+ * credits for a model family, 'request' for an unconfirmed or option-specific
+ * credits refusal, or null for an unrelated error.
+ * `reason` is 'allowance-spent' when upstream says the included allowance is
+ * used up, else 'not-in-plan'.
+ * @param {number} status
+ * @param {Uint8Array|null} body
+ * @returns {{ model: string|null, reason: 'not-in-plan'|'allowance-spent', detail: string }|'request'|null}
+ */
+export function creditsRequiredRefusal(status, body) {
+  if (![400, 402, 403, 429].includes(status) || !body) return null;
+  /** @type {any} */
+  let parsed;
+  try { parsed = JSON.parse(Buffer.from(body).toString('utf8')); } catch { return null; }
+  const error = parsed?.error;
+  const details = error?.details;
+  const message = typeof error?.message === 'string' ? error.message : '';
+  const model = typeof details?.model === 'string' && details.model.trim() ? details.model : null;
+  const exact = message === CREDITS_REQUIRED_MESSAGE;
+  if (details?.error_code !== 'credits_required') return exact ? 'request' : null;
+  // A named model alone does not distinguish a plan refusal from a paid option.
+  if (!/required for this model/i.test(message)) return 'request';
+  return {
+    model,
+    reason: details?.exhausted_included_allowance === true ? 'allowance-spent' : 'not-in-plan',
+    detail: safeLine(message, 200) || CREDITS_REQUIRED_MESSAGE,
+  };
 }
