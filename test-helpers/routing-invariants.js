@@ -962,8 +962,8 @@ export function catalog() {
       }),
     },
     {
-      // "A roll is handed back once, so two is the most": a second move is the
-      // hand-back, and no third move answers the same roll.
+      // "A roll is handed back once, so two is the most": no third move answers
+      // the same roll.
       id: 'O26', doc: 'docs/routing.md:455',
       holds: row => distOn(row) && row.expiry?.enabled === true && row.expiry.preempt !== false,
       check: request((ctx, v) => {

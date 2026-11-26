@@ -1815,7 +1815,7 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
       probing = new Set(h.accounts.filter(a => !gone.has(a.id)).map(a => a.id));
       const restored = row.persist || driver.restoreAlways;
       // The load ring is saved by the minute (docs/routing.md:285): a request
-      // comes back at the end of its minute, or at startup if that is later.
+      // comes back at the end of its minute or at startup, whichever is earlier.
       for (const [id, v] of routed) {
         const kept = restored && !gone.has(id)
           ? v.filter(at => now - at <= LOAD_WINDOW).map(at => Math.min((Math.floor(at / MIN) + 1) * MIN - 1, now)) : [];

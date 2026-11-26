@@ -675,9 +675,9 @@ const UNTAKEN = [
   'RO-pressure-dest', 'RO-two-preempts', 'RO-left-by-handback', 'RO-stay-on-owed', 'RO-first-arrival', 'PIN-restart-idle', 'RA-window',
   // Driven, but at 16 seeds the invariant that judges the outcome never
   // returns true there: G6 counts the docs' outcome as a gap, O1 does not
-  // judge the stay after a second move, and PIN-idle is credited only where
-  // the manager revives an expired conversation's pins, which it no longer
-  // does.
+  // judge the stay after a second move, and at any seed count PIN-idle is
+  // credited only where the manager revives an expired conversation's pins,
+  // which it does not.
   'RO-other-window', 'RO-handback-once', 'PIN-idle',
 ];
 const rolloverReachable = ROLLOVER.filter(r => r.reachable === true);
