@@ -6435,7 +6435,9 @@ export class AccountManager {
       // otherwise read as the soonest reset and hand a capped account the
       // request, clearing its throttle on the way. The probe skips these too.
       if (this.capBars(account, model, advisorModel)) continue;
-      const resetTime = account.rateLimitedUntil
+      // An active account is under no hold: a deadline left on one is a
+      // leftover, and its passing is no reset of anything.
+      const resetTime = (account.status !== 'active' ? account.rateLimitedUntil : null)
         || account.quota.unified5hReset
         || account.quota.unified7dReset
         || (account.quota.resetsAt ? new Date(account.quota.resetsAt).getTime() : null);
@@ -7685,7 +7687,14 @@ export class AccountManager {
     // refuses, the first request sent to it is refused again and fails over
     // (the account leaves rotation again), and until then status shows it
     // active, without the refusal.
-    if (account.status === 'error') account.status = 'active';
+    // The 429 hold the error replaced goes with it, as on re-enabling
+    // (setDisabled): nothing clears the hold of an account that is not
+    // `throttled`, and once lapsed it read as a quota reset in the
+    // all-unavailable revival (#760).
+    if (account.status === 'error') {
+      account.status = 'active';
+      account.rateLimitedUntil = null;
+    }
     console.log(`[TeamClaude] Updated tokens for account "${safeLine(account.name, 64)}"`);
     // What the account now holds, not what came in: the listener writes these
     // onto the account's config row, and a field left out would blank it there.
