@@ -1178,12 +1178,8 @@ export class AccountManager {
 
     // …and on top of it, the family bucket that meters THIS model, when the
     // family has one. A Fable cap stops Fable and leaves Opus alone.
-    const familyKey = this._weeklyBucketFor(model);
-    if (familyKey !== 'unified7d') {
-      const familyCap = this.capFor(familyKey, account);
-      const familyVal = q[familyKey];
-      if (this._atCap(familyCap, familyVal)) return familyKey;
-    }
+    const family = this._familyCapBucket(account, model);
+    if (family) return family;
 
     const tokensCap = this.capFor('tokens', account);
     if (tokensCap != null && q.tokensLimit != null && q.tokensRemaining != null
@@ -1286,14 +1282,22 @@ export class AccountManager {
       if (this._familySpendCapBinds(account, model)) return 'spend';
     }
     if (account?.maxUsage == null) return null;
-    const key = this._weeklyBucketFor(model);
-    if (key === 'unified7d') return null;
     // As in capExceeded: _withoutAdvisorCapped asks before expired windows are
     // cleared, and a window that has reset is never capped on the old reading.
     this._clearExpiredQuotas(account);
-    const cap = this.capFor(key, account);
-    const val = account.quota[key];
-    return this._atCap(cap, val) ? key : null;
+    return this._familyCapBucket(account, model);
+  }
+
+  /** The family weekly bucket metering `model` that is at its cap, or null:
+   * the family's dedicated bucket, or without one the learned scoped weekly
+   * for the family against the weekly cap, as _governingWeekly reads them.
+   * @param {Record<string, any>} account
+   * @param {string|null} model */
+  _familyCapBucket(account, model) {
+    const key = this._weeklyBucketFor(model);
+    if (key !== 'unified7d') return this._atCap(this.capFor(key, account), account.quota[key]) ? key : null;
+    const scoped = this._scopedWeekly(account, model)?.utilization;
+    return scoped != null && this._atCap(this.capFor('unified7d', account), scoped) ? 'scopedWeekly' : null;
   }
 
   /**
@@ -7111,7 +7115,10 @@ export class AccountManager {
     // than merged: a bucket that has dropped out of the payload no longer
     // applies, and keeping a remembered copy would gate on a limit that upstream
     // has stopped reporting.
-    if (usage.scopedWeekly) {
+    // A payload that did not enumerate the caps (a skip_spend reset-status
+    // read without `limits`) proves nothing about them, as for the families
+    // above, and leaves the map alone.
+    if (usage.scopedWeekly && (usage.scopedWeeklyListed !== false || Object.keys(usage.scopedWeekly).length > 0)) {
       q.scopedWeekly = { ...usage.scopedWeekly };
       for (const [family, bucket] of Object.entries(usage.scopedWeekly)) {
         if (bucket?.utilization != null) observed.add(`scoped:${family}`);
