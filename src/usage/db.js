@@ -66,11 +66,11 @@ const STATEMENTS = {
   insertDim: 'INSERT OR IGNORE INTO dim (kind, label) VALUES (?, ?)',
   selectDim: 'SELECT id FROM dim WHERE kind = ? AND label = ?',
   insertUsage: `INSERT INTO usage
-      (ts, caller_id, model_id, account_id, tokens, input, cache_read, cache_write, output, status)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      (ts, caller_id, model_id, account_id, tokens, input, cache_read, cache_write, output, status, cost_micro, capped)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   upsertHourly: `INSERT INTO usage_hourly
-      (caller_id, model_id, account_id, hour, req, tokens, input, cache_read, cache_write, output, refusals)
-    VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
+      (caller_id, model_id, account_id, hour, req, tokens, input, cache_read, cache_write, output, refusals, capped)
+    VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT (caller_id, model_id, account_id, hour) DO UPDATE SET
       req         = req + 1,
       tokens      = tokens + excluded.tokens,
@@ -78,9 +78,11 @@ const STATEMENTS = {
       cache_read  = cache_read + excluded.cache_read,
       cache_write = cache_write + excluded.cache_write,
       output      = output + excluded.output,
-      refusals    = refusals + excluded.refusals`,
+      refusals    = refusals + excluded.refusals,
+      capped      = capped + excluded.capped`,
   pruneUsage: 'DELETE FROM usage WHERE ts < ?',
   pruneHourly: 'DELETE FROM usage_hourly WHERE hour < ?',
+  weekSpend: 'SELECT caller_id, SUM(cost_micro) AS micro FROM usage WHERE ts >= ? AND ts < ? GROUP BY caller_id',
 };
 
 /**

@@ -109,6 +109,22 @@ test('a re-import puts the fresh token on the account its entry owns', async () 
   assert.equal(am.accounts[0].id, idBefore);
 });
 
+test('a re-import that changes the running plan clears its family hold', async () => {
+  const model = 'claude-fable-5-2';
+  const { tui, am } = await makeTUI([
+    { name: 'user@example.com', type: 'oauth', accountUuid: 'uuid-a', accessToken: 't-a', rateLimitTier: 'old-tier' },
+  ]);
+  am.markFamilyRefused(0, model);
+  assert.equal(am.unavailableReason(am.accounts[0], model), 'credits-required');
+  tui._readCredentials = async () => ({ accessToken: 't-a-fresh', refreshToken: 'r-a-fresh', expiresAt: Date.now() + 3600_000 });
+  tui._readProfile = async () => ({ accountUuid: 'uuid-a', email: 'user@example.com', rateLimitTier: 'new-tier' });
+
+  await tui._doImport();
+
+  assert.equal(am.accounts[0].rateLimitTier, 'new-tier');
+  assert.equal(am.unavailableReason(am.accounts[0], model), null);
+});
+
 test('a re-import onto a tokenless entry does not rewrite a live account', async () => {
   // The entry the import updates is the tokenless one: it matches the imported
   // profile by name, and having no accountUuid nothing contradicts that match.

@@ -273,7 +273,7 @@ At the cap, that account receives **nothing**:
 - a pinned request (`TC_ACCT`, `/tc-acct/<name>`) gets the exhausted answer rather than spending past the cap. A pin still never leaks to another account;
 - the paid fallback, and the last-resort revival of a throttled account when nothing is available, skip it too;
 - a request that waited in admission is checked again before it is sent, and moves elsewhere if a reading during the wait put the account at its cap;
-- an advisor request also checks the advisor model's own family cap on every one of these paths (under `advisorEligibility: "prefer"` the advisor is a preference, so only the executor's caps apply).
+- an advisor request also checks the advisor model's own family cap on every one of these paths. Under `advisorEligibility: "prefer"` the advisor is a preference: rotation and a failover hop still stay off an account at that cap while another account can serve the request, but when none can, or the request is pinned there, only the executor's caps apply and the advisor call can cross the cap ([advisor routing](routing.md#model-aware-routing)).
 
 A family reading (Fable, Sonnet) at or past the cap is kept until its window resets, or for a week when no reset time is known. An uncapped spent family reading is revalidated after 30 minutes instead, because only a request of that family can refresh it; for a capped one that request would go past the cap.
 
