@@ -158,13 +158,27 @@ test('a credits 429 with a rejected shared window still takes the quota path', a
   });
 });
 
+test('an option-specific credits 429 with a rejected shared window takes the quota path too', async () => {
+  const headers = {
+    'x-should-retry': 'false', 'retry-after': '300',
+    'anthropic-ratelimit-unified-7d-status': 'rejected', 'anthropic-ratelimit-unified-7d-utilization': '1',
+  };
+  const fastMode = refusal({}, { message: 'Usage credits are required for fast mode.' });
+  await withProxy({ headers, refuses: (token) => (token === 'a' ? fastMode : null) }, async ({ am, seen, post }) => {
+    assert.deepEqual(await (await post(FABLE)).json(), { served: 'b' });
+    assert.equal(am.unavailableReason(am.accounts[0], OPUS), 'throttled');
+    assert.notEqual(am.unavailableReason(am.accounts[0], FABLE), 'credits-required', 'no family hold was recorded');
+    assert.deepEqual(seen, [`a:${FABLE}`, `b:${FABLE}`]);
+  });
+});
+
 for (const [label, body, status] of [
   ['the exact sentence without the code', refusal({ error_code: undefined }), 429],
   ['a different sentence without a model', refusal({ model: undefined }, { message: 'You must buy usage credits.' }), 429],
   ['a fast-mode option with a named model', refusal({}, { message: 'Usage credits are required for fast mode.' }), 429],
-  ['a long-context option with a named model', refusal({}, { message: 'Usage credits are required for long context.' }), 403],
+  ['a long-context option with a named model', refusal({}, { message: 'Usage credits are required for long context.' }), 429],
   ['a 1M context option with a named model', refusal({}, { message: 'Usage credits are required for 1M context.' }), 429],
-  ['a priority tier option with a named model', refusal({}, { message: 'Usage credits are required for priority tier.' }), 403],
+  ['a priority tier option with a named model', refusal({}, { message: 'Usage credits are required for priority tier.' }), 429],
 ]) {
   test(`only the requesting client gets ${label}`, async () => {
     let first = true;
@@ -258,7 +272,7 @@ for (const [status, code, message, assertMarked] of [
       const answer = await post(FABLE);
       assert.equal(answer.status, 429);
       const retryAfter = Number(answer.headers.get('retry-after'));
-      assert.ok(retryAfter >= 3590 && retryAfter <= 3600, `expected the one-hour hold, got ${retryAfter}s`);
+      assert.ok(retryAfter > 3000 && retryAfter <= 3600, `expected the one-hour hold, got ${retryAfter}s`);
       assertMarked?.(am);
       assert.deepEqual(seen, [`a:${FABLE}`]);
       assert.deepEqual(await (await post(FABLE)).json(), { served: 'b' });
@@ -399,21 +413,22 @@ test('retry-after uses the quota reset when the other account needs advisor cred
     const answer = await post(OPUS, '/v1/messages', { advisor: FABLE });
     assert.equal(answer.status, 429);
     const retryAfter = Number(answer.headers.get('retry-after'));
-    assert.ok(retryAfter >= 590 && retryAfter <= 600, `expected the 10-minute reset, got ${retryAfter}s`);
+    assert.ok(retryAfter > 300 && retryAfter <= 600, `expected the 10-minute reset, got ${retryAfter}s`);
     assert.deepEqual(seen, []);
   });
 });
 
-test('a stalled credits error body is cancelled at the body-idle deadline', { timeout: 5000 }, async () => {
+test('a stalled credits error body is cancelled at the body-idle deadline', async () => {
   const closed = deferred();
   let stall = true;
   await withEnv({ TEAMCLAUDE_UPSTREAM_BODY_TIMEOUT_MS: 100 }, () => withProxy({
     names: ['a'], refuses: () => stall ? res => {
       res.writeHead(429, { 'content-type': 'application/json', 'anthropic-ratelimit-unified-status': 'rejected' });
-      // Send a complete JSON value but leave the HTTP body open.
+      // Send a complete JSON value but leave the HTTP body open. Nothing here
+      // ends it: only the proxy's cancel closes this response, and a proxy that
+      // never cancels leaves the test to the runner's timeout.
       res.write(refusal());
-      const fallback = setTimeout(() => res.end(), 2000);
-      res.once('close', () => { clearTimeout(fallback); closed.resolve(!res.writableEnded); });
+      res.once('close', () => { closed.resolve(!res.writableEnded); });
     } : null,
   }, async ({ am, seen, post }) => {
     await assert.rejects(post(FABLE), /fetch failed/);

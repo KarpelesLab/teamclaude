@@ -4995,9 +4995,19 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       const inspected = await holdBody(upstreamBody, ERROR_BODY_INSPECTION_LIMIT);
       const bytes = inspected.buf;
       const credits = creditsRequiredRefusal(status, bytes);
-      const sharedWindowRejected = status === 429 && ['5h', '7d'].some(w =>
+      // A 429 that reports a spent quota window is the account's verdict, and
+      // keeps the quota path below whatever its body says about credits: the
+      // window is recorded and the request rotates. These are the windows that
+      // path acts on (quotaWindowRejected). That holds for an option-specific
+      // refusal as well: relayed from here, it would leave the spent window
+      // unrecorded and the client with a 429 another account could serve.
+      const windowRejected = status === 429 && ['5h', '7d', '7d_oi'].some(w =>
         rateLimitHeaders[`anthropic-ratelimit-unified-${w}-status`] === 'rejected');
-      if (bytes && credits && (credits === 'request' || !sharedWindowRejected)) {
+      // An option-specific refusal is relayed as it came, and a 403 is not
+      // one to hand a client raw: Claude Code reads it as a dead login. It
+      // takes the 403 path below, as it did before this check existed.
+      const relayedForbidden = credits === 'request' && status === 403;
+      if (bytes && credits && !windowRejected && !relayedForbidden) {
         const answer = { status, headers: relayableHeaders(upstreamRes.headers, ctx), body: bytes };
         if (credits !== 'request') {
           const model = credits.model ?? ctx.model;
