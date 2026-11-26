@@ -236,8 +236,8 @@ describe('recording', () => {
     assert.equal(store.errors.get('record'), 1);
     // the transaction was rolled back, so the connection is still usable
     store.stmts.insertUsage = store.db.prepare(`INSERT INTO usage
-      (ts, caller_id, model_id, account_id, tokens, input, cache_read, cache_write, output, status)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+      (ts, caller_id, model_id, account_id, tokens, input, cache_read, cache_write, output, status, cost_micro, capped)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
     assert.equal(recordRequest(store, { ts: T0, caller: 'build-box', model: 'opus', account: 'acct-a', input: 1 }), true);
     assert.equal(raw(store, 'SELECT count(*) AS n FROM usage')[0].n, 1);
   });
@@ -257,8 +257,8 @@ describe('aggregates', () => {
         requests: acc.requests + r.requests, tokens: acc.tokens + r.tokens,
         input: acc.input + r.input, cacheRead: acc.cacheRead + r.cache_read,
         cacheWrite: acc.cacheWrite + r.cache_write, output: acc.output + r.output,
-        refusals: acc.refusals + r.refusals,
-      }), { requests: 0, tokens: 0, input: 0, cacheRead: 0, cacheWrite: 0, output: 0, refusals: 0 });
+        refusals: acc.refusals + r.refusals, capped: acc.capped + r.capped,
+      }), { requests: 0, tokens: 0, input: 0, cacheRead: 0, cacheWrite: 0, output: 0, refusals: 0, capped: 0 });
       assert.ok(totals.requests > 0, `${window} covered no rows`);
       assert.deepEqual(summary.totals, totals);
 
@@ -316,7 +316,7 @@ describe('aggregates', () => {
     assert.equal(summary.available, true);
     assert.equal(summary.until, T0 + 1);
     assert.deepEqual(summary.totals, {
-      requests: 3, tokens: 1000, input: 500, cacheRead: 300, cacheWrite: 100, output: 100, refusals: 1,
+      requests: 3, tokens: 1000, input: 500, cacheRead: 300, cacheWrite: 100, output: 100, refusals: 1, capped: 0,
     });
     // equal tokens, so the tie falls to the busier caller
     assert.deepEqual(summary.callers.map(c => [c.caller, c.tokens, c.requests, c.refusals, c.share]), [

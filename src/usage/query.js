@@ -26,7 +26,8 @@ export const RAW_SQL = `SELECT caller_id, model_id, account_id,
     SUM(cache_read) AS cache_read,
     SUM(cache_write) AS cache_write,
     SUM(output) AS output,
-    SUM(status = 429) AS refusals
+    SUM(status = 429) AS refusals,
+    SUM(capped) AS capped
   FROM usage WHERE ts >= ?
   GROUP BY caller_id, model_id, account_id`;
 
@@ -37,11 +38,17 @@ export const HOURLY_SQL = `SELECT caller_id, model_id, account_id,
     SUM(cache_read) AS cache_read,
     SUM(cache_write) AS cache_write,
     SUM(output) AS output,
-    SUM(refusals) AS refusals
+    SUM(refusals) AS refusals,
+    SUM(capped) AS capped
   FROM usage_hourly WHERE hour >= ?
   GROUP BY caller_id, model_id, account_id`;
 
-const MEASURES = ['requests', 'tokens', 'input', 'cacheRead', 'cacheWrite', 'output', 'refusals'];
+// `refusals` is the pool failing to serve (429); `capped` is a key refused for
+// being over its own weekly figure. Separate measures because they are separate
+// readings, and the key most likely to produce one produces both. `capped` is
+// summed from its own column rather than tested from `status`, since an upstream
+// 403 lands in that field too.
+const MEASURES = ['requests', 'tokens', 'input', 'cacheRead', 'cacheWrite', 'output', 'refusals', 'capped'];
 
 /**
  * The span a window actually covers. A rollup window is snapped to whole hours,
@@ -80,6 +87,7 @@ function add(entry, row) {
   entry.cacheWrite += Number(row.cache_write) || 0;
   entry.output += Number(row.output) || 0;
   entry.refusals += Number(row.refusals) || 0;
+  entry.capped += Number(row.capped) || 0;
   return entry;
 }
 
