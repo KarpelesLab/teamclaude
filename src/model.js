@@ -302,9 +302,25 @@ export const WEEKLY_BUCKET_KEYS = Object.freeze(
 // `*fable*` or `claude-opus-*` selects the models a route handles.
 export function modelGlobMatches(glob, model) {
   if (typeof glob !== 'string' || typeof model !== 'string') return false;
-  const re = '^' + glob.split('*').map(escapeRegExp).join('.*') + '$';
-  return new RegExp(re, 'i').test(model);
+  let re = GLOB_CACHE.get(glob);
+  if (!re) {
+    re = new RegExp('^' + glob.split('*').map(escapeRegExp).join('.*') + '$', 'i');
+    // Globs come from config (routes, blockedModels), so the set is small and
+    // fixed between reloads. The bound only keeps a caller that builds globs
+    // from request data from growing the map for ever.
+    if (GLOB_CACHE.size >= GLOB_CACHE_MAX) GLOB_CACHE.clear();
+    GLOB_CACHE.set(glob, re);
+  }
+  return re.test(model);
 }
+
+// Compiled globs, by pattern. Route lookups match every glob of every route on
+// each availability check, several times per request, and compiling the
+// pattern each time cost more than the rest of the selection (#764). The
+// regexes carry no `g` or `y` flag, so they hold no state between calls.
+/** @type {Map<string, RegExp>} */
+const GLOB_CACHE = new Map();
+const GLOB_CACHE_MAX = 512;
 
 function escapeRegExp(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
