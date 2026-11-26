@@ -78,6 +78,34 @@ test('a bucket that drops out of the payload stops gating', () => {
   assert.equal(am._isAvailable(am.accounts[0], 'claude-opus-5'), true, 'a remembered copy must not outlive the report');
 });
 
+test('a read that did not list the scoped caps keeps the learned ones', () => {
+  const am = new AccountManager([oauth('a')], 0.98);
+  const reset = Date.now() + 3 * 24 * 3600_000;
+  am.applyUsageData(0, { sevenDay: { utilization: 0.2, resetAt: reset }, scopedWeekly: { opus: { utilization: 0.99, resetAt: reset } }, scopedWeeklyListed: true });
+
+  // A reset-status read (skip_spend) carries no `limits`: it says nothing about them.
+  am.applyUsageData(0, { sevenDay: { utilization: 0.2, resetAt: reset }, scopedWeekly: {}, scopedWeeklyListed: false });
+  assert.equal(am.accounts[0].quota.scopedWeekly.opus.utilization, 0.99);
+  assert.equal(am._isAvailable(am.accounts[0], 'claude-opus-5'), false);
+
+  am.applyUsageData(0, { sevenDay: { utilization: 0.2, resetAt: reset }, scopedWeekly: {}, scopedWeeklyListed: true });
+  assert.equal(am._isAvailable(am.accounts[0], 'claude-opus-5'), true, 'a listing without the family still clears it');
+});
+
+test('a scoped weekly counts against the weekly maxUsage cap', () => {
+  const am = new AccountManager([{ ...oauth('a'), maxUsage: 0.95 }], 1);
+  const reset = Date.now() + 3 * 24 * 3600_000;
+  am.applyUsageData(0, { sevenDay: { utilization: 0.2, resetAt: reset }, scopedWeekly: { opus: { utilization: 0.97, resetAt: reset } } });
+  const [a] = am.accounts;
+
+  // Under the switch threshold (1.0), so only the cap can stop it.
+  assert.equal(am.capExceeded(a, 'claude-opus-5'), 'scopedWeekly');
+  assert.equal(am.unavailableReason(a, 'claude-opus-5'), 'capped');
+  assert.equal(am.capExceeded(a, 'claude-haiku-4-5'), null, 'other families are unaffected');
+  assert.equal(am.unavailableReason(a, 'claude-opus-5', 'claude-haiku-4-5'), 'capped');
+  assert.equal(am.unavailableReason(a, 'claude-haiku-4-5', 'claude-opus-5'), 'advisor-capped');
+});
+
 test('the dedicated Fable/Sonnet fields still win — the quota shape is unchanged', () => {
   const am = new AccountManager([oauth('a')], 0.98);
   const reset = Date.now() + 3 * 24 * 3600_000;
