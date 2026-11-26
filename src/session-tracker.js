@@ -34,6 +34,7 @@
 //     made a request this recently. Short, so load-balancing reacts to what is
 //     actually running now rather than to sessions merely lingering in the hour.
 import { remapHeld, newObservation } from './rollover.js';
+import { assertNever } from './band-decision.js';
 
 export const SESSION_KNOWN_TTL_MS = 60 * 60 * 1000; // 1h idle → forgotten
 export const SESSION_ACTIVE_TTL_MS = 2 * 60 * 1000; // 2min idle → no longer "active"
@@ -181,8 +182,10 @@ function setAndReturn(map, key, value) {
  * @property {Map<string, number>|null} handedBack the account's windows as they stood when a hold handed this reading back, so the roll it was handed back for is not held again; null once the reading moves
  */
 /** @typedef {{id: string, provider: string}} AffinityAccount */
-/** @typedef {{bucket: string, account: AffinityAccount, at: number}} AffinityPin */
+/** @typedef {{windows: Record<string, number>, handedBack?: Record<string, number>, provider?: string}} AffinityReading */
+/** @typedef {{bucket: string, account: AffinityAccount, at: number, reading?: AffinityReading}} AffinityPin */
 /** @typedef {{key: string, sessionId: string|null, conversation: string|null, lastSeen: number, pins: AffinityPin[], threads: string[]}} AffinitySession */
+/** @typedef {{account: AffinityAccount, minute: number, count: number}} AffinityRequests */
 /** @param {unknown} value @param {number} limit @returns {value is string} */
 const boundedString = (value, limit) => typeof value === 'string' && value.length > 0 && value.length <= limit;
 /** @param {unknown} value @returns {value is number} */
@@ -193,6 +196,43 @@ const affinityTime = value => typeof value === 'number' && Number.isFinite(value
 // for a damaged file, which must not restore more than a live record can hold.
 const MAX_BUCKET_LENGTH = 128;
 export const MAX_AFFINITY_PINS = 64;
+const MAX_READING_WINDOWS = 64; // an account presents one window per weekly bucket and learned scoped family, far below this
+
+const MINUTE_MS = 60 * 1000;
+
+// All or nothing: a reading missing one window would first-sight that window
+// on the next request and lose any roll of it since the reading was taken.
+/** @param {unknown} raw @returns {Map<string, number>|null} */
+function windowsIn(raw) {
+  if (raw == null || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const entries = Object.entries(raw);
+  if (entries.length > MAX_READING_WINDOWS) return null;
+  for (const [name, reset] of entries) {
+    if (!boundedString(name, MAX_BUCKET_LENGTH) || !affinityTime(reset)) return null;
+  }
+  return new Map(entries);
+}
+// Written unchecked: readingIn validates on the way back in, and a reading it
+// refuses restores its pin without one.
+/** @param {Observation} ref @returns {AffinityReading} */
+function readingOut(ref) {
+  return {
+    windows: Object.fromEntries(ref.windows),
+    ...(ref.handedBack ? { handedBack: Object.fromEntries(ref.handedBack) } : {}),
+    ...(ref.provider != null ? { provider: ref.provider } : {}),
+  };
+}
+// Absent fields are null, not undefined, so spreading this over
+// newObservation() keeps the shape it gives.
+/** @param {any} raw @returns {{windows: Map<string, number>, handedBack: Map<string, number>|null, provider: string|null}|null} */
+function readingIn(raw) {
+  if (raw == null || typeof raw !== 'object') return null;
+  const windows = windowsIn(raw.windows);
+  const handedBack = raw.handedBack == null ? null : windowsIn(raw.handedBack);
+  if (!windows || (raw.handedBack != null && !handedBack)) return null;
+  if (raw.provider != null && !boundedString(raw.provider, MAX_BUCKET_LENGTH)) return null;
+  return { windows, handedBack, provider: raw.provider ?? null };
+}
 /** @param {any} row @returns {row is AffinitySession} */
 function affinityRow(row) {
   return row != null && boundedString(row.key, MAX_KEY_LENGTH)
@@ -205,6 +245,42 @@ function affinityRow(row) {
 function affinityAccount(ref) {
   return ref != null && typeof ref.id === 'string' && !!ref.id
     && typeof ref.provider === 'string' && !!ref.provider;
+}
+/**
+ * Why a saved request bucket is not restored.
+ * @typedef {'not-an-object' | 'account-invalid' | 'minute-not-integer' | 'minute-negative'
+ *         | 'count-not-integer' | 'count-not-positive' | 'outside-window'
+ *         | 'account-unresolved'} RoutedDropReason
+ */
+/**
+ * @typedef {{kind: 'ok', at: number, idx: number, count: number}
+ *         | {kind: 'dropped', reason: RoutedDropReason}} RoutedBucket
+ */
+/**
+ * One saved request bucket, read at `now`. The requests come back stamped at
+ * the last millisecond of their minute, so each is counted up to a minute
+ * longer than the request it stands for and never leaves the window early:
+ * understating an account's load would send it the next placement.
+ * @param {unknown} raw
+ * @param {(account: AffinityAccount) => number|null} resolveAccount
+ * @param {number} now
+ * @returns {RoutedBucket}
+ */
+export function readRoutedBucket(raw, resolveAccount, now) {
+  if (raw == null || typeof raw !== 'object' || Array.isArray(raw)) return { kind: 'dropped', reason: 'not-an-object' };
+  const { account, minute, count } = /** @type {Record<string, unknown>} */ (raw);
+  if (!affinityAccount(account)) return { kind: 'dropped', reason: 'account-invalid' };
+  if (typeof minute !== 'number' || !Number.isInteger(minute)) return { kind: 'dropped', reason: 'minute-not-integer' };
+  if (minute < 0) return { kind: 'dropped', reason: 'minute-negative' };
+  if (typeof count !== 'number' || !Number.isInteger(count)) return { kind: 'dropped', reason: 'count-not-integer' };
+  if (count <= 0) return { kind: 'dropped', reason: 'count-not-positive' };
+  // A minute after now means the clock stepped back since the save: counted
+  // from now, as a pin's time is, since dropping it would understate the load.
+  const at = Math.min((minute + 1) * MINUTE_MS - 1, now);
+  if (at < now - LOAD_WINDOW_MS) return { kind: 'dropped', reason: 'outside-window' };
+  const idx = resolveAccount(account);
+  if (idx == null || !Number.isInteger(idx) || idx < 0) return { kind: 'dropped', reason: 'account-unresolved' };
+  return { kind: 'ok', at, idx, count };
 }
 
 export class SessionTracker {
@@ -233,8 +309,13 @@ export class SessionTracker {
     this._lastSweep = 0;
   }
 
-  // Explicit allowlist: routing knowledge only. Neither live requests nor their
-  // labels, spend and rollover observations belong in a restart snapshot.
+  // Explicit allowlist: routing knowledge only. A pin keeps the rollover reading
+  // taken on its own account, so a roll after that reading is still seen on the
+  // pin's first request after a restart. The load window goes as request counts
+  // per account and minute, so load mode ranks the move that roll triggers on
+  // the load the accounts were carrying. Live requests, their labels and spend
+  // stay out, and so do held rolls: a hold is settled under the stamp of a move
+  // this process made, and no stamp survives the process.
   /** @param {(index: number) => AffinityAccount|null} identifyAccount @param {number} [now] */
   exportAffinity(identifyAccount, now = this._now()) {
     /** @type {AffinitySession[]} */
@@ -245,7 +326,9 @@ export class SessionTracker {
       for (const [bucket, pin] of s.pins) {
         const account = identifyAccount(pin.idx);
         if (pins.length < MAX_AFFINITY_PINS && affinityAccount(account) && boundedString(bucket, MAX_BUCKET_LENGTH) && affinityTime(pin.at)) {
-          pins.push({ bucket, account: { id: account.id, provider: account.provider }, at: pin.at });
+          const ref = s.refs.get(bucket);
+          const reading = ref && ref.idx === pin.idx ? readingOut(ref) : null;
+          pins.push({ bucket, account: { id: account.id, provider: account.provider }, at: pin.at, ...(reading ? { reading } : {}) });
         }
       }
       const threads = [...s.threads];
@@ -253,7 +336,64 @@ export class SessionTracker {
       if ((pins.length || threads.length) && affinityRow(row)) sessions.push(row);
     }
     sessions.sort((a, b) => b.lastSeen - a.lastSeen);
-    return { version: 1, sessions: sessions.slice(0, MAX_SESSIONS) };
+    const routed = this._exportRouted(identifyAccount, now);
+    return { version: 1, sessions: sessions.slice(0, MAX_SESSIONS), ...(routed.length ? { routed } : {}) };
+  }
+
+  // One bucket per account and minute that carried a request, so never more
+  // buckets than the ring holds entries (MAX_ROUTED).
+  /** @param {(index: number) => AffinityAccount|null} identifyAccount @param {number} now @returns {AffinityRequests[]} */
+  _exportRouted(identifyAccount, now) {
+    const cutoff = now - LOAD_WINDOW_MS;
+    /** @type {Map<number, AffinityAccount|null>} */
+    const accounts = new Map();
+    /** @type {Map<string, AffinityRequests>} */
+    const buckets = new Map();
+    for (const [at, idx] of this._routed) {
+      if (at < cutoff) continue;
+      if (!accounts.has(idx)) {
+        const account = identifyAccount(idx);
+        accounts.set(idx, affinityAccount(account) ? { id: account.id, provider: account.provider } : null);
+      }
+      const account = accounts.get(idx);
+      if (!account) continue;
+      const minute = Math.floor(at / MINUTE_MS);
+      const key = `${idx}:${minute}`;
+      const bucket = buckets.get(key);
+      if (bucket) bucket.count += 1;
+      else buckets.set(key, { account: { ...account }, minute, count: 1 });
+    }
+    return [...buckets.values()];
+  }
+
+  // Newest buckets are kept first, as the ring's own cap keeps its newest.
+  /** @param {unknown} raw @param {(account: AffinityAccount) => number|null} resolveAccount @param {number} now */
+  _restoreRouted(raw, resolveAccount, now) {
+    if (!Array.isArray(raw)) return;
+    /** @type {Array<[number, number, number]>} */
+    const buckets = [];
+    for (const saved of raw.slice(0, MAX_ROUTED)) {
+      const bucket = readRoutedBucket(saved, resolveAccount, now);
+      switch (bucket.kind) {
+        case 'ok': buckets.push([bucket.at, bucket.idx, bucket.count]); break;
+        case 'dropped': break;
+        default: assertNever(bucket, '_restoreRouted');
+      }
+    }
+    buckets.sort((x, y) => y[0] - x[0]);
+    /** @type {Array<[number, number]>} */
+    const restored = [];
+    let room = MAX_ROUTED - this._routed.length;
+    for (const [at, idx, count] of buckets) {
+      if (room <= 0) break;
+      const n = Math.min(count, room);
+      for (let i = 0; i < n; i++) restored.push([at, idx]);
+      room -= n;
+    }
+    if (!restored.length) return;
+    this._routed = [...restored, ...this._routed].sort((x, y) => x[0] - y[0]);
+    this._routedCounts = new Map();
+    for (const [, idx] of this._routed) this._routedCounts.set(idx, (this._routedCounts.get(idx) || 0) + 1);
   }
 
   // Keys are opaque, as on ingress. Owner metadata is independent: some keys
@@ -279,12 +419,18 @@ export class SessionTracker {
       if (this.sessions.size >= MAX_SESSIONS) break;
       if (this.sessions.has(row.key)) continue;
       const pins = new Map();
+      /** @type {Map<string, Observation>} */
+      const refs = new Map();
       for (const pin of row.pins) {
         if (pins.size >= MAX_AFFINITY_PINS) break;
         if (!pin || !boundedString(pin.bucket, MAX_BUCKET_LENGTH) || pins.has(pin.bucket)
             || !affinityAccount(pin.account) || !affinityTime(pin.at)) continue;
         const idx = resolveAccount(pin.account);
-        if (idx != null && Number.isInteger(idx) && idx >= 0) pins.set(pin.bucket, { idx, at: Math.min(pin.at, now) });
+        if (idx != null && Number.isInteger(idx) && idx >= 0) {
+          pins.set(pin.bucket, { idx, at: Math.min(pin.at, now) });
+          const reading = readingIn(pin.reading);
+          if (reading) refs.set(pin.bucket, { ...newObservation(), idx, ...reading });
+        }
       }
       // The newest ids are last, as recordThreadMessage leaves them.
       const threads = new Set(row.threads.filter(isMessageId).slice(-MAX_THREAD_MESSAGES));
@@ -293,8 +439,10 @@ export class SessionTracker {
       s.sessionId = row.sessionId;
       s.conversation = row.conversation;
       s.pins = pins;
+      s.refs = refs;
       s.threads = threads;
     }
+    this._restoreRouted(snapshot.routed, resolveAccount, now);
   }
 
   // Record that `sessionId` made a request served by `accountIndex`, spending
@@ -675,9 +823,11 @@ export class SessionTracker {
     return out;
   }
 
-  // Drop every session's rollover observations, leaving the pins alone. None may
-  // survive an interval in which nothing was watching, which is what switching
-  // preemption off creates (AccountManager.setExpiryRouting).
+  // Drop every session's rollover observations, leaving the pins alone. While
+  // preemption is off (AccountManager.setExpiryRouting) the daemon keeps
+  // routing, so a pin can move to an account its reading was not taken on, and
+  // no reading may survive that interval. A restart keeps them: nothing routes
+  // while the daemon is down, so each pin is still where its reading was taken.
   clearObservations() {
     for (const s of this.sessions.values()) s.refs.clear();
   }
