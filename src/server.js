@@ -40,8 +40,8 @@ import { ConfigOpError, setThreshold, thresholdRatio } from './config-ops.js';
 import { envVar, legacyControlUrl } from './brand.js';
 import { recordRequest } from './usage/record.js';
 import { handleUsageRoute } from './usage/routes.js';
-import { limitCostMicro } from './anthropic-pricing.js';
-import { clientLimitStatus, limitRefusal, WeeklyLimiter } from './usage/limits.js';
+import { limitCost } from './anthropic-pricing.js';
+import { clientLimitStatus, limitRefusal, weeklyLimitFor, WeeklyLimiter } from './usage/limits.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
 
@@ -694,6 +694,20 @@ function inferenceOnlyScope(scope) {
   return scope !== undefined && scope !== 'full';
 }
 
+// Replies charged against a weekly key limit at the price table's highest
+// rate because they have no list price, each said once per model and reason:
+// such a key stops well short of its real list spend, and the refusal it gets
+// names only the total. Bounded, since the model is the client's to name.
+/** @type {Set<string>} */
+const ceilingCharged = new Set();
+/** @param {{ model: string, reason: string }} unpriced */
+function noteCeilingCharge({ model, reason }) {
+  const key = `${model}\n${reason}`;
+  if (ceilingCharged.has(key) || ceilingCharged.size >= 64) return;
+  ceilingCharged.add(key);
+  console.error(`[TeamClaude] weeklyUsd: a reply for "${safeLine(model, 64)}" has no list price (${reason}), so it counts against client key limits at the highest rate in the price table`);
+}
+
 function usableClientKeys(clientKeys) {
   if (!checkedClientKeys.has(clientKeys)) {
     checkedClientKeys.add(clientKeys);
@@ -705,6 +719,9 @@ function usableClientKeys(clientKeys) {
       } else {
         if (!knownClientKeyScope(entry.scope)) {
           console.error(`[TeamClaude] proxy.clientKeys: "${name}" has an unrecognised scope and is treated as inference-only; use "inference", "full", or leave scope out`);
+        }
+        if (weeklyLimitFor(entry) === 'invalid') {
+          console.error(`[TeamClaude] proxy.clientKeys: "${safeLine(name, 64)}" has a weeklyUsd that is not a number of at least 0.01, so its requests to the pool are refused; set a number, or leave weeklyUsd out for no limit`);
         }
         if (seen.has(name)) {
           console.error(`[TeamClaude] proxy.clientKeys: duplicate name "${name}" — its keys share one usage counter`);
@@ -2707,8 +2724,9 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         // model the last attempt sent (ctx.sentModel). Booked and recorded
         // before the activity hook, which can throw.
         const servedBy = /** @type {any[]} */ (/** @type {any} */ (accountManager).accounts).find(a => a.name === settled.account);
-        const costMicro = limitCostMicro(settled.sentModel ?? ctx.model, settled.cacheUsage);
+        const { micro: costMicro, unpriced } = limitCost(settled.sentModel ?? ctx.model, settled.cacheUsage);
         limiter.book(client, costMicro, Date.now());
+        if (client && unpriced && costMicro > 0) noteCeilingCharge(unpriced);
         if (!hideActivity) recordRequest(usageStore, {
           caller,
           account: servedBy ? settled.account : null,

@@ -211,10 +211,22 @@ const MAX_PRICE = (() => {
  * @param {Record<string, any>|null|undefined} usage
  */
 export function limitCostMicro(model, usage) {
+  return limitCost(model, usage).micro;
+}
+
+/**
+ * limitCostMicro's figure, with why the reply had no list price when it was
+ * charged at `MAX_PRICE` (null when it was priced), so the caller can say so:
+ * a key that stops at a fraction of its real list spend is otherwise unexplained.
+ * @param {unknown} model
+ * @param {Record<string, any>|null|undefined} usage
+ * @returns {{ micro: number, unpriced: { model: string, reason: string }|null }}
+ */
+export function limitCost(model, usage) {
   const u = usage || {};
   const priced = priceUsage(model, u);
   const usd = priced.ok
     ? priced.costMinor / 100
     : tokenUsd(tokenCounts(u), MAX_PRICE) * (u.inference_geo === 'us' ? US_GEO_MULTIPLIER : 1) + searchUsd(u);
-  return Math.round(usd * 1_000_000);
+  return { micro: Math.round(usd * 1_000_000), unpriced: priced.ok ? null : { model: priced.model, reason: priced.reason } };
 }

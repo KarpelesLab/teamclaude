@@ -450,11 +450,11 @@ A `proxy.clientKeys` entry can carry `weeklyUsd`, a limit on what that key may s
 { "proxy": { "clientKeys": [{ "name": "nightly-agent", "key": "tc-…", "scope": "inference", "weeklyUsd": 200 }] } }
 ```
 
-The spend is an estimate at API list prices, from the usage block of each reply the pool serves the key, priced with the same table as the [prepaid-credit estimate](quota.md#prepaid-api-credit) at the model the account was sent (after its `modelMap`). A reply the table cannot price, such as an unknown model, Priority Tier or a Codex reply, is charged the highest rate the table has in each category. A reply with no usage block costs nothing.
+The spend is an estimate at API list prices, from the usage block of each reply the pool serves the key, priced with the same table as the [prepaid-credit estimate](quota.md#prepaid-api-credit) at the model the account was sent (after its `modelMap`). A reply the table cannot price, such as an unknown model, Priority Tier or a Codex reply, is charged the highest rate the table has in each category, which can be many times its real list price, so such a key stops early; the log says so once per model and reason. A reply with no usage block costs nothing.
 
 The week starts Monday 00:00 UTC. Each request to the pool is checked before an account is chosen: a key at or over its figure gets `403` with a `permission_error` naming the limit, the spend and the reset time. (Not `429`, which Claude Code retries.) Requests already running when the key crosses the figure finish, so the spend can end above it by what they cost. Requests that do not go to the pool, such as the client's own login calls, and requests without a named key are not limited.
 
-`/teamclaude/status` lists each key with a limit under `clientLimits`, with `weeklyUsd`, `spentUsd`, `remainingUsd` and `resetsAt`, or `invalid: true` for a figure that cannot be read. With [usage history](#usage-history) on, the usage route counts refused requests under `capped`.
+`/teamclaude/status` lists each key with a limit under `clientLimits`, with `weeklyUsd`, `spentUsd`, `remainingUsd` and `resetsAt`, or `invalid: true` for a figure that cannot be read (also reported in the log when the config is loaded). With [usage history](#usage-history) on, the usage route counts refused requests under `capped`.
 
 The spend is kept in memory. With usage history on, a restart reads the current week back from the recorded rows. Rows written before this feature carry no cost, so the week of the upgrade starts low. Without usage history a restart starts the week from zero.
 

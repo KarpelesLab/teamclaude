@@ -68,7 +68,10 @@ export class WeeklyLimiter {
     if (!spend) {
       spend = new Map();
       this.weeks.set(week, spend);
-      if (this.weeks.size > 2) this.weeks.delete(Math.min(...this.weeks.keys()));
+      // The oldest week other than the one being booked: after a clock that
+      // ran ahead and came back, this week is the oldest of the three, and
+      // dropping it would send its spend to a map nothing reads.
+      if (this.weeks.size > 2) this.weeks.delete(Math.min(...[...this.weeks.keys()].filter(k => k !== week)));
     }
     spend.set(client, (spend.get(client) ?? 0) + micro);
   }

@@ -29,6 +29,16 @@ test('weeklyUsd is a number of at least a cent, absent for no limit', () => {
   }
 });
 
+test('a clock that ran two weeks ahead and came back does not drop the week being booked', () => {
+  const limiter = new WeeklyLimiter();
+  limiter.book('agent', 5, MONDAY + WEEK);
+  limiter.book('agent', 5, MONDAY + 2 * WEEK);
+  limiter.book('agent', 7, MONDAY);
+  limiter.book('agent', 3, MONDAY);
+  assert.equal(limiter.spent('agent', MONDAY), 10);
+  assert.equal(limiter.spent('agent', MONDAY + 2 * WEEK), 5);
+});
+
 test('spend is per client and per week', () => {
   const limiter = new WeeklyLimiter();
   limiter.book('agent', 1000, MONDAY);
