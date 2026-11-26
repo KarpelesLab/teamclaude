@@ -524,6 +524,15 @@ export class SessionTracker {
   _ensure(sessionId, now) {
     sessionId = keyOf(sessionId);
     let s = this.sessions.get(sessionId);
+    // A record idle past the known window is forgotten, as every read of it
+    // (_live, pinnedAccount, the sweep) already treats it. Without this the
+    // conversation's own next request, which reaches the record through here
+    // first, brought it back with its pins, unless a sweep happened to run in
+    // between (#763).
+    if (s && this._isExpired(s, now)) {
+      this.sessions.delete(sessionId);
+      s = undefined;
+    }
     if (!s) {
       this._makeRoom(now);
       s = {

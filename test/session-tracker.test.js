@@ -78,6 +78,31 @@ test('a session is forgotten after the known (1h) idle window', () => {
   assert.equal(st.stats(clock.t).known, 0);
 });
 
+test('a session idle past the known window is forgotten by its own next request', () => {
+  // No read and no sweep in between: the request reaches the record first (#763).
+  for (const arrive of ['beginRequest', 'touch']) {
+    const { clock, now } = fixedClock();
+    const st = new SessionTracker({ now });
+    st.beginRequest('s1', clock.t);
+    st.touch('s1', 1, SHARED, clock.t);
+    st.endRequest('s1', clock.t);
+    clock.t += SESSION_KNOWN_TTL_MS + 1;
+    if (arrive === 'beginRequest') st.beginRequest('s1', clock.t);
+    else st.touch('s1', null, null, clock.t);
+    assert.equal(st.pinnedAccount('s1', SHARED, clock.t), null, `${arrive} brought the pin back`);
+    assert.equal(st.sessions.get('s1').firstSeen, clock.t, `${arrive} kept the old record`);
+  }
+});
+
+test('a session idle exactly the known window keeps its pin on its next request', () => {
+  const { clock, now } = fixedClock();
+  const st = new SessionTracker({ now });
+  st.touch('s1', 1, SHARED, clock.t);
+  clock.t += SESSION_KNOWN_TTL_MS;
+  st.beginRequest('s1', clock.t);
+  assert.equal(st.pinnedAccount('s1', SHARED, clock.t), 1);
+});
+
 test('a session stays known but goes inactive past the active window', () => {
   const { clock, now } = fixedClock();
   const st = new SessionTracker({ now });
