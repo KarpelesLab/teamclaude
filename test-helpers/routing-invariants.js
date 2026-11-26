@@ -239,12 +239,10 @@ export function reclaimable(ctx, v, q, a) {
 }
 
 /**
- * A fresh catalog for one played history: G2 counts across steps.
+ * A fresh catalog for one played history: O26 counts across steps.
  * @returns {Array<{ id: string, doc: string, gap?: string, runFloor?: number, holds: (row: any) => boolean, check: (ctx: any) => true|string|undefined }>}
  */
 export function catalog() {
-  /** @type {Map<string, number>} */
-  const movesPerRoll = new Map();
   /** @type {Map<string, number>} */
   const handBacksPerRoll = new Map();
   /** @type {Map<string, number>} */
@@ -964,21 +962,9 @@ export function catalog() {
       }),
     },
     {
-      id: 'G2', doc: 'docs/routing.md:409',
-      gap: 'docs/routing.md:409 says at most one cache-miss turn per pin per rollover; a hand-back can move a pin twice on one roll',
-      holds: row => distOn(row) && row.expiry?.enabled === true && row.expiry.preempt !== false,
-      check: request((ctx, v) => {
-        const m = rollMove(ctx, v);
-        if (!m) return undefined;
-        const n = (movesPerRoll.get(m.key) ?? 0) + 1;
-        movesPerRoll.set(m.key, n);
-        return n === 1 ? true : `pin ${m.p} of ${ctx.c} moved ${n} times on one roll of its ${governing(m.a, ctx.model).window} window`;
-      }),
-    },
-    {
-      // The second move G2 counts is the hand-back, and "A roll is handed back
-      // once": no third move answers the same roll.
-      id: 'O26', doc: 'docs/routing.md:411',
+      // "A roll is handed back once, so two is the most": a second move is the
+      // hand-back, and no third move answers the same roll.
+      id: 'O26', doc: 'docs/routing.md:455',
       holds: row => distOn(row) && row.expiry?.enabled === true && row.expiry.preempt !== false,
       check: request((ctx, v) => {
         const m = rollMove(ctx, v);

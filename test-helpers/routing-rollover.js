@@ -143,7 +143,7 @@ export function rolloverMarks() {
     }
     took('RO-return-settled', ctx.pinReturned && ok.has('O28'));
     took('RO-restored-held', ctx.pinHeld && ok.has('O28'));
-    took('RO-cost', ok.has('G2'));
+    took('RO-cost', ok.has('O26'));
     took('PIN-idle', ctx.revived && ok.has('G1'));
     const p = v.p;
     const pin = p == null ? null : fed.get(p);

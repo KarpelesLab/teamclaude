@@ -102,7 +102,7 @@ const runsOf = new Map();
 /** @type {Map<string, number>} */
 const appliedRuns = new Map();
 /** @type {Map<string, { count: number, first: string|null }>} */
-const gaps = new Map([['G1', { count: 0, first: null }], ['G2', { count: 0, first: null }], ['G6', { count: 0, first: null }], ['G7', { count: 0, first: null }], ['G4', { count: 0, first: null }]]);
+const gaps = new Map([['G1', { count: 0, first: null }], ['G6', { count: 0, first: null }], ['G7', { count: 0, first: null }], ['G4', { count: 0, first: null }]]);
 
 // The rollover rows the matrix runs take (test-helpers/routing-rollover.js).
 /** @type {Set<string>} */
@@ -775,12 +775,6 @@ test('G1: a conversation idle past the known window is forgotten (two accounts)'
 // The behaviors below contradict the docs on the current code. Each is
 // a todo test that asserts what the docs say; once the code matches, dropping
 // `todo` turns it into a regular invariant.
-
-test('G2: a pin moves at most once per rollover (matrix)',
-  { todo: 'docs/routing.md:409 says at most one cache-miss turn per pin per rollover; a hand-back can move a pin twice on one roll' }, () => {
-    const g = /** @type {{ count: number, first: string|null }} */ (gaps.get('G2'));
-    assert.equal(g.count, 0, `${g.count} second moves; first:\n${g.first}`);
-  });
 
 test('G6: a roll is handed back once, also after another window rolls (matrix)',
   { todo: 'docs/routing.md:411 says a roll is handed back once, and a reading restored from a hold is held again only for a window that has rolled since; held again for another window, it hands this window\'s roll back a second time' }, () => {
