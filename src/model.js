@@ -23,6 +23,31 @@ export function modelFamily(model) {
   return 'other';
 }
 
+// A family as the operator reads it: "Fable", "Sonnet", "other models".
+/** @param {string} family */
+export function familyLabel(family) {
+  return family === 'other' ? 'other models' : family.charAt(0).toUpperCase() + family.slice(1);
+}
+
+/**
+ * The families an account is sitting out because its plan wants usage credits
+ * for them (AccountManager.markFamilyRefused), as of `now`. Reads the live
+ * account's records (by family, `until` in ms) and the status payload's (a
+ * list, `until` as an ISO string) alike, so the TUI draws both the same way.
+ * @param {unknown} refusals
+ * @param {number} [now]
+ * @returns {Set<string>}
+ */
+export function heldFamilyRefusals(refusals, now = Date.now()) {
+  const list = Array.isArray(refusals) ? refusals : Object.values(refusals ?? {});
+  const held = new Set();
+  for (const r of list) {
+    const until = typeof r?.until === 'string' ? Date.parse(r.until) : r?.until;
+    if (typeof r?.family === 'string' && Number.isFinite(until) && until > now) held.add(r.family);
+  }
+  return held;
+}
+
 // Quota buckets on an account (see AccountManager emptyQuota). The shared 5-hour
 // bucket applies to every request; the weekly bucket depends on the family.
 // A family with no dedicated weekly bucket falls back to the shared 'unified7d'.

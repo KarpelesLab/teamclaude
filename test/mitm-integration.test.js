@@ -18,6 +18,7 @@ import { KEEP_ALIVE_TIMEOUT_MS, streamResponse } from '../src/server.js';
 import { allowLoopbackForward } from '../src/forward-target.js';
 import { AccountManager } from '../src/account-manager.js';
 import { closeUsageStore, openUsageStore, usageStoreAvailable } from '../src/usage/db.js';
+import { WeeklyLimiter } from '../src/usage/limits.js';
 import { gate } from '../test-helpers/gate.js';
 import { childEnvWithoutProxy } from '../test-helpers/env.js';
 
@@ -57,7 +58,7 @@ function endWith(t, ...servers) {
 // Drive a CONNECT through the proxy, then TLS over the tunnel; resolve the TLS
 // socket. The raw socket under it is destroyed when `signal` aborts, during the
 // handshake or after it.
-function connectThroughProxy(proxyPort, target, caCertPem, alpn, signal) {
+function connectThroughProxy(proxyPort, target, caCertPem, alpn, signal, proxyAuth = '') {
   return new Promise((resolve, reject) => {
     const raw = net.connect(proxyPort, '127.0.0.1');
     const onAbort = () => { raw.destroy(); reject(new Error('the test ended before the CONNECT/TLS setup finished')); };
@@ -65,7 +66,8 @@ function connectThroughProxy(proxyPort, target, caCertPem, alpn, signal) {
     else signal.addEventListener('abort', onAbort, { once: true });
     raw.once('close', () => { signal.removeEventListener('abort', onAbort); reject(new Error('socket closed before the TLS handshake finished')); });
     raw.once('error', reject);
-    raw.once('connect', () => raw.write(`CONNECT ${target} HTTP/1.1\r\nHost: ${target}\r\n\r\n`));
+    const authLine = proxyAuth ? `Proxy-Authorization: Basic ${Buffer.from(proxyAuth).toString('base64')}\r\n` : '';
+    raw.once('connect', () => raw.write(`CONNECT ${target} HTTP/1.1\r\nHost: ${target}\r\n${authLine}\r\n`));
     let buf = Buffer.alloc(0);
     const onData = (d) => {
       buf = Buffer.concat([buf, d]);
@@ -98,15 +100,15 @@ function makeUpstream(handler) {
 }
 
 // Build the teamclaude proxy (CONNECT → terminate + forward) against `upPort`.
-function makeProxy(am, upPort, { leafCertPem, leafKeyPem }, { logDir = null, hooks = {}, sx = null, usageStore = undefined } = {}) {
+function makeProxy(am, upPort, { leafCertPem, leafKeyPem }, { logDir = null, hooks = {}, sx = null, usageStore = undefined, proxyConfig = undefined, limiter = undefined } = {}) {
   const proxy = http.createServer();
   allowLoopbackForward(proxy); // tunnel-mode targets in these tests are on this machine
   proxy.on('connect', createConnectHandler({
     // upstream host is 127.0.0.1 so a `CONNECT 127.0.0.1:<port>` is 'rewrite' mode.
-    config: { upstream: `http://127.0.0.1:${upPort}` },
+    config: { upstream: `http://127.0.0.1:${upPort}`, proxy: proxyConfig },
     accountManager: am,
     ensureLeaf: async () => ({ key: leafKeyPem, cert: leafCertPem }),
-    logDir, hooks, log: () => {}, sx, usageStore,
+    logDir, hooks, log: () => {}, sx, usageStore, limiter,
   }));
   return proxy;
 }
@@ -971,4 +973,32 @@ test('MITM: a request through the tunnel writes exactly one usage row', { skip: 
   } finally {
     tlsSock.destroy(); closeHard(proxy); closeHard(upstream); closeUsageStore(usageStore);
   }
+});
+
+test('MITM: a client key over its weekly limit is refused inside the tunnel, before any account', async (t) => {
+  const { caCertPem, leafCertPem, leafKeyPem } = generateCertChain('localhost');
+  let hits = 0;
+  const upstream = makeUpstream(() => { hits++; return { status: 200, body: '{}' }; });
+  const upPort = await listen(upstream);
+
+  const am = new AccountManager([oauthAccount('acct@x', 'REAL-TOKEN')], 0.98);
+  const limiter = new WeeklyLimiter();
+  limiter.book('agent', 10_000, Date.now());
+  const proxyConfig = { apiKey: 'tc-shared', clientKeys: [{ name: 'agent', key: 'tc-agent', weeklyUsd: 0.01 }] };
+  const proxy = makeProxy(am, upPort, { caCertPem, leafCertPem, leafKeyPem }, { proxyConfig, limiter });
+  const proxyPort = await listen(proxy);
+
+  const tlsSock = await connectThroughProxy(proxyPort, `127.0.0.1:${upPort}`, caCertPem, ['h2', 'http/1.1'], endWith(t, proxy, upstream), ':tc-agent');
+  t.after(() => tlsSock.destroy());
+  const client = http2.connect('https://localhost', { createConnection: () => tlsSock });
+  t.after(() => client.close());
+  const req = client.request({ ':method': 'POST', ':path': '/v1/messages', 'content-type': 'application/json' });
+  let resp; req.on('response', (h) => { resp = h; });
+  let text = ''; req.setEncoding('utf8'); req.on('data', (c) => { text += c; });
+  req.end('{"model":"claude-sonnet-5-5"}');
+  await once(req, 'close');
+
+  assert.equal(resp[':status'], 403);
+  assert.match(JSON.parse(text).error.message, /weekly spending limit of \$0\.01 reached/);
+  assert.equal(hits, 0);
 });

@@ -5,18 +5,18 @@ import { createWriteStream, mkdirSync, writeSync } from 'node:fs';
 import { readdir, stat, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { ensureCerts, createConnectHandler, mitmHosts } from './mitm.js';
-import { inspectBillingError } from './billing-error.js';
+import { isBillingError } from './billing-error.js';
 import { patchAccountUuid } from './account-uuid-rewrite.js';
 import { sanitizeToolPairs } from './tool-pair-sanitize.js';
 import { sanitizeCacheControl, cacheControlSubfieldsToStrip } from './cache-control-sanitize.js';
 import { sanitizeContentBlocks, contentBlockTypesToStrip } from './content-block-sanitize.js';
 import { parseRequestModel, parseAdvisorModel, refreshHeldUntil } from './account-manager.js';
 import { isTokenExpired } from './oauth.js';
-import { TopLevelFieldFinder, modelGlobMatches, parseRequestEffort, parseRequestStream } from './model.js';
+import { TopLevelFieldFinder, familyLabel, modelFamily, modelGlobMatches, parseRequestEffort, parseRequestStream } from './model.js';
 import { conversationDigest, pinKeyFor } from './conversation.js';
 import { BodyWriter, truncationNote } from './request-log.js';
 import { upstreamFetch, upstreamPoolStatus, resolveHeadersTimeout } from './upstream-fetch.js';
-import { accountRefusal, isRefused } from './account-refusal.js';
+import { accountRefusal, creditsRequiredRefusal, isRefused } from './account-refusal.js';
 import { applyAuthHeaders, upstreamFor, rewritesBody, defaultHeadersTimeoutFor, providerForPath, providerForHost, interceptHostsFor, providerOf, isSubscriptionAccount, canServeProvider, DEFAULT_PROVIDER, PROVIDERS } from './provider.js';
 import { matchAccounts } from './identity.js';
 import { tunnelTls } from './sx.js';
@@ -40,6 +40,8 @@ import { ConfigOpError, setThreshold, thresholdRatio } from './config-ops.js';
 import { envVar, legacyControlUrl } from './brand.js';
 import { recordRequest } from './usage/record.js';
 import { handleUsageRoute } from './usage/routes.js';
+import { limitCost } from './anthropic-pricing.js';
+import { clientLimitStatus, limitRefusal, weeklyLimitFor, WeeklyLimiter } from './usage/limits.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
 
@@ -692,6 +694,20 @@ function inferenceOnlyScope(scope) {
   return scope !== undefined && scope !== 'full';
 }
 
+// Replies charged against a weekly key limit at the price table's highest
+// rate because they have no list price, each said once per model and reason:
+// such a key stops well short of its real list spend, and the refusal it gets
+// names only the total. Bounded, since the model is the client's to name.
+/** @type {Set<string>} */
+const ceilingCharged = new Set();
+/** @param {{ model: string, reason: string }} unpriced */
+function noteCeilingCharge({ model, reason }) {
+  const key = `${model}\n${reason}`;
+  if (ceilingCharged.has(key) || ceilingCharged.size >= 64) return;
+  ceilingCharged.add(key);
+  console.error(`[TeamClaude] weeklyUsd: a reply for "${safeLine(model, 64)}" has no list price (${reason}), so it counts against client key limits at the highest rate in the price table`);
+}
+
 function usableClientKeys(clientKeys) {
   if (!checkedClientKeys.has(clientKeys)) {
     checkedClientKeys.add(clientKeys);
@@ -703,6 +719,9 @@ function usableClientKeys(clientKeys) {
       } else {
         if (!knownClientKeyScope(entry.scope)) {
           console.error(`[TeamClaude] proxy.clientKeys: "${name}" has an unrecognised scope and is treated as inference-only; use "inference", "full", or leave scope out`);
+        }
+        if (weeklyLimitFor(entry) === 'invalid') {
+          console.error(`[TeamClaude] proxy.clientKeys: "${safeLine(name, 64)}" has a weeklyUsd that is not a number of at least 0.01, so its requests to the pool are refused; set a number, or leave weeklyUsd out for no limit`);
         }
         if (seen.has(name)) {
           console.error(`[TeamClaude] proxy.clientKeys: duplicate name "${name}" — its keys share one usage counter`);
@@ -825,6 +844,10 @@ export function usageCallerLabel(client, isLocal, proxyConfig) {
  *   also holds (drain.js), so a graceful shutdown waits on the same count the listener keeps.
  */
 export function createProxyServer(accountManager, config, hooks = {}, sx = null, clientUsage = null, dimensionUsage = null, { bindHost = null, drain: sharedDrain = null, usageStore = NO_USAGE_STORE } = {}) {
+  // Weekly spend per client key (proxy.clientKeys[].weeklyUsd), one counter for
+  // the server and its MITM listeners, picked up from usage history on start.
+  const limiter = new WeeklyLimiter();
+  limiter.seed(usageStore);
   const boundHost = () => bindHost || config.proxy?.host;
   const drain = sharedDrain ?? createDrainState();
   const upstream = config.upstream || 'https://api.anthropic.com';
@@ -1018,7 +1041,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         res.writeHead(200, { 'Content-Type': 'application/json' });
         // Counters only: how full the upstream admission gate is (see
         // upstream-fetch.js), never which origins or requests.
-        res.end(JSON.stringify({ ...extra, ...status, caller: callerView(req.tcClient, auth.scope), upstreamPool: upstreamPoolStatus(), drain: drain.status() }, null, 2));
+        res.end(JSON.stringify({ ...extra, ...status, caller: callerView(req.tcClient, auth.scope), clientLimits: clientLimitStatus(limiter, config.proxy), upstreamPool: upstreamPoolStatus(), drain: drain.status() }, null, 2));
         return;
       }
 
@@ -1589,7 +1612,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
   // Opt-in egress pin: null unless config.egress.pin is set, and then shared by
   // the base listener and the MITM one so both honour the same hold.
   const egress = createEgressGuard(config, logLine);
-  const forward = createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config, egress, clientUsage, dimensionUsage, drain, usageStore });
+  const forward = createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config, egress, clientUsage, dimensionUsage, drain, usageStore, limiter });
   const server = http.createServer(requestHandler);
   server.keepAliveTimeout = KEEP_ALIVE_TIMEOUT_MS;
 
@@ -1637,7 +1660,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
     const c = await certsPromise;
     return { key: c.leafKeyPem, cert: c.leafCertPem };
   };
-  server.on('connect', createConnectHandler({ config, accountManager, ensureLeaf, leafHosts: mitmHostList, logDir, hooks, log: logLine, sx, egress, clientUsage, dimensionUsage, drain, usageStore }));
+  server.on('connect', createConnectHandler({ config, accountManager, ensureLeaf, leafHosts: mitmHostList, logDir, hooks, log: logLine, sx, egress, clientUsage, dimensionUsage, drain, usageStore, limiter }));
   // Remote Control's real-time channel is a WebSocket, not a request/response
   // call — Node fires 'upgrade' for that handshake, never 'request', so it
   // needs its own listener (base-URL routing path; the MITM path wires the
@@ -1876,7 +1899,7 @@ function advancePinPastBilling(ctx, accountManager) {
     // over.
     const next = ctx.pinChain.shift();
     if (next.index < 0 || next.type !== 'apikey' || providerOf(next) !== providerOf(from)
-        || accountManager.isBillingRejected(next.index) || accountManager.capBars(next, ctx.model, ctx.advisorModel)) continue;
+        || accountManager.isBillingRejected(next.index) || accountManager.capBars(next, ctx.model, ctx.advisorModel, { pinned: true })) continue;
     // Named once per refusal, next to markBillingRejected's line; a request that
     // only passes a cooling account by is not worth a line each.
     if (ctx.tried.has(from)) {
@@ -2210,9 +2233,10 @@ let lastRequestId = 0;
  * @param {string|null} [opts.forcedClient]
  * @param {Object|null} [opts.dimensionUsage]
  * @param {any} [opts.usageStore]  SQLite usage store (src/usage/db.js); defaults to the disabled sentinel
+ * @param {WeeklyLimiter} [opts.limiter]  the weekly key-limit counter, shared with the server's MITM listeners
  * @param {import('./drain.js').DrainState|null} [opts.drain]  the shared drain state (drain.js); a listener made without one keeps its own, which never drains
  */
-export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null, holdMs = 0, config = {}, forcedPin = null, egress = null, clientUsage = null, forcedClient = null, dimensionUsage = null, drain = null, usageStore = NO_USAGE_STORE }) {
+export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null, holdMs = 0, config = {}, forcedPin = null, egress = null, clientUsage = null, forcedClient = null, dimensionUsage = null, drain = null, usageStore = NO_USAGE_STORE, limiter = new WeeklyLimiter() }) {
   const drainState = drain ?? createDrainState();
   return async (req, res) => {
     // Set before anything else, so every response from this listener carries the
@@ -2536,6 +2560,27 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         return;
       }
 
+      // A client key at its weekly limit (proxy.clientKeys[].weeklyUsd) is
+      // refused before an account is chosen or a session opened. `client`
+      // covers both doors into this listener: the per-request key and the MITM
+      // listener's forcedClient. 403, not 429: Claude Code retries a 429.
+      const limitClient = req.tcClient ?? forcedClient ?? null;
+      const overLimit = limitRefusal(limiter, /** @type {any} */ (config).proxy, limitClient, Date.now());
+      if (overLimit) {
+        if (!res.headersSent) {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ type: 'error', error: { type: 'permission_error', message: overLimit } }));
+        }
+        recordEarlyOutcome(accountManager, { pinKey, sessionId }, req.url, true);
+        openEntry = null;   // this path owns the close below; the outer catch must not repeat it
+        if (!hideActivity) {
+          const proxyConfig = /** @type {any} */ (config).proxy;
+          recordRequest(usageStore, { caller: usageCallerLabel(limitClient, loopbackExempt(req.headers, req.socket?.remoteAddress, proxyConfig), proxyConfig), model, account: null, status: 403, capped: true });
+          hooks.onRequestEnd?.(reqId, { callerRequestId: callerId, method: req.method, path: req.url, account: '(over weekly limit)', status: 403, model, effort, sessionId, client: limitClient });
+        }
+        return;
+      }
+
       // compactBeforeSwitch (issue #709, off unless set): a long conversation
       // whose account is about to reach a switch threshold is answered once
       // with the API's own "prompt is too long" 400, so Claude Code compacts it
@@ -2659,7 +2704,6 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         // marked open would send the outer catch to call that same throwing hook
         // a second time for one request.
         openEntry = null;
-        if (!hideActivity) hooks.onRequestEnd?.(reqId, { callerRequestId: callerId, method: req.method, path: req.url, account: ctx.account, status: ctx.status, model: ctx.model, effort, sessionId, pinned: ctx.pinnedIndex != null, client, attempts: ctx.attempt || 0, cacheUsage: ctx.cacheUsage, errorType: ctx.errorType });
         // One SQLite row per request, written here because this is the one
         // place every terminal outcome of forwardRequest already funnels
         // through — success, a hop that exhausted retries, the pool-exhausted
@@ -2675,14 +2719,25 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         const settled = ctx;
         // A telemetry batch the activity log hides (eventLogging) is not usage
         // either: it would add a zero-token row under no model for every batch.
-        const served = /** @type {any[]} */ (/** @type {any} */ (accountManager).accounts).some(a => a.name === settled.account);
+        // What the reply cost against a weekly key limit, priced from the raw
+        // usage block (it carries the cache-write split, tier and geo) at the
+        // model the last attempt sent (ctx.sentModel). Booked and recorded
+        // before the activity hook, which can throw.
+        const servedBy = /** @type {any[]} */ (/** @type {any} */ (accountManager).accounts).find(a => a.name === settled.account);
+        const { micro: costMicro, unpriced } = limitCost(settled.sentModel ?? ctx.model, settled.cacheUsage);
+        limiter.book(client, costMicro, Date.now());
+        if (client && unpriced && costMicro > 0) noteCeilingCharge(unpriced);
         if (!hideActivity) recordRequest(usageStore, {
           caller,
-          account: served ? settled.account : null,
+          account: servedBy ? settled.account : null,
           model: ctx.model,
           status: settled.proxyClosed && (settled.status ?? 200) < 300 ? 502 : settled.status,
+          // only a named key's spend is read back at start, so only it is stored:
+          // a key may be named "(shared)" like the rows of unnamed traffic.
+          costMicro: client ? costMicro : 0,
           ...ctx.usage,
         });
+        if (!hideActivity) hooks.onRequestEnd?.(reqId, { callerRequestId: callerId, method: req.method, path: req.url, account: ctx.account, status: ctx.status, model: ctx.model, effort, sessionId, pinned: ctx.pinnedIndex != null, client, attempts: ctx.attempt || 0, cacheUsage: ctx.cacheUsage, errorType: ctx.errorType });
       }
     } catch (err) {
       reportFailure('[TeamClaude] Unhandled error:', err);
@@ -4251,6 +4306,41 @@ function respondModelUnsupported(res, ctx, denied) {
   res.end(JSON.stringify({ error: { type: 'invalid_request_error', message } }));
 }
 
+/** Relay a credits refusal to the client whose request drew it.
+ * @param {import('node:http').ServerResponse} res
+ * @param {Record<string, any>} ctx
+ * @param {{ status: number, headers: Record<string, string>, body: Uint8Array }} answer */
+function respondCreditsRequired(res, ctx, answer) {
+  ctx.status = answer.status;
+  ctx.delivered = true;
+  if (res.headersSent || clientGone(res)) return;
+  res.writeHead(answer.status, answer.headers);
+  res.end(answer.body);
+}
+
+/**
+ * The upstream response headers a client is given: not the connection-specific
+ * ones (most would make writeHead throw, behind the MITM's h2 server above all;
+ * see CONNECTION_SPECIFIC_HEADERS), not our own correlation header (set before
+ * this head by the listener: an upstream copy would win the merge), not the
+ * encoding and length (fetch may decompress), and not the per-org billing
+ * state when stripOverageHeaders is on (see isOverageHeader).
+ * @param {Headers} headers
+ * @param {Record<string, any>} ctx
+ * @returns {Record<string, string>}
+ */
+function relayableHeaders(headers, ctx) {
+  /** @type {Record<string, string>} */
+  const out = {};
+  for (const [key, value] of headers.entries()) {
+    if (CONNECTION_SPECIFIC_HEADERS.has(key) || key === CORRELATION_HEADER) continue;
+    if (key === 'content-encoding' || key === 'content-length') continue;
+    if (ctx.stripOverage === true && isOverageHeader(key)) continue;
+    out[key] = value;
+  }
+  return out;
+}
+
 /**
  * A GET the pooled token was not scoped for, sent once on the client's own
  * credential (the scope branch of forwardRequest). It takes the forward path's
@@ -4310,6 +4400,14 @@ async function relayOnClientCredential(req, res, upstream, sx, route, ctx) {
   }
 }
 
+/** @param {import('./account-manager.js').AccountManager} am
+ * @param {Record<string, any>} account @param {Record<string, any>} ctx */
+function canRecheckFamily(am, account, ctx) {
+  if (!canServeProvider(account, ctx.provider || DEFAULT_PROVIDER) || am.isPaused(account.index)) return false;
+  const reason = am.unavailableReason(account, ctx.model, ctx.advisorModel, { recheckFamily: true });
+  return reason == null || (reason === 'cordoned' && am.cordonKeeps(ctx.pinKey, ctx.model).has(account.index));
+}
+
 export async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, useSx) {
   const maxRetries = accountManager.accounts.length;
   // This function is exported, so a caller may hand us a ctx built elsewhere.
@@ -4339,10 +4437,13 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // its own 429 pause, as at the hop sites below. With nowhere left the request
   // ends as one with no account does. Selecting normally would walk the fleet
   // cursor off the account the detour went around (#286).
-  const hop = ctx.hopTo ?? null;
-  ctx.hopTo = null;
+  const recheckTo = ctx.creditsRecheckTo ?? null;
+  const creditsRecheck = recheckTo != null;
+  const hop = recheckTo ?? ctx.hopTo ?? null;
+  ctx.creditsRecheckTo = ctx.hopTo = null;
   let hopTo = hop;
-  if (hop != null && hop.index < 0) {
+  if (creditsRecheck && hop.index < 0) hopTo = null;
+  else if (hop != null && hop.index < 0) {
     const again = accountManager.pickAlternate(indicesOf([...ctx.tried, ...(ctx.rolledOff || [])]), ctx.model, ctx.advisorModel, ctx.provider);
     hopTo = again && !accountManager.isPaused(again.index) ? again : null;
     console.log(hopTo
@@ -4400,8 +4501,11 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // The hop's destination was picked by pickAlternate against this request's
   // own exclusions, and is taken as-is: re-selecting here would walk the fleet
   // cursor onto it, which is exactly the move a detour must not make (#286).
+  // Once the re-check finishes, answer from the pool's hold instead of
+  // walking the fleet again, even if an account became available meanwhile.
   const account = hop != null
     ? hopTo
+    : ctx.creditsRechecked ? null
     : ctx.pinnedIndex != null
       ? (pinned && !pinBar ? pinned : null)
       : accountManager.getActiveAccount(
@@ -4445,18 +4549,44 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     if (ctx.pinKey) {
       for (const i of accountManager.cordonKeeps(ctx.pinKey, ctx.model)) {
         const kept = accountManager.accounts[i];
-        if (kept && !kept.disabled) counted.add(kept);
+        if (kept && !kept.disabled && canServeProvider(kept, ctx.provider || DEFAULT_PROVIDER)
+            && accountManager._routeAllows(kept, ctx.model)) counted.add(kept);
       }
     }
     // Every account this request reached held an expired token that could not be
     // renewed, and nothing else was tried: say that, not a refusal or a quota.
     // Matched by account (recordRefusal).
     const unrenewed = ctx.unrenewedAccounts;
-    if (unrenewed?.size && [...ctx.tried].every(a => unrenewed.has(a))
+    if (!ctx.creditsRechecked && unrenewed?.size && [...ctx.tried].every(a => unrenewed.has(a))
         && (ctx.pinnedIndex != null || (counted.size > 0 && [...counted].every(a => ctx.tried.has(a))))) {
       return respondUnrenewed(res, ctx);
     }
-    if (reachable.length && reachable.every(a => accountManager.unavailableReason(a, ctx.model) === 'billing')) {
+    // An account-health failure can mask a live family hold in the selection
+    // verdict. Count that hold, but never bypass the health gate to re-check it.
+    if (!ctx.creditsRechecked) {
+      const now = Date.now();
+      let allHeld = true;
+      let oldest = Infinity;
+      let recheck = null;
+      for (const a of counted) {
+        const armedAt = Math.min(...[ctx.model, ctx.advisorModel].map(model => {
+          const entry = accountManager.familyRefusal(a, model);
+          return entry?.until && entry.until > now ? entry.armedAt : Infinity;
+        }));
+        if (armedAt === Infinity && !ctx.creditsRefused?.has(a)) { allHeld = false; break; }
+        if (armedAt >= oldest || ctx.tried.has(a) || ctx.rolledOff?.has(a) || !canRecheckFamily(accountManager, a, ctx)) continue;
+        oldest = armedAt;
+        recheck = a;
+      }
+      // Relay only a refusal from this request, or send one fresh re-check.
+      if (allHeld && ctx.creditsRefusal) return respondCreditsRequired(res, ctx, ctx.creditsRefusal);
+      if (allHeld && recheck && ctx.pinnedIndex == null) {
+        ctx.creditsRechecked = true;
+        ctx.creditsRecheckTo = recheck;
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
+      }
+    }
+    if (!ctx.creditsRechecked && reachable.length && reachable.every(a => accountManager.unavailableReason(a, ctx.model) === 'billing')) {
       ctx.status = 402;
       ctx.account = '(billing unavailable)';
       if (!res.headersSent && !clientGone(res)) {
@@ -4471,7 +4601,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // Every account that could take this request has a ChatGPT plan that does
     // not serve its model. No reset or wait changes a plan, so the answer is
     // upstream's own 400, as the client would have had it from one account.
-    if (reachable.length && reachable.every(a => accountManager.unavailableReason(a, ctx.model) === 'model-unsupported')) {
+    if (!ctx.creditsRechecked && reachable.length && reachable.every(a => accountManager.unavailableReason(a, ctx.model) === 'model-unsupported')) {
       return respondModelUnsupported(res, ctx, reachable);
     }
     // Every candidate was refused by upstream (403). Waiting will not help — the
@@ -4490,7 +4620,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     const allRefused = refused?.size > 0 && (ctx.pinnedIndex != null
       ? refused.has(accountManager.accounts[ctx.pinnedIndex])
       : counted.size > 0 && [...counted].every(a => refused.has(a)));
-    if (allRefused) {
+    if (!ctx.creditsRechecked && allRefused) {
       const rejected = ctx.credentialRejected;
       const names = [...rejected].map(n => `"${n}"`).join(', ');
       // By account too: an entitlement denial and a plain refusal on two
@@ -4556,7 +4686,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     const redeemHook = resetProvider === 'codex' ? hooks.redeemCodexResetForPool
       : resetProvider === DEFAULT_PROVIDER ? hooks.redeemClaudeResetForPool : null;
     const clears = resetProvider === 'codex' ? RESET_CLEARS : CLAUDE_RESET_CLEARS;
-    const resettable = redeemHook && !ctx.resetRedeemTried
+    const resettable = redeemHook && !ctx.creditsRechecked && !ctx.resetRedeemTried
       ? accountManager.accounts.filter((/** @type {Record<string, any>} */ a) =>
         providerOf(a) === resetProvider && !ctx.tried.has(a)
         // A third-party backend is an Anthropic-shaped account with no Anthropic
@@ -4568,7 +4698,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         // `quota` ahead of `route`, so such an account can read as resettable,
         // and a reset there clears windows this request may never use.
         && accountManager._routeAllows(a, ctx.model)
-        && clears.has(accountManager.unavailableReason(a, ctx.model) ?? ''))
+        && clears.has(accountManager.unavailableReason(a, ctx.model, ctx.advisorModel) ?? ''))
       : [];
     if (resettable.length) {
       // Once per request, whatever it decides: a redemption that reports success
@@ -4603,14 +4733,14 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     const kept = ctx.pinKey ? accountManager.cordonKeeps(ctx.pinKey, ctx.model) : null;
     const candidates = candidateAccounts(accountManager, ctx.model, ctx.provider)
       .map((/** @type {Record<string, any>} */ a) => (kept?.has(a.index) ? { ...a, cordoned: false } : a));
-    const wait = retryWait(accountManager, candidates, ctx.model);
+    const wait = retryWait(accountManager, candidates, ctx.model, ctx.advisorModel);
     const retryAfter = wait.seconds;
 
     // Long-hold mode: hold the HTTP connection and poll until an account
     // recovers or the budget (holdSeconds) runs out. Claude Code waits for
     // the first response byte, so this is transparent to the client as long
     // as API_TIMEOUT_MS on the Claude Code side is large enough.
-    if (ctx.holdBudgetMs > 0) {
+    if (!ctx.creditsRechecked && ctx.holdBudgetMs > 0) {
       // Cap the per-poll sleep to 60s so a newly-available account (e.g. one
       // manually enabled or whose quota reset early) is picked up within a
       // minute instead of sleeping the full retryAfter (often 3600s).
@@ -4627,7 +4757,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     }
 
     const exhaustedRetries = ctx.exhaustedRetries || 0;
-    if (exhaustedRetries < 1 && retryAfter <= INLINE_RETRY_AFTER_MAX_SECONDS) {
+    if (!ctx.creditsRechecked && exhaustedRetries < 1 && retryAfter <= INLINE_RETRY_AFTER_MAX_SECONDS) {
       ctx.exhaustedRetries = exhaustedRetries + 1;
       console.log(`[TeamClaude] All accounts exhausted — waiting ${retryAfter}s before retry`);
       await waitForRetry(retryAfter * 1000, ctx.signal);
@@ -4767,6 +4897,10 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // Every rewrite below runs inside rewriteRequestBody (exported for tests);
   // Content-Length is refreshed below because the body can shrink.
   let sendBody = rewriteRequestBody(body, account, req.url, req.headers['content-type']);
+  // The model this attempt names upstream after the account's modelMap, read
+  // now so a reload during the reply cannot change what it is priced at.
+  ctx.sentModel = typeof ctx.model === 'string' && account.modelMap && Object.hasOwn(account.modelMap, ctx.model) && typeof account.modelMap[ctx.model] === 'string'
+    ? account.modelMap[ctx.model] : ctx.model;
   // If the body changed length (sanitize, model rewrite, or field strip), update
   // Content-Length so the upstream doesn't receive a mismatched framing and
   // truncate or stall.
@@ -4845,8 +4979,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // one account each time, which bounds the re-selection. A pin re-enters
     // its own check and is refused there. And for an account another request
     // put in error meanwhile (an account refusal), pins excepted as above.
-    if (accountManager.capBars(account, ctx.model, ctx.advisorModel)
-        || (ctx.pinnedIndex == null && account.status === 'error')) {
+    if (accountManager.capBars(account, ctx.model, ctx.advisorModel, { pinned: ctx.pinnedIndex != null, recheckFamily: creditsRecheck })
+        || (ctx.pinnedIndex == null && account.status === 'error')
+        || (creditsRecheck && !canRecheckFamily(accountManager, account, ctx))) {
       accountManager.release(account.index, { successful: false });
       ctx.tried.add(account);
       return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
@@ -4870,6 +5005,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     let admittedLoad = 0;
     const entitlementEpoch = account.entitlementEpoch;
     const modelDenialEpoch = account.modelDenialEpoch;
+    const familyRefusalEpoch = account.familyRefusalEpoch;
     try {
       upstreamRes = await upstreamFetch(upstreamUrl, {
         method,
@@ -4898,24 +5034,6 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     }
 
     let upstreamBody = upstreamRes.body;
-    // Only a JSON error is read ahead: any other 400 or 402 (an event stream, a
-    // proxy's HTML page) is relayed as it arrives, not held until it ends.
-    if ((upstreamRes.status === 400 || upstreamRes.status === 402) && !res.headersSent
-        && isJsonContentType(upstreamRes.headers.get('content-type'))) {
-      const inspected = await inspectBillingError(upstreamBody);
-      upstreamBody = inspected.body;
-      if (inspected.billingError) {
-        await upstreamBody?.cancel();
-        accountManager.markBillingRejected(account.index);
-        ctx.tried.add(account);
-        if (clientGone(res)) { ctx.abandoned = true; return; }
-        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
-      }
-    }
-    if (upstreamRes.status < 400 && isCompletionPath(classificationPath(req.url))) {
-      accountManager.clearBillingRejected(account.index);
-    }
-
     // Extract rate limit headers. Anthropic states its quota under
     // `anthropic-ratelimit-*` and Codex under `x-codex-*`; `updateQuota` picks
     // the parser by provider, so keeping only Anthropic's prefix handed a Codex
@@ -4927,6 +5045,61 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         rateLimitHeaders[key] = value;
       }
     }
+    // Inspect once, before quota and billing can turn a model refusal into an
+    // account-wide block. The same body-idle deadline as the relay applies;
+    // a timed-out read cancels the stream and takes the transport failure path.
+    const status = upstreamRes.status;
+    if ([400, 402, 403, 429].includes(status) && upstreamBody && !res.headersSent
+        && isJsonContentType(upstreamRes.headers.get('content-type'))) {
+      const inspected = await holdBody(upstreamBody, ERROR_BODY_INSPECTION_LIMIT);
+      const bytes = inspected.buf;
+      const credits = creditsRequiredRefusal(status, bytes);
+      // A 429 that reports a spent quota window is the account's verdict, and
+      // keeps the quota path below whatever its body says about credits: the
+      // window is recorded and the request rotates. These are the windows that
+      // path acts on (quotaWindowRejected). That holds for an option-specific
+      // refusal as well: relayed from here, it would leave the spent window
+      // unrecorded and the client with a 429 another account could serve.
+      const windowRejected = status === 429 && ['5h', '7d', '7d_oi'].some(w =>
+        rateLimitHeaders[`anthropic-ratelimit-unified-${w}-status`] === 'rejected');
+      // An option-specific refusal is relayed as it came, and a 403 is not
+      // one to hand a client raw: Claude Code reads it as a dead login. It
+      // takes the 403 path below, as it did before this check existed.
+      const relayedForbidden = credits === 'request' && status === 403;
+      if (bytes && credits && !windowRejected && !relayedForbidden) {
+        const answer = { status, headers: relayableHeaders(upstreamRes.headers, ctx), body: bytes };
+        if (credits !== 'request') {
+          const model = credits.model ?? ctx.model;
+          const until = accountManager.markFamilyRefused(account.index, model, { reason: credits.reason, detail: credits.detail });
+          const family = modelFamily(model);
+          const label = family === 'other' ? safeLine(model, 64) : familyLabel(family);
+          console.log(`[TeamClaude] ${status} on "${safeLine(account.name, 64)}" — ${label} needs usage credits`
+            + (until ? `; out of rotation for ${label} until ${new Date(until).toISOString()}` : ''));
+        } else if (creditsRecheck) {
+          accountManager.deferFamilyRecheck(account, ctx.model, ctx.advisorModel);
+        }
+        if (creditsRecheck && status === 403) return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+        if (credits === 'request' || ctx.pinnedIndex != null || creditsRecheck) return respondCreditsRequired(res, ctx, answer);
+        ctx.creditsRefusal = answer;
+        (ctx.creditsRefused ??= new Set()).add(account);
+        ctx.tried.add(account);
+        if (clientGone(res)) { ctx.abandoned = true; return; }
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+      }
+      if ((status === 400 || status === 402) && isBillingError(bytes)) {
+        if (creditsRecheck) accountManager.deferFamilyRecheck(account, ctx.model, ctx.advisorModel);
+        accountManager.markBillingRejected(account.index);
+        ctx.tried.add(account);
+        if (clientGone(res)) { ctx.abandoned = true; return; }
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+      }
+      upstreamBody = bytes ? new ReadableStream({ start(c) { c.enqueue(bytes); c.close(); } }) : inspected.body;
+    }
+    if (creditsRecheck && status !== 200) accountManager.deferFamilyRecheck(account, ctx.model, ctx.advisorModel);
+    if (upstreamRes.status < 400 && isCompletionPath(classificationPath(req.url))) {
+      accountManager.clearBillingRejected(account.index);
+    }
+
     // A spent quota window is still the account's verdict whatever
     // x-should-retry says: that 429 is the one rotation exists for, so it keeps
     // the quota path below. Only the windows that path acts on count; an
@@ -4977,10 +5150,10 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // reason) and noise otherwise.
       let refusal = '';
       if (requestScoped) {
-        const raw = await readErrorBody(upstreamRes.body).catch(() => null);
+        const raw = await readErrorBody(upstreamBody).catch(() => null);
         try { refusal = raw ? String(JSON.parse(raw.toString('utf8'))?.error?.message || '') : ''; } catch { refusal = ''; }
       } else {
-        await upstreamRes.body?.cancel();
+        await upstreamBody?.cancel();
       }
 
       // Durable quota exhaustion vs. a transient rate limit. A "rejected" unified
@@ -5009,7 +5182,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         || codexAccountSpent;
       const fableRejected = rl['anthropic-ratelimit-unified-7d_oi-status'] === 'rejected' && !generalRejected;
       const codexFamilyRejected = spentCodexWindows.length > 0 && !generalRejected;
-      if ((generalRejected || fableRejected || codexFamilyRejected) && retryCount < maxRetries) {
+      if ((generalRejected || fableRejected || codexFamilyRejected) && (creditsRecheck || retryCount < maxRetries)) {
         // A Fable-only rejection leaves the account fine for other models, so we
         // do NOT throttle it globally — the recorded Fable utilization makes
         // selection skip it for Fable requests only. A general rejection spends a
@@ -5086,6 +5259,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         accountManager.pauseAccount(account.index,
           Math.min(retryAfter, RATE_LIMIT_ABSORB_MAX_SECONDS), admittedLoad);
       }
+
+      // Keep the pause but do not wait or send a second re-check.
+      if (creditsRecheck) return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
 
       // ONE bounded failover hop to an idle sibling (#137, #165, #156).
       //
@@ -5274,7 +5450,12 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // account's cache discovering that. After the hop the response goes to the
     // client as it does today, with its own retry-after intact.
     // Never for a pinned request, as for the 429 hop above.
-    if (ctx.pinnedIndex == null && upstreamRes.status >= 500 && !res.headersSent && !ctx.serverErrorHopped && retryCount < maxRetries) {
+    if (ctx.pinnedIndex == null && upstreamRes.status >= 500 && !res.headersSent
+        && (creditsRecheck || (!ctx.serverErrorHopped && retryCount < maxRetries))) {
+      if (creditsRecheck) {
+        await upstreamBody?.cancel();
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+      }
       // Same exclusion as the 429 hop, and the same cursor-preserving pick.
       const alt = accountManager.pickAlternate(
         indicesOf([...ctx.tried, ...(ctx.rolledOff || []), account]),
@@ -5291,10 +5472,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       }
     }
 
-    // `upstreamBody` (declared above, after the billing check) is the body the
-    // relay reads: the upstream's own, or, after the billing check, a released
-    // peek or the 400 check below, the same bytes replayed ahead of the rest of
-    // the same stream.
+    // The relay uses upstreamBody, which includes any bytes already inspected.
 
     // A 400 is normally about the request and goes to the client as it came.
     // An account refusal (account-refusal.js) is about the account: it leaves
@@ -5341,7 +5519,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // in. Skip the account for the rest of this request and fail over. With no
     // account left, the no-account branch reports a proxy error instead.
     if (upstreamRes.status === 403 && !res.headersSent) {
-      const responseBody = await readErrorBody(upstreamRes.body);
+      const responseBody = await readErrorBody(upstreamBody);
       // Except a scope 403: the account is fine, its token just cannot reach
       // this endpoint. A `claude setup-token` token is inference-only, so
       // Claude Code's bootstrap, settings and connector-registry calls draw one
@@ -5352,7 +5530,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // credential. GET only: those calls are, and a completion never is, so
       // the client's login is never spent on inference. A pin keeps its
       // account for every request, as before.
-      if (req.method === 'GET' && ctx.pinnedIndex == null
+      if (!creditsRecheck && req.method === 'GET' && ctx.pinnedIndex == null
           && account.type === 'oauth' && providerOf(account) === DEFAULT_PROVIDER
           && responseBody != null && isOAuthScopeInsufficient(responseBody)
           && /^Bearer \S/i.test(String(req.headers.authorization || ''))) {
@@ -5396,15 +5574,17 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // token is dead too: ensureTokenFresh marks the account errored, and the
     // retry's status check rotates to another account. Bounded to one re-auth
     // per account per request, so a genuinely dead credential does not loop: a
-    // 401 that comes back goes to the branch below.
+    // 401 that comes back goes to the branch below. A re-check refreshes for
+    // future requests, then goes straight there without sending again.
     if (upstreamRes.status === 401 && account.type === 'oauth' && account.refreshToken
-        && retryCount < maxRetries && !ctx.reauthed.has(account)) {
+        && (creditsRecheck || retryCount < maxRetries) && !ctx.reauthed.has(account)) {
       ctx.reauthed.add(account);
       await upstreamRes.body?.cancel();
-      console.log(`[TeamClaude] 401 on "${account.name}" — token rejected; forcing refresh and retrying`);
+      upstreamBody = null;
+      console.log(`[TeamClaude] 401 on "${account.name}" — token rejected; forcing refresh${creditsRecheck ? '' : ' and retrying'}`);
       await accountManager.ensureTokenFresh(account.index, true);
       if (clientGone(res)) { ctx.abandoned = true; return; }
-      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+      if (!creditsRecheck) return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
     }
 
     // A 401 the branch above did not take, or one that came BACK after it. The
@@ -5425,7 +5605,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // successful one (the refresh-storm guard), so the retry may have gone out
     // on the same token — and a later request gets to try the refresh again.
     if (upstreamRes.status === 401 && !res.headersSent) {
-      await upstreamRes.body?.cancel();
+      await upstreamBody?.cancel();
       if (account.type !== 'oauth' || !account.refreshToken) {
         accountManager.markCredentialRejected(account.index, account.type !== 'oauth'
           ? 'upstream rejected its API key (401)'
@@ -5433,7 +5613,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       }
       recordRefusal(ctx, account, 401);
       ctx.tried.add(account);
-      console.error(`[TeamClaude] 401 on "${safeLine(account.name, 64)}"; failing over to another account`);
+      console.error(`[TeamClaude] 401 on "${safeLine(account.name, 64)}"; ${creditsRecheck ? 'returning the pool retry-after' : 'failing over to another account'}`);
       if (clientGone(res)) { ctx.abandoned = true; return; }
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
     }
@@ -5460,7 +5640,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // decisive event instead of the status. The sibling is picked first so a
     // request with nowhere to hop to is never held for nothing. Never for a
     // pinned request, as for the 429 hop above.
-    if (ctx.pinnedIndex == null && isStreaming && upstreamRes.status < 400 && upstreamBody && !res.headersSent
+    if (!creditsRecheck && ctx.pinnedIndex == null && isStreaming && upstreamRes.status < 400 && upstreamBody && !res.headersSent
         && !ctx.streamFailureHopped && retryCount < maxRetries) {
       const alt = accountManager.pickAlternate(
         indicesOf([...ctx.tried, ...(ctx.rolledOff || []), account]),
@@ -5492,22 +5672,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // A request-specific refusal is an answer, not a starving session.
     const deliveredStatus = nonRetryable429 || answeredStatus(upstreamRes.status);
 
-    // Build response headers (skip the connection-specific and encoding
-    // headers). Most connection-specific names would make writeHead throw,
-    // behind the MITM's h2 server above all (see CONNECTION_SPECIFIC_HEADERS).
-    /** @type {Record<string, string>} */
-    const responseHeaders = {};
-    for (const [key, value] of upstreamRes.headers.entries()) {
-      if (CONNECTION_SPECIFIC_HEADERS.has(key)) continue;
-      // Ours, set before this head (see the listener): an upstream copy would win the merge.
-      if (key === CORRELATION_HEADER) continue;
-      // Strip content-encoding/content-length since fetch may auto-decompress
-      if (key === 'content-encoding' || key === 'content-length') continue;
-      // Per-org billing state, dropped when stripOverageHeaders is on (see
-      // isOverageHeader); updateQuota above already saw the full header set.
-      if (ctx.stripOverage === true && isOverageHeader(key)) continue;
-      responseHeaders[key] = value;
-    }
+    // Build response headers (see relayableHeaders). updateQuota above already
+    // saw the full header set.
+    const responseHeaders = relayableHeaders(upstreamRes.headers, ctx);
 
     // A headerless stream is told it is one (see `streamAssumed` above).
     if (streamAssumed) responseHeaders['content-type'] = contentType;
@@ -5517,7 +5684,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // own headers, and an upstream that states its own unified quota is left
     // alone rather than mixed with ours. An error response gets nothing: its
     // `status: allowed` would be a verdict the proxy never made.
-    if (ctx.synthesizeQuota === true && upstreamRes.status < 400
+    if (!creditsRecheck && ctx.synthesizeQuota === true && upstreamRes.status < 400
         && !Object.keys(rateLimitHeaders).some(k => k.startsWith('anthropic-ratelimit-unified-'))) {
       Object.assign(responseHeaders, backendQuotaHeaders(account.quota?.backend?.windows));
     }
@@ -5526,7 +5693,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // poolQuotaHeaders). An error response is left alone: a 429 that reaches
     // the client is one rotation already failed to avoid. A pinned request is
     // left alone too: rotation cannot move it, so its warnings are real.
-    if (ctx.poolQuota === true && ctx.pinnedIndex == null && upstreamRes.status < 400) {
+    if (!creditsRecheck && ctx.poolQuota === true && ctx.pinnedIndex == null && upstreamRes.status < 400) {
       const pool = accountManager.poolQuotaReadings(account, ctx.model, ctx.advisorModel, ctx.provider);
       if (pool) poolQuotaHeaders(responseHeaders, pool);
     }
@@ -5620,6 +5787,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         && isCompletionPath(classificationPath(req.url))) {
       accountManager.clearEntitlementDenied(account, entitlementEpoch);
       accountManager.clearModelDenied(account, ctx.model, modelDenialEpoch);
+      accountManager.clearFamilyRefused(account, ctx.model, familyRefusalEpoch);
+      accountManager.clearFamilyRefused(account, ctx.advisorModel, familyRefusalEpoch);
     }
   } catch (err) {
     // Two of the things that can throw here are not upstream errors at all:
@@ -5666,6 +5835,11 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         res.end(JSON.stringify({ type: 'error', error: { type: 'overloaded_error', message: 'Proxy upstream queue is full; retry shortly.' } }));
       }
       return;
+    }
+
+    if (creditsRecheck && !res.headersSent) {
+      accountManager.deferFamilyRecheck(account, ctx.model, ctx.advisorModel);
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
     }
 
     // Would failing over dial anywhere else? Only an untried account pointing at
@@ -5760,9 +5934,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
 // (reader.cancel destroys the underlying connection on both the direct-fetch and
 // the sx-tunnel path, since both hand back a web ReadableStream). It times the
 // reads of a body being relayed (streamResponse) or held whole (holdBody; the
-// forward path's hold may wait longer, see resolveHeldAnswerIdleTimeout); the
-// bounded diagnostic reads of an error body (readErrorBody, inspectBillingError)
-// are not timed. Override with TEAMCLAUDE_UPSTREAM_BODY_TIMEOUT_MS.
+// forward path's hold may wait longer, see resolveHeldAnswerIdleTimeout).
+// Override with TEAMCLAUDE_UPSTREAM_BODY_TIMEOUT_MS.
 const DEFAULT_BODY_IDLE_TIMEOUT_MS = 120_000;
 
 // The longest delay setTimeout keeps: it holds the delay in a signed 32-bit
@@ -6359,13 +6532,15 @@ export function rewriteModel(body, modelMap) {
  * @param {import('./account-manager.js').AccountManager} accountManager
  * @param {Record<string, any>} account
  * @param {string|null|undefined} model
+ * @param {string|null|undefined} advisorModel
  * @returns {any[]}
  */
-function blockingResets(accountManager, account, model) {
+function blockingResets(accountManager, account, model, advisorModel) {
   const q = account.quota || {};
   /** @type {any[]} */
   const resets = [account.rateLimitedUntil, account.entitlementDeniedUntil, account.routingFailedUntil,
-    account.credentialRejectedUntil, account.billingRejectedUntil];
+    account.credentialRejectedUntil, account.billingRejectedUntil,
+    accountManager.familyRefusal(account, model ?? null)?.until, accountManager.familyRefusal(account, advisorModel ?? null)?.until];
 
   if (q.unified5h != null && q.unified5h >= accountManager.thresholdFor('unified5h')) {
     resets.push(q.unified5hReset);
@@ -6478,16 +6653,17 @@ export function computeRetryAfter(accountManager, candidates, model = null) {
  * @param {import('./account-manager.js').AccountManager} accountManager
  * @param {Record<string, any>[]} candidates
  * @param {string|null|undefined} [model]
+ * @param {string|null|undefined} [advisorModel]
  * @returns {{ seconds: number, resetAt: number | null }}
  */
-export function retryWait(accountManager, candidates, model = null) {
+export function retryWait(accountManager, candidates, model = null, advisorModel = null) {
   const now = Date.now();
   let soonest = Infinity;
   let soonestResetAt = null;
   for (const acct of candidates) {
     if (acct.disabled || acct.cordoned || acct.status === 'error') continue;
     let blockedFor = 0;
-    for (const reset of blockingResets(accountManager, acct, model)) {
+    for (const reset of blockingResets(accountManager, acct, model, advisorModel)) {
       const ms = new Date(reset).getTime() - now;
       // Skips what will not parse (NaN fails both comparisons) and what has
       // already lapsed: a hold that expired is not a hold.

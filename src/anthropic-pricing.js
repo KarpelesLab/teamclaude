@@ -122,6 +122,27 @@ export function priceUsage(model, usage) {
     return { ok: false, model: shown, reason: 'no price for this model' };
   }
   const u = usage || {};
+  const tokens = tokenCounts(u);
+
+  /** @type {PriceRow} */
+  let price = row;
+  if (row.longContext && tokens.prompt > row.longContext.over) price = row.longContext;
+
+  if (u.speed === 'fast') {
+    if (!row.fast) return { ok: false, model: shown, reason: 'no fast-mode price for this model' };
+    price = fastRow(row.fast, price, row.input);
+  }
+
+  let multiplier = 1;
+  if (u.inference_geo === 'us') multiplier *= US_GEO_MULTIPLIER;
+  if (u.service_tier === 'batch') multiplier *= BATCH_MULTIPLIER;
+  else if (u.service_tier === 'priority') return { ok: false, model: shown, reason: 'Priority Tier is not priced' };
+
+  return { ok: true, costMinor: (tokenUsd(tokens, price) * multiplier + searchUsd(u)) * 100 };
+}
+
+/** @param {Record<string, any>} u */
+function tokenCounts(u) {
   const input = count(u.input_tokens);
   const output = count(u.output_tokens);
   const read = count(u.cache_read_input_tokens);
@@ -130,34 +151,82 @@ export function priceUsage(model, usage) {
   const write5mSplit = count(split.ephemeral_5m_input_tokens);
   const writeTotal = count(u.cache_creation_input_tokens);
   const write5m = write5mSplit + Math.max(0, writeTotal - write5mSplit - write1h);
+  return { input, output, read, write5m, write1h, prompt: input + read + write5m + write1h };
+}
 
+/**
+ * Fast mode replaces the base input and output prices; the cache multipliers
+ * apply on top of the fast input price.
+ * @param {{ input: number, output: number }} fast
+ * @param {PriceRow} base
+ * @param {number} baseInput
+ * @returns {PriceRow}
+ */
+function fastRow(fast, base, baseInput) {
+  const inScale = fast.input / baseInput;
+  return {
+    input: fast.input,
+    output: fast.output,
+    cacheWrite5m: base.cacheWrite5m * inScale,
+    cacheWrite1h: base.cacheWrite1h * inScale,
+    cacheRead: base.cacheRead * inScale,
+  };
+}
+
+/** @param {ReturnType<typeof tokenCounts>} t @param {PriceRow} price */
+function tokenUsd(t, price) {
+  return (t.input * price.input + t.output * price.output + t.read * price.cacheRead
+    + t.write5m * price.cacheWrite5m + t.write1h * price.cacheWrite1h) / 1_000_000;
+}
+
+/** @param {Record<string, any>} u */
+function searchUsd(u) {
+  return count(u.server_tool_use?.web_search_requests) * WEB_SEARCH_USD;
+}
+
+// The dearest rate the table knows in each category, over every row and its
+// long-context and fast variants: what a reply `priceUsage` cannot price is
+// charged against a weekly key limit.
+const MAX_PRICE = (() => {
   /** @type {PriceRow} */
-  let price = row;
-  const prompt = input + read + write5m + write1h;
-  if (row.longContext && prompt > row.longContext.over) price = row.longContext;
-
-  if (u.speed === 'fast') {
-    if (!row.fast) return { ok: false, model: shown, reason: 'no fast-mode price for this model' };
-    // Fast mode replaces the base input and output prices; the cache
-    // multipliers apply on top of the fast input price.
-    const inScale = row.fast.input / row.input;
-    price = {
-      input: row.fast.input,
-      output: row.fast.output,
-      cacheWrite5m: price.cacheWrite5m * inScale,
-      cacheWrite1h: price.cacheWrite1h * inScale,
-      cacheRead: price.cacheRead * inScale,
-    };
+  const max = { input: 0, output: 0, cacheWrite5m: 0, cacheWrite1h: 0, cacheRead: 0 };
+  /** @param {PriceRow} p */
+  const fold = (p) => { for (const k of /** @type {(keyof PriceRow)[]} */ (Object.keys(max))) max[k] = Math.max(max[k], p[k]); };
+  for (const row of Object.values(PRICES)) {
+    for (const p of [row, row.longContext].filter(Boolean)) {
+      fold(/** @type {PriceRow} */ (p));
+      if (row.fast) fold(fastRow(row.fast, /** @type {PriceRow} */ (p), row.input));
+    }
   }
+  return max;
+})();
 
-  let multiplier = 1;
-  if (u.inference_geo === 'us') multiplier *= US_GEO_MULTIPLIER;
-  if (u.service_tier === 'batch') multiplier *= BATCH_MULTIPLIER;
-  else if (u.service_tier === 'priority') return { ok: false, model: shown, reason: 'Priority Tier is not priced' };
+/**
+ * What a reply costs against a weekly key limit, in millionths of a dollar.
+ * The list price where `priceUsage` has one; otherwise `MAX_PRICE`, because
+ * two of its refusals (Priority Tier, fast mode on a model with no fast price)
+ * are chosen by the caller's own request, and a limit must not read them as
+ * free. The Batch discount is not applied to that charge for the same reason.
+ * @param {unknown} model
+ * @param {Record<string, any>|null|undefined} usage
+ */
+export function limitCostMicro(model, usage) {
+  return limitCost(model, usage).micro;
+}
 
-  const tokenUsd = (input * price.input + output * price.output + read * price.cacheRead
-    + write5m * price.cacheWrite5m + write1h * price.cacheWrite1h) / 1_000_000;
-  const searches = count(u.server_tool_use?.web_search_requests);
-  const usd = tokenUsd * multiplier + searches * WEB_SEARCH_USD;
-  return { ok: true, costMinor: usd * 100 };
+/**
+ * limitCostMicro's figure, with why the reply had no list price when it was
+ * charged at `MAX_PRICE` (null when it was priced), so the caller can say so:
+ * a key that stops at a fraction of its real list spend is otherwise unexplained.
+ * @param {unknown} model
+ * @param {Record<string, any>|null|undefined} usage
+ * @returns {{ micro: number, unpriced: { model: string, reason: string }|null }}
+ */
+export function limitCost(model, usage) {
+  const u = usage || {};
+  const priced = priceUsage(model, u);
+  const usd = priced.ok
+    ? priced.costMinor / 100
+    : tokenUsd(tokenCounts(u), MAX_PRICE) * (u.inference_geo === 'us' ? US_GEO_MULTIPLIER : 1) + searchUsd(u);
+  return { micro: Math.round(usd * 1_000_000), unpriced: 'reason' in priced ? { model: priced.model, reason: priced.reason } : null };
 }
