@@ -1282,6 +1282,9 @@ export class AccountManager {
       if (this._familySpendCapBinds(account, model)) return 'spend';
     }
     if (account?.maxUsage == null) return null;
+    // As in capExceeded: _withoutAdvisorCapped asks before expired windows are
+    // cleared, and a window that has reset is never capped on the old reading.
+    this._clearExpiredQuotas(account);
     return this._familyCapBucket(account, model);
   }
 
