@@ -168,6 +168,17 @@ test("an advisor model's cap is checked too", () => {
   assert.equal(am.unavailableReason(capped, OPUS, FABLE), 'advisor-capped');
 });
 
+test("an advisor's family cap is not read from a window that has reset", () => {
+  const am = new AccountManager([
+    oauth('capped', { maxUsage: { unified7dFable: 0.8 } }),
+    oauth('backup', { priority: 10 }),
+  ], 0.98);
+  const capped = am.accounts[0];
+  setQuota(capped, { unified7dFable: 0.9, unified7dFableReset: Date.now() - 60_000 });
+
+  assert.equal(am.getActiveAccount(null, OPUS, FABLE).name, 'capped');
+});
+
 test('an uncapped fleet behaves exactly as before', () => {
   const am = new AccountManager([oauth('a'), oauth('b')], 0.98);
   setQuota(am.accounts[0], { unified7d: 0.7, unified7dFable: 0.9 });

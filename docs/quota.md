@@ -279,7 +279,7 @@ A family reading (Fable, Sonnet) at or past the cap is kept until its window res
 
 With [expiry-pressure routing](routing.md#expiry-pressure-routing) on, a capped account's pressure is the room left under its cap, not under 100%: an account at 0.6 with a 0.7 cap has 0.1 to spend before its reset. For a family window the shared weekly cap also bounds that room, since family spend counts against both (by [how much](routing.md#model-aware-routing) was measured on one pool).
 
-Caps are model-scoped exactly like thresholds. `unified5h` and `unified7d` stop every model; `unified7dFable` stops only Fable, so the example above keeps serving Opus and Sonnet from the same account after Fable is done. The cap binds at the level you set (`>=`), and a window that has reset is never capped on the old reading.
+Caps are model-scoped exactly like thresholds. `unified5h` and `unified7d` stop every model; `unified7dFable` stops only Fable, so the example above keeps serving Opus and Sonnet from the same account after Fable is done. A family with no field of its own that upstream meters with a scoped weekly bucket (`scoped:opus`) is held to the `unified7d` cap, as it is to the weekly threshold. The cap binds at the level you set (`>=`), and a window that has reset is never capped on the old reading.
 
 A cap shows on the status screen before it binds — marked on the bar it applies to, named in percent beside it, and reflected in the `Models` row:
 
