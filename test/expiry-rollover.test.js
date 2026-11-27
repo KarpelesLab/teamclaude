@@ -130,6 +130,53 @@ test('a window CLEARED and re-reported at the same instant is not a rollover', (
   assert.equal(serve(am, 's1', OPUS).index, first.index, 're-reporting the window moved the pin');
 });
 
+test('a window that comes back a WEEK later across a null gap is a rollover', () => {
+  // A request served during the gap must leave the recorded reset in place, so
+  // the next window is measured against it.
+  const am = pinnedFleet(ON);
+  const first = serve(am, 's1', OPUS);
+  const q = am.accounts[first.index].quota;
+  const before = q.unified7dReset;
+  q.unified7d = null;
+  q.unified7dReset = null;
+  assert.equal(serve(am, 's1', OPUS).index, first.index, 'the null gap moved the pin');
+  q.unified7d = 0.4;
+  q.unified7dReset = before + WEEK;
+  assert.notEqual(serve(am, 's1', OPUS).index, first.index, 'the rollover across the gap did not move the pin');
+});
+
+test('a restored pin with no reading moves when its first request finds its window ended', () => {
+  const restartable = () => {
+    const am = new AccountManager(['a', 'b'].map(n => ({ ...oauth(n), id: n })), 0.98,
+      { expiryRouting: ON, distributeSessions: true });
+    bucket(am, 0, 'unified7d', 0.4, 10);
+    bucket(am, 1, 'unified7d', 0.4, 10);
+    return am;
+  };
+  const before = restartable();
+  const first = serve(before, 's1', OPUS);
+  rollWindow(before, first.index);
+  const moved = serve(before, 's1', OPUS);
+  assert.notEqual(moved.index, first.index, 'the roll before the restart did not move the pin');
+  const am = restartable();
+  const saved = JSON.parse(JSON.stringify(before.exportAffinityState()));
+  assert.equal(saved.sessions[0].pins[0].reading, undefined, 'the moved pin was saved with a reading');
+  am.restoreAffinityState(saved);
+  am.selectActiveAccount();
+  // Until the session's next request, its reading stays on the account the pin
+  // left, so the pin is saved and restored without one. The pinned window ends
+  // after startup and before that request, which has to read the ended window
+  // before clearing it. The window that request's response reports is then a
+  // roll, and the next request moves the pin.
+  const q = am.accounts[moved.index].quota;
+  const ended = Date.now() - 1000;
+  q.unified7dReset = ended;
+  assert.equal(serve(am, 's1', OPUS).index, moved.index, 'the first request after the restart moved the pin');
+  q.unified7d = 0;
+  q.unified7dReset = ended + WEEK;
+  assert.notEqual(serve(am, 's1', OPUS).index, moved.index, 'the roll found after the restart did not move the pin');
+});
+
 test('a window re-reported slightly LATER is not a rollover either', () => {
   // The forward half of the same drift, and the half ROLLOVER_MIN_JUMP_MS is
   // for. The two writers of a reset disagree on precision, so one instant
