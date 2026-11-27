@@ -773,6 +773,10 @@ const CLIENT_KEY_REFUSED_PATHS = new Map([
   // A read spends the account's usage-request budget; a claim spends a reset.
   ['/teamclaude/resets/read', 'a client key cannot read resets'],
   ['/teamclaude/resets/redeem', 'a client key cannot spend resets'],
+  // A sign-in adds an account to the config, or replaces the tokens of one.
+  ['/teamclaude/login/start', 'a client key cannot add accounts'],
+  ['/teamclaude/login/finish', 'a client key cannot add accounts'],
+  ['/teamclaude/login/cancel', 'a client key cannot add accounts'],
 ]);
 
 // What an inference-scoped key is refused: every route under the control
@@ -1309,6 +1313,60 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         const { message, ...outcome } = result;
         if (result.redeemed) reply(200, { ok: true, account: account.name, ...outcome, message });
         else reply(result.uncertain ? 502 : 409, { ok: false, account: account.name, redeemed: false, uncertain: result.uncertain === true, error: message });
+        return;
+      }
+
+      // Sign in to a Claude account from the dashboard: the TUI login panel's
+      // flow for a server with no terminal, where the page shows the link and
+      // takes the pasted code. The sign-in itself lives in dashboard-login.js;
+      // these routes add only HTTP and the log line. start hands out the link
+      // and an id, finish takes the code for that id, exchanges it and saves
+      // the account, cancel ends the wait. The code, the tokens and the PKCE
+      // verifier are never logged, and the verifier never leaves the process.
+      if (req.method === 'POST' && (req.url === '/teamclaude/login/start'
+        || req.url === '/teamclaude/login/finish' || req.url === '/teamclaude/login/cancel')) {
+        /** @param {number} code @param {Record<string, any>} body */
+        const reply = (code, body) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(body)); };
+        /** @type {ReturnType<typeof import('./dashboard-login.js').createDashboardLogin>|undefined} */
+        const login = hooks.dashboardLogin;
+        if (!login) { reply(501, { ok: false, error: 'sign-in not supported' }); return; }
+        if (req.tcClient) { reply(403, { ok: false, error: 'a client key cannot add accounts' }); return; }
+        // As for the resets routes: with no proxy key at all the gate above
+        // admits every caller, and a route that puts an account of the
+        // caller's choosing into the pool is not one to serve to the network.
+        const keyless = keylessMcpRefusal(req.headers, req.socket.remoteAddress, config.proxy, boundHost(), 'the dashboard sign-in');
+        if (keyless) { reply(403, { ok: false, error: keyless }); return; }
+        let body;
+        try {
+          body = JSON.parse(await readControlBody(req) || '{}') ?? {};
+        } catch (/** @type {any} */ err) {
+          const tooLarge = err.message === 'body too large';
+          reply(tooLarge ? 413 : 400, { ok: false, error: tooLarge ? 'request body too large' : 'invalid request body' });
+          return;
+        }
+        if (req.url === '/teamclaude/login/start') {
+          const started = await login.start();
+          // 409 for a start that a newer start overtook; anything else is the
+          // sign-in failing to start at all.
+          if (started.ok === false) { reply(started.code === 'replaced' ? 409 : 500, { ok: false, error: started.error }); return; }
+          reply(200, { ok: true, id: started.id, url: started.url, expiresAt: started.expiresAt });
+          return;
+        }
+        if (typeof body?.id !== 'string' || !body.id) { reply(400, { ok: false, error: 'missing "id"' }); return; }
+        if (req.url === '/teamclaude/login/cancel') { reply(200, login.cancel(body.id)); return; }
+        if (typeof body.code !== 'string' || !body.code.trim()) { reply(400, { ok: false, error: 'missing "code"' }); return; }
+        const done = await login.finish(body.id, body.code);
+        if (done.ok === false) {
+          // 400 and 409 leave the sign-in waiting, so the caller may send
+          // another paste. 404 and 502 mean it is over: there was none under
+          // that id, or its code was spent on an exchange or a save that failed.
+          const status = { unknown: 404, unusable: 400, busy: 409, failed: 502 }[done.code];
+          if (done.code === 'failed') console.error(`[TeamClaude] Dashboard sign-in failed: ${safeLine(done.error, 300)}`);
+          reply(status, { ok: false, error: done.error });
+          return;
+        }
+        console.log(`[TeamClaude] Dashboard sign-in ${done.action} account "${safeLine(done.account, 64)}"`);
+        reply(200, { ok: true, account: done.account, action: done.action });
         return;
       }
 
