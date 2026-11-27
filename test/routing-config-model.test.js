@@ -649,6 +649,81 @@ test('O27: a request kept on a cordoned account through another bucket\'s pin is
   assert.deepEqual(trace.map(d => d.d), ['d', 'a', 'a', 'b', 'd'], 'the scenario did not route as built');
 });
 
+// Built by hand: at the default seed count the matrix still passes if O17
+// expects a "prefer" hop always, or never, to keep off an account at its
+// advisor cap, or reads prefer's reach fleet-wide, or if the hop is played
+// without the advisor that selection set aside.
+test('O17: under "prefer" a 429 hop keeps off an account at its advisor cap unless nothing else is left', t => {
+  hermetic(t);
+  const start = Date.UTC(2030, 2, 10, 12);
+  const acct = (/** @type {string} */ id, /** @type {number} */ priority) => ({
+    id, priority, org: 'org-1', maxUsage: /** @type {any} */ (null), endsAt: null, hidden7d: false, clockless7d: false, clocklessF: false,
+    u5h: 0.1, r5h: start + 4 * H, u7d: 0.2, r7d: start + 100 * H, F: 0.1, FR: start + 90 * H,
+  });
+  const capped = (/** @type {string} */ id, /** @type {number} */ priority) => ({ ...acct(id, priority), maxUsage: { unified7dFable: 0.5 }, F: 0.6 });
+  // The request goes to `a`. The hop after its 429 has `b` as the only
+  // untried account, or `b` ranked ahead of `c`. When only `a` may serve
+  // Fable, selection sets the advisor aside.
+  const cases = [
+    { name: 'only account left', accounts: [acct('a', 0), capped('b', 0)], fableRoute: null, to: 'b' },
+    { name: 'ranked ahead', accounts: [acct('a', 0), capped('b', 0), acct('c', 10)], fableRoute: null, to: 'c' },
+    { name: 'advisor set aside', accounts: [acct('a', 0), capped('b', 0), acct('c', 10)], fableRoute: ['a'], to: 'c' },
+  ];
+  const row = toRow({ ...base, advisorEligibility: 'prefer' });
+  for (const k of cases) {
+    const history = {
+      seed: 0, start, fableRoute: k.fableRoute, accounts: k.accounts,
+      steps: [{ at: start + MIN, op: 'throttle', c: 'c1', model: OPUS, advisor: FABLE }],
+    };
+    const tally = newTally();
+    /** @type {any[]} */
+    let trace = [];
+    try { trace = run(t, row, history, [], { tally }); } catch (e) {
+      if (e instanceof Broken) assert.fail(`${k.name}: ${explain(t, e, row, history, [])}`);
+      throw e;
+    }
+    assert.deepEqual(trace.map(d => d.d), ['a'], `${k.name}: the scenario did not route as built`);
+    assert.equal(tally.applied.get('O17') ?? 0, 1, `${k.name}: O17 did not judge the hop`);
+    assert.equal(trace[0].to, k.to, `${k.name}: the hop went to ${trace[0].to}`);
+  }
+});
+
+// Built by hand: at the default seed count the matrix still passes if a
+// "strict" hop goes to an account at its advisor cap when no other is left,
+// or if O17 expects that hop when no account serves the advisor.
+test('O17: under "strict" a 429 hop never goes to an account at its advisor cap', t => {
+  hermetic(t);
+  const start = Date.UTC(2030, 2, 10, 12);
+  const acct = (/** @type {string} */ id, /** @type {number} */ priority) => ({
+    id, priority, org: 'org-1', maxUsage: /** @type {any} */ (null), endsAt: null, hidden7d: false, clockless7d: false, clocklessF: false,
+    u5h: 0.1, r5h: start + 4 * H, u7d: 0.2, r7d: start + 100 * H, F: 0.1, FR: start + 90 * H,
+  });
+  const capped = (/** @type {string} */ id, /** @type {number} */ priority) => ({ ...acct(id, priority), maxUsage: { unified7dFable: 0.5 }, F: 0.6 });
+  // The request goes to `a`, and `b` is the only untried account. When `a`
+  // is past its Fable threshold, neither account serves the advisor.
+  const cases = [
+    { name: 'advisor served', accounts: [acct('a', 0), capped('b', 0)] },
+    { name: 'advisor served nowhere', accounts: [{ ...acct('a', 0), F: 0.99 }, capped('b', 0)] },
+  ];
+  const row = toRow({ ...base, advisorEligibility: 'strict' });
+  for (const k of cases) {
+    const history = {
+      seed: 0, start, fableRoute: null, accounts: k.accounts,
+      steps: [{ at: start + MIN, op: 'throttle', c: 'c1', model: OPUS, advisor: FABLE }],
+    };
+    const tally = newTally();
+    /** @type {any[]} */
+    let trace = [];
+    try { trace = run(t, row, history, [], { tally }); } catch (e) {
+      if (e instanceof Broken) assert.fail(`${k.name}: ${explain(t, e, row, history, [])}`);
+      throw e;
+    }
+    assert.deepEqual(trace.map(d => d.d), ['a'], `${k.name}: the scenario did not route as built`);
+    assert.equal(tally.applied.get('O17') ?? 0, 1, `${k.name}: O17 did not judge the hop`);
+    assert.equal(trace[0].to, undefined, `${k.name}: the hop went to ${trace[0].to}`);
+  }
+});
+
 // The hold and removal tables' paths play under every row and are judged by
 // the same invariants as the matrix.
 const reachable = TRANSITIONS.filter(r => r.reachable === true);

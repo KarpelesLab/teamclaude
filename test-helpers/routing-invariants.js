@@ -1066,13 +1066,24 @@ export function catalog() {
 }
 
 /** The accounts a hop could go to: neither the 429's nor rolled off, and
- * available for the request's model. @param {any} ctx */
+ * available for the request's model. An account whose cap bars the advisor's
+ * family is kept off while another of these serves the request, and always
+ * under "strict", where these must also serve the advisor if any account can
+ * (docs/routing.md#model-aware-routing). "prefer" goes by the request's model,
+ * as these all serve the advisor or the hop sets it aside. @param {any} ctx */
 function hopCandidates(ctx) {
-  const { fed, model, now } = ctx;
+  const { fed, model, now, adv, row } = ctx;
   const paused = (/** @type {string} */ id) => (ctx.pausedUntil.get(id) ?? -Infinity) > now;
-  const idle = [...fed.values()].filter((/** @type {any} */ a) => a.id !== ctx.from && !ctx.rolledOff.includes(a.id)
-    && unavailable(a, model, ctx.row.threshold) == null);
-  return { idle: /** @type {any[]} */ (idle), paused };
+  /** @type {any[]} */
+  let idle = [...fed.values()].filter((/** @type {any} */ a) => a.id !== ctx.from && !ctx.rolledOff.includes(a.id)
+    && unavailable(a, model, row.threshold) == null);
+  if (adv) {
+    const strict = advisorMode(row) === 'strict';
+    const capped = idle.filter(a => familyCapped(a, adv.advisor));
+    if (strict || capped.length < idle.length) idle = idle.filter(a => !capped.includes(a));
+    if (strict && adv.both.length) idle = idle.filter(a => servesAdvisor(a, adv.advisor, row.threshold));
+  }
+  return { idle, paused };
 }
 
 /** Whether a rolled pin's re-rank is the placement pick, which O29 and O28
