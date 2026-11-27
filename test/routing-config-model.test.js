@@ -61,14 +61,14 @@ const on = (/** @type {number} */ tolerance, /** @type {boolean} */ preempt, /**
 // The setups docs/routing.md documents, each a row as written.
 const PROFILES = {
   defaults: base, // config.example.json
-  even: { ...base, dist: 'even' }, // docs/routing.md:237
-  'adaptive-persist': { ...base, dist: 'adaptive', persist: true }, // docs/routing.md:263
-  'pressure-scoring': { ...base, dist: 'adaptive-pressure', ...on(3, false, '0') }, // docs/routing.md:352
-  'expiry-preempt': { ...base, dist: 'even', ...on(1.5, true, '0') }, // docs/routing.md:394
-  reclaim: { ...base, dist: 'adaptive', ...on(3, true, '24') }, // docs/routing.md:424
-  load: { ...base, dist: 'load' }, // docs/routing.md:380
-  'soonest-reset': { ...base, soonest: true }, // docs/routing.md:23
-  'no-session-reset-switch': { ...base, sessionReset: false }, // docs/routing.md:25
+  even: { ...base, dist: 'even' }, // docs/routing.md#session-aware-routing
+  'adaptive-persist': { ...base, dist: 'adaptive', persist: true }, // docs/routing.md#affinity-across-restarts
+  'pressure-scoring': { ...base, dist: 'adaptive-pressure', ...on(3, false, '0') }, // docs/routing.md#scoring-by-expiry-pressure
+  'expiry-preempt': { ...base, dist: 'even', ...on(1.5, true, '0') }, // docs/routing.md#expiry-pressure-routing
+  reclaim: { ...base, dist: 'adaptive', ...on(3, true, '24') }, // docs/routing.md#the-reclaim-window
+  load: { ...base, dist: 'load' }, // docs/routing.md#load-distribution
+  'soonest-reset': { ...base, soonest: true }, // docs/routing.md#choosing-an-account
+  'no-session-reset-switch': { ...base, sessionReset: false }, // docs/routing.md#choosing-an-account
 };
 
 const env = process.env;
@@ -93,20 +93,18 @@ const profileNames = new Map(Object.entries(PROFILES).map(([k, v]) => [JSON.stri
 const cells = env.ROUTING_MODEL_MATRIX === 'product' ? productCells() : [...coveringArray(Object.values(PROFILES)), ...NEEDED];
 const rows = cells.map(c => toRow(c, profileNames.get(JSON.stringify(c)))).filter(r => !ONLY_ROW || r.name.includes(ONLY_ROW));
 
-/** @type {Map<string, number>} */
-const applied = new Map();
-// Per row: how many histories it played, and in how many of them each
-// invariant applied, for the floors that are a share of a row's runs.
-/** @type {Map<string, number>} */
-const runsOf = new Map();
-/** @type {Map<string, number>} */
-const appliedRuns = new Map();
-/** @type {Map<string, { count: number, first: string|null }>} */
-const gaps = new Map([['G1', { count: 0, first: null }], ['G6', { count: 0, first: null }], ['G7', { count: 0, first: null }], ['G4', { count: 0, first: null }]]);
-
-// The rollover rows the matrix runs take (test-helpers/routing-rollover.js).
-/** @type {Set<string>} */
-const rolled = new Set();
+/**
+ * `runs` and `appliedRuns` count, for one row, the histories it played and in
+ * how many of them each invariant applied, for the floors that are a share of
+ * a row's runs.
+ * @typedef {{ applied: Map<string, number>, runs: number, appliedRuns: Map<string, number>,
+ *   gaps: Map<string, { count: number, first: string|null }>, taken: Set<string>, error: unknown }} Tally
+ */
+/** @returns {Tally} */
+const newTally = () => ({
+  applied: new Map(), runs: 0, appliedRuns: new Map(),
+  gaps: new Map(['G1', 'G6', 'G7', 'G4'].map(id => [id, { count: 0, first: null }])), taken: new Set(), error: null,
+});
 
 /** The steps after which a seed's restarts happen, in order. They fall among
  * the random events, since one inside a closing episode only cuts it short.
@@ -141,17 +139,18 @@ function hermetic(t) {
 }
 
 /**
- * Plays one history and checks it. Gap breaches are tallied when `tally` is
- * set; any other breach throws Broken. `only` limits the check to one
+ * Plays one history and checks it. Gap breaches are added to `tally` when it
+ * is given; any other breach throws Broken. `only` limits the check to one
  * invariant. `perRun` counts the run toward the row's per-run floors.
  * @param {import('node:test').TestContext} t @param {Row} row @param {History} history
- * @param {number[]} restarts @param {{ only?: string, tally?: boolean, perRun?: boolean, label?: string, unchecked?: boolean, taken?: Set<string>, marks?: boolean }} [opts]
+ * @param {number[]} restarts @param {{ only?: string, tally?: Tally, perRun?: boolean, label?: string, unchecked?: boolean, taken?: Set<string>, marks?: boolean }} [opts]
  */
 function run(t, row, history, restarts, opts = {}) {
   const invariants = opts.unchecked ? [] : catalog().filter(inv => inv.holds(row) && (!opts.only || inv.id === opts.only));
   /** @type {Set<string>} */
   const hit = new Set();
   const mark = opts.marks ? rolloverMarks() : null;
+  const tally = opts.tally;
   const check = (/** @type {any} */ ctx) => {
     /** @type {Set<string>} */
     const ok = new Set();
@@ -159,14 +158,14 @@ function run(t, row, history, restarts, opts = {}) {
       const r = inv.check(ctx);
       if (r === undefined) continue;
       if (r === true) {
-        if (opts.tally) applied.set(inv.id, (applied.get(inv.id) ?? 0) + 1);
+        if (tally) tally.applied.set(inv.id, (tally.applied.get(inv.id) ?? 0) + 1);
         hit.add(inv.id);
         ok.add(inv.id);
         continue;
       }
       if (inv.gap) {
-        if (!opts.tally) continue;
-        const g = /** @type {{ count: number, first: string|null }} */ (gaps.get(inv.id));
+        if (!tally) continue;
+        const g = /** @type {{ count: number, first: string|null }} */ (tally.gaps.get(inv.id));
         g.count++;
         g.first ??= `${r}\nrow: ${row.name}\nseed ${history.seed}, step ${ctx.i}${opts.label ?? ''}`;
         continue;
@@ -177,9 +176,9 @@ function run(t, row, history, restarts, opts = {}) {
     return ok;
   };
   const trace = play({ AccountManager, validateAdaptiveConfig, t, history, row, restarts, check, taken: opts.taken });
-  if (opts.perRun) {
-    runsOf.set(row.name, (runsOf.get(row.name) ?? 0) + 1);
-    for (const id of hit) appliedRuns.set(`${id}\t${row.name}`, (appliedRuns.get(`${id}\t${row.name}`) ?? 0) + 1);
+  if (opts.perRun && tally) {
+    tally.runs++;
+    for (const id of hit) tally.appliedRuns.set(id, (tally.appliedRuns.get(id) ?? 0) + 1);
   }
   return trace;
 }
@@ -206,12 +205,12 @@ function explain(t, /** @type {Broken} */ err, /** @type {Row} */ row, /** @type
 }
 
 /** Both runs of one seed: uninterrupted, then restarting at every point.
- * @param {import('node:test').TestContext} t @param {Row} row @param {number} seed */
-function runSeed(t, row, seed) {
+ * @param {import('node:test').TestContext} t @param {Row} row @param {number} seed @param {Tally} tally */
+function runSeed(t, row, seed, tally) {
   const h = generate(seed);
   for (const restarts of [[], restartPoints(seed, h)]) {
     try {
-      const trace = run(t, row, h, restarts, { tally: true, perRun: true, taken: rolled, marks: true, label: restarts.length ? ` (restart after step ${restarts})` : '' });
+      const trace = run(t, row, h, restarts, { tally, perRun: true, taken: tally.taken, marks: true, label: restarts.length ? ` (restart after step ${restarts})` : '' });
       if (ONLY_SEED != null) {
         t.diagnostic(`restarts [${restarts}]`);
         for (const d of trace) t.diagnostic(JSON.stringify(d));
@@ -223,10 +222,27 @@ function runSeed(t, row, seed) {
   }
 }
 
+// Each row's matrix runs, and the transition paths below, are played once by
+// whichever test needs them first, so that any test can also run alone.
+/** @type {Map<string, Tally>} */
+const rowTallies = new Map();
+/** The rollover rows a row's runs take (test-helpers/routing-rollover.js) are
+ * in its `taken`. @param {import('node:test').TestContext} t @param {Row} row */
+function rowTally(t, row) {
+  let tally = rowTallies.get(row.name);
+  if (!tally) {
+    tally = newTally();
+    rowTallies.set(row.name, tally);
+    try { for (const seed of seeds) runSeed(t, row, seed, tally); } catch (e) { tally.error = e; }
+  }
+  return tally;
+}
+
 for (const row of rows) {
   test(`routing model: ${row.name}`, t => {
     hermetic(t);
-    for (const seed of seeds) runSeed(t, row, seed);
+    const { error } = rowTally(t, row);
+    if (error) throw error;
   });
 }
 
@@ -274,7 +290,9 @@ const identical = (/** @type {any[]} */ a, /** @type {any[]} */ b) => {
 /** @param {Row} r @param {Partial<Row>} change @param {string} label */
 const variant = (r, change, label) => ({ ...r, ...change, name: `${r.name} ${label}` });
 
-// O4 (docs/routing.md:450): a knob written but off routes byte-identically.
+// O4 (docs/routing.md#the-reclaim-window): an `expiryRouting` block written
+// with `enabled: false` routes byte-identically to no block, and
+// `reclaimHours: 0` to `reclaimHours` unset.
 differential('O4 expiry written but off equals absent',
   r => (r.expiry === undefined ? variant(r, { expiry: { enabled: false, tolerance: 3, preempt: false, reclaimHours: 24 } }, '(written-off)') : null),
   identical);
@@ -286,10 +304,10 @@ differential('O4 reclaimHours 0 equals unset',
     return variant(r, { expiry: rest }, '(reclaim unset)');
   },
   identical);
-// O9 (docs/routing.md:365): pressure scoring changes where a conversation is
-// placed, never whether a pinned one moves. Up to the first difference the two
-// managers hold the same state, so that step must be a placement or the
-// destination of a move both made.
+// O9 (docs/routing.md#scoring-by-expiry-pressure): pressure scoring changes
+// where a conversation is placed, never whether a pinned one moves. Up to the
+// first difference the two managers are in the same state, so that step must
+// be a placement or the destination of a move both made.
 differential('O9 pressure scoring never decides a move',
   r => (r.dist === 'adaptive' ? variant(r, { dist: 'adaptive-pressure' }, '(pressure)') : null),
   (a, b) => {
@@ -304,7 +322,7 @@ differential('O9 pressure scoring never decides a move',
   });
 
 // A session-reset switch built by hand, so that one is played whatever seeds
-// run; its checks count toward the floor below.
+// run.
 test('O13b: a 5h reset moves traffic to the account that reset (three accounts)', t => {
   hermetic(t);
   const start = Date.UTC(2030, 2, 10, 12);
@@ -333,15 +351,15 @@ test('O13b: a 5h reset moves traffic to the account that reset (three accounts)'
     ],
   };
   const row = toRow(base, 'defaults');
-  const before = applied.get('O13b') ?? 0;
+  const tally = newTally();
   /** @type {any[]} */
   let trace = [];
-  try { trace = run(t, row, history, [], { tally: true }); } catch (e) {
+  try { trace = run(t, row, history, [], { tally }); } catch (e) {
     if (e instanceof Broken) assert.fail(explain(t, e, row, history, []));
     throw e;
   }
   assert.deepEqual(trace.map(d => d.d), ['a', 'b', 'b', 'a'], 'the scenario did not route as built');
-  assert.equal((applied.get('O13b') ?? 0) - before, 1, 'O13b did not judge the switch');
+  assert.equal(tally.applied.get('O13b') ?? 0, 1, 'O13b did not judge the switch');
 });
 
 // Built by hand: at the default seed count no restart starts on the
@@ -417,9 +435,9 @@ test('a removal keeps the roll its bucket\'s reading holds for the conversation\
     throw e;
   }
   assert.deepEqual(trace.slice(0, 3).map(d => [d.d, d.to]), [['a', undefined], ['a', undefined], ['a', 'x']], 'the scenario did not route as built');
-  // docs/routing.md:411 holds the roll until a stay is served at the
-  // destination, and :417 moves traffic that returns before then off the
-  // rolled account as soon as anywhere better is available.
+  // The roll is held until a stay is served at the destination (O28), and
+  // traffic that returns before then moves off the rolled account as soon as
+  // anywhere better is available (RO-handback).
   assert.notEqual(trace[3].d, 'a', 'the request returned to a, whose unsettled roll the reading holds');
 });
 
@@ -458,19 +476,17 @@ test('a serve in one bucket keeps the roll held in the conversation\'s other buc
     ],
   };
   const row = toRow({ ...base, dist: 'adaptive-pressure', ...on(1.5, true, '0') });
-  const judged = () => applied.get('O15') ?? 0;
-  const before = judged();
+  const all = newTally();
   /** @type {any[]} */
   let trace = [];
-  try { trace = run(t, row, history, [], { tally: true }); } catch (e) {
+  try { trace = run(t, row, history, [], { tally: all }); } catch (e) {
     if (e instanceof Broken) assert.fail(explain(t, e, row, history, []));
     throw e;
   }
   assert.deepEqual(trace.slice(0, 6).map(d => d.d), ['a', 'a', 'x', 'x', 'x', 'a'], 'the scenario did not route as built');
-  const all = judged() - before;
-  const mid = judged();
-  run(t, row, { ...history, steps: history.steps.slice(0, -1) }, [], { tally: true });
-  assert.equal(all - (judged() - mid), 1, 'O15 did not judge the last request');
+  const head = newTally();
+  run(t, row, { ...history, steps: history.steps.slice(0, -1) }, [], { tally: head });
+  assert.equal((all.applied.get('O15') ?? 0) - (head.applied.get('O15') ?? 0), 1, 'O15 did not judge the last request');
 });
 
 // Built by hand: no matrix history re-ranks a rolled pin under load while a
@@ -546,15 +562,16 @@ test('O27: a request diverted off a cursor that serves other models ramps its de
       ],
     };
     const row = toRow(k.cell);
-    const before = applied.get('O27') ?? 0;
+    const tally = newTally();
     /** @type {any[]} */
     let trace = [];
-    try { trace = run(t, row, history, [], { tally: true }); } catch (e) {
+    try { trace = run(t, row, history, [], { tally }); } catch (e) {
       if (e instanceof Broken) assert.fail(explain(t, e, row, history, []));
       throw e;
     }
     assert.deepEqual(trace.map(d => d.d), ['a', 'a', 'b', 'a'], `${k.name}: the scenario did not route as built`);
-    assert.equal((applied.get('O27') ?? 0) - before, k.judged, `${k.name}: O27 judged the diversion ${(applied.get('O27') ?? 0) - before} times`);
+    const judged = tally.applied.get('O27') ?? 0;
+    assert.equal(judged, k.judged, `${k.name}: O27 judged the diversion ${judged} times`);
   }
 });
 
@@ -586,15 +603,15 @@ test('O27: a request diverted onto its conversation\'s pin ramps the destination
     ],
   };
   const row = toRow(base, 'defaults');
-  const before = applied.get('O27') ?? 0;
+  const tally = newTally();
   /** @type {any[]} */
   let trace = [];
-  try { trace = run(t, row, history, [], { tally: true }); } catch (e) {
+  try { trace = run(t, row, history, [], { tally }); } catch (e) {
     if (e instanceof Broken) assert.fail(explain(t, e, row, history, []));
     throw e;
   }
   assert.deepEqual(trace.map(d => d.d), ['a', 'b', 'a', 'b', 'a'], 'the scenario did not route as built');
-  assert.equal((applied.get('O27') ?? 0) - before, 1, 'O27 did not judge the diversion onto the pin');
+  assert.equal(tally.applied.get('O27') ?? 0, 1, 'O27 did not judge the diversion onto the pin');
 });
 
 // Built by hand: a cordoned account keeps a conversation through its pin in
@@ -634,27 +651,67 @@ test('O27: a request kept on a cordoned account through another bucket\'s pin is
 
 // The hold and removal tables' paths play under every row and are judged by
 // the same invariants as the matrix.
-/** @type {Set<string>} */
-const taken = new Set();
 const reachable = TRANSITIONS.filter(r => r.reachable === true);
 // No matrix row sends an advisor with the setting left out, as Claude Code
 // with config.example.json does, so the paths also run that way.
 const pathRows = [...rows, toRow({ ...base, advisorEligibility: 'default' }, 'defaults')].filter(r => !ONLY_ROW || r.name.includes(ONLY_ROW));
-test('transitions: every reachable row of the hold and removal tables is taken', t => {
-  hermetic(t);
-  for (const row of pathRows) {
-    for (const h of transitionPaths(Date.UTC(2030, 2, 10, 12))) {
-      try { run(t, row, h, [], { tally: true, taken }); } catch (e) {
-        if (e instanceof Broken) assert.fail(`${explain(t, e, row, h, [])}\npath: ${h.name}`);
-        throw e;
+/** @type {Tally|null} */
+let pathsTally = null;
+/** @param {import('node:test').TestContext} t */
+function pathTally(t) {
+  if (pathsTally) return pathsTally;
+  const tally = pathsTally = newTally();
+  try {
+    for (const row of pathRows) {
+      for (const h of transitionPaths(Date.UTC(2030, 2, 10, 12))) {
+        try { run(t, row, h, [], { tally, taken: tally.taken }); } catch (e) {
+          if (e instanceof Broken) assert.fail(`${explain(t, e, row, h, [])}\npath: ${h.name}`);
+          throw e;
+        }
       }
     }
+  } catch (e) { tally.error = e; }
+  return tally;
+}
+
+/** The tallies of every matrix row and then of the paths, the order a whole
+ * run plays them in.
+ * @param {import('node:test').TestContext} t @param {{ paths?: boolean }} [opts] */
+function tallies(t, { paths = true } = {}) {
+  const parts = rows.map(r => /** @type {[string, Tally]} */ ([`routing model: ${r.name}`, rowTally(t, r)]));
+  if (paths) parts.push(['transitions: every reachable row of the hold and removal tables is taken', pathTally(t)]);
+  const broke = parts.filter(([, x]) => x.error).map(([name]) => name);
+  assert.deepEqual(broke, [], 'broken, so the totals are partial; each test named prints why');
+  return parts.map(([, x]) => x);
+}
+
+/** @param {Tally[]} parts */
+function sum(parts) {
+  /** @type {Map<string, number>} */
+  const applied = new Map();
+  const gaps = newTally().gaps;
+  for (const x of parts) {
+    for (const [id, n] of x.applied) applied.set(id, (applied.get(id) ?? 0) + n);
+    for (const [id, g] of x.gaps) {
+      const s = /** @type {{ count: number, first: string|null }} */ (gaps.get(id));
+      s.count += g.count;
+      s.first ??= g.first;
+    }
   }
+  return { applied, gaps };
+}
+
+test('transitions: every reachable row of the hold and removal tables is taken', t => {
+  hermetic(t);
+  const { taken, error } = pathTally(t);
+  if (error) throw error;
   if (ONLY_ROW) return;
   assert.deepEqual(reachable.filter(r => !takes(taken, r)).map(r => r.id), [], 'rows no path took');
 });
 
 test('transitions covered', t => {
+  hermetic(t);
+  const { taken } = pathTally(t);
   t.diagnostic(`transitions covered ${reachable.filter(r => takes(taken, r)).length}/${reachable.length}`);
 });
 
@@ -681,53 +738,81 @@ const UNTAKEN = [
   'RO-other-window', 'RO-handback-once', 'PIN-idle',
 ];
 const rolloverReachable = ROLLOVER.filter(r => r.reachable === true);
-test('transitions: every reachable rollover row but the listed ones is taken', { skip: ONLY_ROW || ONLY_SEED != null ? 'filtered run' : false }, () => {
-  assert.deepEqual(rolloverReachable.filter(r => !rolled.has(r.id) && !UNTAKEN.includes(r.id)).map(r => r.id), [], 'rollover rows no episode took');
+/** @param {import('node:test').TestContext} t */
+const rolled = t => new Set(rows.flatMap(r => [...rowTally(t, r).taken]));
+test('transitions: every reachable rollover row but the listed ones is taken', { skip: ONLY_ROW || ONLY_SEED != null ? 'filtered run' : false }, t => {
+  hermetic(t);
+  tallies(t, { paths: false });
+  const taken = rolled(t);
+  assert.deepEqual(rolloverReachable.filter(r => !taken.has(r.id) && !UNTAKEN.includes(r.id)).map(r => r.id), [], 'rollover rows no episode took');
 });
 
 test('rollover transitions covered', t => {
-  t.diagnostic(`rollover transitions covered ${rolloverReachable.filter(r => rolled.has(r.id)).length}/${rolloverReachable.length}`);
+  hermetic(t);
+  const taken = rolled(t);
+  t.diagnostic(`rollover transitions covered ${rolloverReachable.filter(r => taken.has(r.id)).length}/${rolloverReachable.length}`);
 });
 
 test('rollover rows no episode takes yet', { todo: UNTAKEN.join(', ') || false }, () => {
   assert.deepEqual(UNTAKEN, []);
 });
 
-// A row's citation ties its outcome to the docs. The quoted sentence is what
-// is checked: a row fails when its sentence is no longer in the file, which is
-// a rule that was reworded or removed. A docs edit that only moves the sentence
-// to another line fails nothing, and the lines to update are printed.
-test('every quoted docs sentence is still in the file its row cites', t => {
+// A row's or an invariant's citation ties its outcome to the docs. The quoted
+// sentence is what is checked: a citation fails when its sentence is no longer
+// in the file, which is a rule that was reworded or removed. A docs edit that
+// only moves the sentence to another line fails nothing, and the lines to
+// update are printed.
+test('every quoted docs sentence is still in the file its row or invariant cites', t => {
   const norm = (/** @type {string} */ s) => s.replace(/\s+/g, ' ').trim();
   /** @type {Record<string, string>} */
   const quotes = { ...QUOTES, ...ROLLOVER_QUOTES };
+  /** @type {{ id: string, file: string, n: number, quote: string }[]} */
+  const cites = [];
+  for (const r of [...TRANSITIONS, ...ROLLOVER]) {
+    if (typeof r.docs !== 'string') continue;
+    const [file, n] = r.docs.split(':');
+    cites.push({ id: r.id, file, n: Number(n), quote: quotes[r.id] });
+  }
+  // An invariant cites one file, and may name several lines in it, each with
+  // its own sentence: 'docs/routing.md:<line> and :<line>'.
+  /** @type {string[]} */
+  const unquoted = [];
+  for (const inv of catalog()) {
+    const file = inv.doc.split(':')[0];
+    const ns = [...inv.doc.matchAll(/:(\d+)(?:-\d+)?/g)].map(m => Number(m[1]));
+    const qs = [inv.quote].flat();
+    const quoted = qs.filter(q => typeof q === 'string' && q.trim()).length;
+    if (qs.length !== ns.length || quoted !== qs.length) unquoted.push(`${inv.id} (${inv.doc}): ${quoted} quotes for ${ns.length} lines`);
+    ns.forEach((n, i) => { if (qs[i]) cites.push({ id: inv.id, file, n, quote: qs[i] }); });
+  }
+  assert.deepEqual(unquoted, [], 'each line an invariant cites needs its quoted sentence');
   /** @type {Map<string, string[]>} */
   const files = new Map();
   /** @type {string[]} */
   const gone = [];
   /** @type {string[]} */
   const moved = [];
-  for (const r of [...TRANSITIONS, ...ROLLOVER]) {
-    if (typeof r.docs !== 'string') continue;
-    const [file, n] = r.docs.split(':');
+  for (const { id, file, n, quote: q } of cites) {
     if (!files.has(file)) files.set(file, readFileSync(new URL(`../${file}`, import.meta.url), 'utf8').split('\n'));
     const lines = /** @type {string[]} */ (files.get(file));
-    const quote = norm(quotes[r.id]);
+    const quote = norm(q);
     // The sentence may start late on its line and wrap onto the next ones.
     const startsOn = (/** @type {number} */ i) => {
       const at = norm(lines.slice(i, i + 6).join(' ')).indexOf(quote);
       return at >= 0 && at < norm(lines[i] ?? '').length;
     };
-    if (startsOn(Number(n) - 1)) continue;
+    if (startsOn(n - 1)) continue;
     const now = lines.findIndex((_, i) => startsOn(i));
-    if (now < 0) gone.push(`${r.id} (${r.docs})`);
-    else moved.push(`${r.id}: ${r.docs} is now ${file}:${now + 1}`);
+    if (now < 0) gone.push(`${id} (${file}:${n})`);
+    else moved.push(`${id}: ${file}:${n} is now ${file}:${now + 1}`);
   }
   if (moved.length) t.diagnostic(`quoted sentences that moved; update the citations:\n${moved.join('\n')}`);
-  assert.deepEqual(gone, [], 'rows whose quoted sentence is no longer in the docs: the rule was reworded or removed, so update the quote, or the row');
+  assert.deepEqual(gone, [], 'citations whose quoted sentence is no longer in the docs: the rule was reworded or removed, so update the quote, or the row or invariant');
 });
 
 test('every invariant holds in a row and is applied there', { skip: ONLY_ROW || ONLY_SEED != null ? 'filtered run' : false }, t => {
+  hermetic(t);
+  const { applied } = sum(tallies(t));
   t.diagnostic(`${rows.length} rows, ${seeds.length} seeds each, ${RESTART_POINTS} restart points per seed`);
   t.diagnostic(`checks applied: ${[...applied].map(([k, n]) => `${k}=${n}`).join(' ')}`);
   const dead = catalog().filter(inv => !inv.gap && !rows.some(r => inv.holds(r))).map(inv => inv.id);
@@ -736,15 +821,22 @@ test('every invariant holds in a row and is applied there', { skip: ONLY_ROW || 
   assert.deepEqual(vacuous, [], `vacuous: ${vacuous} (applied: ${JSON.stringify(Object.fromEntries(applied))})`);
   // A share of a few seeds says nothing, so fewer seeds than CI runs skip it.
   const thin = SEEDS < DEFAULT_SEEDS ? [] : catalog().filter(inv => inv.runFloor != null).flatMap(inv => rows.filter(r => inv.holds(r)).flatMap(r => {
-    const runs = runsOf.get(r.name) ?? 0;
-    const hits = appliedRuns.get(`${inv.id}\t${r.name}`) ?? 0;
+    const { runs, appliedRuns } = rowTally(t, r);
+    const hits = appliedRuns.get(inv.id) ?? 0;
     return hits < /** @type {number} */ (inv.runFloor) * runs ? [`${inv.id} applied in ${hits} of ${runs} runs (floor ${inv.runFloor}): ${r.name}`] : [];
   }));
   assert.deepEqual(thin, [], `below the per-run floor:\n${thin.join('\n')}`);
 });
 
-test('G1: a conversation idle past the known window is forgotten (matrix)', () => {
-  const g = /** @type {{ count: number, first: string|null }} */ (gaps.get('G1'));
+/** A gap's breaches over the matrix and the paths.
+ * @param {import('node:test').TestContext} t @param {string} id */
+function gap(t, id) {
+  hermetic(t);
+  return /** @type {{ count: number, first: string|null }} */ (sum(tallies(t)).gaps.get(id));
+}
+
+test('G1: a conversation idle past the known window is forgotten (matrix)', t => {
+  const g = gap(t, 'G1');
   assert.equal(g.count, 0, `${g.count} revivals; first:\n${g.first}`);
 });
 
@@ -778,27 +870,27 @@ test('G1: a conversation idle past the known window is forgotten (two accounts)'
 // `todo` turns it into a regular invariant.
 
 test('G6: a roll is handed back once, also after another window rolls (matrix)',
-  { todo: 'docs/routing.md:411 says a roll is handed back once, and a reading restored from a hold is held again only for a window that has rolled since; held again for another window, it hands this window\'s roll back a second time' }, () => {
-    const g = /** @type {{ count: number, first: string|null }} */ (gaps.get('G6'));
+  { todo: 'docs/routing.md#expiry-pressure-routing says a roll is handed back once, and a reading restored from a hold is held again only for a window that has rolled since; held again for another window, it hands this window\'s roll back a second time' }, t => {
+    const g = gap(t, 'G6');
     assert.equal(g.count, 0, `${g.count} third moves; first:\n${g.first}`);
   });
 
 test('G7: a roll is handed back once, also with a reclaim window (matrix)',
-  { todo: 'docs/routing.md:411 says a roll is handed back once; with a reclaim window a pin moves a third time on one roll, by reclaim or by a hand-back, which no reading in the model separates' }, () => {
-    const g = /** @type {{ count: number, first: string|null }} */ (gaps.get('G7'));
+  { todo: 'docs/routing.md#expiry-pressure-routing says a roll is handed back once; with a reclaim window a pin moves a third time on one roll, by reclaim or by a hand-back, which no reading in the model separates' }, t => {
+    const g = gap(t, 'G7');
     assert.equal(g.count, 0, `${g.count} third moves; first:\n${g.first}`);
   });
 
 test('G4: a 429 hops to an untried, unpaused idle account (matrix)',
-  { todo: 'docs/routing.md:126 says a rate-limit 429 takes "**one** failover hop, onto an account that is not already tried and not inside its own 429 pause"; the hop takes only the best pick, and none when that pick is paused' }, () => {
-    const g = /** @type {{ count: number, first: string|null }} */ (gaps.get('G4'));
+  { todo: 'docs/routing.md#one-failover-hop-on-a-rate-limit says a rate-limit 429 takes "**one** failover hop, onto an account that is not already tried and not inside its own 429 pause"; the hop takes only the best pick, and none when that pick is paused' }, t => {
+    const g = gap(t, 'G4');
     assert.equal(g.count, 0, `${g.count} 429s took no hop while an untried, unpaused account was idle; first:\n${g.first}`);
   });
 
 // Built by hand: at the default seed count no history reaches the probe with
 // an account at its advisor cap, so a matrix check would judge nothing.
 test('G3: the probe skips an account at its advisor-family cap under "strict"',
-  { todo: 'docs/quota.md:276 says an advisor request checks the advisor family cap on the exhausted-fleet probe; under "strict" the probe runs in the pass that has dropped the advisor' }, t => {
+  { todo: 'docs/quota.md#per-account-usage-caps says an advisor request checks the advisor family cap on the exhausted-fleet probe; under "strict" the probe runs in the pass that has dropped the advisor' }, t => {
     hermetic(t);
     const start = Date.UTC(2030, 2, 10, 12);
     const acct = (/** @type {string} */ id, /** @type {number} */ u7d) => ({

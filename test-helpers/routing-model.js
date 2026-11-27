@@ -35,9 +35,9 @@ const RATE_LIMIT_ABSORB_MAX = 60;
 // Past that cap, so a 429 with nowhere to hop goes back to the client at once
 // rather than waiting to retry the same account.
 const RETRY_AFTER = 90;
-// docs/routing.md:70-71.
+// The length H1 quotes.
 const BILLING_COOLDOWN = 5 * MIN;
-// docs/routing.md:88; the last applies to every later denial.
+// The lengths H5 quotes; the last applies to every later denial.
 const ENTITLEMENT_COOLDOWNS = [5 * MIN, 15 * MIN, H];
 // The probes of a cooldown's end, by their offset from it in ms.
 const PROBE_AT = new Map([[-1, 'end-1ms'], [0, 'end'], [1, 'end+1ms']]);
@@ -524,7 +524,8 @@ function rollEpisode(steps, accounts, convs, at, rand) {
 // ---- configuration -----------------------------------------------------------
 
 /** The `stormRamp` block each row value writes. `malformed` holds a 0 and a
- * quoted number, which docs/routing.md:168 says are ignored field by field. */
+ * quoted number, which docs/routing.md#storm-control says are ignored field
+ * by field. */
 export const RAMPS = /** @type {Record<string, any>} */ ({
   default: undefined,
   off: { enabled: false },
@@ -532,9 +533,9 @@ export const RAMPS = /** @type {Record<string, any>} */ ({
   malformed: { startConc: 0, stepMs: '250' },
 });
 
-/** The ramp a row runs under, as docs/routing.md:153-168 describe it: on, with
- * one request at once at a switch, unless the block says otherwise in a value
- * it accepts. @param {Row} row */
+/** The ramp a row runs under, as docs/routing.md#storm-control describes it:
+ * on, with one request at once at a switch, unless the block says otherwise
+ * in a value it accepts. @param {Row} row */
 export function rampOf(row) {
   const raw = RAMPS[row.stormRamp ?? 'default'] ?? {};
   const ok = (/** @type {any} */ x) => typeof x === 'number' && Number.isFinite(x) && x > 0;
@@ -712,8 +713,9 @@ export function familyCapped(a, model) {
   return a.maxUsage != null && model === FABLE && hit(capOf(a.maxUsage, 'unified7dFable'), a.f);
 }
 
-/** Whether `a` can also serve an advisor on `advisor` (docs/routing.md:180):
- * its bucket for that family is not spent or capped, and no route bars it.
+/** Whether `a` can also serve an advisor on `advisor`
+ * (docs/routing.md#model-aware-routing): its bucket for that family is not
+ * spent or capped, and no route bars it.
  * @param {Fed} a @param {string} advisor @param {any} threshold */
 export function servesAdvisor(a, advisor, threshold) {
   if (familyCapped(a, advisor) || a.barred.has(advisor)) return false;
@@ -721,11 +723,12 @@ export function servesAdvisor(a, advisor, threshold) {
 }
 
 /**
- * How docs/routing.md:178-195 routes a request on `model` that declares an
- * advisor on `advisor`. `excluded` holds the accounts whose advisor-family cap
- * keeps selection off them, which is all such accounts while another can serve
- * the request, else none; `cands` the accounts that can serve the request
- * outside it, and `both` those of them that can serve the advisor too.
+ * How docs/routing.md#model-aware-routing routes a request on `model` that
+ * declares an advisor on `advisor`. `excluded` holds the accounts whose
+ * advisor-family cap keeps selection off them, which is all such accounts
+ * while another can serve the request, else none; `cands` the accounts that
+ * can serve the request outside it, and `both` those of them that can serve
+ * the advisor too.
  * `routed` is the advisor that selection is held to: none where 'prefer' sets a
  * narrowing advisor aside. `plain` is where the advisor changes no decision,
  * so the request is judged as one that declared none: set aside, or every
@@ -749,7 +752,7 @@ export function advisorRouting(fed, model, advisor, row) {
 
 /** The mode a row's advised requests are routed under, or null where they
  * send no advisor. `default` sends the advisor with the setting left out,
- * which docs/configuration.md:76 makes "strict".
+ * which docs/configuration.md#fields makes "strict".
  * @param {Row} row @returns {'strict'|'prefer'|null} */
 export const advisorMode = row => (row.advisorEligibility === 'default' ? 'strict'
   : row.advisorEligibility === 'strict' || row.advisorEligibility === 'prefer' ? row.advisorEligibility : null);
@@ -776,9 +779,9 @@ function limitOf(a, model) {
 const clamp01 = (/** @type {number} */ x) => Math.min(1, Math.max(0, x));
 
 /**
- * Pressure as docs/routing.md:397-405 defines it: room per second to the
- * deadline; `absent` with a lower bound over a full week when the reset is not
- * known, and with none when the utilization is not.
+ * Pressure as docs/routing.md#expiry-pressure-routing defines it: room per
+ * second to the deadline; `absent` with a lower bound over a full week when
+ * the reset is not known, and with none when the utilization is not.
  * @param {Fed} a @param {string} model @param {number} now
  * @returns {{ kind: 'known', value: number } | { kind: 'absent', bound: number|null }}
  */
@@ -793,7 +796,7 @@ export function pressure(a, model, now) {
 }
 
 /**
- * The top pressure band (docs/routing.md:403-407) over `cands`: every account
+ * The top pressure band (O3) over `cands`: every account
  * outside the top priority tier, and inside it every account within
  * `tolerance` of the best known pressure or without one. All of them when the
  * knob is off, when there are fewer than two, or when none is known. `floor` is
@@ -854,16 +857,16 @@ export function windowsOf(a) {
  * reading took past their reset, which the manager still held when it read.
  * `owed` maps each account a rest or a hand-back left while rolled to the
  * windows read there, when the reading was in no doubt. Only a served
- * request can end that hold (docs/routing.md:411). An entry lasts until a
+ * request can end that hold (O28). An entry lasts until a
  * later request selecting under this reading is served, and a return before
  * then is handed that reading back. `handed` holds, for a
  * reading restored that way, the windows its account showed at the hand-back:
  * the roll handed back is not held again, and one past them is.
  * `gen` counts the reading's moves. `stamps` holds, for an escaped account, the
- * move that left it (docs/routing.md:411), or null where that move was a
+ * move that left it (O28), or null where that move was a
  * return onto an account left while rolled, which no stay settles. An escape
  * whose move's stay was served is dropped and its account put in `settled`, so
- * a return there reads it whole (:417), and `returned` says the reading was
+ * a return there reads it whole (O28), and `returned` says the reading was
  * moved onto such an account. `held` keeps the reading an escape left behind,
  * for an escape whose roll the manager is known to hold: stamped, taken from a
  * reading with no doubt or stale window, and touched since by no hop or
@@ -954,7 +957,7 @@ function moveObs(obs, a, fed, step = null) {
 }
 
 /** Restores the reading held for `a` when traffic returns to it before a
- * request was served (docs/routing.md:417), as _firstSightOn does. Returns
+ * request was served (RO-handback), as _firstSightOn does. Returns
  * whether it did. The roll of the account it leaves is held from request
  * `step` under no stamp.
  * @param {Obs} obs @param {Fed} a @param {Map<string, Fed>} fed @param {number|null} step */
@@ -1028,8 +1031,8 @@ export function restOn(obs, a, model, fed, lapsed, step) {
   const g = governing(a, model);
   if (g.reset == null) { takeLapsed(obs, lapsed); return false; }
   if (rolledSince(obs, a, model)) {
-    // docs/routing.md:411 and :417 do not say whether a window already past
-    // its reset counts as read, so a jump from one is neither a roll nor not one.
+    // The sentences O28 quotes do not say whether a window already past its
+    // reset counts as read, so a jump from one is neither a roll nor not one.
     if (!obs.stale.has(g.window)) return true;
     obs.uncertain = true;
     return false;
@@ -1311,8 +1314,9 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
     am.updateQuota(acc.index, headersOf(x, model), model, 200);
     noteReading(acc.id);
     // A completion to a request sent after the last entitlement denial clears
-    // the count that lengthens the next cooldown (docs/routing.md:90). It
-    // clears a billing cooldown too, which no docs line covers.
+    // the count that lengthens the next cooldown
+    // (docs/routing.md#oauth-entitlement-denials). It clears a billing
+    // cooldown too, which no docs line covers.
     am.clearBillingRejected(acc.index);
     am.clearEntitlementDenied(acc, acc.entitlementEpoch);
     const f = /** @type {Fed} */ (fed.get(acc.id));
@@ -1328,7 +1332,7 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
     const f = /** @type {Fed} */ (fed.get(acc.id));
     note('hold', stateOf(f), kind, !!ctx.adv);
     // Read before the request is sent. A denial to a request sent before the
-    // last one does not count (docs/routing.md:88).
+    // last one does not count (docs/routing.md#oauth-entitlement-denials).
     const epoch = acc.entitlementEpoch;
     if (kind === 'billing') {
       am.markBillingRejected(acc.index);
@@ -1345,11 +1349,12 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
     }
     /** @type {{ rolledOff?: Set<number> }} */
     const selection = {};
-    // Every attempt re-reads the stamp before it selects (docs/routing.md:415),
+    // Every attempt re-reads the stamp before it selects (RO-retry-confirms),
     // the failover included.
     const carried = am.observedGeneration(c, model);
-    // The retry passes the request's advisor (docs/routing.md:195), read
-    // again now that the refused account is held.
+    // The retry passes the request's advisor
+    // (docs/routing.md#model-aware-routing), read again now that the refused
+    // account is held.
     const adv = ctx.adv ? advisorRouting(fed, model, ctx.adv.advisor, row) : null;
     const alt = am.getActiveAccount(new Set([acc.index]), model, adv?.advisor ?? null, c, undefined, selection);
     if (!ctx.edge) check({ ...ctx, failover: true, kind, from: acc.id, d: alt?.id ?? '-', adv, view: undefined });
@@ -1463,7 +1468,8 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
         f.cordoned = !f.cordoned; am.setCordoned(byId(f.id).index, f.cordoned);
       }
     } else if (s.op === 'late' && f) {
-      // docs/routing.md:88: it does not count as another denial.
+      // docs/routing.md#oauth-entitlement-denials: it does not count as
+      // another denial.
       note('hold', stateOf(f), 'entitled-in-flight');
       am.markEntitlementDenied(byId(f.id).index, { detail: DENIAL, epoch: sentUnder.get(f.id) });
     } else if (s.op === 'remove' && x && f) {
@@ -1490,7 +1496,7 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
       // request that shows it kept its state: the next request for one in
       // rotation or in error, the probe 1 ms before its cooldown ends for one
       // held, and for one with denials counted, that probe of the cooldown its
-      // next denial arms, whose length the count sets (docs/routing.md:88).
+      // next denial arms, whose length the count sets (H5).
       for (const g of fed.values()) {
         const st = stateOf(g);
         const by = g.id === x.id || st === 'free' ? 'R1' : st === 'error' ? 'H3' : st === 'billed' ? 'H1' : 'H2';
@@ -1560,17 +1566,16 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
       const held = unname(curObs);
       curObs = held ?? newObs();
       // No docs line says where a cursor on the removed account goes, and there
-      // the model follows the manager. Any other cursor stays on its account
-      // (docs/routing.md:19).
+      // the model follows the manager. Any other cursor stays on its account (U2).
       cur = before === x.id ? cursor() : before;
       // A roll moves the sticky current account only with preempt on
-      // (docs/routing.md:409); without it the moved cursor is plain
-      // stickiness (docs/routing.md:19), judged as any other.
+      // (CU-roll); without it the moved cursor is plain stickiness (U2),
+      // judged as any other.
       if (preempting && before === x.id) {
         // A cursor moved by the removal is offered the reading its account's
-        // removal left. docs/routing.md:417 lists the first placements whose
-        // roll is not detected and does not name this one, and no other docs
-        // line covers it, so its first roll is left unjudged.
+        // removal left. The passage RO-unread cites lists the first placements
+        // whose roll is not detected and does not name this one, and no other
+        // docs line covers it, so its first roll is left unjudged.
         // A reading handed back there is the one read before its roll.
         const back = held != null && held.on == null && cur != null && handBack(curObs, /** @type {Fed} */ (fed.get(cur)), fed, step);
         if (!back) {
@@ -1814,8 +1819,9 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
       requalify = new Set();
       probing = new Set(h.accounts.filter(a => !gone.has(a.id)).map(a => a.id));
       const restored = row.persist || driver.restoreAlways;
-      // The load ring is saved by the minute (docs/routing.md:285): a request
-      // comes back at the end of its minute or at startup, whichever is earlier.
+      // The load ring is saved by the minute
+      // (docs/routing.md#affinity-across-restarts): a request comes back at
+      // the end of its minute or at startup, whichever is earlier.
       for (const [id, v] of routed) {
         const kept = restored && !gone.has(id)
           ? v.filter(at => now - at <= LOAD_WINDOW).map(at => Math.min((Math.floor(at / MIN) + 1) * MIN - 1, now)) : [];
@@ -1828,7 +1834,7 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
           if (now - v.lastSeen > KNOWN_TTL) { convs.delete(k); continue; }
           // Under preemption a pin keeps the reading on its own account, with
           // its hand-back windows; held rolls and readings on other accounts
-          // are dropped (docs/routing.md:289).
+          // are dropped (docs/routing.md#affinity-across-restarts).
           /** @type {Map<string, Obs>} */
           const kept = new Map();
           if (preempting) {

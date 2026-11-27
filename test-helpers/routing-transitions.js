@@ -59,7 +59,7 @@ const row = (/** @type {string} */ id, /** @type {string} */ machine, /** @type 
   return { id, machine, state, event, shape, expect, docs: Array.isArray(cite) ? cite[0] : cite, reachable: true };
 };
 
-const OTHERS = { inferred: 'docs/accounts.md:158 drops only the removed account, so a removal leaves every other one as it was' };
+const OTHERS = { inferred: 'a removal leaves every other account as it was, since R1 drops only the removed one' };
 const EDGE = { inferred: 'no docs line says whether a cooldown still holds at the instant it ends, so this probe is unjudged' };
 
 /** @returns {TransitionRow[]} */
@@ -99,21 +99,21 @@ function holdRows() {
 /** @returns {TransitionRow[]} */
 function removalRows() {
   const out = [];
-  const stays = (/** @type {string} */ what) => ({ inferred: `no docs line covers renumbering; the ${what} names the same account, as docs/routing.md:19 keeps the current one` });
+  const stays = (/** @type {string} */ what) => ({ inferred: `no docs line covers renumbering; the ${what} names the same account (U2)` });
   /** @type {Array<[string, string, string, Cite, Cite]>} */
   const pointers = [
     ['cursor', 'cursor', 'moves to an account still in the fleet', stays('cursor'), SENTENCES.dropped],
     ['route-cursor', 'rcur', 'names no removed account', stays('route cursor'), SENTENCES.dropped],
     ['provider-cursor', 'pcur', 'names no removed account', stays('provider cursor'), SENTENCES.dropped],
     ['route-pin', 'rpin', 'cleared, not handed to the account in its slot',
-      { inferred: 'no docs line covers renumbering; a TUI route pin (docs/routing.md:228) stays on the account picked' },
-      { inferred: 'a pin on an account dropped from the fleet (docs/accounts.md:158) pins nothing' }],
+      { inferred: 'no docs line covers renumbering; a TUI route pin (docs/routing.md#model-routes) stays on the account picked' },
+      { inferred: 'a pin on an account dropped from the fleet (R1) pins nothing' }],
     ['session-pin', 'spin', 'deleted', stays('conversation pin'), SENTENCES.pinsDeleted],
     ['quota-reading', 'quota', "the in-flight response's reading lands on no account",
-      { inferred: 'readings come off the responses each account serves (docs/quota.md:7), so they stay with it' },
-      { inferred: 'readings come off the responses each account serves (docs/quota.md:7), so no other account takes one' }],
+      { inferred: 'readings come off the responses each account serves (docs/quota.md#how-quota-is-observed), so they stay with it' },
+      { inferred: 'readings come off the responses each account serves (docs/quota.md#how-quota-is-observed), so no other account takes one' }],
     ['rollover-reading', 'roll', 'unjudged', SENTENCES.roll,
-      { inferred: 'docs/routing.md:417 lists the first placements whose roll goes undetected and does not name a cursor a removal moved' }],
+      { inferred: 'the passage RO-unread cites lists the first placements whose roll is not detected and does not name a cursor a removal moved' }],
   ];
   for (const [state, tag, atExpect, otherDocs, atDocs] of pointers) {
     const other = state === 'rollover-reading' ? 'a roll of its account still moves the cursor off it'

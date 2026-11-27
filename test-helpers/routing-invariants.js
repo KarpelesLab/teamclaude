@@ -2,9 +2,12 @@
 // judged against the independent model in routing-model.js and never against
 // a decision function of the code under test.
 //
-// An invariant is `{ id, doc, holds(row), gap?, runFloor?, check(ctx) }`.
-// `check` returns undefined where it does not apply, true where it applied and
-// held, and a string saying what broke otherwise. The count of `true` results
+// An invariant is `{ id, doc, quote, holds(row), gap?, runFloor?, check(ctx) }`.
+// `doc` names the docs lines the rule is read from, and `quote` the sentence
+// that starts on each of them, which a test finds there; an inferred rule is
+// marked so in `doc` and quotes the lines it is inferred from. `check`
+// returns undefined where it does not apply, true where it applied and held,
+// and a string saying what broke otherwise. The count of `true` results
 // is the vacuity floor: an invariant that never applied in a row where it holds
 // proves nothing. `runFloor`, where set, is the share of each such row's runs
 // in which it must apply at least once. A `gap` invariant states what
@@ -142,7 +145,7 @@ export function inBand(/** @type {any} */ b, /** @type {any} */ a, /** @type {st
     if (b.floor == null) return true;
     const pr = pressure(a, model, now);
     if (pr.kind !== 'known' || pr.value >= b.floor * (1 + EPS)) return true;
-    // At tolerance 1 the floor is the best pressure itself (docs/routing.md:407):
+    // At tolerance 1 the floor is the best pressure itself (O3):
     // the account with it is in the band unless another is within EPS of it.
     return pr.value === b.max && b.known.filter((/** @type {number} */ x) => x > b.max * (1 - EPS)).length === 1 ? true : null;
   }
@@ -185,7 +188,7 @@ const cmp = (/** @type {number[]} */ a, /** @type {number[]} */ b) => {
 
 /** The adaptive tier _pickAdaptive scores: the band's top priority, without
  * the spent ones unless every one is. Spent is judged within that priority:
- * the band's bar is the best pressure of the top tier (docs/routing.md:407).
+ * the band's bar is the best pressure of the top tier (O3).
  * @param {any} ctx @param {any[]} cands */
 function adaptiveTier(ctx, cands) {
   const { ranked } = rankedTier(cands, ctx);
@@ -217,8 +220,8 @@ function fiveHourFactor(a, ctx) {
   return limit > 0 ? Math.min(1, Math.max(0, (limit - use) / limit)) : 0;
 }
 
-/** The reclaim conditions of docs/routing.md:427-436 for moving a pin on `q`
- * to `a`, or why not. Null when a reading sits on an edge.
+/** The reclaim conditions O11 cites for moving a pin on `q` to `a`, or why
+ * not. Null when a reading is on an edge.
  * @param {any} ctx @param {any} v @param {any} q @param {any} a */
 export function reclaimable(ctx, v, q, a) {
   const { model, now, ex } = ctx;
@@ -240,7 +243,7 @@ export function reclaimable(ctx, v, q, a) {
 
 /**
  * A fresh catalog for one played history: O26 counts across steps.
- * @returns {Array<{ id: string, doc: string, gap?: string, runFloor?: number, holds: (row: any) => boolean, check: (ctx: any) => true|string|undefined }>}
+ * @returns {Array<{ id: string, doc: string, quote: string|string[], gap?: string, runFloor?: number, holds: (row: any) => boolean, check: (ctx: any) => true|string|undefined }>}
  */
 export function catalog() {
   /** @type {Map<string, number>} */
@@ -269,8 +272,8 @@ export function catalog() {
     if (!(ctx.pinRolled || ctx.pinUncertain)) return null;
     return { p, a, key: `${ctx.life}|${ctx.c}|${ctx.bucket}|${p}|${governing(a, ctx.model).reset}` };
   };
-  // A move off a roll that a reclaim (docs/routing.md:427-436) could have
-  // made, which no reading in the model separates from a hand-back.
+  // A move off a roll that a reclaim (O11) could have made, which no reading
+  // in the model separates from a hand-back.
   const reclaimShaped = (/** @type {any} */ ctx, /** @type {any} */ v, /** @type {any} */ m) =>
     ctx.ex.reclaimHours > 0 && !ctx.pinRolled && inBand(v.B, m.a, ctx.model, ctx.now) === false
       && reclaimable(ctx, v, m.a, ctx.fed.get(ctx.d)) === '';
@@ -290,7 +293,7 @@ export function catalog() {
   const ids = (/** @type {any[]} */ xs) => `[${xs.map(a => a.id)}]`;
   // Where a request went, as the advisor invariants read it: a candidate, or
   // a cordoned account holding one of the conversation's pins, which keeps
-  // what is on it (docs/routing.md:21).
+  // what is on it (U1).
   const tookOneOf = (/** @type {any} */ ctx, /** @type {any} */ v, /** @type {any[]} */ set, needsAdvisor = false) => {
     if (set.some(a => a.id === ctx.d)) return true;
     const a = ctx.fed.get(ctx.d);
@@ -308,11 +311,11 @@ export function catalog() {
     }
     return true;
   };
-  // "The next request after the cooldown retries the account"
-  // (docs/routing.md:81) means the account is back in rotation, not that the
-  // request goes to it: where it goes is still the ordinary choice
-  // (docs/routing.md:19). So this checks only that the request after a hold
-  // of `kind` ends is served while the released account can take it.
+  // "The next request after the cooldown retries the account" (H4) means the
+  // account is back in rotation, not that the request goes to it: where it
+  // goes is still the ordinary choice (U2). So this checks only that the
+  // request after a hold of `kind` ends is served while the released account
+  // can take it.
   const returns = (/** @type {string} */ kind) => (/** @type {any} */ ctx) => {
     if (ctx.restart || ctx.removal || ctx.hop || ctx.failover || !ctx.released?.size) return undefined;
     const back = [...ctx.released].filter(([id, k]) => k === kind && unavailable(ctx.fed.get(id), ctx.model, ctx.row.threshold) == null);
@@ -326,6 +329,7 @@ export function catalog() {
       // "a running account whose entry is gone from the file is dropped from
       // the fleet", and a removal from the TUI "takes effect at once".
       id: 'R1', doc: 'docs/accounts.md:158',
+      quote: 'Account **removals** made on disk (`teamclaude remove` from another shell, or a hand edit) are applied by the same reload: a running account whose entry is gone from the file is dropped from the fleet',
       holds: () => true,
       check: ctx => {
         if (ctx.removal) { removed.add(ctx.removed); return undefined; }
@@ -337,10 +341,10 @@ export function catalog() {
     {
       // No docs line says where the reading of a response goes when its
       // account was removed while the response was in flight. Readings come
-      // "off the responses that flow through" the proxy (docs/quota.md:7), so
-      // R2 holds that reading to no account: it changes no other account's
-      // readings.
+      // "off the responses that flow through" the proxy, so R2 holds that
+      // reading to no account: it changes no other account's readings.
       id: 'R2', doc: 'docs/quota.md:7, inferred',
+      quote: 'TeamClaude is **passive** by default: it reads `anthropic-ratelimit-unified-*` headers off the responses that flow through it.',
       holds: () => true,
       check: ctx => {
         if (!ctx.removal) return undefined;
@@ -349,14 +353,15 @@ export function catalog() {
       },
     },
     {
-      // The current account stays where it is (docs/routing.md:19), and the
-      // removal of another account gives rotation no reason to move it. No
-      // docs line covers a removal's renumbering, so this holds the cursor,
-      // every route and provider cursor, a route pin and every conversation's
-      // pin to the account each named, wherever that account now sits. A pin
-      // on the removed account goes with it (docs/routing.md:409), and a
-      // cursor on it moves to an account still in the fleet.
+      // The current account stays where it is, and the removal of another
+      // account gives rotation no reason to move it. No docs line covers a
+      // removal's renumbering, so this holds the cursor, every route and
+      // provider cursor, a route pin and every conversation's pin to the
+      // account each named, wherever that account now sits. A pin on the
+      // removed account goes with it (PIN-release), and a cursor on it moves to
+      // an account still in the fleet.
       id: 'R3', doc: 'docs/routing.md:19, inferred',
+      quote: 'It stays on the current one and only rotates when that account nears `switchThreshold` (default `0.98`).',
       holds: () => true,
       check: ctx => {
         if (!ctx.removal) return undefined;
@@ -383,13 +388,14 @@ export function catalog() {
         return true;
       },
     },
-    { id: 'H1', doc: 'docs/routing.md:70-71', holds: () => true, check: keepsOff('billing') },
-    { id: 'H2', doc: 'docs/routing.md:88', holds: () => true, check: keepsOff('entitlement') },
-    { id: 'H3', doc: 'docs/routing.md:108', holds: () => true, check: keepsOff('error') },
-    { id: 'H4', doc: 'docs/routing.md:81', holds: () => true, check: returns('billing') },
-    { id: 'H5', doc: 'docs/routing.md:88', holds: () => true, check: returns('entitlement') },
+    { id: 'H1', doc: 'docs/routing.md:68', quote: "An HTTP `400` with Anthropic's `invalid_request_error` message beginning `Your credit balance is too low to access the Anthropic API.`, or an HTTP `400` or `402` with a structured `billing_error`, excludes that account from automatic rotation for five minutes.", holds: () => true, check: keepsOff('billing') },
+    { id: 'H2', doc: 'docs/routing.md:88', quote: 'TeamClaude fails the current request over to another account and keeps the denied account out of automatic rotation for a cooldown shared by later requests.', holds: () => true, check: keepsOff('entitlement') },
+    { id: 'H3', doc: 'docs/routing.md:116', quote: "On an OAuth account, any of these in a JSON `400` or a `403` puts the account in `error` with upstream's message (see [Why an account is in `error`](accounts.md#why-an-account-is-in-error)), and the request fails over.", holds: () => true, check: keepsOff('error') },
+    { id: 'H4', doc: 'docs/routing.md:80', quote: 'The next request after the cooldown retries the account.', holds: () => true, check: returns('billing') },
+    { id: 'H5', doc: 'docs/routing.md:88', quote: 'The cooldown expires on its own, so an organization policy change can recover without restarting the proxy, and it lengthens while the denials keep coming with no served request in between: 5 min, 15 min, then 1 h for every one after that.', holds: () => true, check: returns('entitlement') },
     {
       id: 'U1', doc: 'docs/routing.md:21',
+      quote: 'An account you have [cordoned](usage.md#cordoning-one-account) is never picked for new work, whatever its priority; a conversation already on it stays there.',
       holds: () => true,
       check: anySelection((ctx, v) => {
         if (ctx.d === '-') return undefined;
@@ -405,7 +411,8 @@ export function catalog() {
       // The deciding route is the first whose globs match, so every account
       // it lists, or every account when it lists none, stays a candidate, and
       // the routes after it bar nothing.
-      id: 'O19', doc: 'docs/routing.md:210',
+      id: 'O19', doc: 'docs/routing.md:218',
+      quote: '**`match`** — one or more model globs; the first route whose globs match wins.',
       holds: layered,
       check: request((ctx, v) => {
         const matching = ctx.routes.filter((/** @type {any} */ r) => r.match.some((/** @type {string} */ g) => globMatches(g, ctx.model)));
@@ -421,7 +428,8 @@ export function catalog() {
       // A route restricts only the models it matches: a model none matches
       // may go to any account, and a route matching no request model changes
       // nothing.
-      id: 'O20', doc: 'docs/routing.md:201',
+      id: 'O20', doc: 'docs/routing.md:209',
+      quote: "Each route matches the request's `model` id against shell-style globs (`*` is the only wildcard) and, on the **first matching** route, restricts the request to the listed accounts:",
       holds: layered,
       check: request((ctx, v) => {
         if (routeOf(ctx.routes, ctx.model)) return undefined;
@@ -431,7 +439,8 @@ export function catalog() {
     },
     {
       // A reloaded table routes the next request.
-      id: 'O21', doc: 'docs/routing.md:215',
+      id: 'O21', doc: 'docs/routing.md:223',
+      quote: 'Manage routes from the shell (changes apply to a running server immediately):',
       holds: layered,
       check: request((ctx, v) => {
         if (!ctx.reloaded) return undefined;
@@ -444,7 +453,8 @@ export function catalog() {
       // "strict": an account that can serve both models takes the request
       // whenever one is available; one whose advisor bucket is spent, capped
       // or barred by a route does not.
-      id: 'O22', doc: 'docs/routing.md:190',
+      id: 'O22', doc: 'docs/routing.md:198',
+      quote: '`"strict"` (the default) keeps the request on the accounts that can serve both models.',
       holds: row => advisorMode(row) === 'strict',
       check: advised((ctx, v, adv) => {
         if (!adv.both.length) return undefined;
@@ -456,7 +466,8 @@ export function catalog() {
     {
       // With no account able to serve the advisor, the request is routed by
       // its main model, in either mode.
-      id: 'O23', doc: 'docs/routing.md:193',
+      id: 'O23', doc: 'docs/routing.md:201',
+      quote: 'In both modes, no account able to serve the advisor at all means main-model-only routing, as before.',
       holds: advising,
       check: advised((ctx, v, adv) => {
         if (adv.both.length || !adv.cands.length) return undefined;
@@ -465,13 +476,13 @@ export function catalog() {
       }),
     },
     {
-      // Judged on selection, the path its doc line names
-      // (_withoutAdvisorCapped), in both modes. docs/quota.md:276 says the cap
-      // does not apply under "prefer"; that sentence is about the paths that
-      // skip selection (capBars: a pin, the exhausted-fleet probe, the paid
-      // fallback), which a G3 test in routing-config-model.test.js judges on
-      // the probe.
-      id: 'O24', doc: 'docs/routing.md:195',
+      // Judged on selection (_withoutAdvisorCapped), in both modes. Under
+      // "prefer", docs/quota.md#per-account-usage-caps says the advisor call
+      // can cross the cap only when no other account can serve the request or
+      // it is pinned there: the paths that skip selection (capBars: a pin, the
+      // exhausted-fleet probe, the paid fallback). A G3 test judges the probe.
+      id: 'O24', doc: 'docs/routing.md:203',
+      quote: "An account's [`maxUsage`](quota.md#per-account-usage-caps) cap on the advisor's family is read in both modes: while another account can serve the request, selection and a failover hop stay off an account whose cap bars that family, since the advisor call would cross it.",
       holds: advising,
       check: advised((ctx, v, adv) => {
         if (!adv.cands.length) return undefined;
@@ -482,9 +493,12 @@ export function catalog() {
       }, true),
     },
     {
-      // A refusal fails the request over (docs/routing.md:71, :88, :108), so
-      // the failover is judged as the request is.
+      // A refusal fails the request over (docs/routing.md#billing-refusals,
+      // docs/routing.md#oauth-entitlement-denials,
+      // docs/routing.md#account-refusals), so the failover is judged as the
+      // request is.
       id: 'U2', doc: 'docs/routing.md:19',
+      quote: 'It stays on the current one and only rotates when that account nears `switchThreshold` (default `0.98`).',
       holds: () => true,
       check: ctx => (ctx.failover ? anySelection : request)((ctx, v) => {
         if (!v.av.length) return undefined;
@@ -496,7 +510,8 @@ export function catalog() {
       })(ctx),
     },
     {
-      id: 'O14', doc: 'docs/routing.md:240',
+      id: 'O14', doc: 'docs/routing.md:248',
+      quote: 'Account **priority still wins** (a higher-priority account is never skipped to balance load), and a conversation whose account becomes exhausted re-routes automatically.',
       holds: distOn,
       check: request((ctx, v) => {
         if (v.kind.kind !== 'untagged' || !v.av.length) return undefined;
@@ -508,7 +523,8 @@ export function catalog() {
       }),
     },
     {
-      id: 'U3', doc: 'docs/routing.md:240',
+      id: 'U3', doc: 'docs/routing.md:248',
+      quote: 'Account **priority still wins** (a higher-priority account is never skipped to balance load), and a conversation whose account becomes exhausted re-routes automatically.',
       holds: () => true,
       check: request((ctx, v) => {
         if (!v.av.length || ctx.d === '-') return undefined;
@@ -517,7 +533,8 @@ export function catalog() {
       }),
     },
     {
-      id: 'U5', doc: 'docs/routing.md:267',
+      id: 'U5', doc: 'docs/routing.md:268',
+      quote: 'To retain automatic affinity for your own pooled accounts across proxy restarts:',
       holds: row => row.persist,
       check: ctx => {
         if (!ctx.restart) return undefined;
@@ -533,7 +550,8 @@ export function catalog() {
       },
     },
     {
-      id: 'U6', doc: 'docs/routing.md:269',
+      id: 'U6', doc: 'docs/routing.md:277',
+      quote: 'When off, startup ignores saved affinity and the next ordinary state save removes that section.',
       holds: row => !row.persist,
       check: ctx => {
         if (!ctx.restart) return undefined;
@@ -543,7 +561,8 @@ export function catalog() {
       },
     },
     {
-      id: 'O1', doc: 'docs/routing.md:409',
+      id: 'O1', doc: 'docs/routing.md:455',
+      quote: 'A pin **stops being honoured** when the account cannot serve the request (every reason `teamclaude status` names on its **Blocked** line, from spent quota through a rate-limit hold to an upstream refusal), when a higher-priority account is available, or when that account was already tried and failed earlier in the same request.',
       holds: distOn,
       check: request((ctx, v) => {
         if (v.kind.kind !== 'pin') return undefined;
@@ -556,11 +575,11 @@ export function catalog() {
     {
       // A pin the reading returned to keeps the request once the move off its
       // roll was served at the destination: "Traffic that returns after a serve
-      // finds the roll released and reads the origin whole" (docs/routing.md:417).
-      // Served only under a later stamp, "the roll stays held" (:411): the
-      // reading restored on the return has rolled, and the pin is re-ranked as
-      // O29 judges a rolled pin.
-      id: 'O28', doc: 'docs/routing.md:411 and :417',
+      // finds the roll released and reads the origin whole". Served only under
+      // a later stamp, "the roll stays held": the reading restored on the
+      // return has rolled, and the pin is re-ranked as O29 judges a rolled pin.
+      id: 'O28', doc: 'docs/routing.md:457 and :463',
+      quote: ["The roll a preemption pushes traffic off is **held** until an attempt selecting under this move's stamp is **served** at the destination — upstream's response headers gave a status below 400 — and the reading is still the one that move left there: once it has moved away and come back its stamp is a later one, and the roll stays held.", 'Traffic that returns after a serve finds the roll released and reads the origin whole, keeping the week that account gained until the window rolls again.'],
       holds: row => distOn(row) && row.expiry?.enabled === true && row.expiry.preempt !== false,
       check: request((ctx, v) => {
         if (ctx.pinHeld) {
@@ -578,7 +597,8 @@ export function catalog() {
       }),
     },
     {
-      id: 'O15', doc: 'docs/routing.md:409',
+      id: 'O15', doc: 'docs/routing.md:455',
+      quote: "With `preempt` on, a **pinned conversation** (and the sticky current account) is re-routed when its account's governing weekly window **rolls over**",
       holds: row => distOn(row) && row.expiry?.enabled === true && row.expiry.preempt !== false,
       check: request((ctx, v) => {
         if (v.kind.kind !== 'rolled') return undefined;
@@ -590,7 +610,8 @@ export function catalog() {
     },
     {
       // O15 for the sticky current account, which the same sentence names.
-      id: 'O25', doc: 'docs/routing.md:409',
+      id: 'O25', doc: 'docs/routing.md:455',
+      quote: "With `preempt` on, a **pinned conversation** (and the sticky current account) is re-routed when its account's governing weekly window **rolls over**",
       holds: row => row.dist === 'off' && row.expiry?.enabled === true && row.expiry.preempt !== false,
       check: request((ctx, v) => {
         const cur = ctx.cur;
@@ -604,6 +625,7 @@ export function catalog() {
     },
     {
       id: 'O13', doc: 'docs/routing.md:25',
+      quote: "Separately, and on by default, an account whose 5-hour window resets takes the traffic straight away when its deadline (its weekly reset, or its [end date](#an-account-with-an-end-date) when that comes first) is sooner than the current account's, even though the current account is healthy",
       holds: row => row.dist === 'off',
       check: request((ctx, v) => {
         const cur = ctx.cur;
@@ -631,6 +653,7 @@ export function catalog() {
     },
     {
       id: 'O13b', doc: 'docs/routing.md:25',
+      quote: "Separately, and on by default, an account whose 5-hour window resets takes the traffic straight away when its deadline (its weekly reset, or its [end date](#an-account-with-an-end-date) when that comes first) is sooner than the current account's, even though the current account is healthy",
       holds: row => row.dist === 'off' && row.sessionReset && !row.soonest && row.expiry?.enabled !== true,
       // The generator's session-reset episode reaches a switch in most runs.
       runFloor: 0.5,
@@ -649,6 +672,7 @@ export function catalog() {
     },
     {
       id: 'O2', doc: 'docs/routing.md:19',
+      quote: 'It stays on the current one and only rotates when that account nears `switchThreshold` (default `0.98`).',
       holds: row => row.dist === 'off',
       check: request((ctx, v) => {
         const cur = ctx.cur;
@@ -669,7 +693,8 @@ export function catalog() {
       }),
     },
     {
-      id: 'O3', doc: 'docs/routing.md:403',
+      id: 'O3', doc: 'docs/routing.md:453',
+      quote: 'Selection then draws from the **top pressure band**: accounts within `tolerance` (a ratio, ≥ 1) of the best pressure in the top priority tier.',
       holds: row => row.expiry?.enabled === true,
       check: request((ctx, v) => {
         if (ctx.d === '-' || !v.av.length || v.reason(ctx.fed.get(ctx.d)) != null) return undefined;
@@ -694,7 +719,8 @@ export function catalog() {
       }),
     },
     {
-      id: 'O5', doc: 'docs/routing.md:240',
+      id: 'O5', doc: 'docs/routing.md:248',
+      quote: 'When on, TeamClaude routes each **new** conversation to the least-loaded eligible account (fewest active conversations, then fewest in-flight)',
       holds: row => row.dist === 'even',
       check: request((ctx, v) => {
         const k = v.kind.kind;
@@ -704,7 +730,8 @@ export function catalog() {
       }),
     },
     {
-      id: 'O6', doc: 'docs/routing.md:383',
+      id: 'O6', doc: 'docs/routing.md:429',
+      quote: 'The `load` mode places each **new** conversation on the eligible account that served the **fewest requests in the last ten minutes** (`LOAD_WINDOW_MS`), then falls through to the even keys (fewest active conversations, fewest in-flight, expiry pressure, soonest reset) as tie-breaks.',
       holds: row => row.dist === 'load',
       check: request((ctx, v) => {
         const k = v.kind.kind;
@@ -716,12 +743,13 @@ export function catalog() {
     },
     {
       // A rolled pin is re-ranked, and stays only where "the re-rank ran and
-      // the account it was on still ranked best" (docs/routing.md:417): under
-      // even and load that re-rank is the placement pick over the band with the
-      // pin in it. The adaptive modes decide the move on a burndown score this
-      // model does not compute, and a reclaim window can move the pin on its own
-      // terms, so neither is judged here.
-      id: 'O29', doc: 'docs/routing.md:417',
+      // the account it was on still ranked best": under even and load that
+      // re-rank is the placement pick over the band with the pin in it. The
+      // adaptive modes base the move on a burndown score this model does not
+      // compute, and a reclaim window can move the pin on its own terms, so
+      // neither is judged here.
+      id: 'O29', doc: 'docs/routing.md:463',
+      quote: 'A rollover that moves nothing logs why: no eligible account could take the traffic, or the re-rank ran and the account it was on still ranked best.',
       holds: row => (row.dist === 'even' || row.dist === 'load') && row.expiry?.enabled === true && row.expiry.preempt !== false
         && !(row.expiry.reclaimHours > 0),
       // Random rolls leave a rolled pin in place in about a third of the runs.
@@ -735,19 +763,21 @@ export function catalog() {
     {
       // Requests "onto a just-switched-to account are paced: concurrency
       // starts at" startConc, and storm control off sends "the full burst
-      // immediately" (docs/routing.md:155, :166). A switch here is a cursor
-      // move with distribution off, a request diverted off a cursor whose
-      // family bucket or cap, or its advisor's, bars only this request (:174,
-      // :178), and a pin's move off its roll or into a reclaim window, which
-      // :436 paces "as after any other move". Other moves, the cursor move a
+      // immediately" (docs/routing.md#storm-control). A switch here is a
+      // cursor move with distribution off, a request diverted off a cursor
+      // whose family bucket or cap, or its advisor's, bars only this request
+      // (docs/routing.md#model-aware-routing), and a pin's move off its roll
+      // or into a reclaim window, which docs/routing.md#the-reclaim-window
+      // paces "as after any other move". Other moves, the cursor move a
       // cordon or a disable makes between requests, a move off a cursor a
       // route bars for the request or its advisor, a family's first
       // diversion since start, restart or removal, and the ramp a pause arms,
       // are not judged: the docs do not say they ramp, and the first
       // diversion moves no traffic of the family off an account.
       // A request routed to a cordoned account is not a switch, since a
-      // cordoned account takes no new work (:21).
-      id: 'O27', doc: 'docs/routing.md:155',
+      // cordoned account takes no new work (U1).
+      id: 'O27', doc: 'docs/routing.md:163',
+      quote: 'To prevent this, requests onto a **just-switched-to account** are paced: concurrency starts at 1 and the cap ramps up step by step, then lifts once the ramp window (`windowMs`, 30 seconds by default) has passed.',
       holds: () => true,
       check: anyRequest((ctx, v) => {
         if (ctx.d === '-') return undefined;
@@ -786,7 +816,8 @@ export function catalog() {
       }),
     },
     {
-      id: 'O7', doc: 'docs/routing.md:341',
+      id: 'O7', doc: 'docs/routing.md:362',
+      quote: 'Adaptive mode does the opposite of even: it concentrates new conversations on the account with the **least remaining weekly credit**, to finish that window off',
       holds: row => row.dist === 'adaptive',
       check: request((ctx, v) => {
         if (v.kind.kind !== 'placement' || bandEdge(ctx, v)) return undefined;
@@ -812,7 +843,8 @@ export function catalog() {
       }),
     },
     {
-      id: 'O8', doc: 'docs/routing.md:360',
+      id: 'O8', doc: 'docs/routing.md:406',
+      quote: 'score = P ÷ (1 + load)',
       holds: pressureScoring,
       check: request((ctx, v) => {
         if (v.kind.kind !== 'placement' || bandEdge(ctx, v)) return undefined;
@@ -838,7 +870,8 @@ export function catalog() {
       }),
     },
     {
-      id: 'O10', doc: 'docs/routing.md:375',
+      id: 'O10', doc: 'docs/routing.md:421',
+      quote: 'With `"fiveHourSoftMargin": 0.15` in `adaptiveDistribution` (`0`, off, by default; read at startup, and only under `"scoring": "pressure"`), a new conversation stops going to an account once its live 5-hour use reaches its own 5-hour cap, or a full window with no cap, less the margin',
       holds: row => row.dist === 'adaptive-pressure-soft',
       check: request((ctx, v) => {
         const k = v.kind.kind;
@@ -848,7 +881,8 @@ export function catalog() {
       }),
     },
     {
-      id: 'O11', doc: 'docs/routing.md:427',
+      id: 'O11', doc: 'docs/routing.md:473',
+      quote: 'With it on, a conversation pinned to an account P moves to an account A on its next request when all of these hold:',
       holds: row => row.expiry?.enabled === true && row.expiry.reclaimHours > 0,
       check: request((ctx, v) => {
         if (v.kind.kind !== 'pin') return undefined;
@@ -870,6 +904,7 @@ export function catalog() {
     },
     {
       id: 'O12', doc: 'docs/routing.md:23',
+      quote: 'To make the soonest reset a standing preference rather than a tiebreak, set `"preferSoonestWeeklyReset": true`.',
       holds: row => row.dist === 'off' && row.soonest,
       check: request((ctx, v) => {
         if (ctx.d === '-' || ctx.d !== ctx.cur) return undefined;
@@ -888,6 +923,7 @@ export function catalog() {
     },
     {
       id: 'O16', doc: 'docs/routing.md:23',
+      quote: 'When it does have to pick, ranking is: lowest `priority` number first, then, among accounts of equal priority, the one whose governing weekly bucket resets soonest.',
       // With expiry routing on, pressure ranks ahead of the deadline (O3).
       holds: row => row.dist === 'off' && !row.soonest && row.expiry?.enabled !== true,
       check: request((ctx, v) => {
@@ -898,20 +934,21 @@ export function catalog() {
         if (ctx.row.sessionReset && ctx.sessionResets.size) return undefined;
         if (ctx.d === ctx.famCur && ctx.cur != null && v.reason(ctx.fed.get(ctx.cur)) != null) return undefined;
         // An unknown deadline ranks first, so that it gets read (the probe bias
-        // of docs/routing.md:403).
+        // of docs/routing.md#expiry-pressure-routing).
         const key = (/** @type {any} */ x) => rankingDeadline(x, ctx.model, ctx.now, ctx.ex) ?? -Infinity;
         const sooner = v.av.filter((/** @type {any} */ x) => x.priority === v.top && key(x) < key(a));
         return sooner.length ? `rotated to ${ctx.d} while [${sooner.map((/** @type {any} */ x) => x.id)}] reset sooner` : true;
       }),
     },
     {
-      id: 'O17', doc: 'docs/routing.md:126',
+      id: 'O17', doc: 'docs/routing.md:134',
+      quote: 'So a rate-limit 429 takes **one** failover hop, onto an account that is not already tried and not inside its own 429 pause.',
       holds: () => true,
       check: ctx => {
         if (!ctx.hop) return undefined;
         const { idle, paused } = hopCandidates(ctx);
-        // A rate-limit 429 "does not switch" (docs/routing.md:57): the hop
-        // detours one request.
+        // A rate-limit 429 "does not switch"
+        // (docs/routing.md#the-two-kinds-of-429): the hop detours one request.
         if (ctx.cursorAfter !== ctx.cursorBefore) return `the hop moved the cursor from ${ctx.cursorBefore} to ${ctx.cursorAfter}`;
         if (ctx.to == null) {
           // A paused best pick leaves the 429 unhopped; G4 counts those.
@@ -926,12 +963,13 @@ export function catalog() {
       },
     },
     {
-      id: 'O18', doc: 'docs/routing.md:240 and :409, inferred',
-      // No docs line states this rule. It is inferred from docs/routing.md:240,
-      // where a new conversation is pinned to the account it is routed to, and
-      // :409, where a pin stops being honored once its account has failed in
-      // the same request, and which names the four writers of a pin map.
+      id: 'O18', doc: 'docs/routing.md:248 and :455, inferred',
+      // No docs line states this rule. It is inferred from the sentence where
+      // a new conversation is pinned to the account it is routed to, and the
+      // one where a pin stops being honored once its account has failed in
+      // the same request, whose paragraph names the four writers of a pin map.
       // A pin decides routing only under distribution.
+      quote: ["When on, TeamClaude routes each **new** conversation to the least-loaded eligible account (fewest active conversations, then fewest in-flight) and **pins** it there for the model family's weekly quota bucket", 'A pin **stops being honoured** when the account cannot serve the request (every reason `teamclaude status` names on its **Blocked** line, from spent quota through a rate-limit hold to an upstream refusal), when a higher-priority account is available, or when that account was already tried and failed earlier in the same request.'],
       holds: distOn,
       check: ctx => {
         if (!ctx.hop) return undefined;
@@ -952,7 +990,8 @@ export function catalog() {
     },
     {
       id: 'G1', doc: 'docs/routing.md:240',
-      gap: 'docs/routing.md:240 says a conversation is forgotten after an hour idle, with its pins',
+      quote: 'a conversation is forgotten after an hour idle',
+      gap: 'docs/routing.md#session-aware-routing says a conversation is forgotten after an hour idle, with its pins',
       // Pins decide routing only under distribution.
       holds: distOn,
       check: request((ctx, v) => {
@@ -965,6 +1004,7 @@ export function catalog() {
       // "A roll is handed back once, so two is the most": no third move answers
       // the same roll.
       id: 'O26', doc: 'docs/routing.md:455',
+      quote: 'A roll is handed back once, so two is the most.',
       holds: row => distOn(row) && row.expiry?.enabled === true && row.expiry.preempt !== false,
       check: request((ctx, v) => {
         const m = rollMove(ctx, v);
@@ -981,8 +1021,9 @@ export function catalog() {
       }),
     },
     {
-      id: 'G6', doc: 'docs/routing.md:411',
-      gap: 'docs/routing.md:411 says a roll is handed back once, and a reading restored from a hold is held again only for a window that has rolled since; held again for another window, it hands this window\'s roll back a second time',
+      id: 'G6', doc: 'docs/routing.md:457',
+      quote: 'A reading restored from a hold is held again only for a window that has rolled since the hand-back, so two accounts that have each rolled cannot trade their rolls for ever.',
+      gap: 'docs/routing.md#expiry-pressure-routing says a roll is handed back once, and a reading restored from a hold is held again only for a window that has rolled since; held again for another window, it hands this window\'s roll back a second time',
       holds: row => distOn(row) && row.expiry?.enabled === true && row.expiry.preempt !== false,
       check: request((ctx, v) => {
         const m = rollMove(ctx, v);
@@ -995,8 +1036,9 @@ export function catalog() {
       }),
     },
     {
-      id: 'G7', doc: 'docs/routing.md:411',
-      gap: 'docs/routing.md:411 says a roll is handed back once; with a reclaim window a pin moves a third time on one roll, by reclaim or by a hand-back, which no reading in the model separates',
+      id: 'G7', doc: 'docs/routing.md:457',
+      quote: 'A roll is handed back once.',
+      gap: 'docs/routing.md#expiry-pressure-routing says a roll is handed back once; with a reclaim window a pin moves a third time on one roll, by reclaim or by a hand-back, which no reading in the model separates',
       holds: row => distOn(row) && row.expiry?.enabled === true && row.expiry.preempt !== false && row.expiry.reclaimHours > 0,
       check: request((ctx, v) => {
         const m = rollMove(ctx, v);
@@ -1009,8 +1051,9 @@ export function catalog() {
       }),
     },
     {
-      id: 'G4', doc: 'docs/routing.md:126',
-      gap: 'docs/routing.md:126 says a rate-limit 429 takes "**one** failover hop, onto an account that is not already tried and not inside its own 429 pause"; the hop takes only the best pick, and none when that pick is paused',
+      id: 'G4', doc: 'docs/routing.md:134',
+      quote: 'So a rate-limit 429 takes **one** failover hop, onto an account that is not already tried and not inside its own 429 pause.',
+      gap: 'docs/routing.md#one-failover-hop-on-a-rate-limit says a rate-limit 429 takes "**one** failover hop, onto an account that is not already tried and not inside its own 429 pause"; the hop takes only the best pick, and none when that pick is paused',
       holds: () => true,
       check: ctx => {
         if (!ctx.hop || ctx.to != null) return undefined;
