@@ -176,7 +176,7 @@ export function generate(seed) {
   // while another is the cursor, both cleared of the re-rank flag, and
   // random events almost never line that up.
   const events = steps.length;
-  throttleEpisode(steps, convs, prng(seed ^ 0x7feb352d));
+  throttleEpisode(steps, convs, prng(seed ^ 0x7feb352d), prng(seed ^ 0x2f2b8a17 ^ 0x7feb352d));
   sessionResetEpisode(steps, accounts, convs, prng(seed ^ 0x1b873593));
   advisorCapEpisode(steps, accounts, convs, prng(seed ^ 0x4cf5ad43));
   returnEpisode(steps, accounts, convs, prng(seed ^ 0x1d872b41));
@@ -219,16 +219,21 @@ function routeTable(accounts, rand, shape) {
 
 /** Appends the throttle episode: two conversations take turns, each drawing a
  * per-minute 429 twice and coming back in between, closer together than a
- * pause lasts, so that a hop meets accounts inside their pause.
- * @param {Step[]} steps @param {string[]} convs @param {() => number} rand */
-function throttleEpisode(steps, convs, rand) {
+ * pause lasts, so that a hop meets accounts inside their pause. `advised`
+ * decides which Opus throttles declare an advisor, apart from `rand` so that
+ * the episode is otherwise the same.
+ * @param {Step[]} steps @param {string[]} convs @param {() => number} rand @param {() => number} advised */
+function throttleEpisode(steps, convs, rand, advised) {
   let at = steps.length ? steps[steps.length - 1].at : 0;
   const x = convs[Math.floor(rand() * convs.length)];
   const others = convs.filter(k => k !== x);
   const y = others[Math.floor(rand() * others.length)];
   for (const [op, c] of /** @type {const} */ ([['throttle', x], ['request', y], ['request', x], ['throttle', y], ['throttle', x], ['request', y], ['request', x]])) {
     at += (2 + Math.floor(rand() * 19)) * SEC;
-    steps.push({ at, op, c, model: rand() < 0.7 ? OPUS : FABLE });
+    /** @type {Step} */
+    const s = { at, op, c, model: rand() < 0.7 ? OPUS : FABLE };
+    if (op === 'throttle' && s.model === OPUS && advised() < ADVISED_RATE) s.advisor = FABLE;
+    steps.push(s);
   }
 }
 
@@ -389,6 +394,9 @@ function advisorCapEpisode(steps, accounts, convs, rand) {
   push({ op: 'usage', id: p.id, u7d: 0.1, f: Math.min(0.99, r2(cap + 0.05)) });
   for (const a of accounts) if (a !== p) push({ op: 'usage', id: a.id, u7d: r2(rand() * 0.35), f: null });
   for (const x of [c, k, c]) push({ op: 'request', c: x, model: OPUS, advisor: FABLE });
+  // A 429 whose hop meets the capped account, which with two accounts is the
+  // only one left.
+  push({ op: 'throttle', c: k, model: OPUS, advisor: FABLE });
 }
 
 /** The first reset of a window of `period` after `t`, from one at `r`.
@@ -1394,7 +1402,10 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
     pausedUntil.set(acc.id, now + Math.min(RETRY_AFTER, RATE_LIMIT_ABSORB_MAX) * SEC);
     const pinsBefore = am.exportAffinityState();
     const cursorBefore = cursor();
-    const alt = am.pickAlternate(new Set([acc.index, ...(selection.rolledOff ?? [])]), model, null);
+    // The hop passes the request's advisor, as the server's does, read again
+    // now that the 429's readings are in.
+    const adv = ctx.adv ? advisorRouting(fed, model, ctx.adv.advisor, row) : null;
+    const alt = am.pickAlternate(new Set([acc.index, ...(selection.rolledOff ?? [])]), model, adv?.advisor ?? null);
     const to = alt && !am.isPaused(alt.index) ? alt : null;
     if (sighted) unsure(sighted);
     if (to) {
@@ -1402,7 +1413,7 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
       if (sighted) firstSight(sighted, /** @type {Fed} */ (fed.get(to.id)), fed, step);
     }
     if (!ctx.edge) check({
-      ...ctx, hop: true, from: acc.id, to: to?.id ?? null, pausedUntil: new Map(pausedUntil),
+      ...ctx, hop: true, from: acc.id, to: to?.id ?? null, adv, pausedUntil: new Map(pausedUntil),
       rolledOff: [...(selection.rolledOff ?? [])].map(k => am.accounts[k].id),
       cursorBefore, cursorAfter: cursor(), pinsBefore, pinsAfter: am.exportAffinityState(), view: undefined,
     });
@@ -1607,8 +1618,7 @@ export function play({ AccountManager, validateAdaptiveConfig, t, history: h, ro
       }
       const bucket = bucketOf(model);
       noticeResets();
-      // Throttle steps declare no advisor, so a hop is judged on the request model.
-      const adv = s.advisor && (s.op === 'request' || s.op === 'fault') && advising ? advisorRouting(fed, model, s.advisor, row) : null;
+      const adv = s.advisor && (s.op === 'request' || s.op === 'fault' || s.op === 'throttle') && advising ? advisorRouting(fed, model, s.advisor, row) : null;
       const key = cursorKeyOf(model, adv?.routed ?? null);
       // The readings _pickActiveAccount takes before it decides.
       let curRolled = false;
