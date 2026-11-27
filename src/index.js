@@ -43,6 +43,7 @@ import { ResetCreditRedeemer } from './codex-reset-credits.js';
 import { redeemPolicyWarnings } from './codex-reset-policy.js';
 import { ClaudeResetRedeemer } from './claude-resets.js';
 import { createResetActions } from './reset-actions.js';
+import { createDashboardLogin } from './dashboard-login.js';
 import { Warmer, warmApplicable } from './warmer.js';
 import { formatWarmupScheduleConfirmation, resolveWarmupConfig } from './warmup-schedule.js';
 import { TUI, ACCOUNT_SORTS } from './tui.js';
@@ -1070,6 +1071,15 @@ async function serverCommand() {
   const drain = createDrainState();
   // The resets routes: the same reads and claims as the TUI's resets panel.
   hooks.resetActions = resetActions;
+  // The sign-in routes behind the dashboard's Add account control: the TUI
+  // panel's own path (loginAccount above) with the page in the panel's place.
+  // No loopback listener, since the browser is on another machine; the same
+  // upsert, which throws instead of exiting and leaves the reload to us.
+  hooks.dashboardLogin = createDashboardLogin({
+    startLogin: startOAuthLogin,
+    upsert: (/** @type {Record<string, any>} */ tokens) => upsertOAuthAccount(undefined, tokens, 'login', null, false, { fatal: false, notify: false }),
+    reload: reloadAccounts,
+  });
   const server = createProxyServer(accountManager, config, hooks, sx, clientUsage, dimensionUsage, { bindHost, drain, usageStore });
   // Said once, at start: a value that is set but cannot turn the drain on would otherwise
   // leave SIGTERM stopping at once with nothing to say why.

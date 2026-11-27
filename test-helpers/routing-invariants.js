@@ -325,7 +325,7 @@ export function catalog() {
     {
       // "a running account whose entry is gone from the file is dropped from
       // the fleet", and a removal from the TUI "takes effect at once".
-      id: 'R1', doc: 'docs/accounts.md:156',
+      id: 'R1', doc: 'docs/accounts.md:158',
       holds: () => true,
       check: ctx => {
         if (ctx.removal) { removed.add(ctx.removed); return undefined; }

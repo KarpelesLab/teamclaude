@@ -14,6 +14,8 @@ The browser is sent back to a listener on this machine, so it has to run here. O
 
 Run it once per account. You can add accounts while the server is running — press **R** in the TUI to reload.
 
+A server that runs with no terminal can take the sign-in from its browser dashboard instead: **Add account** there shows the sign-in link, takes the pasted code, and saves the account into the config file the running server reads. It adds Claude logins only. See [Status dashboard (browser)](usage.md#status-dashboard-browser).
+
 If the profile cannot be identified, login stops without adding a placeholder
 account. Retry after confirming the credential is valid, or pass
 `teamclaude login --name <name>` to add it without profile detection. A
@@ -832,6 +834,10 @@ machine that name it in `Host`, as the MCP endpoint does.
 
 The account is named as for `teamclaude switch`. Grant ids come from the list
 and stay in memory only, like the panel's.
+
+The browser dashboard's **spend reset** button on an account card drives these
+routes: a read, a confirmation, then the spend. See
+[Status dashboard (browser)](usage.md#status-dashboard-browser).
 
 ### Spending a Claude reset automatically
 

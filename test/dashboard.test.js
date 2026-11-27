@@ -12,6 +12,8 @@ import {
   thresholdRequest, thresholdPercentText, thresholdOutcome,
   usageFor, USAGE_VIEWS, backendQuotaRows,
   callerCan, callerNotice, cardNoteKey, cardNoteFor, CARD_NOTE_MAX_AGE_MS, accountGroups,
+  loginOffered, loginRequest, signInUrl, loginFinishOutcome,
+  resetOffered, resetRequest, resetGrantRows, resetDefaultGrant, resetSummaryLines, resetConfirmLines, resetRedeemOutcome,
 } from '../src/dashboard.js';
 import { USAGE_WINDOWS } from '../src/client-usage.js';
 
@@ -1125,4 +1127,340 @@ test('a backend account card draws its probed windows, not "quota unknown" (#530
   assert.deepEqual(backendQuotaRows({ label: 'Balance', text: '$4.20', utilization: null }, now),
     { rows: [], text: 'Balance: $4.20' });
   assert.deepEqual(backendQuotaRows(null, now), { rows: [], text: null });
+});
+
+// ── Add account and Spend reset (#765) ──────────────────────────────────────
+// The page's decisions are pure helpers, tested here; the two page tests after
+// them drive the served script against the stub DOM to pin the order of the
+// requests it sends.
+
+const OPERATOR = { kind: 'operator', client: null, refused: [] };
+const CLIENT = {
+  kind: 'client', client: 'ci',
+  refused: ['/teamclaude/threshold', '/teamclaude/resets/read', '/teamclaude/resets/redeem',
+    '/teamclaude/login/start', '/teamclaude/login/finish', '/teamclaude/login/cancel'],
+};
+
+test('Add account is offered to the operator and withheld from a client key', () => {
+  assert.equal(loginOffered(OPERATOR), true);
+  assert.equal(loginOffered(CLIENT), false);
+  // A status with no `caller` (an older server) keeps the control: the server
+  // still refuses what it must.
+  assert.equal(loginOffered(undefined), true);
+});
+
+test('loginRequest posts each step of a sign-in with the page key', () => {
+  assert.deepEqual(loginRequest('start', null, 'tc-k'), {
+    url: '/teamclaude/login/start',
+    init: { method: 'POST', headers: { 'x-api-key': 'tc-k', 'content-type': 'application/json' }, body: '{}' },
+  });
+  const finish = loginRequest('finish', { id: 'i1', code: 'abc#st' }, null);
+  assert.equal(finish.url, '/teamclaude/login/finish');
+  assert.equal(finish.init.headers['x-api-key'], '');
+  assert.deepEqual(JSON.parse(finish.init.body), { id: 'i1', code: 'abc#st' });
+  assert.equal(loginRequest('cancel', { id: 'i1' }, 'k').url, '/teamclaude/login/cancel');
+});
+
+test('signInUrl admits an https address and nothing else as the link', () => {
+  assert.equal(signInUrl('https://claude.ai/oauth/authorize?code=true&state=s'), 'https://claude.ai/oauth/authorize?code=true&state=s');
+  for (const bad of ['javascript:alert(1)', 'data:text/html,<script>1</script>', 'http://claude.ai/oauth/authorize',
+    '//claude.ai/x', '/teamclaude/status', 'not a url', '', null, undefined, 7, { href: 'https://x' }]) {
+    assert.equal(signInUrl(bad), null, String(bad));
+  }
+});
+
+test('loginFinishOutcome says which account was added or updated, and when a sign-in is over', () => {
+  assert.deepEqual(loginFinishOutcome(200, { ok: true, account: 'alice@example.com', action: 'added' }),
+    { kind: 'ok', text: 'added account alice@example.com', ended: true });
+  assert.deepEqual(loginFinishOutcome(200, { ok: true, account: 'alice@example.com', action: 'updated' }),
+    { kind: 'ok', text: 'signed in again: updated account alice@example.com', ended: true });
+  // A paste the server could not use, and a finish already running: the
+  // sign-in is still waiting, so the field stays.
+  assert.deepEqual(loginFinishOutcome(400, { ok: false, error: 'That is not the whole code' }),
+    { kind: 'error', text: 'sign-in failed: That is not the whole code', ended: false });
+  assert.equal(loginFinishOutcome(409, { ok: false, error: 'busy' }).ended, false);
+  // Gone on the server, or its code spent on a failed exchange: start again.
+  assert.equal(loginFinishOutcome(404, { ok: false, error: 'expired' }).ended, true);
+  assert.equal(loginFinishOutcome(502, { ok: false, error: 'exchange failed' }).ended, true);
+  assert.deepEqual(loginFinishOutcome(500, null), { kind: 'error', text: 'sign-in failed: status 500', ended: false });
+});
+
+const RESET_NOW = 1_800_000_000_000;
+const heldAccount = (resetCredits) => ({ name: 'alice@example.com', provider: 'anthropic', type: 'oauth', quota: { resetCredits } });
+
+test('a card offers Spend reset exactly when its badge counts a usable reset, and never to a client key', () => {
+  const held = heldAccount({ available: 1, seenAt: RESET_NOW });
+  assert.equal(resetOffered(held, OPERATOR, RESET_NOW), true);
+  assert.equal(resetOffered(held, undefined, RESET_NOW), true);
+  assert.equal(resetOffered(held, CLIENT, RESET_NOW), false);
+  // Either refusal withholds it: the click reads before it spends.
+  assert.equal(resetOffered(held, { refused: ['/teamclaude/resets/read'] }, RESET_NOW), false);
+  assert.equal(resetOffered(held, { refused: ['/teamclaude/resets/redeem'] }, RESET_NOW), false);
+  // The same readings the badge drops: none held, lapsed, or too old to trust.
+  const none = [
+    heldAccount({ available: 0, seenAt: RESET_NOW }),
+    heldAccount({ available: 1, seenAt: RESET_NOW, expiresAt: RESET_NOW - 1 }),
+    heldAccount({ available: 1, seenAt: RESET_NOW - 10 * 24 * 3600_000 }),
+    { name: 'bob', quota: {} }, { name: 'carol' }, null,
+  ];
+  for (const account of none) {
+    assert.equal(resetOffered(account, OPERATOR, RESET_NOW), false, JSON.stringify(account));
+    const badges = accountBadges(account, null, null, RESET_NOW).map(b => b.text);
+    assert.ok(!badges.some(text => /reset/.test(text)), 'no badge either');
+  }
+  assert.ok(accountBadges(held, null, null, RESET_NOW).some(b => b.text === '1 reset credit'));
+});
+
+test('resetRequest names the account, and the grant only for a spend, and never forces', () => {
+  const read = resetRequest('read', 'alice@example.com', null, 'tc-k');
+  assert.equal(read.url, '/teamclaude/resets/read');
+  assert.equal(read.init.method, 'POST');
+  assert.equal(read.init.headers['x-api-key'], 'tc-k');
+  assert.deepEqual(JSON.parse(read.init.body), { account: 'alice@example.com' });
+  const spend = resetRequest('redeem', 'alice@example.com', 'g-weekly', 'tc-k');
+  assert.equal(spend.url, '/teamclaude/resets/redeem');
+  assert.deepEqual(JSON.parse(spend.init.body), { account: 'alice@example.com', grantId: 'g-weekly' });
+});
+
+const grant = (over) => ({ id: 'g', kind: 'weekly', label: null, resetsLeft: 1, resetsTotal: 1, clears: ['five_hour', 'seven_day'],
+  endsAt: null, next: false, blocked: null, warnings: [], ...over });
+const WEEKLY = grant({ id: 'g-weekly', next: true });
+const FABLE = grant({ id: 'g-fable', kind: 'fable', clears: ['seven_day_overage_included'], warnings: ['no weekly limit is exhausted'] });
+const SPENT = grant({ id: 'g-spent', resetsLeft: 0, blocked: 'no resets left' });
+const PAUSED = grant({ id: 'g-paused', kind: 'session', clears: ['five_hour'], blocked: 'reset is paused' });
+const CODEX = grant({ id: 'c-1', kind: 'codex', label: 'Rate limit reset', clears: [] });
+const details = (grants, over) => ({ provider: 'claude', error: null, seenAt: RESET_NOW - 12_000, stale: false, retryAt: null,
+  ineligibleReason: null, atLimit: true, exhausted: ['seven_day'], cooldownUntil: null, weeklyResetsAt: null, fleetHoldUntil: null, grants, ...over });
+
+test('resetGrantRows lists the grants that still hold a reset, with what each clears', () => {
+  const rows = resetGrantRows(details([WEEKLY, SPENT, FABLE, PAUSED]), RESET_NOW);
+  assert.deepEqual(rows.map(r => r.id), ['g-weekly', 'g-fable', 'g-paused'], 'a grant with nothing left is not listed');
+  assert.equal(rows[0].title, 'Weekly reset');
+  assert.equal(rows[0].text, '1 left · clears 5h + week · next');
+  // A Fable reset clears the Fable weekly only, and the row says so.
+  assert.equal(rows[1].title, 'Fable reset');
+  assert.equal(rows[1].text, '1 left · clears Fable week');
+  assert.deepEqual(rows[1].warnings, ['no weekly limit is exhausted']);
+  assert.equal(rows[2].blocked, 'reset is paused');
+  const codex = resetGrantRows(details([CODEX], { provider: 'codex' }), RESET_NOW)[0];
+  assert.equal(codex.title, 'Codex reset credit (Rate limit reset)');
+  assert.equal(codex.text, '1 left · clears the spent rate-limit windows of this Codex account');
+  // An expiry is said with the same formatter the page uses, so this holds in any locale.
+  const ends = RESET_NOW + 3 * 24 * 3600_000;
+  const day = new Date(ends).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+  assert.equal(resetGrantRows(details([grant({ endsAt: ends })]), RESET_NOW)[0].text, `1 left · clears 5h + week · expires ${day}`);
+  assert.deepEqual(resetGrantRows(null, RESET_NOW), []);
+  assert.deepEqual(resetGrantRows({ error: 'could not read reset status' }, RESET_NOW), []);
+});
+
+test('the confirmation opens on the only spendable grant, and asks when there are several', () => {
+  assert.equal(resetDefaultGrant(resetGrantRows(details([WEEKLY, PAUSED]), RESET_NOW)), 'g-weekly');
+  assert.equal(resetDefaultGrant(resetGrantRows(details([WEEKLY, FABLE]), RESET_NOW)), null);
+  assert.equal(resetDefaultGrant(resetGrantRows(details([PAUSED]), RESET_NOW)), null);
+  assert.equal(resetDefaultGrant([]), null);
+});
+
+test('the confirmation names the account, the grant and the windows it clears, and says it cannot be undone', () => {
+  const [weekly, fable] = resetGrantRows(details([WEEKLY, FABLE]), RESET_NOW);
+  assert.deepEqual(resetConfirmLines('alice@example.com', weekly), [
+    { cls: '', text: 'Spend one Weekly reset on alice@example.com?' },
+    { cls: '', text: 'It clears 5h + week.' },
+    { cls: 'error', text: 'A spend cannot be undone.' },
+  ]);
+  // A Fable reset leaves the shared weekly spent; its warnings are the
+  // server's, shown before the person agrees.
+  assert.deepEqual(resetConfirmLines('alice@example.com', fable), [
+    { cls: '', text: 'Spend one Fable reset on alice@example.com?' },
+    { cls: '', text: 'It clears Fable week. It does not clear the weekly limit the other models share.' },
+    { cls: 'warn', text: 'no weekly limit is exhausted' },
+    { cls: 'error', text: 'A spend cannot be undone.' },
+  ]);
+  const [codex] = resetGrantRows(details([CODEX], { provider: 'codex' }), RESET_NOW);
+  assert.equal(resetConfirmLines('carol', codex)[1].text, 'It clears the spent rate-limit windows of this Codex account.');
+});
+
+test('resetSummaryLines says how old the reading is, the limit state and the holds', () => {
+  assert.deepEqual(resetSummaryLines({ read: true, readableAt: null, details: details([WEEKLY]) }, RESET_NOW), [
+    { cls: '', text: 'Claude · as of 12s ago' },
+    { cls: '', text: 'at a limit: week' },
+  ]);
+  // Inside the read floor the server answered from its cache: said, with the wait.
+  const cached = resetSummaryLines({ read: false, readableAt: RESET_NOW + 45_000, details: details([WEEKLY], { atLimit: false, exhausted: [], seenAt: RESET_NOW - 75_000 }) }, RESET_NOW);
+  assert.deepEqual(cached, [
+    { cls: '', text: 'Claude · as of 1m ago' },
+    { cls: '', text: 'not at a limit' },
+    { cls: 'warn', text: 'this is the last reading; a fresh read is allowed in 45s' },
+  ]);
+  const held = resetSummaryLines({ read: true, details: details([WEEKLY], { fleetHoldUntil: RESET_NOW + 600_000, ineligibleReason: 'plan' }) }, RESET_NOW);
+  assert.ok(held.some(l => l.cls === 'warn' && l.text.startsWith('a reset was spent, or may have been, within the last hour; hold until ')));
+  assert.ok(held.some(l => l.cls === 'error' && l.text === 'ineligible: plan'));
+  // A read that failed with nothing cached: the error, and no limit line to mislead.
+  assert.deepEqual(resetSummaryLines({ read: true, details: details([], { error: 'HTTP 429', seenAt: null, atLimit: null, retryAt: RESET_NOW + 30_000 }) }, RESET_NOW), [
+    { cls: '', text: 'Claude' },
+    { cls: 'error', text: 'HTTP 429' },
+    { cls: 'warn', text: 'retry in 30s' },
+  ]);
+  assert.deepEqual(resetSummaryLines({ read: false, details: null }, RESET_NOW), [{ cls: 'warn', text: 'no reset reading for this account yet' }]);
+});
+
+test('resetRedeemOutcome shows the server\'s own line for a spend, a refusal and an unread verdict', () => {
+  assert.deepEqual(resetRedeemOutcome(200, { ok: true, redeemed: true, message: 'Manually redeemed a claude reset on "alice" (reset)', resetsLeft: 0, cleared: ['five_hour', 'seven_day'] }),
+    { kind: 'ok', text: 'Manually redeemed a claude reset on "alice" (reset) · 0 left · cleared 5h + week' });
+  // The hold after a recent claim: the server's words, and nothing forced.
+  const hold = 'Manual reset on "alice": a reset was spent, or may have been, within the last hour; read again, and send "force": true to spend another';
+  assert.deepEqual(resetRedeemOutcome(409, { ok: false, redeemed: false, uncertain: false, error: hold }), { kind: 'error', text: hold });
+  assert.deepEqual(resetRedeemOutcome(502, { ok: false, redeemed: false, uncertain: true, error: 'Manual reset on "alice": no answer' }),
+    { kind: 'warn', text: 'Manual reset on "alice": no answer · no verdict was read, so the reset may have been spent' });
+  assert.deepEqual(resetRedeemOutcome(403, { ok: false, error: 'a client key cannot spend resets' }), { kind: 'error', text: 'a client key cannot spend resets' });
+  assert.deepEqual(resetRedeemOutcome(500, null), { kind: 'error', text: 'status 500' });
+});
+
+// The helpers above reach the page as source text. resetOffered calls
+// heldResetCredits, which calls heldResetKinds, and the labels are module
+// constants: a page missing any of them would throw at first render.
+test('the Add account and Spend reset helpers run inside the serialized bundle', () => {
+  const script = inlineScripts(renderDashboardHtml()).at(-1);
+  const bundle = script.slice(script.indexOf('var STARVED_MIN'), script.indexOf('function el('));
+  const page = new Function(`${bundle}; return { resetOffered, resetGrantRows, resetConfirmLines, resetSummaryLines, resetRedeemOutcome, signInUrl, loginFinishOutcome, loginOffered };`)();
+  const held = heldAccount({ available: 2, fable: 1, seenAt: RESET_NOW });
+  assert.equal(page.resetOffered(held, OPERATOR, RESET_NOW), true);
+  const d = details([WEEKLY, FABLE]);
+  assert.deepEqual(page.resetGrantRows(d, RESET_NOW), resetGrantRows(d, RESET_NOW));
+  assert.deepEqual(page.resetConfirmLines('alice', page.resetGrantRows(d, RESET_NOW)[1]), resetConfirmLines('alice', resetGrantRows(d, RESET_NOW)[1]));
+  assert.deepEqual(page.resetSummaryLines({ read: true, details: d }, RESET_NOW), resetSummaryLines({ read: true, details: d }, RESET_NOW));
+  assert.equal(page.signInUrl('javascript:alert(1)'), null);
+  assert.equal(page.loginOffered(CLIENT), false);
+});
+
+test('the sign-in link opens in a new tab without handing the page to it', () => {
+  const html = renderDashboardHtml();
+  assert.match(html, /<a id="loginLink" target="_blank" rel="noopener noreferrer">/);
+});
+
+test('the page hides Add account from a client key and shows it to the operator', async () => {
+  const page = bootPage({ storedKey: 'tc-client' });
+  await page.answer(200, { accounts: [], caller: CLIENT });
+  assert.equal(page.byId('addAcct').style.display, 'none');
+  const operator = bootPage();
+  await operator.answer(200, { accounts: [], caller: OPERATOR });
+  assert.equal(operator.byId('addAcct').style.display, '');
+});
+
+test('Add account starts a sign-in, keeps the field after a refused paste, and returns to the start when it is over', async () => {
+  const page = bootPage({ storedKey: 'tc-op' });
+  await page.answer(200, { accounts: [], caller: OPERATOR });
+  page.byId('addAcct').fire('click');
+  assert.equal(page.requests.length, 1);
+  assert.equal(page.requests[0].url, '/teamclaude/login/start');
+  assert.equal(page.requests[0].init.headers['x-api-key'], 'tc-op');
+  const link = 'https://claude.ai/oauth/authorize?code=true&state=s1';
+  await page.answer(200, { ok: true, id: 'i1', url: link, expiresAt: Date.now() + 300_000 });
+  assert.equal(page.byId('loginBox').style.display, '');
+  assert.equal(page.byId('loginLink').href, link);
+
+  // An empty field sends nothing.
+  page.byId('loginFinish').fire('click');
+  assert.equal(page.requests.length, 0);
+  assert.equal(page.byId('loginMsg').style.display, 'block');
+
+  page.byId('loginCode').value = ' half-a-code ';
+  page.byId('loginFinish').fire('click');
+  assert.equal(page.requests[0].url, '/teamclaude/login/finish');
+  assert.deepEqual(JSON.parse(page.requests[0].init.body), { id: 'i1', code: 'half-a-code' });
+  await page.answer(400, { ok: false, error: 'That is not the whole code' });
+  assert.equal(page.byId('loginBox').style.display, '', 'the box stays for another paste');
+  assert.equal(page.byId('loginCode').value, ' half-a-code ');
+  assert.equal(page.byId('loginMsg').textContent, 'sign-in failed: That is not the whole code');
+
+  page.byId('loginFinish').fire('click');
+  await page.answer(404, { ok: false, error: 'that sign-in has expired or was replaced; start again' });
+  assert.equal(page.byId('loginBox').style.display, 'none', 'an ended sign-in goes back to the start');
+  assert.equal(page.byId('loginCode').value, '');
+  assert.match(page.byId('note').textContent, /sign-in failed: that sign-in has expired or was replaced; start again/);
+  assert.equal(page.byId('note').className, 'error');
+});
+
+test('a finished sign-in says which account was added and polls for it', async () => {
+  const page = bootPage();
+  await page.answer(200, { accounts: [], caller: OPERATOR });
+  page.byId('addAcct').fire('click');
+  await page.answer(200, { ok: true, id: 'i1', url: 'https://claude.ai/oauth/authorize?state=s1', expiresAt: Date.now() + 300_000 });
+  page.byId('loginCode').value = 'ac_1#s1';
+  page.byId('loginFinish').fire('click');
+  await page.answer(200, { ok: true, account: 'alice@example.com', action: 'added' });
+  assert.equal(page.byId('loginBox').style.display, 'none');
+  assert.match(page.byId('note').textContent, /added account alice@example\.com$/);
+  assert.equal(page.byId('note').className, 'ok');
+  assert.equal(page.requests.length, 1);
+  assert.equal(page.requests[0].url, '/teamclaude/status', 'the next poll shows the new card');
+});
+
+test('a sign-in link that is not https is never shown, and its sign-in is cancelled', async () => {
+  const page = bootPage();
+  await page.answer(200, { accounts: [], caller: OPERATOR });
+  page.byId('addAcct').fire('click');
+  await page.answer(200, { ok: true, id: 'i1', url: 'javascript:alert(document.domain)', expiresAt: 1 });
+  assert.notEqual(page.byId('loginBox').style.display, '');
+  assert.notEqual(page.byId('loginLink').href, 'javascript:alert(document.domain)');
+  assert.equal(page.requests.length, 1);
+  assert.equal(page.requests[0].url, '/teamclaude/login/cancel');
+  assert.deepEqual(JSON.parse(page.requests[0].init.body), { id: 'i1' });
+  assert.match(page.byId('note').textContent, /not an https address/);
+});
+
+test('Cancel closes the box and tells the server to stop waiting', async () => {
+  const page = bootPage();
+  await page.answer(200, { accounts: [], caller: OPERATOR });
+  page.byId('addAcct').fire('click');
+  await page.answer(200, { ok: true, id: 'i1', url: 'https://claude.ai/oauth/authorize?state=s1', expiresAt: 1 });
+  page.byId('loginCancel').fire('click');
+  assert.equal(page.byId('loginBox').style.display, 'none');
+  assert.equal(page.requests[0].url, '/teamclaude/login/cancel');
+  assert.deepEqual(JSON.parse(page.requests[0].init.body), { id: 'i1' });
+});
+
+test('Spend reset reads first, asks, and only then spends the chosen grant, without force', async () => {
+  const page = bootPage({ storedKey: 'tc-op' });
+  const status = { accounts: [heldAccount({ available: 1, seenAt: Date.now() })], caller: OPERATOR };
+  await page.answer(200, status);
+  page.click('spend reset');
+  assert.equal(page.requests.length, 1);
+  assert.equal(page.requests[0].url, '/teamclaude/resets/read');
+  assert.deepEqual(JSON.parse(page.requests[0].init.body), { account: 'alice@example.com' });
+  await page.answer(200, { ok: true, account: 'alice@example.com', read: true, readableAt: null, details: details([WEEKLY], { seenAt: Date.now() }) });
+  // The confirmation is on the page and nothing has been spent.
+  assert.equal(page.requests.length, 0);
+  assert.equal(page.labelled('Spend one Weekly reset on alice@example.com?'), 1);
+  assert.equal(page.labelled('It clears 5h + week.'), 1);
+  assert.equal(page.labelled('A spend cannot be undone.'), 1);
+
+  page.click('Spend it');
+  assert.equal(page.requests.length, 1);
+  assert.equal(page.requests[0].url, '/teamclaude/resets/redeem');
+  assert.equal(page.requests[0].init.headers['x-api-key'], 'tc-op');
+  assert.deepEqual(JSON.parse(page.requests[0].init.body), { account: 'alice@example.com', grantId: 'g-weekly' });
+  await page.answer(409, { ok: false, redeemed: false, uncertain: false, error: 'Manual reset on "alice@example.com": a reset was spent, or may have been, within the last hour' });
+  // The refusal is shown above the card as the server worded it, and the page
+  // polls; it does not send the spend again.
+  assert.equal(page.requests.length, 1);
+  assert.equal(page.requests[0].url, '/teamclaude/status');
+  await page.answer(200, status);
+  assert.equal(page.requests.length, 0);
+});
+
+test('Cancel on the confirmation spends nothing, and a client key is offered no spend at all', async () => {
+  const page = bootPage();
+  const accounts = [heldAccount({ available: 1, seenAt: Date.now() })];
+  await page.answer(200, { accounts, caller: OPERATOR });
+  page.click('spend reset');
+  await page.answer(200, { ok: true, account: 'alice@example.com', read: false, readableAt: Date.now() + 60_000, details: details([WEEKLY, FABLE], { seenAt: Date.now() }) });
+  // Two spendable grants: the page lists them and waits for a choice.
+  assert.equal(page.labelled('A spend cannot be undone.'), 0);
+  assert.equal(page.labelled('spend this one'), 2);
+  page.click('Close');
+  assert.equal(page.requests.length, 0);
+
+  const client = bootPage({ storedKey: 'tc-client' });
+  await client.answer(200, { accounts, caller: CLIENT });
+  assert.equal(client.labelled('spend reset'), 0);
 });
