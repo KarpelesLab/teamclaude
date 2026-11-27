@@ -2482,7 +2482,7 @@ export class AccountManager {
    * provider partition, the expiry band. Returns the account or null.
    */
   pickAlternate(exclude, model = null, advisorModel = null, provider = DEFAULT_PROVIDER) {
-    const excluded = this._withoutAdvisorCapped(this._excludeOtherProviders(exclude, provider), model, advisorModel);
+    let excluded = this._withoutAdvisorCapped(this._excludeOtherProviders(exclude, provider), model, advisorModel);
     // The fallback as a last resort, through the same pure picker the
     // selection walk uses: a 429/5xx hop off a probed, spent account would
     // otherwise end the request in a 429 while an account that can still serve
@@ -2498,7 +2498,23 @@ export class AccountManager {
     // this one request and not the fleet.
     const reach = advisorModel && this.advisorEligibility === 'prefer'
       ? this._advisorReach(excluded, model, advisorModel) : null;
-    const selectedAdvisor = reach && reach.eligible < reach.of ? null : advisorModel;
+    // Under 'strict' the advisor is set aside, as selection does, only when no
+    // account can serve it, tried ones included; its family's cap still binds.
+    // A fleet that cannot serve the request at all keeps the advisor, so the
+    // paid fallback honors the advisor's route.
+    let unserved = false;
+    if (advisorModel && this.advisorEligibility !== 'prefer') {
+      const partition = this._excludeOtherProviders(null, provider);
+      const fleet = this._advisorReach(this._withoutAdvisorCapped(partition, model, advisorModel), model, advisorModel);
+      unserved = fleet.of > 0 && fleet.eligible === 0;
+    }
+    if (unserved) {
+      const capped = this.accounts
+        .filter(a => !excluded?.has(a.index) && this._familyCapExceeded(a, advisorModel))
+        .map(a => a.index);
+      if (capped.length) excluded = new Set([...(excluded ?? []), ...capped]);
+    }
+    const selectedAdvisor = (reach && reach.eligible < reach.of) || unserved ? null : advisorModel;
     const extra = this._preferredExtraUsage(excluded, model, selectedAdvisor, provider);
     const normal = this._pickBestAvailable(extra ?? excluded, model, selectedAdvisor);
     if (normal) return normal;
