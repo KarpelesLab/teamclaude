@@ -15,7 +15,7 @@
 // operator/OAuth-derived, but they still never reach innerHTML.
 
 import { createHash } from 'node:crypto';
-import { UNAVAILABLE_TEXT, RESET_CREDIT_MAX_AGE_MS, outsideSpendText, forecastText, fleetForecastText, showSessionRow, showWeeklyRow, creditText } from './status-renderer.js';
+import { UNAVAILABLE_TEXT, RESET_CREDIT_MAX_AGE_MS, outsideSpendText, forecastText, fleetForecastText, showSessionRow, showWeeklyRow, creditText, heldResetKinds, heldResetCredits } from './status-renderer.js';
 import { USAGE_WINDOWS } from './client-usage.js';
 
 export function renderDashboardHtml() {
@@ -609,6 +609,273 @@ export function cardNoteFor(notes, key, now) {
   return n;
 }
 
+// ── Add account (the sign-in routes) ──────────────────────────────────────
+
+/**
+ * Whether the page offers Add account to this caller. A client key is refused
+ * by the sign-in routes, so for one the control is not drawn.
+ *
+ * @param {any} caller  status.caller
+ */
+export function loginOffered(caller) {
+  return callerCan(caller, '/teamclaude/login/start');
+}
+
+/**
+ * The request for one step of a sign-in: `start`, `finish` or `cancel`.
+ *
+ * @param {'start'|'finish'|'cancel'} step
+ * @param {{ id?: string, code?: string }|null} body
+ * @param {string|null|undefined} key
+ */
+export function loginRequest(step, body, key) {
+  return {
+    url: '/teamclaude/login/' + step,
+    init: {
+      method: 'POST',
+      headers: { 'x-api-key': key || '', 'content-type': 'application/json' },
+      body: JSON.stringify(body || {}),
+    },
+  };
+}
+
+/**
+ * The sign-in link as the page may use it for an href, or null. Only an https
+ * address is one: the value comes from the server, and a `javascript:` or
+ * `data:` address in an href would run in the page that holds the proxy key.
+ *
+ * @param {unknown} url
+ * @returns {string|null}
+ */
+export function signInUrl(url) {
+  if (typeof url !== 'string') return null;
+  try {
+    var parsed = new URL(url);
+    return parsed.protocol === 'https:' ? parsed.href : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * What to say after a finish, and whether that sign-in is over. A paste the
+ * server could not use (400) or a finish already running (409) leaves it
+ * waiting, so the field stays for another try. A sign-in the server no longer
+ * holds (404) and one whose code was spent on a failed exchange (502) are
+ * over: the page goes back to the start.
+ *
+ * @param {number} status  the HTTP status of the answer
+ * @param {any} res  its JSON body
+ * @returns {{ kind: string, text: string, ended: boolean }}
+ */
+export function loginFinishOutcome(status, res) {
+  if (res && res.ok) {
+    return { kind: 'ok', text: (res.action === 'updated' ? 'signed in again: updated account ' : 'added account ') + res.account, ended: true };
+  }
+  return {
+    kind: 'error',
+    text: 'sign-in failed: ' + (res && res.error ? res.error : 'status ' + status),
+    ended: status === 404 || status === 502,
+  };
+}
+
+// ── Spend reset (the resets routes) ───────────────────────────────────────
+
+// The TUI resets panel's own words for a grant's kind and for the limits it
+// clears (RESET_KIND_LABEL and RESET_LIMIT_LABEL in tui.js), duplicated for
+// the reason the threshold tables above are: the browser runs no import.
+// SHARED_CONSTS writes both into the page.
+/** @type {Object<string, string>} */
+export var RESET_KIND_LABELS = { weekly: 'Weekly reset', fable: 'Fable reset', session: 'Session reset', codex: 'Codex reset credit' };
+/** @type {Object<string, string>} */
+export var RESET_LIMIT_LABELS = { five_hour: '5h', seven_day: 'week', seven_day_overage_included: 'Fable week' };
+
+/**
+ * Whether an account card offers "spend reset": the caller may read and spend
+ * resets, and the account's last quota reading holds one that has not lapsed.
+ * It is the count the card's "N reset credits" badge shows, so the button and
+ * the badge appear together.
+ *
+ * @param {any} account  one entry of status.accounts
+ * @param {any} caller  status.caller
+ * @param {number} [now]
+ */
+export function resetOffered(account, caller, now) {
+  if (!callerCan(caller, '/teamclaude/resets/read') || !callerCan(caller, '/teamclaude/resets/redeem')) return false;
+  return heldResetCredits((account || {}).quota, now == null ? Date.now() : now) > 0;
+}
+
+/**
+ * The request for a reset read (`read`) or a spend (`redeem`). A spend names
+ * the grant; `force` is never sent, so the hour's hold after a claim stays a
+ * refusal the server words.
+ *
+ * @param {'read'|'redeem'} step
+ * @param {string} account
+ * @param {string|null|undefined} grantId
+ * @param {string|null|undefined} key
+ */
+export function resetRequest(step, account, grantId, key) {
+  /** @type {{ account: string, grantId?: string }} */
+  var body = { account: account };
+  if (step === 'redeem') body.grantId = grantId || '';
+  return {
+    url: '/teamclaude/resets/' + step,
+    init: {
+      method: 'POST',
+      headers: { 'x-api-key': key || '', 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    },
+  };
+}
+
+/**
+ * Which windows a grant clears, as the confirmation says it. A Claude grant
+ * lists them; a Codex credit lists none, and clears whatever windows the
+ * account has spent.
+ *
+ * @param {any} grant  one of details.grants
+ */
+export function resetClearsText(grant) {
+  var g = grant || {};
+  if (g.kind === 'codex') return 'the spent rate-limit windows of this Codex account';
+  var clears = (Array.isArray(g.clears) ? g.clears : []).map(function (/** @type {string} */ limit) { return RESET_LIMIT_LABELS[limit] || limit; });
+  return clears.length ? clears.join(' + ') : 'no window the server named';
+}
+
+/**
+ * The grants a card offers, from the details a read answered: the ones that
+ * still hold a reset, as the TUI panel lists them. A blocked grant is listed
+ * with its reason and cannot be chosen.
+ *
+ * @param {any} details  the `details` of /teamclaude/resets/read
+ * @param {number} [now]
+ * @returns {{ id: string, title: string, text: string, blocked: string|null, warnings: string[], grant: any }[]}
+ */
+export function resetGrantRows(details, now) {
+  var at = now == null ? Date.now() : now;
+  var grants = (details && Array.isArray(details.grants)) ? details.grants : [];
+  return grants.filter(function (/** @type {any} */ g) { return g && g.resetsLeft >= 1; }).map(function (/** @type {any} */ g) {
+    var title = RESET_KIND_LABELS[g.kind] || 'Reset';
+    var parts = [g.resetsLeft + ' left', 'clears ' + resetClearsText(g)];
+    if (typeof g.endsAt === 'number' && isFinite(g.endsAt)) {
+      parts.push(g.endsAt <= at ? 'expired' : 'expires ' + new Date(g.endsAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }));
+    }
+    if (g.next) parts.push('next');
+    return {
+      id: g.id,
+      title: title + (g.label && g.label !== title ? ' (' + g.label + ')' : ''),
+      text: parts.join(' · '),
+      blocked: g.blocked || null,
+      warnings: Array.isArray(g.warnings) ? g.warnings : [],
+      grant: g,
+    };
+  });
+}
+
+/**
+ * The grant a confirmation opens on without asking: the only one that can be
+ * spent, when there is exactly one. With several the person chooses.
+ *
+ * @param {{ id: string, blocked: string|null }[]} rows  resetGrantRows
+ * @returns {string|null}
+ */
+export function resetDefaultGrant(rows) {
+  var open = (rows || []).filter(function (r) { return !r.blocked; });
+  return open.length === 1 ? open[0].id : null;
+}
+
+/**
+ * What the account's reading says besides its grants, one line each: how old
+ * it is, whether a fresh read was allowed, the limit state, and the holds a
+ * person should know before spending. The TUI panel's header, for the page.
+ *
+ * @param {any} res  the answer of /teamclaude/resets/read
+ * @param {number} [now]
+ * @returns {{ cls: string, text: string }[]}
+ */
+export function resetSummaryLines(res, now) {
+  var at = now == null ? Date.now() : now;
+  var r = res || {};
+  var d = r.details;
+  /** @type {{ cls: string, text: string }[]} */
+  var lines = [];
+  /** @param {number} ts */
+  var clock = function (ts) { return new Date(ts).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }); };
+  /** @param {number} ms */
+  var secs = function (ms) { return Math.max(0, Math.ceil(ms / 1000)) + 's'; };
+  if (!d) {
+    lines.push({ cls: 'warn', text: 'no reset reading for this account yet' });
+  } else {
+    var age = typeof d.seenAt === 'number' ? Math.max(0, Math.floor((at - d.seenAt) / 1000)) : null;
+    var head = (d.provider === 'codex' ? 'Codex' : 'Claude') + (d.stale ? ' · stale' : '')
+      + (age == null ? '' : ' · as of ' + (age < 60 ? age + 's' : Math.floor(age / 60) + 'm') + ' ago');
+    lines.push({ cls: '', text: head });
+    if (d.error) lines.push({ cls: 'error', text: d.error });
+    if (d.retryAt != null && d.retryAt > at) lines.push({ cls: 'warn', text: 'retry in ' + secs(d.retryAt - at) });
+    if (!d.error || d.seenAt != null) {
+      var limits = (d.exhausted || []).map(function (/** @type {string} */ limit) { return RESET_LIMIT_LABELS[limit] || limit; }).join(' + ');
+      var limit = d.atLimit === true ? 'at a limit' + (limits ? ': ' + limits : '') : d.atLimit === false ? 'not at a limit' : 'limit state unknown';
+      lines.push({ cls: '', text: limit + (d.weeklyResetsAt == null ? '' : ' · week resets ' + clock(d.weeklyResetsAt)) });
+      if (d.cooldownUntil != null && d.cooldownUntil > at) lines.push({ cls: 'warn', text: 'upstream cooldown until ' + clock(d.cooldownUntil) });
+      if (d.fleetHoldUntil != null) lines.push({ cls: 'warn', text: 'a reset was spent, or may have been, within the last hour; hold until ' + clock(d.fleetHoldUntil) });
+      if (d.ineligibleReason) lines.push({ cls: 'error', text: 'ineligible: ' + d.ineligibleReason });
+    }
+  }
+  // The server allows one read every two minutes (or what upstream asked for):
+  // inside that it answered from its cache, and the page says so.
+  if (r.read === false && r.readableAt != null && r.readableAt > at) {
+    lines.push({ cls: 'warn', text: 'this is the last reading; a fresh read is allowed in ' + secs(r.readableAt - at) });
+  }
+  return lines;
+}
+
+/**
+ * The confirmation before a spend, one line each: the account and the grant,
+ * the windows the spend clears, the server's warnings about spending it now,
+ * and that it cannot be undone. A Fable reset says what it leaves spent,
+ * because its name alone does not.
+ *
+ * @param {string} account
+ * @param {{ title: string, warnings: string[], grant: any }} row  one of resetGrantRows
+ * @returns {{ cls: string, text: string }[]}
+ */
+export function resetConfirmLines(account, row) {
+  /** @type {{ cls: string, text: string }[]} */
+  var lines = [
+    { cls: '', text: 'Spend one ' + row.title + ' on ' + account + '?' },
+    { cls: '', text: 'It clears ' + resetClearsText(row.grant) + '.'
+      + (row.grant && row.grant.kind === 'fable' ? ' It does not clear the weekly limit the other models share.' : '') },
+  ];
+  (row.warnings || []).forEach(function (w) { lines.push({ cls: 'warn', text: w }); });
+  lines.push({ cls: 'error', text: 'A spend cannot be undone.' });
+  return lines;
+}
+
+/**
+ * What to say after a spend: the server's own line, with what is left and
+ * what was cleared. A claim with no verdict (502, `uncertain`) is a warning,
+ * since the reset may be gone.
+ *
+ * @param {number} status
+ * @param {any} res
+ * @returns {{ kind: string, text: string }}
+ */
+export function resetRedeemOutcome(status, res) {
+  var r = res || {};
+  if (r.ok && r.redeemed) {
+    var cleared = (Array.isArray(r.cleared) ? r.cleared : []).map(function (/** @type {string} */ limit) { return RESET_LIMIT_LABELS[limit] || limit; });
+    return {
+      kind: 'ok',
+      text: (r.message || 'reset spent') + (r.resetsLeft == null ? '' : ' · ' + r.resetsLeft + ' left')
+        + (cleared.length ? ' · cleared ' + cleared.join(' + ') : ''),
+    };
+  }
+  var why = r.error || r.message || 'status ' + status;
+  if (r.uncertain) return { kind: 'warn', text: why + ' · no verdict was read, so the reset may have been spent' };
+  return { kind: 'error', text: why };
+}
+
 export function switchOutcome(res) {
   if (!res || !res.ok) return { kind: 'error', text: 'switch failed' + (res && res.error ? ': ' + res.error : '') };
   if (res.eligible === false) return { kind: 'warn', text: 'switched to ' + res.account + ', but rotation will not use it' + (res.reason ? ': ' + res.reason : '') };
@@ -804,7 +1071,9 @@ const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, modelLabel, recentModelLabels, providerLabel, accountGroups, thresholdBadgeText, accountBadges, sessionRows, sessionPinsText, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
   outsideSpendText, forecastText, fleetForecastText, showSessionRow, showWeeklyRow, callerCan, callerNotice, cardNoteKey, cardNoteFor, backendQuotaRows,
-  creditText,
+  creditText, heldResetKinds, heldResetCredits,
+  loginOffered, loginRequest, signInUrl, loginFinishOutcome,
+  resetOffered, resetRequest, resetClearsText, resetGrantRows, resetDefaultGrant, resetSummaryLines, resetConfirmLines, resetRedeemOutcome,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -820,6 +1089,8 @@ const SHARED_CONSTS = [
   `var THRESHOLD_BUCKET_LABELS = ${JSON.stringify(THRESHOLD_BUCKET_LABELS)};`,
   `var USAGE_VIEWS = ${JSON.stringify(USAGE_VIEWS)};`,
   `var CARD_NOTE_MAX_AGE_MS = ${CARD_NOTE_MAX_AGE_MS};`,
+  `var RESET_KIND_LABELS = ${JSON.stringify(RESET_KIND_LABELS)};`,
+  `var RESET_LIMIT_LABELS = ${JSON.stringify(RESET_LIMIT_LABELS)};`,
 ].join('\n');
 
 const PAGE = `<!doctype html>
@@ -916,6 +1187,16 @@ const PAGE = `<!doctype html>
      second row. */
   .actions .thr { display: flex; align-items: center; gap: 6px; margin-left: auto; font-size: 12px; color: var(--dim); }
   .actions .thr input { width: 64px; font: inherit; font-size: 12px; padding: 4px 8px; text-align: right; border-radius: 999px; border: 1px solid var(--line); background: transparent; color: var(--text); }
+  /* The sign-in box and a card's reset panel: a few lines of text over a row of
+     buttons that sit together at the start, unlike a card head's, which are
+     pushed to its end. */
+  .steps { color: var(--dim); font-size: 12px; margin-top: 6px; }
+  .steps a { color: var(--accent); }
+  .btnrow { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 8px; }
+  .btnrow .act { margin-left: 0; }
+  .btnrow input { flex: 1; min-width: 180px; font: inherit; font-size: 12px; padding: 4px 10px; border-radius: 999px; border: 1px solid var(--line); background: transparent; color: var(--text); }
+  .resetpanel { border-top: 1px solid var(--line); margin-top: 10px; padding-top: 4px; }
+  .resetpanel .cardnote { margin: 6px 0 0; }
   th.sortable { cursor: pointer; user-select: none; }
   th.sortable:hover { color: var(--text); }
   td.dim { color: var(--dim); }
@@ -963,6 +1244,7 @@ const PAGE = `<!doctype html>
     <div class="actions">
       <button id="reload" type="button">Reload config</button>
       <button id="probe" type="button">Probe quotas</button>
+      <button id="addAcct" type="button" title="Sign in to a Claude account and add it to this proxy">Add account</button>
       <button id="theme" type="button" title="Switch between following the system, light and dark"></button>
       <span class="thr">
         <label for="thrVal">Switch at</label>
@@ -974,6 +1256,16 @@ const PAGE = `<!doctype html>
     <div id="err"></div>
     <div id="problems"></div>
     <div id="note"></div>
+    <div id="loginBox" class="card" style="display:none">
+      <div class="row"><span class="name">Add a Claude account</span><span class="tag" id="loginExpiry"></span></div>
+      <p class="steps">Open <a id="loginLink" target="_blank" rel="noopener noreferrer">the sign-in page</a>, sign in to the account to add, and paste the code the page shows here. An account this proxy already holds gets its sign-in renewed.</p>
+      <div class="btnrow">
+        <input id="loginCode" type="text" autocomplete="off" spellcheck="false" placeholder="code from the sign-in page">
+        <button id="loginFinish" class="act" type="button">Finish</button>
+        <button id="loginCancel" class="act" type="button">Cancel</button>
+      </div>
+      <div id="loginMsg" class="cardnote" style="display:none"></div>
+    </div>
     <div id="caller" style="display:none"><span id="callerText"></span> <button id="changeKey" class="act" type="button">Change key</button></div>
     <div id="routesWrap" style="display:none">
       <h2>Routing</h2>
@@ -1157,6 +1449,15 @@ ${SHARED_HELPERS}
       var ctlLast = el('button', 'act', 'deprioritize');
       ctlLast.addEventListener('click', function () { doControlAccount(a.name, cardNoteKey(a), { place: 'last' }, ctlLast); });
       head.appendChild(ctlLast);
+    }
+    // Spend a banked reset: drawn while the card's badge counts one, and never
+    // for a client key. The click only opens the panel under the card; the
+    // spend is behind its confirmation.
+    if (resetOffered(a, caller, Date.now())) {
+      var ctlReset = el('button', 'act', 'spend reset');
+      ctlReset.title = 'Read the banked resets of this account, then choose one to spend';
+      ctlReset.addEventListener('click', function () { openReset(a); });
+      head.appendChild(ctlReset);
     }
     card.appendChild(head);
     // A cordon is the badge's to say: the account still serves what is on it.
@@ -1477,6 +1778,11 @@ ${SHARED_HELPERS}
     var canThreshold = callerCan(s.caller, '/teamclaude/threshold');
     thrInput.disabled = !canThreshold;
     document.getElementById('thrSet').style.display = canThreshold ? '' : 'none';
+    // Add account is the operator's: for a client key the button is not drawn,
+    // and a sign-in box left open from before the key changed is put away.
+    var canLogin = loginOffered(s.caller);
+    document.getElementById('addAcct').style.display = canLogin ? '' : 'none';
+    if (!canLogin) closeLogin();
     var notice = callerNotice(s.caller);
     document.getElementById('callerText').textContent = notice || '';
     document.getElementById('caller').style.display = notice ? 'block' : 'none';
@@ -1530,7 +1836,11 @@ ${SHARED_HELPERS}
       g.accounts.forEach(function (a) {
         var cn = cardNoteFor(cardNotes, cardNoteKey(a), now);
         if (cn) box.appendChild(el('div', 'cardnote ' + cn.kind, cn.text));
-        box.appendChild(renderAccount(a, s.currentAccount, currentAccounts, s.switchThreshold, s.switchThresholds, s.caller));
+        var card = renderAccount(a, s.currentAccount, currentAccounts, s.switchThreshold, s.switchThresholds, s.caller);
+        // The reset panel is page state drawn into the card on every render,
+        // since the poll rebuilds the card it belongs to.
+        if (resetPanel && resetPanel.key === cardNoteKey(a)) card.appendChild(renderResetPanel(resetPanel));
+        box.appendChild(card);
       });
     });
     renderProblems(s);
@@ -1658,6 +1968,196 @@ ${SHARED_HELPERS}
       .finally(function () { btn.disabled = false; });
   }
 
+  // ── Add account ─────────────────────────────────────────────────────────
+  // The id of the sign-in the box is showing, or null while it is closed. The
+  // verifier stays on the server; the page holds only this id and the link.
+  var loginId = null;
+
+  function closeLogin() {
+    loginId = null;
+    document.getElementById('loginBox').style.display = 'none';
+    document.getElementById('loginCode').value = '';
+  }
+
+  function loginMsg(kind, text) {
+    var m = document.getElementById('loginMsg');
+    m.className = 'cardnote ' + kind;
+    m.textContent = text;
+    m.style.display = text ? 'block' : 'none';
+  }
+
+  // An answer together with its status: whether a sign-in is over is read off
+  // the status (loginFinishOutcome), which the body does not repeat.
+  function postJson(r) {
+    return fetch(r.url, r.init).then(function (res) {
+      if (res.status === 401) { localStorage.removeItem(KEY); showKeybox(); return null; }
+      return res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; })
+        .then(function (json) { return { status: res.status, json: json }; });
+    });
+  }
+
+  function doLoginStart(btn) {
+    btn.disabled = true;
+    postJson(loginRequest('start', null, localStorage.getItem(KEY)))
+      .then(function (a) {
+        if (!a) return;
+        if (!a.json.ok) { note('error', 'add account failed' + (a.json.error ? ': ' + a.json.error : '')); return; }
+        var url = signInUrl(a.json.url);
+        if (!url) {
+          // Nothing to show, so the sign-in the server just started is ended
+          // rather than left waiting out its five minutes.
+          postJson(loginRequest('cancel', { id: a.json.id }, localStorage.getItem(KEY))).catch(function () {});
+          note('error', 'add account failed: the server sent a sign-in link that is not an https address');
+          return;
+        }
+        loginId = a.json.id;
+        document.getElementById('loginLink').href = url;
+        document.getElementById('loginExpiry').textContent = a.json.expiresAt
+          ? 'waits for the code until ' + new Date(a.json.expiresAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
+        document.getElementById('loginCode').value = '';
+        loginMsg('', '');
+        document.getElementById('loginBox').style.display = '';
+        document.getElementById('loginCode').focus();
+      })
+      .catch(function (e) { note('error', 'add account failed: ' + e.message); })
+      .finally(function () { btn.disabled = false; });
+  }
+
+  function doLoginFinish(btn) {
+    var id = loginId;
+    if (!id) return;
+    var code = document.getElementById('loginCode').value.trim();
+    if (!code) { loginMsg('error', 'paste the code the sign-in page shows'); return; }
+    btn.disabled = true;
+    loginMsg('', '');
+    postJson(loginRequest('finish', { id: id, code: code }, localStorage.getItem(KEY)))
+      .then(function (a) {
+        if (!a) return;
+        var out = loginFinishOutcome(a.status, a.json);
+        // The box may have been closed or restarted while this was in flight;
+        // then it shows another sign-in, and only the note reports this one.
+        if (!out.ended) { if (loginId === id) loginMsg(out.kind, out.text); return; }
+        if (loginId === id) closeLogin();
+        note(out.kind, out.text + (out.kind === 'ok' ? '' : ' · start again with Add account'));
+        if (out.kind === 'ok') poll();
+      })
+      .catch(function (e) { if (loginId === id) loginMsg('error', 'sign-in failed: ' + e.message); })
+      .finally(function () { btn.disabled = false; });
+  }
+
+  function doLoginCancel() {
+    var id = loginId;
+    closeLogin();
+    // Told so the server stops waiting now; were the request lost, its
+    // sign-in would still end by itself at its timeout.
+    if (id) postJson(loginRequest('cancel', { id: id }, localStorage.getItem(KEY))).catch(function () {});
+  }
+
+  // ── Spend reset ─────────────────────────────────────────────────────────
+  // One panel at a time, under the card it was opened from:
+  //   { key, account, phase, res, grantId, error }
+  // phase is reading, then choose or confirm, then spending; or failed. It is
+  // page state because the poll rebuilds every card; render() draws it back in.
+  var resetPanel = null;
+
+  function closeReset() {
+    resetPanel = null;
+    if (lastStatus) render(lastStatus);
+  }
+
+  // The click on a card: one fresh read first. The server holds reads to one
+  // every two minutes and answers from its cache inside that, saying so.
+  function openReset(a) {
+    var panel = { key: cardNoteKey(a), account: a.name, phase: 'reading', res: null, grantId: null, error: null };
+    resetPanel = panel;
+    if (lastStatus) render(lastStatus);
+    postJson(resetRequest('read', a.name, null, localStorage.getItem(KEY)))
+      .then(function (ans) {
+        if (!ans || resetPanel !== panel) return;
+        if (!ans.json.ok) { panel.phase = 'failed'; panel.error = 'reset read failed: ' + (ans.json.error || 'status ' + ans.status); return; }
+        panel.res = ans.json;
+        panel.grantId = resetDefaultGrant(resetGrantRows(ans.json.details));
+        panel.phase = panel.grantId ? 'confirm' : 'choose';
+      })
+      .catch(function (e) { if (resetPanel === panel) { panel.phase = 'failed'; panel.error = 'reset read failed: ' + e.message; } })
+      .finally(function () { if (resetPanel === panel && lastStatus) render(lastStatus); });
+  }
+
+  function spendReset(panel) {
+    // The confirmation is consumed here, before the request leaves: a second
+    // click finds the panel already spending and sends nothing.
+    if (resetPanel !== panel || panel.phase !== 'confirm' || !panel.grantId) return;
+    panel.phase = 'spending';
+    if (lastStatus) render(lastStatus);
+    postJson(resetRequest('redeem', panel.account, panel.grantId, localStorage.getItem(KEY)))
+      .then(function (ans) {
+        if (!ans) return;
+        var out = resetRedeemOutcome(ans.status, ans.json);
+        cardNote(panel.key, out.kind, out.text, false);
+      })
+      // The request may have reached the server before the connection failed,
+      // so this cannot say the reset is still there.
+      .catch(function (e) { cardNote(panel.key, 'warn', 'spend not confirmed: ' + e.message + ' · the reset may have been spent; open spend reset again to read', false); })
+      .finally(function () {
+        if (resetPanel === panel) resetPanel = null;
+        if (lastStatus) render(lastStatus);
+        poll();
+      });
+  }
+
+  function renderResetPanel(panel) {
+    var box = el('div', 'resetpanel');
+    var lines = function (list) { list.forEach(function (l) { box.appendChild(el('div', 'cardnote ' + l.cls, l.text)); }); };
+    var buttons = el('div', 'btnrow');
+    var closeBtn = function (label) {
+      var b = el('button', 'act', label);
+      b.addEventListener('click', closeReset);
+      return b;
+    };
+    if (panel.phase === 'reading') {
+      box.appendChild(el('div', 'cardnote', 'Reading the banked resets of ' + panel.account + '…'));
+      return box;
+    }
+    if (panel.phase === 'spending') {
+      box.appendChild(el('div', 'cardnote', 'Spending the reset on ' + panel.account + '…'));
+      return box;
+    }
+    if (panel.phase === 'failed') {
+      box.appendChild(el('div', 'cardnote error', panel.error));
+      buttons.appendChild(closeBtn('Close'));
+      box.appendChild(buttons);
+      return box;
+    }
+    var rows = resetGrantRows(panel.res.details);
+    lines(resetSummaryLines(panel.res));
+    var chosen = panel.phase === 'confirm' ? rows.filter(function (r) { return r.id === panel.grantId && !r.blocked; })[0] : null;
+    if (chosen) {
+      lines(resetConfirmLines(panel.account, chosen));
+      var yes = el('button', 'act', 'Spend it');
+      yes.addEventListener('click', function () { spendReset(panel); });
+      buttons.appendChild(yes);
+      buttons.appendChild(closeBtn('Cancel'));
+      box.appendChild(buttons);
+      return box;
+    }
+    if (!rows.length) box.appendChild(el('div', 'cardnote', 'no banked resets'));
+    rows.forEach(function (r) {
+      var line = el('div', 'btnrow');
+      line.appendChild(el('span', 'name', r.title));
+      line.appendChild(el('span', 'tag', r.text));
+      if (r.blocked) line.appendChild(el('span', 'warnt', 'cannot be spent: ' + r.blocked));
+      else {
+        var pick = el('button', 'act', 'spend this one');
+        pick.addEventListener('click', function () { panel.grantId = r.id; panel.phase = 'confirm'; if (lastStatus) render(lastStatus); });
+        line.appendChild(pick);
+      }
+      box.appendChild(line);
+    });
+    buttons.appendChild(closeBtn('Close'));
+    box.appendChild(buttons);
+    return box;
+  }
+
   function showKeybox() {
     if (timer) { clearInterval(timer); timer = null; }
     document.getElementById('app').style.display = 'none';
@@ -1745,6 +2245,12 @@ ${SHARED_HELPERS}
   document.getElementById('reload').addEventListener('click', function () { doControl('/teamclaude/reload', 'config reload', this); });
   document.getElementById('probe').addEventListener('click', function () { doControl('/teamclaude/probe', 'quota probe', this); });
   document.getElementById('thrSet').addEventListener('click', function () { doThreshold(this); });
+  document.getElementById('addAcct').addEventListener('click', function () { doLoginStart(this); });
+  document.getElementById('loginFinish').addEventListener('click', function () { doLoginFinish(this); });
+  document.getElementById('loginCancel').addEventListener('click', function () { doLoginCancel(); });
+  document.getElementById('loginCode').addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') document.getElementById('loginFinish').click();
+  });
   // A client key is a valid key, so nothing else on the page would ever ask for
   // another one: the operator needs a way back to the key box.
   document.getElementById('changeKey').addEventListener('click', function () { localStorage.removeItem(KEY); document.getElementById('key').value = ''; showKeybox(); });
