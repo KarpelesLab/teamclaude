@@ -227,6 +227,29 @@ test('a failover hop reads the advisor model the way selection did', () => {
   });
 });
 
+test('strict: with no account able to serve the advisor, a failover hop routes by the request model', () => {
+  const am = new AccountManager([oauth('a'), oauth('b'), oauth('c')], 0.98);
+  for (const account of am.accounts) spendFable(account);
+  capture(() => {
+    const first = am.getActiveAccount(null, OPUS, FABLE);
+    assert.equal(first?.name, 'a');
+    assert.equal(am.pickAlternate(new Set([first.index]), OPUS, FABLE)?.name, 'b');
+  });
+});
+
+test('strict: a hop that sets the advisor aside still stays off an account capped on its family', () => {
+  const am = new AccountManager([
+    oauth('a'),
+    oauth('capped', { maxUsage: { unified7dFable: 0.8 } }),
+  ], 0.98);
+  spendFable(am.accounts[0]);
+  am.accounts[1].quota.unified7dFable = 0.9;
+  am.accounts[1].quota.unified7dFableReset = Date.now() + 3600_000;
+  capture(() => {
+    assert.equal(am.pickAlternate(new Set([0]), OPUS, FABLE), null);
+  });
+});
+
 test('no eligible account still degrades to the request model, in both modes', () => {
   for (const advisorEligibility of ['strict', 'prefer']) {
     const am = new AccountManager([oauth('a'), oauth('b')], 0.98, { advisorEligibility });
