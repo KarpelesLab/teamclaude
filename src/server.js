@@ -1846,7 +1846,8 @@ export function resolveAccountPin(accountManager, token) {
  *
  * `a,b,c` pins a session to `a` and names where a request goes when upstream
  * billing refuses the account it is on: the next listed API-key account (see
- * advancePinPastBilling). The whole string is tried as one name first, so a pin
+ * advancePinPastBilling). A list headed by a subscription is walked for quota
+ * instead (pickFromSubscriptionList). The whole string is tried as one name first, so a pin
  * that resolves today, a display name with a comma in its org included, still
  * names that one account. Every name of a list has to match, for the reason an
  * unknown single name is refused: a typo that quietly shortened the list would
@@ -1909,6 +1910,57 @@ function advancePinPastBilling(ctx, accountManager) {
     ctx.pinnedIndex = next.index;
     return;
   }
+}
+
+/**
+ * Whether this request is pinned to a list headed by a subscription, the list
+ * pickFromSubscriptionList walks.
+ * @param {Record<string, any>} ctx
+ */
+function isSubscriptionList(ctx) {
+  return !!ctx.pinList && ctx.pinList[0].type !== 'apikey';
+}
+
+/**
+ * Point a request pinned to a list of subscriptions (resolvePinList) at the
+ * listed account it goes to now. Called before each selection, so a quota
+ * rejection, which marks the account and comes back here, moves the request on.
+ *
+ * The first listed subscription that can serve it under its switch threshold;
+ * failing that, the first one past the threshold only, since a pin may spend to
+ * its cap (pinListChoice); failing that, the first one not yet tried, as a pin
+ * to that one account would. Chosen again, by the same rule, only once the
+ * account it is on cannot take it: a quota rejection, a token that could not be
+ * renewed, a hold another request armed while this one waited, a removal.
+ * Accounts this request has tried are passed over, so the list ends as a pin to
+ * its last account does. Only subscriptions of the
+ * head's provider: an API key the list names is never reached this way, and a
+ * list headed by an API key keeps advancePinPastBilling's contract. Never an
+ * account the list does not name.
+ *
+ * @param {Record<string, any>} ctx
+ * @param {import('./account-manager.js').AccountManager} accountManager
+ */
+function pickFromSubscriptionList(ctx, accountManager) {
+  if (!isSubscriptionList(ctx)) return;
+  const list = ctx.pinList;
+  // Chosen once per request, then held: a retry on the same account (a
+  // transient 429, a 5xx, a fresh egress) stays on it, as a pin's would, even
+  // when the answer it got put the account past its threshold. Only an account
+  // this request can no longer use (tried, or removed) is chosen again.
+  const from = ctx.pinnedAccount;
+  if (ctx.pinListChosen && from && from.index >= 0 && !ctx.tried.has(from)) return;
+  ctx.pinListChosen = true;
+  const open = list.filter((/** @type {Record<string, any>} */ a) => a.index >= 0 && a.type !== 'apikey'
+    && providerOf(a) === providerOf(list[0]) && !ctx.tried.has(a));
+  if (!open.length) return;
+  const next = accountManager.pinListChoice(open, ctx.model, ctx.advisorModel) ?? open[0];
+  if (next === from) return;
+  if (from && ctx.tried.has(from)) {
+    console.log(`[TeamClaude] Pinned account "${safeLine(from.name, 64)}" cannot serve; this request moves to "${safeLine(next.name, 64)}", the next account its pin names`);
+  }
+  ctx.pinnedAccount = next;
+  ctx.pinnedIndex = next.index;
 }
 
 /**
@@ -2648,7 +2700,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // retries and holds of this request keep them, and a reload applies to
       // subsequent requests. `tried` and `reauthed` collect accounts, not
       // indices (indicesOf).
-      const ctx = { account: null, callerRequestId: callerId, status: null, attempt: 0, tried: new Set(), reauthed: new Set(), model, advisorModel, streamRequested: parseRequestStream(body), fleetMessageThreads: config?.messageThreads === true, pinnedIndex, pinnedAccount, unknownPin, pinChain: pinChainAccounts, provider, holdBudgetMs: holdMs, pinKey, onMessage, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, stripOverage: shouldStripOverageHeaders(config), synthesizeQuota: shouldSynthesizeQuotaHeaders(config), poolQuota: shouldPoolQuotaHeaders(config), logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config), cacheUsage: /** @type {Record<string, any>|null} */ (null), errorType: /** @type {string|null} */ (null), usage };
+      const ctx = { account: null, callerRequestId: callerId, status: null, attempt: 0, tried: new Set(), reauthed: new Set(), model, advisorModel, streamRequested: parseRequestStream(body), fleetMessageThreads: config?.messageThreads === true, pinnedIndex, pinnedAccount, unknownPin, pinChain: pinChainAccounts, pinList: pinChainAccounts.length ? [pinnedAccount, ...pinChainAccounts] : null, provider, holdBudgetMs: holdMs, pinKey, onMessage, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, stripOverage: shouldStripOverageHeaders(config), synthesizeQuota: shouldSynthesizeQuotaHeaders(config), poolQuota: shouldPoolQuotaHeaders(config), logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config), cacheUsage: /** @type {Record<string, any>|null} */ (null), errorType: /** @type {string|null} */ (null), usage };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request.
@@ -4466,10 +4518,11 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // for an already-tried pin — it still never leaks to another account. So does
   // a model the account's plan just refused (capBars checks that too), and the
   // no-account branch answers it with upstream's 400.
-  // A pin that names several accounts is the one exception, and only for
-  // billing: once upstream billing has refused the account it is on (the
-  // billing check below starts its cooldown and comes back here), the request
-  // goes to the next one listed.
+  // A pin that names several accounts is the one exception: a list of API keys
+  // only for billing (once upstream billing has refused the account it is on,
+  // the billing check below starts its cooldown and comes back here, and the
+  // request goes to the next one listed), a list of subscriptions for quota
+  // (pickFromSubscriptionList).
   // The pin is held as the account (ctx.pinnedAccount), since one removed while
   // this request waited renumbers the rest in place; its index is read again
   // here, for this attempt. It is -1 once the pinned account itself has left,
@@ -4479,6 +4532,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // its admission. The third, the per-origin socket queue upstreamFetch waits
   // in, is not followed by one.
   if (ctx.pinnedAccount) ctx.pinnedIndex = ctx.pinnedAccount.index;
+  pickFromSubscriptionList(ctx, accountManager);
   if (ctx.pinnedIndex != null && ctx.pinnedIndex < 0) return respondPinGone(res, ctx);
   advancePinPastBilling(ctx, accountManager);
   const pinned = ctx.pinnedIndex != null && !ctx.tried.has(accountManager.accounts[ctx.pinnedIndex])
@@ -4796,7 +4850,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // instead, with the account that left among those it has tried: nothing was
   // sent, so the retry budget is not spent.
   if (account.index < 0) {
-    if (ctx.pinnedIndex != null) return respondPinGone(res, ctx);
+    if (ctx.pinnedIndex != null && !isSubscriptionList(ctx)) return respondPinGone(res, ctx);
     ctx.tried.add(account);
     return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
   }
@@ -4815,7 +4869,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     (ctx.unrenewed ??= new Set()).add(account.name);
     ctx.tried.add(account);
     console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}": token expired and not renewed; not sending it upstream`);
-    if (ctx.pinnedIndex == null && retryCount < maxRetries) {
+    if ((ctx.pinnedIndex == null || isSubscriptionList(ctx)) && retryCount < maxRetries) {
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
     }
     return respondUnrenewed(res, ctx);
@@ -4957,7 +5011,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // so every request queued there would go out together on a credential
     // the operator has just removed. It is selected again, as above.
     if (account.index < 0) {
-      if (ctx.pinnedIndex != null) return respondPinGone(res, ctx);
+      if (ctx.pinnedIndex != null && !isSubscriptionList(ctx)) return respondPinGone(res, ctx);
       ctx.tried.add(account);
       return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
     }
@@ -4981,6 +5035,10 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // put in error meanwhile (an account refusal), pins excepted as above.
     if (accountManager.capBars(account, ctx.model, ctx.advisorModel, { pinned: ctx.pinnedIndex != null, recheckFamily: creditsRecheck })
         || (ctx.pinnedIndex == null && account.status === 'error')
+        // A list of subscriptions moves on from an account another request found
+        // spent while this one waited, as it would have at selection.
+        || (isSubscriptionList(ctx) && ['throttled', 'upstream-rejected'].includes(
+          /** @type {string} */ (accountManager.unavailableReason(account, ctx.model, ctx.advisorModel, { named: true }))))
         || (creditsRecheck && !canRecheckFamily(accountManager, account, ctx))) {
       accountManager.release(account.index, { successful: false });
       ctx.tried.add(account);

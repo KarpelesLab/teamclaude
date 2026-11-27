@@ -3590,7 +3590,9 @@ Environment:
                       accountUuid/orgUuid, or a display name/email:
                         TC_ACCT=me@example.com teamclaude run
                       A comma list of API-key accounts (TC_ACCT=a,b,c) moves
-                      along the list when billing refuses the current one.
+                      along the list when billing refuses the current one; a
+                      list of subscriptions keeps the session to them, in
+                      order, moving on when one's quota is spent.
                       Prefer a UUID for anything scripted: display names are
                       rewritten when an email gains a second org. Read by 'run'
                       and 'env', then removed from the environment so it never
