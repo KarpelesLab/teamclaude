@@ -145,7 +145,7 @@ test('a window that comes back a WEEK later across a null gap is a rollover', ()
   assert.notEqual(serve(am, 's1', OPUS).index, first.index, 'the rollover across the gap did not move the pin');
 });
 
-test('a restored pin with no reading moves when its first request finds its window ended', () => {
+test('a restored pin with no reading moves after its first request finds its window ended', () => {
   const restartable = () => {
     const am = new AccountManager(['a', 'b'].map(n => ({ ...oauth(n), id: n })), 0.98,
       { expiryRouting: ON, distributeSessions: true });
