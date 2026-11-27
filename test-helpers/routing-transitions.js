@@ -29,10 +29,10 @@ const SENTENCES = /** @type {Record<string, [string, string]>} */ ({
   flight: ['docs/routing.md:88', 'A `403` to a request sent before the last denial was recorded was already in flight then and does not count as another.'],
   clears: ['docs/routing.md:90', 'The denial stays on the account past its cooldown, until it delivers a whole completion (`/v1/messages`) for a request sent after the last denial.'],
   refused: ['docs/routing.md:116', "On an OAuth account, any of these in a JSON `400` or a `403` puts the account in `error` with upstream's message (see [Why an account is in `error`](accounts.md#why-an-account-is-in-error)), and the request fails over."],
-  error: ['docs/accounts.md:275', 'It also leaves rotation when upstream refuses the account itself ([account refusals](routing.md#account-refusals)).'],
+  error: ['docs/accounts.md:277', 'It also leaves rotation when upstream refuses the account itself ([account refusals](routing.md#account-refusals)).'],
   advisorCap: ['docs/routing.md:203', "An account's [`maxUsage`](quota.md#per-account-usage-caps) cap on the advisor's family is read in both modes: while another account can serve the request, selection and a failover hop stay off an account whose cap bars that family, since the advisor call would cross it."],
   stays: ['docs/routing.md:19', 'It stays on the current one and only rotates when that account nears `switchThreshold` (default `0.98`).'],
-  dropped: ['docs/accounts.md:156', 'Account **removals** made on disk (`teamclaude remove` from another shell, or a hand edit) are applied by the same reload: a running account whose entry is gone from the file is dropped from the fleet, and the reload reports how many it added and how many it removed.'],
+  dropped: ['docs/accounts.md:158', 'Account **removals** made on disk (`teamclaude remove` from another shell, or a hand edit) are applied by the same reload: a running account whose entry is gone from the file is dropped from the fleet, and the reload reports how many it added and how many it removed.'],
   pinsDeleted: ['docs/routing.md:455', 'And a pin can simply **cease to exist**: removing an account deletes the pins that named it, [`teamclaude release`](usage.md#releasing-the-conversations-on-an-account) deletes the pins on one account on your say-so, and a conversation idle past the known window is forgotten along with all of them.'],
   returns: ['docs/routing.md:463', 'Traffic that returns before the destination has served anything is preempted off the rolled account again as soon as anywhere better is available, because the stay was never confirmed.'],
   roll: ['docs/routing.md:455', "With `preempt` on, a **pinned conversation** (and the sticky current account) is re-routed when its account's governing weekly window **rolls over** — the account just became both the freshest and the furthest-dated choice, so staying would burn the window that gained a full week while sooner-expiring quota goes unspent."],
@@ -59,7 +59,7 @@ const row = (/** @type {string} */ id, /** @type {string} */ machine, /** @type 
   return { id, machine, state, event, shape, expect, docs: Array.isArray(cite) ? cite[0] : cite, reachable: true };
 };
 
-const OTHERS = { inferred: 'docs/accounts.md:156 drops only the removed account, so a removal leaves every other one as it was' };
+const OTHERS = { inferred: 'docs/accounts.md:158 drops only the removed account, so a removal leaves every other one as it was' };
 const EDGE = { inferred: 'no docs line says whether a cooldown still holds at the instant it ends, so this probe is unjudged' };
 
 /** @returns {TransitionRow[]} */
@@ -107,7 +107,7 @@ function removalRows() {
     ['provider-cursor', 'pcur', 'names no removed account', stays('provider cursor'), SENTENCES.dropped],
     ['route-pin', 'rpin', 'cleared, not handed to the account in its slot',
       { inferred: 'no docs line covers renumbering; a TUI route pin (docs/routing.md:228) stays on the account picked' },
-      { inferred: 'a pin on an account dropped from the fleet (docs/accounts.md:156) pins nothing' }],
+      { inferred: 'a pin on an account dropped from the fleet (docs/accounts.md:158) pins nothing' }],
     ['session-pin', 'spin', 'deleted', stays('conversation pin'), SENTENCES.pinsDeleted],
     ['quota-reading', 'quota', "the in-flight response's reading lands on no account",
       { inferred: 'readings come off the responses each account serves (docs/quota.md:7), so they stay with it' },

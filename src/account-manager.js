@@ -5431,9 +5431,9 @@ export class AccountManager {
       return;
     }
     const win = this._governingWindow(account, model);
-    // Redundant with _jumped's own null check, and kept because "there is
-    // nothing to record" says something different from "what was recorded is
-    // unusable".
+    // Not redundant with _jumped's null check. With no reset _jumped reports no
+    // jump, so the write below would replace the recorded reset with null and
+    // the window after a null gap would have nothing to be measured against.
     if (win.resetAt == null) return;
     // NEVER FORWARD OVER A ROLL THIS CHOICE HAS NOT ESCAPED. The window has
     // jumped since the reading was taken, so the preemption did not stick.

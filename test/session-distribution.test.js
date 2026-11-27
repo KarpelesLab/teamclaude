@@ -380,3 +380,18 @@ test('untagged requests reach a lower tier when the one above is unavailable', (
   for (let i = 0; i < 4; i++) seen.add(am.getActiveAccount(new Set([0, 1]), null, null, null).name);
   assert.deepEqual([...seen], ['fallback']);
 });
+
+// With every account over the switch threshold the band is empty, and the walk
+// still owes the request its exhausted-fleet probe. Distribution must not turn
+// that into a refusal.
+test('distribution on: an untagged request on an exhausted fleet gets the same probe as with it off', () => {
+  const fleet = (opts) => {
+    const am = mgr(['a', 'b'], opts);
+    weekly(am, 0, [0.995, 10], [0.1, 10]);
+    weekly(am, 1, [0.99, 10], [0.1, 10]);
+    return am;
+  };
+  const off = fleet({}).getActiveAccount(null, null, null, null);
+  assert.equal(off?.name, 'b', 'the fixture must probe the less-spent account');
+  assert.equal(fleet({ distributeSessions: true }).getActiveAccount(null, null, null, null)?.name, off.name);
+});
