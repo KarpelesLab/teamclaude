@@ -493,3 +493,11 @@ A caller can name its own requests, so the proxy's log lines and activity can be
 - The id is for correlation only. It is not an identity, it is not used to deduplicate requests, and it never affects which account is chosen. The inbound `x-request-id` is still forwarded upstream as the caller sent it.
 - Each upstream attempt's request-log file starts with a header such as `=== REQUEST (account: live, retry: 1, attempt: 2, request: 1, caller: ticket.42) ===`. `request` is the proxy's number for the request, `attempt` counts the upstream sends for it (a failover, a 429 retry and a stream-failure hop each add one), and `caller` is the caller's id. A hop that is answered with a 401 writes no file of its own, so the files show the attempt that answered.
 - The activity hooks (`onRequestStart`, `onRequestEnd`) carry `callerRequestId`, and `onRequestEnd` also carries `attempts`.
+
+## Tools built by others
+
+These are separate projects with their own authors. They are listed because they build on TeamClaude's documented surfaces; nothing here is maintained, reviewed or released by this project, so read a tool's own source and permissions before you install it.
+
+- [Runout Bar](https://github.com/RobinVivant/runout-bar) (macOS, MIT): a menu bar app that reads `teamclaude status --json` and draws one level bar per account, with the time the pool is projected to run out. It switches accounts and probes through the `teamclaude` CLI.
+
+A tool like these should read `teamclaude status --json` or `GET /teamclaude/status`, and act through the CLI or the [control routes](#control-routes-under-a-second-name). Those are the surfaces meant for other programs, and the [rename to TeamRouter](../README.md#renaming-to-teamrouter) keeps their old names working through 2.x. The config file's layout and the modules under `src/` are not an interface and change without notice.
