@@ -163,3 +163,47 @@ test('status names the lost plan, since when, and what to do', () => {
   const text = renderStatus(am.getStatus(), { color: false });
   assert.match(text, /Plan\s+its OAuth profile no longer shows the Claude Max plan \(since .+ ago\) — renew the plan or disable the account/);
 });
+
+// A token with nothing to refresh it, rejected upstream, stayed `active` under
+// the probe: the usage read can answer such a token 429 rather than 401, and a
+// 401 from the profile read was dropped as an error. The account kept its place
+// in rotation until a request routed to it took the 401.
+const REJECTED = { error: 'HTTP 401: OAuth access token has been revoked.', status: 401 };
+const LIMITED = { error: 'HTTP 429: Rate limited. Please try again later.', status: 429 };
+
+test('a 401 from the profile read takes a token with nothing to refresh out of rotation', async () => {
+  const am = new AccountManager([oauth('a', MAX)], 0.98);
+  const prober = new Prober(am, { intervalMs: 0, probeFn: async () => LIMITED, profileFn: async () => REJECTED, log: () => {} });
+  await prober.probeAll();
+  const row = am.getStatus().accounts[0];
+  assert.equal(row.status, 'error');
+  assert.equal(row.errorReason.code, 'credential_rejected');
+});
+
+test('a 401 from the usage read does the same', async () => {
+  const am = new AccountManager([oauth('a', MAX)], 0.98);
+  const prober = new Prober(am, { intervalMs: 0, probeFn: async () => REJECTED, profileFn: async () => MAX, log: () => {} });
+  await prober.probeAll();
+  assert.equal(am.getStatus().accounts[0].errorReason?.code, 'credential_rejected');
+});
+
+test('an account with a refresh token is left to the refresh, not marked by the probe', async () => {
+  const am = new AccountManager([oauth('a', { ...MAX, refreshToken: 'r-a' })], 0.98, { refreshFn: async () => { throw Object.assign(new Error('Token refresh failed (503)'), { status: 503 }); } });
+  const prober = new Prober(am, { intervalMs: 0, probeFn: async () => LIMITED, profileFn: async () => REJECTED, log: () => {} });
+  await prober.probeAll();
+  assert.equal(am.getStatus().accounts[0].status, 'active');
+});
+
+test('a rejected token is not sent again by the probe until it changes', async () => {
+  const am = new AccountManager([oauth('a', MAX)], 0.98);
+  let reads = 0;
+  const prober = new Prober(am, { intervalMs: 0, probeFn: async () => { reads++; return LIMITED; }, profileFn: async () => REJECTED, log: () => {} });
+  await prober.probeAll();
+  const { since } = am.getStatus().accounts[0].errorReason;
+  await prober.probeAll();
+  assert.equal(reads, 1);
+  assert.equal(am.getStatus().accounts[0].errorReason.since, since);
+  am.updateAccountTokens(0, { accessToken: 't-new', expiresAt: Date.now() + 3600_000 });
+  await prober.probeAll();
+  assert.equal(reads, 2, 'a new token is probed again');
+});

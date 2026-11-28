@@ -172,11 +172,23 @@ export class Prober {
   // `probeDisabledAccounts` lifts the first skip, and only that one: the
   // operator asked for a disabled account's quota to stay current while it is
   // out of rotation, and accepts the refresh that comes with it. A dead token
-  // stays skipped either way.
+  // stays skipped either way. So does an access token upstream rejected with
+  // nothing to refresh it: new tokens put the account back to 'active'.
   _probeable(account) {
     if (!account?.credential) return false;
     if (account.disabled && this.config?.probeDisabledAccounts !== true) return false;
     if (account._deadRefreshToken && account._deadRefreshToken === account.refreshToken) return false;
+    if (account.status === 'error' && account.errorReason?.code === 'credential_rejected') return false;
+    return true;
+  }
+
+  // A 401 on a token with no refresh token behind it: the same verdict a
+  // request routed to it would reach, without waiting for one. An account that
+  // holds a refresh token is left to the refresh.
+  /** @param {Record<string, any>} account @param {any} reading */
+  _checkRejected(account, reading) {
+    if (reading?.status !== 401 || account.refreshToken) return false;
+    this.am.markCredentialRejected(account.index, 'upstream rejected its token (401) and it has no refresh token');
     return true;
   }
 
@@ -201,8 +213,9 @@ export class Prober {
 
       if (!usage || usage.error) {
         rememberResetReading(account, 'claude', usage ?? { error: 'probe timed out' });
-        // A refused usage read can be the lapsed plan itself; the profile says.
-        if (usage) await this._readProfile(account);
+        // A refused usage read can be the lapsed plan itself, or a dead token
+        // the usage endpoint answers 429 instead of 401; the profile says.
+        if (usage && !this._checkRejected(account, usage)) await this._readProfile(account);
         const finishedAt = Date.now();
         this._recordAccount(account, {
           status: usage?.error ? 'error' : 'timeout',
@@ -245,6 +258,7 @@ export class Prober {
     if (!missingTier && now - (this.profileReadAt.get(account) ?? -Infinity) < this.profileIntervalMs) return;
     this.profileReadAt.set(account, now);
     const profile = await this._withTimeout(this.profileFn(account.credential, account.routing ?? null));
+    if (this._checkRejected(account, profile)) return;
     this.am.applyProfileData(account.index, profile);
   }
 
