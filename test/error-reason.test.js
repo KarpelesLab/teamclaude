@@ -121,3 +121,51 @@ test('status names the last good refresh beside a rejected refresh token', async
   assert.equal(row.lastRefreshAt, okAt, 'the rejection does not move it');
   assert.match(unavailableLine(row, paint) ?? '', /needs a re-login: upstream rejected its refresh token \(400\); last good refresh \S+ ago — run: teamclaude login/);
 });
+
+// A restart started every account 'active', so a revoked token went back into
+// rotation and took a 401 on the first request routed to it. The rejection is
+// kept in the state file against the token it was about, never the token itself.
+const restart = (am, entry) => {
+  const restarted = new AccountManager([entry], 0.98);
+  restarted.restoreQuotaState(JSON.parse(JSON.stringify(am.exportQuotaState())));
+  return restarted;
+};
+
+test('a token rejected before a restart is still rejected after it', () => {
+  const entry = expiring({ refreshToken: undefined, expiresAt: Date.now() + 3600_000 });
+  const am = new AccountManager([{ ...entry }], 0.98);
+  am.markCredentialRejected(0, 'upstream rejected its token (401) and it has no refresh token');
+  const { since } = am.getStatus().accounts[0].errorReason;
+  assert.doesNotMatch(JSON.stringify(am.exportQuotaState()), /secret-value/, 'no token in the state file');
+
+  const row = restart(am, { ...entry }).getStatus().accounts[0];
+  assert.equal(row.status, 'error');
+  assert.equal(row.errorReason.code, 'credential_rejected');
+  assert.equal(row.errorReason.since, since);
+  assert.equal(row.errorReason.remedy, am.getStatus().accounts[0].errorReason.remedy);
+});
+
+test('a rejected refresh token is still rejected after a restart', async () => {
+  const am = new AccountManager([expiring()], 0.98, { refreshFn: async () => { throw rejected(400); } });
+  await am.ensureTokenFresh(0);
+  const row = restart(am, expiring()).getStatus().accounts[0];
+  assert.equal(row.status, 'error');
+  assert.equal(row.errorReason.code, 'refresh_rejected');
+});
+
+test('a new token signed in while the proxy was down clears the saved rejection', () => {
+  const entry = expiring({ refreshToken: undefined, expiresAt: Date.now() + 3600_000 });
+  const am = new AccountManager([{ ...entry }], 0.98);
+  am.markCredentialRejected(0, 'upstream rejected its token (401) and it has no refresh token');
+  const row = restart(am, { ...entry, accessToken: 'at-new-value' }).getStatus().accounts[0];
+  assert.equal(row.status, 'active');
+  assert.equal(row.errorReason, null);
+});
+
+test('a refusal about the account itself is asked again after a restart', () => {
+  const entry = expiring({ refreshToken: undefined, expiresAt: Date.now() + 3600_000 });
+  const am = new AccountManager([{ ...entry }], 0.98);
+  am.markRefused(am.accounts[0], { code: 'account_on_hold', message: 'on hold', link: null });
+  assert.equal(am.getStatus().accounts[0].status, 'error');
+  assert.equal(restart(am, { ...entry }).getStatus().accounts[0].status, 'active');
+});
