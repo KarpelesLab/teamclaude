@@ -1,4 +1,5 @@
 import { performance } from 'node:perf_hooks';
+import { createHash } from 'node:crypto';
 import { refreshAccessToken, isTokenExpiringSoon, isTokenExpired, isRefreshRejection, formatMoney } from './oauth.js';
 import { providerOf, DEFAULT_PROVIDER, isSubscriptionAccount, canServeProvider } from './provider.js';
 import { refreshCodexToken } from './codex-auth.js';
@@ -174,6 +175,18 @@ export const DEFAULT_SWITCH_THRESHOLD = 0.98;
 // Quota fields that survive a restart: utilization levels and their reset
 // windows, learned passively from upstream responses. Transient/derived state
 // (probing, requalify, rateLimitedUntil) is intentionally excluded.
+// The 'error' codes that are about the token, not the account: a token upstream
+// rejected never works again, so the rejection outlives a restart for as long
+// as the account still holds that token. A refusal about the account itself
+// (account-refusal.js) is not kept: upstream can lift it, and a restart asks again.
+const PERSISTED_ERROR_CODES = new Set(['credential_rejected', 'refresh_rejected']);
+
+// Which tokens an account holds, as a digest: the state file names the
+// rejected token without holding it.
+function tokenFingerprint(/** @type {Record<string, any>} */ account) {
+  return createHash('sha256').update(`${account.credential ?? ''}\0${account.refreshToken ?? ''}`).digest('hex').slice(0, 32);
+}
+
 const PERSISTED_QUOTA_FIELDS = [
   'unified5h', 'unified7d', 'unified7dSonnet', 'unified7dFable',
   'unified5hReset', 'unified7dReset', 'unified7dSonnetReset', 'unified7dFableReset',
@@ -8102,7 +8115,9 @@ export class AccountManager {
       // The local credit ledger (api-credit.js), only on an account with a
       // credit setting: a fleet without one writes the file it always wrote.
       const credit = exportCreditState(a);
-      return { id: a.id, accountUuid: a.accountUuid, accountId: a.accountId, userId: a.userId, provider: providerOf(a), orgUuid: a.orgUuid, orgName: a.orgName, name: a.name, profile, quota, adaptive, outsideSpend, ...(credit ? { credit } : {}) };
+      const rejected = a.status === 'error' && a.errorReason && PERSISTED_ERROR_CODES.has(a.errorReason.code)
+        ? { ...a.errorReason, token: tokenFingerprint(a) } : null;
+      return { id: a.id, accountUuid: a.accountUuid, accountId: a.accountId, userId: a.userId, provider: providerOf(a), orgUuid: a.orgUuid, orgName: a.orgName, name: a.name, profile, quota, adaptive, outsideSpend, ...(credit ? { credit } : {}), ...(rejected ? { rejected } : {}) };
     });
   }
 
@@ -8148,9 +8163,31 @@ export class AccountManager {
       this.outsideSpend.restore(account.index, match.outsideSpend);
       this.concurrencyLearner.restore(account.index, match.adaptive?.concCap);
       restoreCreditState(account, match.credit);
+      this._restoreRejection(account, match.rejected);
       // We already know this account's weekly window, so it isn't "probing".
       if (account.quota.unified7dReset != null) account.probing = false;
     }
+  }
+
+  /**
+   * Put an account back in 'error' over a token rejected in a previous run,
+   * if it still holds that token; a new login since then clears it.
+   * @param {Record<string, any>} account
+   * @param {unknown} saved
+   */
+  _restoreRejection(account, saved) {
+    const r = /** @type {Record<string, any>|null} */ (saved && typeof saved === 'object' ? saved : null);
+    if (!r || !PERSISTED_ERROR_CODES.has(r.code) || r.token !== tokenFingerprint(account)) return;
+    account.status = 'error';
+    account.errorReason = {
+      code: r.code,
+      detail: typeof r.detail === 'string' ? safeLine(r.detail, 300) : '',
+      since: Number.isFinite(r.since) ? r.since : Date.now(),
+      remedy: loginCommandFor(account),
+      link: null,
+    };
+    // As after the rejection itself: the dead refresh token is not sent again.
+    if (r.code === 'refresh_rejected' && account.refreshToken) account._deadRefreshToken = account.refreshToken;
   }
 
   /**
