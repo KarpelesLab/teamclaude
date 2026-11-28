@@ -479,3 +479,26 @@ test('a subscription list moves on from an account removed while its token was r
     },
   });
 });
+
+// Under advisorEligibility "prefer" the advisor is a preference. When its
+// family cap bars every listed account, the list is read again by the main
+// model, as rotation is, so a first listed account whose window reads spent is
+// passed over for the next one.
+test('a subscription list under advisor "prefer" picks by the main model when the advisor bars every listed account', async () => {
+  const caps = { maxUsage: { unified7dFable: 0.7 } };
+  await withPin([sub('a'), sub('b', caps), sub('c', caps)], 'b,c', quota(new Set()), async ({ am, seen, port }) => {
+    for (const i of [1, 2]) {
+      Object.assign(am.accounts[i].quota, {
+        unified7d: 0.2, unified7dReset: Date.now() + 86_400_000,
+        unified7dFable: 0.75, unified7dFableReset: Date.now() + 86_400_000,
+      });
+    }
+    Object.assign(am.accounts[1].quota, { unified5h: 1, unified5hReset: Date.now() + 3600_000 });
+    const body = {
+      model: 'claude-opus-5', max_tokens: 1, messages: [],
+      tools: [{ type: 'advisor_20260301', name: 'advisor', model: 'claude-fable-5-1' }],
+    };
+    assert.deepEqual(await post(`http://127.0.0.1:${port}/v1/messages`, body), served('Bearer tok-c'));
+    assert.deepEqual(seen, ['Bearer tok-c']);
+  }, { advisorEligibility: 'prefer' });
+});

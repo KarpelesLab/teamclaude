@@ -4459,11 +4459,25 @@ export class AccountManager {
    * its cap. Null when every one is barred by something harder (a cap, a
    * rate-limit hold, a spent window, upstream's rejection, an error). The placement rules that
    * a pin does not ask (disabled, cordoned, routes) are not asked here either.
+   * Under `advisorEligibility: "prefer"` the advisor is a preference: when it
+   * bars every listed account, the list is read again by the main model alone.
    * @param {Record<string, any>[]} accounts
    * @param {string|null} [model]
    * @param {string|null} [advisorModel]
    */
   pinListChoice(accounts, model = null, advisorModel = null) {
+    const choice = this._pinListPass(accounts, model, advisorModel);
+    if (choice || !advisorModel || this.advisorEligibility !== 'prefer') return choice;
+    return this._pinListPass(accounts, model, null);
+  }
+
+  /**
+   * One reading of a pin's list for pinListChoice.
+   * @param {Record<string, any>[]} accounts
+   * @param {string|null} model
+   * @param {string|null} advisorModel
+   */
+  _pinListPass(accounts, model, advisorModel) {
     let past = null;
     for (const account of accounts) {
       const reason = this.unavailableReason(account, model, advisorModel, { named: true });
